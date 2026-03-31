@@ -1,0 +1,32 @@
+---
+source: crates/codegen/tests/object_lowering.rs
+input_file: test_files/object_lowering/large_struct_field_offset.sntn
+---
+target = "evm-ethereum-osaka"
+
+type @g1 = {i256, i256};
+type @g2 = {i256, i256, i256, i256};
+type @big_vk = {i256, i256, i256, i256, i256, @g1, @g1, @g1, @g1, @g1, [@g1; 3], [@g1; 1], [i256; 1], [@g2; 2], @g1};
+
+func public %get_s0x() -> i256 {
+    block0:
+        v0.*@big_vk = alloca @big_vk;
+        v1.*i256 = gep v0 0.i64 0.i256;
+        mstore v1 42.i256 i256;
+        v10.*@g1 = gep v0 0.i64 5.i256;
+        v11.*i256 = gep v10 0.i64 0.i256;
+        mstore v11 100.i256 i256;
+        v12.*i256 = gep v10 0.i64 1.i256;
+        mstore v12 200.i256 i256;
+        v20.*[@g1; 3] = gep v0 0.i64 10.i256;
+        v21.*@g1 = gep v20 0.i64 0.i256;
+        v22.*i256 = gep v21 0.i64 0.i256;
+        mstore v22 999.i256 i256;
+        v23.*i256 = gep v21 0.i64 1.i256;
+        mstore v23 888.i256 i256;
+        v30.*[@g1; 3] = gep v0 0.i64 10.i256;
+        v31.*@g1 = gep v30 0.i64 0.i256;
+        v32.*i256 = gep v31 0.i64 0.i256;
+        v33.i256 = mload v32 i256;
+        return v33;
+}

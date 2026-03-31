@@ -1,0 +1,28 @@
+target = "evm-ethereum-osaka"
+
+type @g1 = {i256, i256};
+type @g2 = {i256, i256, i256, i256};
+type @big_vk = {i256, i256, i256, i256, i256, @g1, @g1, @g1, @g1, @g1, [@g1; 3], [@g1; 1], [i256; 1], [@g2; 2], @g1};
+
+func public %get_s0x() -> i256 {
+    block0:
+        v0.objref<@big_vk> = obj.alloc @big_vk;
+        v1.objref<i256> = obj.proj v0 0.i256;
+        obj.store v1 42.i256;
+        v10.objref<@g1> = obj.proj v0 5.i256;
+        v11.objref<i256> = obj.proj v10 0.i256;
+        obj.store v11 100.i256;
+        v12.objref<i256> = obj.proj v10 1.i256;
+        obj.store v12 200.i256;
+        v20.objref<[@g1; 3]> = obj.proj v0 10.i256;
+        v21.objref<@g1> = obj.index v20 0.i256;
+        v22.objref<i256> = obj.proj v21 0.i256;
+        obj.store v22 999.i256;
+        v23.objref<i256> = obj.proj v21 1.i256;
+        obj.store v23 888.i256;
+        v30.objref<[@g1; 3]> = obj.proj v0 10.i256;
+        v31.objref<@g1> = obj.index v30 0.i256;
+        v32.objref<i256> = obj.proj v31 0.i256;
+        v33.i256 = obj.load v32;
+        return v33;
+}
