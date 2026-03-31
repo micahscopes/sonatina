@@ -1,13 +1,14 @@
 ---
 source: crates/codegen/tests/evm.rs
+assertion_line: 456
 expression: "String::from_utf8(out).unwrap()"
 input_file: test_files/evm/fe_vault_test_vault_multiuser_unoptimized.sntn
 ---
 evm.config: stack_reach=16 vcode=true bytecode_hex=false stackify_trace=false evm_trace=false emit_observability=false opt=2
 
 object: Contract
-  section runtime: 4403 bytes
-  total: 4403 bytes
+  section runtime: 4396 bytes
+  total: 4396 bytes
 
 object: Vault
   section init: 855 bytes
@@ -44,7 +45,7 @@ functions:
     mem: scratch_words=0 stable_words=5 stable_mode=StaticAbs(base=0xe0) entry_abs_words=2 abs_words_end=7
   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__GetTotalShares_hbe2278c3233da528__5145d089cb2da672: ir_blocks=5 ir_insts=26 vcode_ops=88 fixups=11 imm_bytes=11
     mem: scratch_words=0 stable_words=5 stable_mode=StaticAbs(base=0xe0) entry_abs_words=2 abs_words_end=7
-  evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__AddYield_h1b194739dad02c6e__f712b0a646b2bb64: ir_blocks=7 ir_insts=38 vcode_ops=123 fixups=14 imm_bytes=15
+  evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__AddYield_h1b194739dad02c6e__f712b0a646b2bb64: ir_blocks=5 ir_insts=35 vcode_ops=113 fixups=13 imm_bytes=15
     mem: scratch_words=0 stable_words=9 stable_mode=StaticAbs(base=0xe0) entry_abs_words=2 abs_words_end=11
   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__Withdraw_h97c67fe0f317b1b0__d9e92202bb8b3b1d: ir_blocks=5 ir_insts=29 vcode_ops=105 fixups=13 imm_bytes=12
     mem: scratch_words=0 stable_words=5 stable_mode=StaticAbs(base=0x100) entry_abs_words=3 abs_words_end=8
@@ -84,7 +85,7 @@ functions:
     mem: scratch_words=0 stable_words=2 stable_mode=StaticAbs(base=0xa0) entry_abs_words=0 abs_words_end=2
 
 evm:
-  case ok: calldata_len=0 success reason=Return gas_used=532143 gas_refunded=79600 logs=0 output=call len=32 tx_gas=21000 runtime_gas=511143
+  case ok: calldata_len=0 success reason=Return gas_used=532122 gas_refunded=79600 logs=0 output=call len=32 tx_gas=21000 runtime_gas=511122
 
 
 --------------- DEBUG ---------------
@@ -1118,16 +1119,16 @@ evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__GetTotalS
 evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__AddYield_h1b194739dad02c6e__f712b0a646b2bb64:
   block0:
     JUMPDEST
-    PUSH1 0x40 (64)  // v49.i256 = mload 64.i32 i256;
+    PUSH1 0x40 (64)  // v48.i256 = mload 64.i32 i256;
     MLOAD
-    PUSH1 0xe0 (224)  // v42.*@__fe_obj_SolEncoder_5 = alloca @__fe_obj_SolEncoder_5;
-    DUP1  // call %solencoder_h1b9228b90dad6928_new v42;
+    PUSH1 0xe0 (224)  // v41.*@__fe_obj_SolEncoder_5 = alloca @__fe_obj_SolEncoder_5;
+    DUP1  // call %solencoder_h1b9228b90dad6928_new v41;
     PUSH1 `pc + (4)`
     SWAP1
     PUSH1 FuncRef(81)
     JUMP
     JUMPDEST
-    DUP1  // v22.i256 = call %solencoder_h1b9228b90dad6928_abiencoder_hffd58d20d4321024_reserve_head v42 36.i256;
+    DUP1  // v22.i256 = call %solencoder_h1b9228b90dad6928_abiencoder_hffd58d20d4321024_reserve_head v41 36.i256;
     PUSH1 0x24 (36)
     PUSH1 `pc + (4)`
     SWAP2
@@ -1137,29 +1138,29 @@ evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__AddYield_
     PUSH29 0x300000000000000000000000000000000000000000000000000000000 (80879840001451919384001045261058892020911433267621717443310830747648)  // mstore v22 80879840001451919384001045261058892020911433267621717443310830747648.i256 i256;
     DUP2
     MSTORE
-    PUSH1 0x4 (4)  // v46.i256 = add v22 4.i256;
+    PUSH1 0x4 (4)  // v45.i256 = add v22 4.i256;
     DUP2
     ADD
-    SWAP1  // v47.i1 = lt v46 v22;
+    SWAP1  // v46.i1 = lt v45 v22;
     DUP2
     LT
-    PUSH1 section_unit0  // br v47 block5 block7;
+    PUSH1 section_unit0  // br v46 block5 block7;
     JUMPI
   block7:
     JUMPDEST
-    DUP2  // v28.*i256 = gep v42 0.i256 1.i256;
+    DUP2  // v28.*i256 = gep v41 0.i256 1.i256;
     POP
     PUSH2 0x100 (256)
-    MSTORE  // mstore v28 v46 i256;
-    DUP1  // call %solencoder_h1b9228b90dad6928_abiencoder_hffd58d20d4321024_write_word v42 v3;
+    MSTORE  // mstore v28 v45 i256;
+    DUP1  // call %solencoder_h1b9228b90dad6928_abiencoder_hffd58d20d4321024_write_word v41 v3;
     SWAP6
     PUSH1 `pc + (4)`
     SWAP2
     PUSH1 FuncRef(100)
     JUMP
     JUMPDEST
-    PUSH2 0x140 (320)  // v43.*@__fe_obj_tuple_4 = alloca @__fe_obj_tuple_4;
-    DUP1  // call %solencoder_h1b9228b90dad6928_abiencoder_hffd58d20d4321024_finish v43 v42;
+    PUSH2 0x140 (320)  // v42.*@__fe_obj_tuple_4 = alloca @__fe_obj_tuple_4;
+    DUP1  // call %solencoder_h1b9228b90dad6928_abiencoder_hffd58d20d4321024_finish v42 v41;
     SWAP6
     PUSH1 `pc + (4)`
     SWAP2
@@ -1168,7 +1169,7 @@ evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__AddYield_
     JUMPDEST
     DUP5  // v9.i256 = mload v8 i256;
     MLOAD
-    SWAP5  // v11.*i256 = gep v43 0.i256 1.i256;
+    SWAP5  // v11.*i256 = gep v42 0.i256 1.i256;
     POP
     PUSH2 0x160 (352)
     MLOAD  // v12.i256 = mload v11 i256;
@@ -1200,36 +1201,30 @@ evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__AddYield_
     SWAP2  // v30.i1 = eq v13 0.i256;
     PUSH0
     EQ
-    ISZERO  // br v30 block1 block9;
-    PUSH1 block9
+    ISZERO  // br v30 block1 block2;
+    PUSH1 block2
     JUMPI
   block1:
     SWAP1  // evm_revert v16 v14;
     REVERT
-  block9:
+  block2:
     JUMPDEST
-    PUSH0  // v37.i1 = lt v14 0.i256;
-    DUP2
-    LT
-    PUSH1 section_unit0  // br v37 block10 block11;
-    JUMPI
-  block11:
-    PUSH1 0xe0 (224)  // v38.*@__fe_obj_MemoryBytes_6 = alloca @__fe_obj_MemoryBytes_6;
-    SWAP2  // mstore v39 v16 i256;
+    PUSH1 0xe0 (224)  // v37.*@__fe_obj_MemoryBytes_6 = alloca @__fe_obj_MemoryBytes_6;
+    SWAP2  // mstore v38 v16 i256;
     DUP3
     MSTORE
-    DUP2  // v40.*i256 = gep v38 0.i256 1.i256;
+    DUP2  // v39.*i256 = gep v37 0.i256 1.i256;
     POP
     PUSH2 0x100 (256)
-    MSTORE  // mstore v40 v14 i256;
-    PUSH2 0x180 (384)  // v44.*@__fe_obj_SolDecoder_8 = alloca @__fe_obj_SolDecoder_8;
-    SWAP1  // call %soldecoder_i__ha12a03fcb5ba844b_new__MemoryBytes_h1e381015a9b0111b__59e0d528d54cca1b v44 v38;
+    MSTORE  // mstore v39 v14 i256;
+    PUSH2 0x180 (384)  // v43.*@__fe_obj_SolDecoder_8 = alloca @__fe_obj_SolDecoder_8;
+    SWAP1  // call %soldecoder_i__ha12a03fcb5ba844b_new__MemoryBytes_h1e381015a9b0111b__59e0d528d54cca1b v43 v37;
     PUSH1 `pc + (4)`
     SWAP2
     PUSH1 FuncRef(84)
     JUMP
     JUMPDEST
-    SWAP2  // mstore 64.i32 v49 i256;
+    SWAP2  // mstore 64.i32 v48 i256;
     POP
     POP
     PUSH1 0x40 (64)

@@ -1,0 +1,74 @@
+#! evm.config: { opt: 2 }
+#! evm.case: ok
+#!   calldata:
+#!   expect: return u256(999)
+
+target = "evm-ethereum-osaka"
+
+type @g1 = {i256, i256};
+type @g2 = {i256, i256, i256, i256};
+type @big_vk = {i256, i256, i256, i256, i256, @g1, @g1, @g1, @g1, @g1, [@g1; 3], [@g1; 1], [i256; 1], [@g2; 2], @g1};
+
+func public %entry() {
+    block0:
+        v0.i256 = call %get_s0x;
+        mstore 0.i32 v0 i256;
+        evm_return 0.i8 32.i8;
+}
+
+object @Contract {
+  section runtime {
+    entry %entry;
+  }
+}
+
+func private %get_s0x() -> i256 {
+    block0:
+        v0.objref<@big_vk> = obj.alloc @big_vk;
+        v1.objref<i256> = obj.proj v0 0.i256;
+        obj.store v1 42.i256;
+        v2.objref<i256> = obj.proj v0 1.i256;
+        obj.store v2 43.i256;
+        v3.objref<i256> = obj.proj v0 2.i256;
+        obj.store v3 44.i256;
+        v4.objref<i256> = obj.proj v0 3.i256;
+        obj.store v4 45.i256;
+        v5.objref<i256> = obj.proj v0 4.i256;
+        obj.store v5 46.i256;
+        v10.objref<@g1> = obj.proj v0 5.i256;
+        v11.objref<i256> = obj.proj v10 0.i256;
+        obj.store v11 100.i256;
+        v12.objref<i256> = obj.proj v10 1.i256;
+        obj.store v12 101.i256;
+        v13.objref<@g1> = obj.proj v0 6.i256;
+        v14.objref<i256> = obj.proj v13 0.i256;
+        obj.store v14 200.i256;
+        v15.objref<i256> = obj.proj v13 1.i256;
+        obj.store v15 201.i256;
+        v16.objref<@g1> = obj.proj v0 7.i256;
+        v17.objref<i256> = obj.proj v16 0.i256;
+        obj.store v17 300.i256;
+        v18.objref<i256> = obj.proj v16 1.i256;
+        obj.store v18 301.i256;
+        v19.objref<@g1> = obj.proj v0 8.i256;
+        v20.objref<i256> = obj.proj v19 0.i256;
+        obj.store v20 400.i256;
+        v21.objref<i256> = obj.proj v19 1.i256;
+        obj.store v21 401.i256;
+        v22.objref<@g1> = obj.proj v0 9.i256;
+        v23.objref<i256> = obj.proj v22 0.i256;
+        obj.store v23 500.i256;
+        v24.objref<i256> = obj.proj v22 1.i256;
+        obj.store v24 501.i256;
+        v30.objref<[@g1; 3]> = obj.proj v0 10.i256;
+        v31.objref<@g1> = obj.index v30 0.i256;
+        v32.objref<i256> = obj.proj v31 0.i256;
+        obj.store v32 999.i256;
+        v33.objref<i256> = obj.proj v31 1.i256;
+        obj.store v33 998.i256;
+        v40.objref<[@g1; 3]> = obj.proj v0 10.i256;
+        v41.objref<@g1> = obj.index v40 0.i256;
+        v42.objref<i256> = obj.proj v41 0.i256;
+        v43.i256 = obj.load v42;
+        return v43;
+}

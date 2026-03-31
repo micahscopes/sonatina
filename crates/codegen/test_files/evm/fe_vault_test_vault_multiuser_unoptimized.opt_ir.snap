@@ -443,25 +443,18 @@ func private %evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_s
         v16.i256 = ptr_to_int v15 i256;
         evm_return_data_copy v16 0.i256 v14;
         v30.i1 = eq v13 0.i256;
-        br v30 block1 block9;
+        br v30 block1 block2;
 
     block1:
         evm_revert v16 v14;
 
-    block9:
-        v37.i1 = lt v14 0.i256;
-        br v37 block10 block11;
-
-    block10:
-        evm_revert 0.i256 0.i256;
-
-    block11:
-        v38.objref<@__fe_obj_MemoryBytes_6> = obj.alloc @__fe_obj_MemoryBytes_6;
-        v39.objref<i256> = obj.proj v38 0.i256;
-        obj.store v39 v16;
-        v40.objref<i256> = obj.proj v38 1.i256;
-        obj.store v40 v14;
-        v41.objref<@__fe_obj_SolDecoder_8> = call %soldecoder_i__ha12a03fcb5ba844b_new__MemoryBytes_h1e381015a9b0111b__59e0d528d54cca1b v38;
+    block2:
+        v37.objref<@__fe_obj_MemoryBytes_6> = obj.alloc @__fe_obj_MemoryBytes_6;
+        v38.objref<i256> = obj.proj v37 0.i256;
+        obj.store v38 v16;
+        v39.objref<i256> = obj.proj v37 1.i256;
+        obj.store v39 v14;
+        v40.objref<@__fe_obj_SolDecoder_8> = call %soldecoder_i__ha12a03fcb5ba844b_new__MemoryBytes_h1e381015a9b0111b__59e0d528d54cca1b v37;
         return;
 }
 

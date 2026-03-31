@@ -595,19 +595,10 @@ func private %evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor__AddYield_h
         v48.i1 = is_zero v15;
         v49.i256 = zext v48 i256;
         v41.i1 = is_zero v49;
-        br v41 block4 block1;
+        br v41 block6 block1;
 
     block1:
         evm_revert v18 v16;
-
-    block4:
-        v51.i1 = lt v16 0.i256;
-        v52.i256 = zext v51 i256;
-        v42.i1 = is_zero v52;
-        br v42 block6 block5;
-
-    block5:
-        evm_revert 0.i256 0.i256;
 
     block6:
         v36.*@__fe_MemoryBytes_3 = alloca @__fe_MemoryBytes_3;

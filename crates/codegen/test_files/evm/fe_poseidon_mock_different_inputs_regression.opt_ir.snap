@@ -160,18 +160,14 @@ func private %poseidon_mock(v0.i256, v1.i256) -> i256 {
         obj.store v13 v53;
         v15.objref<i256> = obj.index v9 2.i256;
         obj.store v15 0.i256;
-        v19.objref<@__fe_obj_Range_0> = obj.alloc @__fe_obj_Range_0;
-        v20.objref<i256> = obj.proj v19 1.i256;
-        obj.store v20 2.i256;
-        v21.i256 = call %range_known_const_s__usize___unknown__h4e84f6b6b8307914_seq_ha637d2df505bccf2_len__0__fc6647014fb554e5 v19;
         jump block1;
 
     block1:
         v63.i256 = phi (0.i256 block0) (v33 block3);
         v60.objref<[i256; 3]> = phi (v9 block0) (v31 block3);
         v22.i256 = phi (0.i256 block0) (v36 block3);
-        v24.i1 = lt v22 v21;
-        br v24 block2 block14;
+        v24.i1 = lt v22 2.i256;
+        br v24 block2 block5;
 
     block2:
         v29.objref<[i256; 3]> = call %ark v60 v63;
@@ -185,10 +181,10 @@ func private %poseidon_mock(v0.i256, v1.i256) -> i256 {
         jump block1;
 
     block5:
-        v73.i256 = phi (v63 block14) (v52 block7);
-        v70.objref<[i256; 3]> = phi (v60 block14) (v51 block7);
-        v42.i256 = phi (0.i256 block14) (v55 block7);
-        v44.i1 = lt v42 v41;
+        v73.i256 = phi (v63 block1) (v52 block7);
+        v70.objref<[i256; 3]> = phi (v60 block1) (v51 block7);
+        v42.i256 = phi (0.i256 block1) (v55 block7);
+        v44.i1 = lt v42 2.i256;
         br v44 block6 block8;
 
     block6:
@@ -209,28 +205,6 @@ func private %poseidon_mock(v0.i256, v1.i256) -> i256 {
 
     block9:
         evm_revert 0.i256 0.i256;
-
-    block14:
-        v39.objref<@__fe_obj_Range_0> = obj.alloc @__fe_obj_Range_0;
-        v40.objref<i256> = obj.proj v39 1.i256;
-        obj.store v40 2.i256;
-        v41.i256 = call %range_known_const_s__usize___unknown__h4e84f6b6b8307914_seq_ha637d2df505bccf2_len__0__fc6647014fb554e5 v39;
-        jump block5;
-}
-
-func private %range_known_const_s__usize___unknown__h4e84f6b6b8307914_seq_ha637d2df505bccf2_len__0__fc6647014fb554e5(v0.objref<@__fe_obj_Range_0>) -> i256 {
-    block0:
-        v31.objref<i256> = obj.proj v0 1.i64;
-        v32.i256 = obj.load v31;
-        v11.i1 = lt v32 0.i256;
-        br v11 block3 block2;
-
-    block2:
-        jump block3;
-
-    block3:
-        v11.i256 = phi (0.i256 block0) (v32 block2);
-        return v11;
 }
 
 func public %entry() {
