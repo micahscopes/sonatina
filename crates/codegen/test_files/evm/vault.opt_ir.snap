@@ -187,8 +187,13 @@ func private %__Vault_recv_0_1(v0.i256, v1.i256) -> i256 {
 
     block4:
         v14.i256 = evm_caller;
-        v30.i256 = call %storagemap_storage_slot_with_salt__Address_h257056268eac7027__5ab99f7153cdba29 v14 0.i256;
-        v31.i256 = evm_sload v30;
+        v50.*i8 = evm_malloc 0.i256;
+        v51.i256 = ptr_to_int v50 i256;
+        mstore v51 v14 i256;
+        v53.i256 = add 32.i256 v51;
+        mstore v53 0.i256 i256;
+        v55.i256 = evm_keccak256 v51 64.i256;
+        v31.i256 = evm_sload v55;
         v45.i1 = gt v0 v31;
         v46.i256 = zext v45 i256;
         v35.i1 = is_zero v46;
@@ -207,8 +212,13 @@ func private %__Vault_recv_0_1(v0.i256, v1.i256) -> i256 {
         v33.i256 = sub v32 v27;
         evm_sstore v1 v33;
         v36.i256 = sub v31 v0;
-        v32.i256 = call %storagemap_storage_slot_with_salt__Address_h257056268eac7027__5ab99f7153cdba29 v14 0.i256;
-        evm_sstore v32 v36;
+        v56.*i8 = evm_malloc 0.i256;
+        v57.i256 = ptr_to_int v56 i256;
+        mstore v57 v14 i256;
+        v58.i256 = add 32.i256 v57;
+        mstore v58 0.i256 i256;
+        v59.i256 = evm_keccak256 v57 64.i256;
+        evm_sstore v59 v36;
         return v27;
 }
 
@@ -256,41 +266,50 @@ func private %__Vault_runtime() {
 
     block2:
         v17.i256 = call %soldecoder_i__ha12a03fcb5ba844b_abidecoder_h638151350e80a086_read_word__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563 v3;
-        v34.i1 = is_zero v17;
-        v35.i256 = zext v34 i256;
-        v36.i1 = is_zero v35;
-        br v36 block21 block18;
+        v63.i1 = is_zero v17;
+        v64.i256 = zext v63 i256;
+        v59.i1 = is_zero v64;
+        br v59 block16 block13;
 
-    block21:
-        v38.i256 = evm_sload 1.i256;
-        v39.i1 = is_zero v38;
-        br v39 block23 block22;
-
-    block22:
-        v40.i256 = evm_sload 0.i256;
-        v41.i256 = mul v17 v38;
-        v42.i256 = evm_udiv v41 v40;
-        jump block23;
-
-    block23:
-        v43.i256 = phi (v17 block21) (v42 block22);
-        v44.i256 = evm_sload 0.i256;
-        v45.i256 = add v17 v44;
-        evm_sstore 0.i256 v45;
-        v46.i256 = evm_sload 1.i256;
-        v47.i256 = add v43 v46;
-        evm_sstore 1.i256 v47;
-        v48.i256 = evm_caller;
-        v49.i256 = call %storagemap_storage_slot_with_salt__Address_h257056268eac7027__5ab99f7153cdba29 v48 0.i256;
-        v50.i256 = evm_sload v49;
-        v51.i256 = add v43 v50;
-        v52.i256 = call %storagemap_storage_slot_with_salt__Address_h257056268eac7027__5ab99f7153cdba29 v48 0.i256;
-        evm_sstore v52 v51;
-        jump block18;
+    block16:
+        v28.i256 = evm_sload 1.i256;
+        v29.i1 = is_zero v28;
+        br v29 block19 block18;
 
     block18:
-        v53.i256 = phi (0.i256 block2) (v43 block23);
-        call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v53;
+        v35.i256 = evm_sload 0.i256;
+        v65.i256 = mul v28 v17;
+        v37.i256 = evm_udiv v65 v35;
+        jump block19;
+
+    block19:
+        v38.i256 = phi (v17 block16) (v37 block18);
+        v39.i256 = evm_sload 0.i256;
+        v40.i256 = add v39 v17;
+        evm_sstore 0.i256 v40;
+        v43.i256 = add v38 v28;
+        evm_sstore 1.i256 v43;
+        v45.i256 = evm_caller;
+        v66.*i8 = evm_malloc 0.i256;
+        v67.i256 = ptr_to_int v66 i256;
+        mstore v67 v45 i256;
+        v69.i256 = add 32.i256 v67;
+        mstore v69 0.i256 i256;
+        v71.i256 = evm_keccak256 v67 64.i256;
+        v47.i256 = evm_sload v71;
+        v48.i256 = add v38 v47;
+        v72.*i8 = evm_malloc 0.i256;
+        v73.i256 = ptr_to_int v72 i256;
+        mstore v73 v45 i256;
+        v74.i256 = add 32.i256 v73;
+        mstore v74 0.i256 i256;
+        v75.i256 = evm_keccak256 v73 64.i256;
+        evm_sstore v75 v48;
+        jump block13;
+
+    block13:
+        v50.i256 = phi (0.i256 block2) (v38 block19);
+        call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v50;
         unreachable;
 
     block3:
@@ -301,26 +320,31 @@ func private %__Vault_runtime() {
 
     block4:
         v25.i256 = call %soldecoder_i__ha12a03fcb5ba844b_abidecoder_h638151350e80a086_read_word__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563 v3;
-        v24.i256 = evm_sload 0.i256;
-        v25.i256 = add v24 v25;
-        evm_sstore 0.i256 v25;
+        v51.i256 = evm_sload 0.i256;
+        v52.i256 = add v51 v25;
+        evm_sstore 0.i256 v52;
         evm_return 0.i256 0.i256;
 
     block5:
-        v26.i256 = evm_sload 0.i256;
-        call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v26;
+        v53.i256 = evm_sload 0.i256;
+        call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v53;
         unreachable;
 
     block6:
-        v28.i256 = evm_sload 1.i256;
-        call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v28;
+        v55.i256 = evm_sload 1.i256;
+        call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v55;
         unreachable;
 
     block7:
-        v29.i256 = evm_caller;
-        v30.i256 = call %storagemap_storage_slot_with_salt__Address_h257056268eac7027__5ab99f7153cdba29 v29 0.i256;
-        v31.i256 = evm_sload v30;
-        call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v31;
+        v56.i256 = evm_caller;
+        v76.*i8 = evm_malloc 0.i256;
+        v77.i256 = ptr_to_int v76 i256;
+        mstore v77 v56 i256;
+        v78.i256 = add 32.i256 v77;
+        mstore v78 0.i256 i256;
+        v79.i256 = evm_keccak256 v77 64.i256;
+        v58.i256 = evm_sload v79;
+        call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v58;
         unreachable;
 
     block8:
@@ -764,15 +788,25 @@ func private %evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor__ProxyWithd
 
 func public %storagemap_k__v__const_salt__u256__h5955888dd44c2a19_get_stor__Address_h257056268eac7027_u256_0__6e989e4cb63e64c3(v0.i256, v1.i256) -> i256 {
     block0:
-        v5.i256 = call %storagemap_storage_slot_with_salt__Address_h257056268eac7027__5ab99f7153cdba29 v1 0.i256;
-        v6.i256 = evm_sload v5;
+        v7.*i8 = evm_malloc 0.i256;
+        v8.i256 = ptr_to_int v7 i256;
+        mstore v8 v1 i256;
+        v10.i256 = add 32.i256 v8;
+        mstore v10 0.i256 i256;
+        v12.i256 = evm_keccak256 v8 64.i256;
+        v6.i256 = evm_sload v12;
         return v6;
 }
 
 func public %storagemap_k__v__const_salt__u256__h5955888dd44c2a19_set_stor__Address_h257056268eac7027_u256_0__6e989e4cb63e64c3(v0.i256, v1.i256, v2.i256) {
     block0:
-        v5.i256 = call %storagemap_storage_slot_with_salt__Address_h257056268eac7027__5ab99f7153cdba29 v1 0.i256;
-        evm_sstore v5 v2;
+        v6.*i8 = evm_malloc 0.i256;
+        v7.i256 = ptr_to_int v6 i256;
+        mstore v7 v1 i256;
+        v9.i256 = add 32.i256 v7;
+        mstore v9 0.i256 i256;
+        v11.i256 = evm_keccak256 v7 64.i256;
+        evm_sstore v11 v2;
         return;
 }
 
@@ -971,17 +1005,6 @@ func public %solencoder_h1b9228b90dad6928_new() -> i256 {
         v11.*i256 = gep v12 0.i256 2.i256;
         mstore v11 0.i256 i256;
         return v3;
-}
-
-func private %storagemap_storage_slot_with_salt__Address_h257056268eac7027__5ab99f7153cdba29(v0.i256, v1.i256) -> i256 {
-    block0:
-        v3.*i8 = evm_malloc 0.i256;
-        v4.i256 = ptr_to_int v3 i256;
-        mstore v4 v0 i256;
-        v6.i256 = add 32.i256 v4;
-        mstore v6 v1 i256;
-        v10.i256 = evm_keccak256 v4 64.i256;
-        return v10;
 }
 
 func public %cursor_i__h140a998c67d6d59c_new__MemoryBytes_h1e381015a9b0111b__59e0d528d54cca1b(v0.i256) -> i256 {

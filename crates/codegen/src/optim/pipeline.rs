@@ -243,27 +243,29 @@ fn size_inliner_config() -> InlinerConfig {
 
 fn speed_inliner_config() -> InlinerConfig {
     InlinerConfig {
-        // The speed-oriented mode stays more selective about inlining, because
-        // on the EVM a smaller post-inline body often wins on runtime gas.
+        // The speed-oriented mode inlines more aggressively for runtime gas
+        // savings on the EVM, where eliminating JUMP call overhead and enabling
+        // cross-function constant propagation outweighs modest code growth.
         enable_full_inliner: true,
         splice_max_insts: 4,
-        max_inlinee_blocks: 6,
-        max_inlinee_insts: 32,
-        max_multi_use_inlinee_blocks: 3,
-        max_multi_use_inlinee_insts: 12,
-        max_growth_per_caller: 32,
-        max_total_growth: 160,
-        max_inline_depth: 3,
-        inline_threshold: 10,
-        inline_threshold_cold: 5,
-        single_use_bonus: 8,
-        leaf_bonus: 2,
+        max_inlinee_blocks: 8,
+        max_inlinee_insts: 40,
+        max_multi_use_inlinee_blocks: 4,
+        max_multi_use_inlinee_insts: 16,
+        max_growth_per_caller: 40,
+        max_total_growth: 200,
+        max_inline_depth: 4,
+        inline_threshold: 12,
+        inline_threshold_cold: 6,
+        single_use_bonus: 10,
+        leaf_bonus: 3,
         loop_penalty: 32,
-        max_multi_use_object_helper_blocks: 2,
-        max_multi_use_object_helper_insts: 12,
-        max_multi_use_object_helper_call_count: 4,
-        object_scalarization_bonus_cap: 10,
-        object_helper_cluster_bonus: 4,
+        multi_block_multi_use_penalty: 6,
+        max_multi_use_object_helper_blocks: 3,
+        max_multi_use_object_helper_insts: 14,
+        max_multi_use_object_helper_call_count: 5,
+        object_scalarization_bonus_cap: 12,
+        object_helper_cluster_bonus: 5,
         ..InlinerConfig::default()
     }
 }

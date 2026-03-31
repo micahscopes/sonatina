@@ -10,47 +10,47 @@ global private const [i8; 32] $__fe_const_data_1 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 
 func private %__repro_runtime_entry() {
     block0:
-        v7.objref<[i256; 1]> = obj.alloc [i256; 1];
-        v8.i256 = sym_addr $__fe_const_data_0;
-        v9.*[i256; 1] = int_to_ptr v8 *[i256; 1];
-        v10.*i256 = bitcast v9 *i256;
-        v11.i256 = ptr_to_int v10 i256;
-        v12.*i256 = alloca i256;
-        v13.i256 = ptr_to_int v12 i256;
-        evm_code_copy v13 v11 32.i256;
-        v15.i256 = mload v13 i256;
-        v16.objref<i256> = obj.index v7 0.i256;
-        obj.store v16 v15;
-        v17.i256 = sym_addr $__fe_const_data_1;
-        v18.*[i256; 1] = int_to_ptr v17 *[i256; 1];
-        v19.*i256 = bitcast v18 *i256;
-        v20.i256 = ptr_to_int v19 i256;
-        jump block9;
+        v1.objref<[i256; 1]> = obj.alloc [i256; 1];
+        v2.i256 = sym_addr $__fe_const_data_0;
+        v3.*[i256; 1] = int_to_ptr v2 *[i256; 1];
+        v4.*i256 = bitcast v3 *i256;
+        v5.i256 = ptr_to_int v4 i256;
+        v6.*i256 = alloca i256;
+        v7.i256 = ptr_to_int v6 i256;
+        evm_code_copy v7 v5 32.i256;
+        v9.i256 = mload v7 i256;
+        v10.objref<i256> = obj.index v1 0.i256;
+        obj.store v10 v9;
+        v11.i256 = sym_addr $__fe_const_data_1;
+        v12.*[i256; 1] = int_to_ptr v11 *[i256; 1];
+        v13.*i256 = bitcast v12 *i256;
+        v14.i256 = ptr_to_int v13 i256;
+        jump block3;
 
-    block9:
-        v22.objref<[i256; 1]> = phi (v7 block0) (v27 block10);
-        v24.i256 = phi (0.i256 block0) (v32 block10);
-        v26.i1 = lt v24 1.i256;
-        br v26 block10 block11;
-
-    block10:
-        v27.objref<[i256; 1]> = obj.alloc [i256; 1];
-        v28.*i256 = alloca i256;
-        v29.i256 = ptr_to_int v28 i256;
-        evm_code_copy v29 v20 32.i256;
-        v30.i256 = mload v29 i256;
-        v31.objref<i256> = obj.index v27 0.i256;
-        obj.store v31 v30;
-        v32.i256 = add 1.i256 v24;
-        jump block9;
-
-    block11:
-        v33.objref<i256> = obj.index v22 0.i256;
-        v34.i256 = obj.load v33;
-        v3.i1 = eq 2.i256 v34;
-        br v3 block1 block4;
+    block3:
+        v16.objref<[i256; 1]> = phi (v1 block0) (v21 block4);
+        v18.i256 = phi (0.i256 block0) (v26 block4);
+        v20.i1 = lt v18 1.i256;
+        br v20 block4 block5;
 
     block4:
+        v21.objref<[i256; 1]> = obj.alloc [i256; 1];
+        v22.*i256 = alloca i256;
+        v23.i256 = ptr_to_int v22 i256;
+        evm_code_copy v23 v14 32.i256;
+        v24.i256 = mload v23 i256;
+        v25.objref<i256> = obj.index v21 0.i256;
+        obj.store v25 v24;
+        v26.i256 = add 1.i256 v18;
+        jump block3;
+
+    block5:
+        v27.objref<i256> = obj.index v16 0.i256;
+        v28.i256 = obj.load v27;
+        v30.i1 = eq 2.i256 v28;
+        br v30 block1 block6;
+
+    block6:
         evm_revert 0.i256 0.i256;
 
     block1:

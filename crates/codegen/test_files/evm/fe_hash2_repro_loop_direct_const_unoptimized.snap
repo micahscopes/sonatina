@@ -21,118 +21,118 @@ evm:
 
 // func private %__repro_runtime_entry()
   block0 P=[] T=[]
-    // v7.*[i256; 1] = alloca [i256; 1];
+    // v1.*[i256; 1] = alloca [i256; 1];
     - stack=[]
-      alloca [] -> v7
-    // v8.i256 = sym_addr $__fe_const_data_0;
-    - stack=[v7]
-      sym_addr [] -> v8
-    // v9.*[i256; 1] = int_to_ptr v8 *[i256; 1];
-    - stack=[v8, v7]
-      int_to_ptr [v8] -> v8
-    // v10.*i256 = bitcast v9 *i256;
-    - stack=[v8, v7]
-      bitcast [v8] -> v8
-    // v11.i256 = ptr_to_int v10 i256;
-    - stack=[v8, v7]
-      ptr_to_int [v8] -> v8
-    // v12.*i256 = alloca i256;
-    - stack=[v8, v7]
-      alloca [] -> v12
-    // v13.i256 = ptr_to_int v12 i256;
-    - stack=[v12, v8, v7]
-      ptr_to_int [v12] -> v12
-    // evm_code_copy v13 v11 32.i256;
-    - stack=[v12, v8, v7], last_use=[v8]
+      alloca [] -> v1
+    // v2.i256 = sym_addr $__fe_const_data_0;
+    - stack=[v1]
+      sym_addr [] -> v2
+    // v3.*[i256; 1] = int_to_ptr v2 *[i256; 1];
+    - stack=[v2, v1]
+      int_to_ptr [v2] -> v2
+    // v4.*i256 = bitcast v3 *i256;
+    - stack=[v2, v1]
+      bitcast [v2] -> v2
+    // v5.i256 = ptr_to_int v4 i256;
+    - stack=[v2, v1]
+      ptr_to_int [v2] -> v2
+    // v6.*i256 = alloca i256;
+    - stack=[v2, v1]
+      alloca [] -> v6
+    // v7.i256 = ptr_to_int v6 i256;
+    - stack=[v6, v2, v1]
+      ptr_to_int [v6] -> v6
+    // evm_code_copy v7 v5 32.i256;
+    - stack=[v6, v2, v1], last_use=[v2]
       pre: [PUSH(32), SWAP1, SWAP2, DUP3]
-      evm_code_copy [v12, v8, 32]
-    // v15.i256 = mload v13 i256;
-    - stack=[v12, v7], last_use=[v12]
-      mload [v12] -> v15
-    // v16.*i256 = bitcast v7 *i256;
-    - stack=[v15, v7]
-      bitcast [v7] -> v7
-    // mstore v16 v15 i256;
-    - stack=[v15, v7], last_use=[v15]
+      evm_code_copy [v6, v2, 32]
+    // v9.i256 = mload v7 i256;
+    - stack=[v6, v1], last_use=[v6]
+      mload [v6] -> v9
+    // v10.*i256 = bitcast v1 *i256;
+    - stack=[v9, v1]
+      bitcast [v1] -> v1
+    // mstore v10 v9 i256;
+    - stack=[v9, v1], last_use=[v9]
       pre: [DUP2]
-      mstore [v7, v15]
-    // v17.i256 = sym_addr $__fe_const_data_1;
-    - stack=[v7]
-      sym_addr [] -> v17
-    // v18.*[i256; 1] = int_to_ptr v17 *[i256; 1];
-    - stack=[v17, v7]
-      int_to_ptr [v17] -> v17
-    // v19.*i256 = bitcast v18 *i256;
-    - stack=[v17, v7]
-      bitcast [v17] -> v17
-    // v20.i256 = ptr_to_int v19 i256;
-    - stack=[v17, v7]
-      ptr_to_int [v17] -> v17
-    // jump block9;
-    - stack=[v17, v7]
-      exit(block9): [PUSH(0), SWAP1, SWAP2]
-      jump -> block9
-  block9 P=[v36, v24] T=[v17]
-    // v26.i1 = lt v24 1.i256;
-    - stack=[v36, v24, v17]
+      mstore [v1, v9]
+    // v11.i256 = sym_addr $__fe_const_data_1;
+    - stack=[v1]
+      sym_addr [] -> v11
+    // v12.*[i256; 1] = int_to_ptr v11 *[i256; 1];
+    - stack=[v11, v1]
+      int_to_ptr [v11] -> v11
+    // v13.*i256 = bitcast v12 *i256;
+    - stack=[v11, v1]
+      bitcast [v11] -> v11
+    // v14.i256 = ptr_to_int v13 i256;
+    - stack=[v11, v1]
+      ptr_to_int [v11] -> v11
+    // jump block3;
+    - stack=[v11, v1]
+      exit(block3): [PUSH(0), SWAP1, SWAP2]
+      jump -> block3
+  block3 P=[v34, v18] T=[v11]
+    // v20.i1 = lt v18 1.i256;
+    - stack=[v34, v18, v11]
       pre: [PUSH(1), DUP3]
-      lt [v24, 1] -> v26
-    // br v26 block10 block11;
-    - stack=[v26, v36, v24, v17]
-      br [v26] -> [block10, block11]
-  block10 P=[] T=[v24, v17]
-    inherited from block9: [v36x, v24, v17]
+      lt [v18, 1] -> v20
+    // br v20 block4 block5;
+    - stack=[v20, v34, v18, v11]
+      br [v20] -> [block4, block5]
+  block4 P=[] T=[v18, v11]
+    inherited from block3: [v34x, v18, v11]
     prologue: [POP]
-    // v27.*[i256; 1] = alloca [i256; 1];
-    - stack=[v24, v17]
-      alloca [] -> v27
-    // v28.*i256 = alloca i256;
-    - stack=[v27, v24, v17]
-      alloca [] -> v28
-    // v29.i256 = ptr_to_int v28 i256;
-    - stack=[v28, v27, v24, v17]
-      ptr_to_int [v28] -> v28
-    // evm_code_copy v29 v20 32.i256;
-    - stack=[v28, v27, v24, v17]
+    // v21.*[i256; 1] = alloca [i256; 1];
+    - stack=[v18, v11]
+      alloca [] -> v21
+    // v22.*i256 = alloca i256;
+    - stack=[v21, v18, v11]
+      alloca [] -> v22
+    // v23.i256 = ptr_to_int v22 i256;
+    - stack=[v22, v21, v18, v11]
+      ptr_to_int [v22] -> v22
+    // evm_code_copy v23 v14 32.i256;
+    - stack=[v22, v21, v18, v11]
       pre: [PUSH(32), DUP5, DUP3]
-      evm_code_copy [v28, v17, 32]
-    // v30.i256 = mload v29 i256;
-    - stack=[v28, v27, v24, v17], last_use=[v28]
-      mload [v28] -> v30
-    // v31.*i256 = bitcast v27 *i256;
-    - stack=[v30, v27, v24, v17]
-      bitcast [v27] -> v27
-    // mstore v31 v30 i256;
-    - stack=[v30, v27, v24, v17], last_use=[v30]
+      evm_code_copy [v22, v11, 32]
+    // v24.i256 = mload v23 i256;
+    - stack=[v22, v21, v18, v11], last_use=[v22]
+      mload [v22] -> v24
+    // v25.*i256 = bitcast v21 *i256;
+    - stack=[v24, v21, v18, v11]
+      bitcast [v21] -> v21
+    // mstore v25 v24 i256;
+    - stack=[v24, v21, v18, v11], last_use=[v24]
       pre: [DUP2]
-      mstore [v27, v30]
-    // v32.i256 = add 1.i256 v24;
-    - stack=[v27, v24, v17], last_use=[v24]
+      mstore [v21, v24]
+    // v26.i256 = add 1.i256 v18;
+    - stack=[v21, v18, v11], last_use=[v18]
       pre: [SWAP1, PUSH(1)]
-      add [1, v24] -> v32
-    // jump block9;
-    - stack=[v32, v27, v17]
-      exit(block9): [SWAP1]
-      jump -> block9
-  block11 P=[] T=[v36]
-    inherited from block9: [v36, v24x, v17x]
-    // v34.i256 = mload v36 i256;
-    - stack=[v36, v24x, v17x], last_use=[v36]
+      add [1, v18] -> v26
+    // jump block3;
+    - stack=[v26, v21, v11]
+      exit(block3): [SWAP1]
+      jump -> block3
+  block5 P=[] T=[v34]
+    inherited from block3: [v34, v18x, v11x]
+    // v28.i256 = mload v34 i256;
+    - stack=[v34, v18x, v11x], last_use=[v34]
       cleanup: [SWAP2, POP, POP]
-      mload [v36] -> v34
-    // v3.i1 = eq 2.i256 v34;
-    - stack=[v34], last_use=[v34]
+      mload [v34] -> v28
+    // v30.i1 = eq 2.i256 v28;
+    - stack=[v28], last_use=[v28]
       pre: [PUSH(2)]
-      eq [2, v34] -> v3
-    // br v3 block1 block4;
-    - stack=[v3]
-      br [v3] -> [block1, block4]
+      eq [2, v28] -> v30
+    // br v30 block1 block6;
+    - stack=[v30]
+      br [v30] -> [block1, block6]
   block1 P=[] T=[]
     // evm_return 0.i256 0.i256;
     - stack=[]
       pre: [PUSH(0), PUSH(0)]
       evm_return [0, 0]
-  block4 P=[] T=[]
+  block6 P=[] T=[]
     // evm_revert 0.i256 0.i256;
     - stack=[]
       pre: [PUSH(0), PUSH(0)]
@@ -141,62 +141,62 @@ evm:
 // func private %__repro_runtime_entry()
 __repro_runtime_entry:
   block0:
-    PUSH1 0xa0 (160)  // v7.*[i256; 1] = alloca [i256; 1];
-    PUSH0 0x0 (0)  // v8.i256 = sym_addr $__fe_const_data_0;
-    PUSH1 0xc0 (192)  // v12.*i256 = alloca i256;
-    PUSH1 0x20 (32)  // evm_code_copy v13 v11 32.i256;
+    PUSH1 0xa0 (160)  // v1.*[i256; 1] = alloca [i256; 1];
+    PUSH0 0x0 (0)  // v2.i256 = sym_addr $__fe_const_data_0;
+    PUSH1 0xc0 (192)  // v6.*i256 = alloca i256;
+    PUSH1 0x20 (32)  // evm_code_copy v7 v5 32.i256;
     SWAP1
     SWAP2
     DUP3
     CODECOPY
-    MLOAD  // v15.i256 = mload v13 i256;
-    DUP2  // mstore v16 v15 i256;
+    MLOAD  // v9.i256 = mload v7 i256;
+    DUP2  // mstore v10 v9 i256;
     MSTORE
-    PUSH0 0x0 (0)  // v17.i256 = sym_addr $__fe_const_data_1;
-    PUSH0  // jump block9;
+    PUSH0 0x0 (0)  // v11.i256 = sym_addr $__fe_const_data_1;
+    PUSH0  // jump block3;
     SWAP1
     SWAP2
-  block9:
+  block3:
     JUMPDEST
-    PUSH1 0x1 (1)  // v26.i1 = lt v24 1.i256;
+    PUSH1 0x1 (1)  // v20.i1 = lt v18 1.i256;
     DUP3
     LT
-    ISZERO  // br v26 block10 block11;
-    PUSH1 block11
+    ISZERO  // br v20 block4 block5;
+    PUSH1 block5
     JUMPI
-  block10:
-    POP  // v27.*[i256; 1] = alloca [i256; 1];
+  block4:
+    POP  // v21.*[i256; 1] = alloca [i256; 1];
     PUSH1 0xc0 (192)
-    PUSH1 0xe0 (224)  // v28.*i256 = alloca i256;
-    PUSH1 0x20 (32)  // evm_code_copy v29 v20 32.i256;
+    PUSH1 0xe0 (224)  // v22.*i256 = alloca i256;
+    PUSH1 0x20 (32)  // evm_code_copy v23 v14 32.i256;
     DUP5
     DUP3
     CODECOPY
-    MLOAD  // v30.i256 = mload v29 i256;
-    DUP2  // mstore v31 v30 i256;
+    MLOAD  // v24.i256 = mload v23 i256;
+    DUP2  // mstore v25 v24 i256;
     MSTORE
-    SWAP1  // v32.i256 = add 1.i256 v24;
+    SWAP1  // v26.i256 = add 1.i256 v18;
     PUSH1 0x1 (1)
     ADD
-    SWAP1  // jump block9;
-    PUSH1 block9
+    SWAP1  // jump block3;
+    PUSH1 block3
     JUMP
-  block11:
+  block5:
     JUMPDEST
-    SWAP2  // v34.i256 = mload v36 i256;
+    SWAP2  // v28.i256 = mload v34 i256;
     POP
     POP
     MLOAD
-    PUSH1 0x2 (2)  // v3.i1 = eq 2.i256 v34;
+    PUSH1 0x2 (2)  // v30.i1 = eq 2.i256 v28;
     EQ
-    ISZERO  // br v3 block1 block4;
-    PUSH1 block4
+    ISZERO  // br v30 block1 block6;
+    PUSH1 block6
     JUMPI
   block1:
     PUSH0  // evm_return 0.i256 0.i256;
     PUSH0
     RETURN
-  block4:
+  block6:
     JUMPDEST
     PUSH0  // evm_revert 0.i256 0.i256;
     PUSH0
