@@ -549,6 +549,7 @@ impl SccpSolver {
         let phi_value = func.dfg.inst_result(inst).expect("phi has no result");
         let phi_ty = func.dfg.value_ty(phi_value);
 
+
         let reachable_preds: BTreeSet<_> = func
             .dfg
             .cast_phi(inst)

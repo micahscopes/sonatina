@@ -50,7 +50,12 @@ pub struct AggregateScalarize {
 
 impl AggregateScalarize {
     pub fn run(&mut self, func: &mut Function) -> bool {
-        self.run_with_local_object_args(func, None)
+        let mut changed = self.run_with_local_object_args(func, None);
+        // After scalarization, eliminate allocas that are only written to (never read).
+        // This catches cases where wide aggregates exceed the scalarization limit
+        // but are unused (e.g., decoded message parameters that the handler ignores).
+        changed |= super::cleanup::eliminate_dead_allocas(func);
+        changed
     }
 
     // `local_object_args` must be computed before entering `func_store.modify(...)`.

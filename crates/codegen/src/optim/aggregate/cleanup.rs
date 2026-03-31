@@ -3,6 +3,7 @@ use smallvec::SmallVec;
 use sonatina_ir::{
     Function, InstId, ValueId,
     func_cursor::{CursorLocation, FuncCursor, InstInserter},
+    inst::{data, downcast},
 };
 
 #[derive(Default)]
@@ -75,6 +76,101 @@ fn inst_operands(func: &Function, inst: InstId) -> SmallVec<[ValueId; 8]> {
         .inst(inst)
         .for_each_value(&mut |value| operands.push(value));
     operands
+}
+
+/// Eliminate alloca instructions whose memory is only written to, never read.
+///
+/// This handles the case where Fe's ABI decoder allocates and populates an
+/// aggregate (e.g., `[u256; 32]`) that exceeds the scalarization limit and is
+/// subsequently unused in the handler body. The stores to the alloca and the
+/// alloca itself become dead, but normal DCE/LoadStore can't catch them because
+/// stores are side-effecting.
+///
+/// Algorithm:
+/// 1. For each alloca, collect all transitive users (through GEP chains).
+/// 2. Classify each user as write-only (Mstore with the pointer as addr),
+///    pointer-producing (GEP), or read/escape (anything else).
+/// 3. If ALL users are writes or pointer-producers, the alloca is dead:
+///    remove all the stores, GEPs, and the alloca.
+pub(crate) fn eliminate_dead_allocas(func: &mut Function) -> bool {
+    let allocas: Vec<_> = func
+        .layout
+        .iter_block()
+        .flat_map(|block| func.layout.iter_inst(block))
+        .filter(|&inst| {
+            func.layout.is_inst_inserted(inst)
+                && downcast::<&data::Alloca>(func.inst_set(), func.dfg.inst(inst)).is_some()
+        })
+        .collect();
+
+    let mut changed = false;
+    for alloca_inst in allocas {
+        let Some(alloca_value) = func.dfg.inst_result(alloca_inst) else {
+            continue;
+        };
+
+        // Collect all pointer values derived from this alloca (through GEP/casts)
+        let mut pointer_values: Vec<ValueId> = vec![alloca_value];
+        let mut to_remove: Vec<InstId> = Vec::new();
+        let mut is_dead = true;
+        let mut i = 0;
+
+        while i < pointer_values.len() {
+            let ptr = pointer_values[i];
+            i += 1;
+
+            let user_insts: Vec<InstId> = func.dfg.users(ptr).copied().collect();
+            for user_inst in user_insts {
+                if !func.layout.is_inst_inserted(user_inst) {
+                    continue;
+                }
+
+                // Check if this is a GEP (produces another pointer from the alloca)
+                if downcast::<&data::Gep>(func.inst_set(), func.dfg.inst(user_inst)).is_some() {
+                    if let Some(gep_result) = func.dfg.inst_result(user_inst) {
+                        if !pointer_values.contains(&gep_result) {
+                            pointer_values.push(gep_result);
+                        }
+                    }
+                    to_remove.push(user_inst);
+                    continue;
+                }
+
+                // Check if this is an Mstore with the pointer as the address
+                if let Some(store) =
+                    downcast::<&data::Mstore>(func.inst_set(), func.dfg.inst(user_inst))
+                {
+                    if *store.addr() == ptr {
+                        to_remove.push(user_inst);
+                        continue;
+                    }
+                }
+
+                // Any other use (Mload, call, return, etc.) → alloca is live
+                is_dead = false;
+                break;
+            }
+
+            if !is_dead {
+                break;
+            }
+        }
+
+        if is_dead {
+            // Remove all stores and GEPs, then the alloca
+            for inst in to_remove {
+                if func.layout.is_inst_inserted(inst) {
+                    InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+                }
+            }
+            if func.layout.is_inst_inserted(alloca_inst) {
+                InstInserter::at_location(CursorLocation::At(alloca_inst)).remove_inst(func);
+            }
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 #[cfg(test)]
