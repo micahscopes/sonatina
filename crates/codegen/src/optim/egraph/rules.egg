@@ -212,6 +212,14 @@
 ; ~(x | y) = (~x) & (~y)
 (rewrite (Not (Or x y)) (And (Not x) (Not y)))
 
+; --- Inverse Arithmetic ---
+; (x + y) - y = x (valid under wrapping)
+(rewrite (Sub (Add x y) y) x)
+; (x + y) - x = y (valid under wrapping)
+(rewrite (Sub (Add x y) x) y)
+; (x - y) + y = x (valid under wrapping)
+(rewrite (Add (Sub x y) y) x)
+
 ; --- Strength Reduction ---
 ; x * 2 = x << 1
 (rewrite (Mul x (Const (i256 2) ty)) (Shl (Const (i256 1) ty) x))

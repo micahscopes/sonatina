@@ -96,17 +96,17 @@ __Bench_recv_0_4:
 __Bench_recv_0_5:
   block0:
     JUMPDEST
-    DUP1  // v33.*i256 = gep v0 0.i256 1.i256;
+    DUP1  // v39.*i256 = gep v0 0.i256 1.i256;
     PUSH1 0x20 (32)
     ADD
-    MLOAD  // v34.i256 = mload v33 i256;
-    SWAP1  // v32.i256 = mload v31 i256;
+    MLOAD  // v40.i256 = mload v39 i256;
+    SWAP1  // v38.i256 = mload v37 i256;
     MLOAD
     PUSH0  // jump block3;
     DUP3
   block3:
     JUMPDEST
-    DUP3  // v12.i1 = lt v11 v32;
+    DUP3  // v12.i1 = lt v11 v38;
     DUP3
     LT
     PUSH1 block4  // br v12 block4 block1;
@@ -120,7 +120,7 @@ __Bench_recv_0_5:
     JUMP
   block4:
     JUMPDEST
-    DUP2  // v24.i256 = xor v34 v11;
+    DUP2  // v24.i256 = xor v40 v11;
     DUP5
     XOR
     XOR  // v14.i256 = xor v9 v24;

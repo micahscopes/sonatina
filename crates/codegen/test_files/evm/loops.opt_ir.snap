@@ -50,20 +50,20 @@ func private %__Bench_recv_0_4(v0.i256) -> i256 {
 
 func private %__Bench_recv_0_5(v0.objref<@__fe_obj_XorLoopUnchecked_1>) -> i256 {
     block0:
-        v33.objref<i256> = obj.proj v0 1.i64;
-        v34.i256 = obj.load v33;
-        v31.objref<i256> = obj.proj v0 0.i64;
-        v32.i256 = obj.load v31;
+        v39.objref<i256> = obj.proj v0 1.i64;
+        v40.i256 = obj.load v39;
+        v37.objref<i256> = obj.proj v0 0.i64;
+        v38.i256 = obj.load v37;
         jump block3;
 
     block3:
-        v9.i256 = phi (v34 block0) (v14 block4);
+        v9.i256 = phi (v40 block0) (v14 block4);
         v11.i256 = phi (0.i256 block0) (v15 block4);
-        v12.i1 = lt v11 v32;
+        v12.i1 = lt v11 v38;
         br v12 block4 block1;
 
     block4:
-        v24.i256 = xor v34 v11;
+        v24.i256 = xor v40 v11;
         v14.i256 = xor v9 v24;
         v15.i256 = add 1.i256 v11;
         jump block3;
