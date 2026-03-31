@@ -212,6 +212,16 @@
 ; ~(x | y) = (~x) & (~y)
 (rewrite (Not (Or x y)) (And (Not x) (Not y)))
 
+; --- Pointer cast cancellation ---
+; PtrToInt(IntToPtr(x, _), _) = x  (when types match)
+(rule ((= e (PtrToInt (IntToPtr x _ty1) ty2))
+       (= ty2 (expr-type x)))
+      ((union e x)))
+; IntToPtr(PtrToInt(x, _), _) = x  (when types match)
+(rule ((= e (IntToPtr (PtrToInt x _ty1) ty2))
+       (= ty2 (expr-type x)))
+      ((union e x)))
+
 ; --- Inverse Arithmetic ---
 ; (x + y) - y = x (valid under wrapping)
 (rewrite (Sub (Add x y) y) x)
