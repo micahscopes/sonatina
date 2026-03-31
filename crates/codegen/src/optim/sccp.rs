@@ -594,6 +594,11 @@ impl SccpSolver {
             };
             func.dfg.change_to_alias(phi_value, phi_arg);
             InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+        } else if let Some(cond_value) =
+            try_fold_branch_select_phi(func, inst, phi_value, phi_ty)
+        {
+            func.dfg.change_to_alias(phi_value, cond_value);
+            InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
         } else {
             func.dfg.attach_user(inst);
         }
@@ -893,6 +898,163 @@ impl State for CellState<'_, '_> {
 
     fn dfg(&self) -> &DataFlowGraph {
         self.dfg
+    }
+}
+
+/// Fold a phi of the form `phi(const_0, const_1)` where the two predecessors
+/// are reached via a conditional branch on some `cond: I1`.
+///
+/// Patterns matched:
+///   phi(0 from pred_z, 1 from pred_nz)  →  zext(cond, phi_ty)
+///   phi(1 from pred_z, 0 from pred_nz)  →  zext(is_zero(cond), phi_ty)
+///   phi(0 from pred_nz, 1 from pred_z)  →  zext(is_zero(cond), phi_ty)
+///   phi(1 from pred_nz, 0 from pred_z)  →  zext(cond, phi_ty)
+///
+/// This eliminates branch+phi overhead for Fe's `if cond { 1 } else { 0 }`.
+fn try_fold_branch_select_phi(
+    func: &mut Function,
+    phi_inst: InstId,
+    _phi_value: ValueId,
+    phi_ty: Type,
+) -> Option<ValueId> {
+    if !phi_ty.is_integral() {
+        return None;
+    }
+
+    let phi = func.dfg.cast_phi(phi_inst)?;
+    let args = phi.args();
+    if args.len() != 2 {
+        return None;
+    }
+
+    let (val_a, pred_a) = args[0];
+    let (val_b, pred_b) = args[1];
+
+    // Both values must be known immediates.
+    let imm_a = func.dfg.value_imm(val_a)?;
+    let imm_b = func.dfg.value_imm(val_b)?;
+
+    let zero = Immediate::zero(phi_ty);
+    let one = Immediate::one(phi_ty);
+
+    // Determine which value is 0 and which is 1.
+    let (zero_pred, one_pred) = if imm_a == zero && imm_b == one {
+        (pred_a, pred_b)
+    } else if imm_a == one && imm_b == zero {
+        (pred_b, pred_a)
+    } else {
+        return None;
+    };
+
+    // Both predecessors must be trivial blocks (only phis + jump).
+    // Find the common "branch" block that reaches both predecessors.
+    let branch_block = find_common_branch_predecessor(func, zero_pred, one_pred)?;
+
+    // The branch block must end with a conditional branch.
+    let term = func.layout.last_inst_of(branch_block)?;
+    use sonatina_ir::inst::control_flow::Br;
+    let br = downcast::<&Br>(func.inst_set(), func.dfg.inst(term))?;
+    let cond = *br.cond();
+    let nz_dest = *br.nz_dest();
+    let z_dest = *br.z_dest();
+
+    // Match the branch targets to our phi predecessors.
+    let needs_invert = if nz_dest == one_pred && z_dest == zero_pred {
+        // cond=true → 1, cond=false → 0 → result = zext(cond)
+        false
+    } else if nz_dest == zero_pred && z_dest == one_pred {
+        // cond=true → 0, cond=false → 1 → result = zext(is_zero(cond))
+        true
+    } else {
+        return None;
+    };
+
+    // Build the replacement value.
+    let phi_block = func.layout.inst_block(phi_inst);
+    let insert_before = func.layout.first_inst_of(phi_block)?;
+
+    let is = func.inst_set();
+    use sonatina_ir::inst::cmp::IsZero;
+    let result = if needs_invert {
+        // Insert is_zero(cond), then zext
+        let Some(iz_is) = is.has_is_zero() else { return None };
+        let iz_inst = func.dfg.make_inst(IsZero::new(iz_is, cond));
+        let iz_val = func.dfg.make_value(Value::Inst {
+            inst: iz_inst,
+            result_idx: 0,
+            ty: Type::I1,
+        });
+        func.dfg.attach_result(iz_inst, iz_val);
+        func.layout.insert_inst_before(iz_inst, insert_before);
+
+        if phi_ty == Type::I1 {
+            iz_val
+        } else {
+            let Some(zext_is) = is.has_zext() else { return None };
+            let zext_inst = func.dfg.make_inst(cast::Zext::new(zext_is, iz_val, phi_ty));
+            let zext_val = func.dfg.make_value(Value::Inst {
+                inst: zext_inst,
+                result_idx: 0,
+                ty: phi_ty,
+            });
+            func.dfg.attach_result(zext_inst, zext_val);
+            func.layout.insert_inst_before(zext_inst, insert_before);
+            zext_val
+        }
+    } else if phi_ty == Type::I1 {
+        cond
+    } else {
+        let Some(zext_is) = is.has_zext() else { return None };
+        let zext_inst = func.dfg.make_inst(cast::Zext::new(zext_is, cond, phi_ty));
+        let zext_val = func.dfg.make_value(Value::Inst {
+            inst: zext_inst,
+            result_idx: 0,
+            ty: phi_ty,
+        });
+        func.dfg.attach_result(zext_inst, zext_val);
+        func.layout.insert_inst_before(zext_inst, insert_before);
+        zext_val
+    };
+
+    Some(result)
+}
+
+/// Find a common predecessor block that ends with a conditional branch
+/// targeting the two given blocks (directly or through trivial trampolines).
+fn find_common_branch_predecessor(
+    func: &Function,
+    block_a: BlockId,
+    block_b: BlockId,
+) -> Option<BlockId> {
+    // Simple case: both blocks have exactly one predecessor and it's the same block.
+    let pred_a = single_predecessor(func, block_a)?;
+    let pred_b = single_predecessor(func, block_b)?;
+
+    if pred_a == pred_b {
+        return Some(pred_a);
+    }
+
+    None
+}
+
+/// Return the single predecessor of a block if it has exactly one.
+fn single_predecessor(func: &Function, block: BlockId) -> Option<BlockId> {
+    let mut preds = Vec::new();
+    for b in func.layout.iter_block() {
+        if let Some(last) = func.layout.last_inst_of(b) {
+            if let Some(bi) = func.dfg.branch_info(last) {
+                for dest in bi.dests() {
+                    if dest == block && !preds.contains(&b) {
+                        preds.push(b);
+                    }
+                }
+            }
+        }
+    }
+    if preds.len() == 1 {
+        Some(preds[0])
+    } else {
+        None
     }
 }
 
