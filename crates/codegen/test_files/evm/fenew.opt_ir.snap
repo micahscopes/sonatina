@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/evm.rs
+assertion_line: 458
 expression: opt_ir_snapshot
 input_file: test_files/evm/fenew.sntn
 ---
@@ -166,17 +167,10 @@ func private %evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_s
         v16.i256 = ptr_to_int v15 i256;
         evm_return_data_copy v16 0.i256 v14;
         v16.i1 = is_zero v13;
-        br v16 block1 block4;
+        br v16 block1 block6;
 
     block1:
         evm_revert v16 v14;
-
-    block4:
-        v17.i1 = lt v14 0.i256;
-        br v17 block5 block6;
-
-    block5:
-        evm_revert 0.i256 0.i256;
 
     block6:
         v18.objref<@__fe_obj_MemoryBytes_2> = obj.alloc @__fe_obj_MemoryBytes_2;

@@ -1,6 +1,6 @@
 use sonatina_ir::{
     Function, Immediate, Type, ValueId,
-    inst::{BinaryInstKind, CastInstKind, UnaryInstKind, cast, downcast},
+    inst::{BinaryInstKind, CastInstKind, UnaryInstKind, arith, cast, downcast},
 };
 
 use crate::analysis::known_bits::{
@@ -203,6 +203,71 @@ pub(crate) fn simplify_binary_with_facts(
                 return SimplifyExprResult::Copy(rhs);
             }
         }
+        BinaryInstKind::Lt => {
+            if ty.is_integral() {
+                // x < x = false
+                if facts.same_non_undef(lhs, rhs) {
+                    return SimplifyExprResult::Const(Immediate::I1(false));
+                }
+                // Known-bits comparison folding
+                if let Some(result) =
+                    fold_unsigned_lt_with_known_bits(func, lhs, rhs, facts)
+                {
+                    return SimplifyExprResult::Const(Immediate::I1(result));
+                }
+                // Overflow check pattern: (x + c) < x → false when no overflow
+                if let Some(result) =
+                    fold_add_overflow_check(func, lhs, rhs, facts)
+                {
+                    return SimplifyExprResult::Const(Immediate::I1(result));
+                }
+            }
+        }
+        BinaryInstKind::Gt => {
+            if ty.is_integral() {
+                if facts.same_non_undef(lhs, rhs) {
+                    return SimplifyExprResult::Const(Immediate::I1(false));
+                }
+                // Gt(a, b) = Lt(b, a)
+                if let Some(result) =
+                    fold_unsigned_lt_with_known_bits(func, rhs, lhs, facts)
+                {
+                    return SimplifyExprResult::Const(Immediate::I1(result));
+                }
+                // x > (x + c) → false when no overflow
+                if let Some(result) =
+                    fold_add_overflow_check(func, rhs, lhs, facts)
+                {
+                    return SimplifyExprResult::Const(Immediate::I1(result));
+                }
+            }
+        }
+        BinaryInstKind::Le => {
+            if ty.is_integral() {
+                if facts.same_non_undef(lhs, rhs) {
+                    return SimplifyExprResult::Const(Immediate::I1(true));
+                }
+                // Le(a, b) = !Lt(b, a)
+                if let Some(result) =
+                    fold_unsigned_lt_with_known_bits(func, rhs, lhs, facts)
+                {
+                    return SimplifyExprResult::Const(Immediate::I1(!result));
+                }
+            }
+        }
+        BinaryInstKind::Ge => {
+            if ty.is_integral() {
+                if facts.same_non_undef(lhs, rhs) {
+                    return SimplifyExprResult::Const(Immediate::I1(true));
+                }
+                // Ge(a, b) = !Lt(a, b)
+                if let Some(result) =
+                    fold_unsigned_lt_with_known_bits(func, lhs, rhs, facts)
+                {
+                    return SimplifyExprResult::Const(Immediate::I1(!result));
+                }
+            }
+        }
         BinaryInstKind::Uaddo
         | BinaryInstKind::Uaddsat
         | BinaryInstKind::Saddo
@@ -215,12 +280,8 @@ pub(crate) fn simplify_binary_with_facts(
         | BinaryInstKind::Usubsat
         | BinaryInstKind::Ssubo
         | BinaryInstKind::Ssubsat
-        | BinaryInstKind::Lt
-        | BinaryInstKind::Gt
         | BinaryInstKind::Slt
         | BinaryInstKind::Sgt
-        | BinaryInstKind::Le
-        | BinaryInstKind::Ge
         | BinaryInstKind::Sle
         | BinaryInstKind::Sge
         | BinaryInstKind::EvmUdivo
@@ -362,6 +423,101 @@ fn simplify_mask_copy_with_facts(
     }
 
     keeps_mask(facts.known_bits(func, value), proved_mask).then_some(value)
+}
+
+/// Fold unsigned Lt comparison using known-bits bounds.
+///
+/// From known-bits we can derive:
+/// - `unsigned_max(v) = ~known_zero & type_mask` (all unknown bits set to 1)
+/// - `unsigned_min(v) = known_one` (all unknown bits set to 0)
+///
+/// If `unsigned_max(lhs) < unsigned_min(rhs)`, then `lhs < rhs` is always true.
+/// If `unsigned_min(lhs) >= unsigned_max(rhs)`, then `lhs < rhs` is always false.
+fn fold_unsigned_lt_with_known_bits(
+    func: &Function,
+    lhs: ValueId,
+    rhs: ValueId,
+    facts: &impl ExprFactProvider,
+) -> Option<bool> {
+    let ty = func.dfg.value_ty(lhs);
+    if !supports_known_bits(ty) || facts.may_be_undef(lhs) || facts.may_be_undef(rhs) {
+        return None;
+    }
+
+    let mask = type_mask(ty);
+    let lhs_kb = facts.known_bits(func, lhs);
+    let rhs_kb = facts.known_bits(func, rhs);
+
+    let lhs_max = !lhs_kb.known_zero & mask;
+    let lhs_min = lhs_kb.known_one & mask;
+    let rhs_max = !rhs_kb.known_zero & mask;
+    let rhs_min = rhs_kb.known_one & mask;
+
+    if lhs_max < rhs_min {
+        Some(true)
+    } else if lhs_min >= rhs_max {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Detect and fold the unsigned overflow check pattern:
+///   `(x + c) < x` → false  when  `unsigned_max(x) + c` doesn't overflow
+///   `(x + c) < x` → true   when  `unsigned_min(x) + c` always overflows
+///
+/// This pattern is emitted by Fe for bounds-checked pointer arithmetic
+/// (e.g., `scratch + 32`, `offset + 0x20`). If the operand is bounded
+/// (high bits known zero), the overflow is provably impossible.
+fn fold_add_overflow_check(
+    func: &Function,
+    sum: ValueId,
+    base: ValueId,
+    facts: &impl ExprFactProvider,
+) -> Option<bool> {
+    // Look through `sum` to find an Add instruction: sum = add(a, b)
+    let (inst, _) = func.dfg.value_inst_result(sum)?;
+    let add = downcast::<&arith::Add>(func.inst_set(), func.dfg.inst(inst))?;
+
+    let add_lhs = *add.lhs();
+    let add_rhs = *add.rhs();
+
+    // Match: (base + c) < base  OR  (c + base) < base
+    let constant_operand = if facts.same_non_undef(add_lhs, base) {
+        add_rhs
+    } else if facts.same_non_undef(add_rhs, base) {
+        add_lhs
+    } else {
+        return None;
+    };
+
+    let c_imm = facts.known_imm(constant_operand)?;
+    if c_imm.is_zero() {
+        // x + 0 == x, so (x + 0) < x is always false
+        return Some(false);
+    }
+
+    let ty = func.dfg.value_ty(base);
+    let mask = type_mask(ty);
+    let c_val = c_imm.as_i256().to_u256() & mask;
+
+    let base_kb = facts.known_bits(func, base);
+    let base_max = !base_kb.known_zero & mask;
+    let base_min = base_kb.known_one & mask;
+
+    // If max(base) + c doesn't overflow → (base + c) < base is always false
+    let (_, overflow) = base_max.overflowing_add(c_val);
+    if !overflow && (base_max + c_val) <= mask {
+        return Some(false);
+    }
+
+    // If min(base) + c always overflows → (base + c) < base is always true
+    let (_, overflow) = base_min.overflowing_add(c_val);
+    if overflow || (base_min + c_val) > mask {
+        return Some(true);
+    }
+
+    None
 }
 
 #[cfg(test)]
