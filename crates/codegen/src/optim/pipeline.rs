@@ -284,6 +284,9 @@ impl Pipeline {
         p.add_step(Step::Inline);
         p.add_step(Step::FuncPasses(SECONDARY_FUNC_PASSES.to_vec()));
         p.add_step(Step::DeadFuncElim);
+        // Final cleanup: catch opportunities exposed by the last inline round
+        // (constant propagation into inlined callees, dead check elimination).
+        p.add_step(Step::FuncPasses(POST_DEAD_ARG_CLEANUP_PASSES.to_vec()));
         p
     }
 
