@@ -182,6 +182,8 @@ const SECONDARY_FUNC_PASSES: &[Pass] = &[
 
 const POST_DEAD_ARG_CLEANUP_PASSES: &[Pass] = &[
     Pass::CfgCleanup,
+    Pass::LoadStore,
+    Pass::CheckedArithElim,
     Pass::Sccp,
     Pass::BranchCanonicalize,
     Pass::CfgCleanup,
