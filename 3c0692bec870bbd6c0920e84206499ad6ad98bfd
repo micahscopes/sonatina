@@ -1,0 +1,63 @@
+=== Sonatina VCode Stats ===
+    8     8 │   ark: ir_blocks=8 ir_insts=50 vcode_ops=146 fixups=9 imm_bytes=31
+    9     9 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   10    10 │   sigma_full: ir_blocks=1 ir_insts=24 vcode_ops=81 fixups=1 imm_bytes=18
+   11    11 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   12    12 │   mix: ir_blocks=7 ir_insts=39 vcode_ops=110 fixups=10 imm_bytes=22
+   13    13 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   14       │-  poseidon_mock: ir_blocks=12 ir_insts=52 vcode_ops=189 fixups=25 imm_bytes=27
+   15       │-    mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   16       │-  range_known_const_s__usize___unknown__h4e84f6b6b8307914_seq_ha637d2df505bccf2_len__0__fc6647014fb554e5: ir_blocks=4 ir_insts=7 vcode_ops=13 fixups=1 imm_bytes=0
+         14 │+  poseidon_mock: ir_blocks=12 ir_insts=50 vcode_ops=175 fixups=21 imm_bytes=29
+   17    15 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   18    16 │   entry: ir_blocks=3 ir_insts=7 vcode_ops=27 fixups=5 imm_bytes=6
+   19    17 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   22       │-  case ok: calldata_len=0 success reason=Return gas_used=49641 gas_refunded=0 logs=0 output=call len=32 tx_gas=21000 runtime_gas=28641
+         20 │+  case ok: calldata_len=0 success reason=Return gas_used=49389 gas_refunded=0 logs=0 output=call len=32 tx_gas=21000 runtime_gas=28389
+    8     8 │   ark: ir_blocks=8 ir_insts=45 vcode_ops=134 fixups=8 imm_bytes=26
+    9       │-    mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=7 abs_words_end=0
+          9 │+    mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=6 abs_words_end=0
+   10    10 │   sigma_full: ir_blocks=1 ir_insts=22 vcode_ops=60 fixups=0 imm_bytes=13
+   11       │-    mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=7 abs_words_end=0
+         11 │+    mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=6 abs_words_end=0
+   12    12 │   mix: ir_blocks=7 ir_insts=37 vcode_ops=110 fixups=10 imm_bytes=22
+   13       │-    mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=7 abs_words_end=0
+   14       │-  poseidon_mock: ir_blocks=12 ir_insts=57 vcode_ops=179 fixups=23 imm_bytes=25
+   15       │-    mem: scratch_words=0 stable_words=7 stable_mode=StaticAbs(base=0xa0) entry_abs_words=0 abs_words_end=7
+   16       │-  range_known_const_s__usize___unknown__h4e84f6b6b8307914_seq_ha637d2df505bccf2_len__0__fc6647014fb554e5: ir_blocks=4 ir_insts=8 vcode_ops=13 fixups=1 imm_bytes=0
+   17       │-    mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=7 abs_words_end=0
+         13 │+    mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=6 abs_words_end=0
+         14 │+  poseidon_mock: ir_blocks=12 ir_insts=49 vcode_ops=151 fixups=19 imm_bytes=21
+         15 │+    mem: scratch_words=0 stable_words=6 stable_mode=StaticAbs(base=0xa0) entry_abs_words=0 abs_words_end=6
+   18    16 │   entry: ir_blocks=3 ir_insts=7 vcode_ops=27 fixups=5 imm_bytes=6
+   19    17 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   22       │-  case ok: calldata_len=0 success reason=Return gas_used=48835 gas_refunded=0 logs=0 output=call len=32 tx_gas=21000 runtime_gas=27835
+         20 │+  case ok: calldata_len=0 success reason=Return gas_used=48500 gas_refunded=0 logs=0 output=call len=32 tx_gas=21000 runtime_gas=27500
+   42    42 │   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor__GetTotalAssets_h830b2520704d49fc__947e7051a757f184: ir_blocks=3 ir_insts=27 vcode_ops=85 fixups=10 imm_bytes=13
+   43    43 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   44    44 │   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor__GetTotalShares_hbe2278c3233da528__5145d089cb2da672: ir_blocks=3 ir_insts=27 vcode_ops=85 fixups=10 imm_bytes=13
+   45    45 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   46       │-  evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor__AddYield_h1b194739dad02c6e__f712b0a646b2bb64: ir_blocks=5 ir_insts=39 vcode_ops=110 fixups=13 imm_bytes=15
+         46 │+  evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor__AddYield_h1b194739dad02c6e__f712b0a646b2bb64: ir_blocks=3 ir_insts=34 vcode_ops=100 fixups=12 imm_bytes=15
+   47    47 │     mem: scratch_words=0 stable_words=2 stable_mode=StaticAbs(base=0xa0) entry_abs_words=0 abs_words_end=2
+   48    48 │   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor__Withdraw_h97c67fe0f317b1b0__d9e92202bb8b3b1d: ir_blocks=3 ir_insts=28 vcode_ops=93 fixups=12 imm_bytes=13
+   49    49 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   50    50 │   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor__GetMyShares_h4b85c900112aeed6__1df2a8280dde4872: ir_blocks=3 ir_insts=27 vcode_ops=85 fixups=10 imm_bytes=13
+   88    88 │   cursor_i__h140a998c67d6d59c_fork__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563: ir_blocks=1 ir_insts=11 vcode_ops=28 fixups=1 imm_bytes=6
+   89    89 │     mem: scratch_words=0 stable_words=0 stable_mode=None entry_abs_words=0 abs_words_end=0
+   92       │-  case ok: calldata_len=0 success reason=Return gas_used=527262 gas_refunded=79600 logs=0 output=call len=0 tx_gas=21000 runtime_gas=506262
+         92 │+  case ok: calldata_len=0 success reason=Return gas_used=527240 gas_refunded=79600 logs=0 output=call len=0 tx_gas=21000 runtime_gas=506240
+   38    38 │   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__GetTotalAssets_h830b2520704d49fc__947e7051a757f184: ir_blocks=5 ir_insts=26 vcode_ops=88 fixups=11 imm_bytes=11
+   39    39 │     mem: scratch_words=0 stable_words=5 stable_mode=StaticAbs(base=0xe0) entry_abs_words=2 abs_words_end=7
+   40    40 │   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__GetTotalShares_hbe2278c3233da528__5145d089cb2da672: ir_blocks=5 ir_insts=26 vcode_ops=88 fixups=11 imm_bytes=11
+   41    41 │     mem: scratch_words=0 stable_words=5 stable_mode=StaticAbs(base=0xe0) entry_abs_words=2 abs_words_end=7
+   42       │-  evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__AddYield_h1b194739dad02c6e__f712b0a646b2bb64: ir_blocks=7 ir_insts=38 vcode_ops=123 fixups=14 imm_bytes=15
+         42 │+  evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__AddYield_h1b194739dad02c6e__f712b0a646b2bb64: ir_blocks=5 ir_insts=35 vcode_ops=113 fixups=13 imm_bytes=15
+   43    43 │     mem: scratch_words=0 stable_words=9 stable_mode=StaticAbs(base=0xe0) entry_abs_words=2 abs_words_end=11
+   44    44 │   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__Withdraw_h97c67fe0f317b1b0__d9e92202bb8b3b1d: ir_blocks=5 ir_insts=29 vcode_ops=105 fixups=13 imm_bytes=12
+   45    45 │     mem: scratch_words=0 stable_words=5 stable_mode=StaticAbs(base=0x100) entry_abs_words=3 abs_words_end=8
+   46    46 │   evm_hef0af3106e109414_call_h2e84dd1b94aea876_call_stor_arg0_root_stor__GetMyShares_h4b85c900112aeed6__1df2a8280dde4872: ir_blocks=5 ir_insts=26 vcode_ops=88 fixups=11 imm_bytes=11
+   78    78 │   entry: ir_blocks=5 ir_insts=81 vcode_ops=325 fixups=66 imm_bytes=48
+   79    79 │     mem: scratch_words=0 stable_words=2 stable_mode=StaticAbs(base=0xa0) entry_abs_words=0 abs_words_end=2
+   82       │-  case ok: calldata_len=0 success reason=Return gas_used=532143 gas_refunded=79600 logs=0 output=call len=32 tx_gas=21000 runtime_gas=511143
+         82 │+  case ok: calldata_len=0 success reason=Return gas_used=532122 gas_refunded=79600 logs=0 output=call len=32 tx_gas=21000 runtime_gas=511122
