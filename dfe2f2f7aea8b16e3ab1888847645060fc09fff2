@@ -1,0 +1,14 @@
+WHAT: Updates EVM test snapshots to reflect the comparison folding
+changes from the previous commit.
+
+WHY: Sonatina uses insta-style snapshot testing for EVM codegen. The
+known-bits comparison folding changed some test outputs (fewer
+instructions in snapshots where comparisons got folded). This commit
+accepts those snapshot changes.
+
+GAS IMPACT: None. This is a test-only change.
+
+CODEGEN IMPACT: None on rosetta contracts. Snapshot diffs show the
+optimization working correctly in synthetic test cases.
+
+TEAM NOTES: Housekeeping commit. The interesting work is in step 1.
