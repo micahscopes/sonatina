@@ -1,0 +1,17 @@
+---
+source: crates/codegen/tests/object_load_store.rs
+input_file: test_files/object_load_store/init_store_killed_by_same_index_store.sntn
+---
+target = "evm-ethereum-osaka"
+
+type @pair = {i256, i256};
+
+func private %f(v0.i256, v1.i256) -> objref<@pair> {
+    block0:
+        v2.objref<@pair> = obj.alloc @pair;
+        v3.objref<i256> = obj.proj v2 0.i8;
+        v4.objref<i256> = obj.proj v2 1.i8;
+        obj.store v3 v0;
+        obj.store v4 v1;
+        return v2;
+}
