@@ -1,0 +1,20 @@
+WHAT: Raises max_multi_use_inlinee_blocks from 4 to 8 and insts from
+16 to 24 in speed mode. Allows larger multi-use helper functions to
+be inlined.
+
+WHY: ABI decoder helpers with 3-4 blocks (error check branches) were
+still blocked by the previous limit of 4. Raising to 8 lets these
+larger helpers get inlined.
+
+GAS IMPACT: -222 gas total.
+  governance/delegate: -74
+  governance/propose: -74
+  governance/vote: -74
+
+CODEGEN IMPACT: Only governance benefited. The delegate/propose/vote
+functions have ABI decode helpers just over the previous size limit.
+
+TEAM NOTES: Third inliner tuning commit (steps 3, 4, 11). Total from
+all three: ~1100 gas, exclusively on governance. This is the ceiling
+for inliner parameter tuning — the stubborn contracts need source-level
+changes (Fe std library) not optimizer knob-turning.
