@@ -1,0 +1,13 @@
+WHAT: Raises object helper inlining limits for cross-function scalarization.
+max_multi_use_object_helper_insts: 14→24, call_count threshold adjusted.
+
+WHY: Object helper functions (struct constructors, field accessors) that cross
+function boundaries prevent scalarization. Raising limits allows more of these
+to be inlined, enabling the optimizer to eliminate intermediate obj.alloc/store/load.
+
+GAS IMPACT: None on any contract.
+
+TEAM NOTES: The remaining struct-passing overhead is architectural, not a
+threshold problem. Small structs like G1Point{x,y} go through objref parameters
+regardless of inlining limits. The fix requires SSA aggregate representation
+(ExtractValue/InsertValue) in Sonatina's EVM codegen.
