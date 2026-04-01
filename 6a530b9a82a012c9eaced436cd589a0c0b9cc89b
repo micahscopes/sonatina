@@ -1,0 +1,66 @@
+=== Benchmark Results (step 6 of 26) ===
+Commit: 6a530b9a82a0 (sonatina)
+Fe at: 8d4e0bccbe30
+
+erc20:
+  fe_approve: 28955
+  fe_transfer: 58765
+  sol_approve: 27849
+  sol_transfer: 56579
+  bytecode: 2321 bytes
+
+math:
+  fe_mulDivRoundingUp: 6996
+  fe_mulDiv_512bit: 6954
+  fe_mulDiv_simple: 6456
+  sol_mulDivRoundingUp: 6242
+  sol_mulDiv_512bit: 6168
+  sol_mulDiv_simple: 5697
+  bytecode: 1161 bytes
+
+amm:
+  fe_addLiquidity: 17782
+  fe_getK: 9810
+  fe_swapAForB: 18293
+  sol_addLiquidity: 15698
+  sol_getK: 9723
+  sol_swapAForB: 16426
+  bytecode: 2239 bytes
+
+escrow:
+  fe_deposit: 59528
+  fe_getBalance: 4464
+  fe_release: 3443
+  sol_deposit: 59155
+  sol_getBalance: 3932
+  sol_release: 2996
+  bytecode: 645 bytes
+
+governance:
+  fe_balanceOf: 8062
+  fe_delegate: 61740
+  fe_execute: 32098
+  fe_mint: 18589
+  fe_propose: 85534
+  fe_transfer: 19796
+  fe_vote: 54809
+  sol_balanceOf: 12709
+  sol_delegate: 60318
+  sol_execute: 33762
+  sol_mint: 23015
+  sol_propose: 106990
+  sol_transfer: 24089
+  sol_vote: 54502
+  bytecode: 3907 bytes
+
+merkle:
+  fe_computeRoot_depth7: 9971
+  fe_verify_depth7: 14810
+  sol_computeRoot_depth7: 10122
+  sol_verify_depth7: 15045
+  bytecode: 1613 bytes
+
+verifier:
+  fe_plonkVerify: 351696
+  fe_groth16Verify: 196519
+  sol_plonkVerify: 286297
