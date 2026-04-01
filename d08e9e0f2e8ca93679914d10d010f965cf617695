@@ -1,0 +1,13 @@
+WHAT: Adds a final optimization cleanup pass after the last inline round.
+
+WHY: After inlining, new optimization opportunities may emerge (dead code,
+constant folding) that the earlier passes didn't see. This adds one more
+cleanup sweep to catch those.
+
+GAS IMPACT: None on rosetta contracts.
+
+TEAM NOTES: Correct in theory but the inlined code doesn't produce patterns
+that the cleanup pass recognizes. The remaining overhead in these contracts
+comes from deeper issues (ABI decode patterns, stack scheduling) that
+simple cleanup passes can't address. This and step 6 together represent
+the end of diminishing returns from pipeline expansion.
