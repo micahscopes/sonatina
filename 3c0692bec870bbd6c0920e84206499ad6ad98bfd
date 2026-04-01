@@ -1,0 +1,22 @@
+WHAT: Extends simplify_expr to fold unsigned comparisons (Lt, Gt, Le, Ge)
+using known-bits bounds, and eliminates the overflow check pattern
+(x + c) < x when known-bits prove no overflow.
+
+WHY: Fe's safe arithmetic generates redundant comparison+branch patterns
+that evaluate to constants when the operand ranges are known. This pass
+recognizes those patterns and folds them at the IR level.
+
+GAS IMPACT: Minimal — only governance improved (-18 gas on delegate,
+propose, vote). Most rosetta contracts use uaddo (checked add) rather
+than the Add+Lt pattern this targets, so CheckedArithElim handles those
+cases instead.
+
+CODEGEN IMPACT: Test snapshots show the optimization correctly removes
+patterns like `Lt v16 0.i256` (always false for unsigned). No opcode
+count changes on rosetta contracts.
+
+TEAM NOTES: This is a correct optimization but has limited practical
+impact on Fe-generated code because the compiler prefers uaddo over
+manual overflow checks. Worth keeping for correctness but don't expect
+gas wins from this alone. The real overflow check elimination happens
+in CheckedArithElim, which handles uaddo directly.
