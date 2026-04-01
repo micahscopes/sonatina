@@ -1,0 +1,13 @@
+WHAT: Adds test files for rematerialization patterns and additional OLS
+init-overwrite patterns in Sonatina IR test suite.
+
+WHY: Documents optimization opportunities for future passes. Rematerialization
+(recomputing cheap values instead of keeping them on stack) would reduce SWAP
+overhead. OLS loop patterns show where cross-block analysis is needed.
+
+GAS IMPACT: None (test-only).
+
+TEAM NOTES: These tests were written to guide implementation of remat and
+cross-block OLS passes. Neither pass was implemented during this campaign —
+the bigger wins came from Fe std library changes instead. The tests remain
+as specifications for future work.
