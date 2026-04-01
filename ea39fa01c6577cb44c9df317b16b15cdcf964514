@@ -1,0 +1,24 @@
+WHAT: Final inliner tuning — raises max_inlinee_blocks 8→12, max_inlinee_insts
+40→48, and adjusts the multi-block threshold for speed mode.
+
+WHY: Last attempt to squeeze more inlining gains from threshold adjustments.
+
+GAS IMPACT: -1193 gas total, mostly governance.
+  governance/vote: -510
+  governance/execute: -331
+  governance/delegate: -238
+  governance/propose: -199
+  escrow/release: -48, deposit: -36
+  governance/mint: -28
+  Small regressions: math (+2), erc20/transfer (+10), groth16 (+196)
+
+TEAM NOTES: The governance improvements come from inlining deeper into the
+token contract's transfer/mint functions. The groth16 regression (+196) is
+concerning — more aggressive inlining can increase code size and cause worse
+instruction scheduling. This is the final commit in the campaign, and it
+shows the characteristic mixed results of inliner tuning at its limits.
+
+Campaign summary: 26 commits across sonatina and fe. The biggest wins came
+from Fe std library changes (unchecked arithmetic, ArrayView), not from
+sonatina optimizer tuning. Steps 15-18 (Fe std) saved ~12,000 gas vs
+steps 1-14 (sonatina optimizer) saving ~1,500 gas.
