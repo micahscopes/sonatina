@@ -1,0 +1,12 @@
+WHAT: Adds OLS test files documenting init-store-killed-by-overwrite patterns.
+Tests confirm same-block dead store elimination already works, but cross-block
+(loop-overwrite) patterns are not yet eliminated.
+
+WHY: Documenting the gap before implementing the optimization. Tests serve as
+regression tests and specify the expected behavior.
+
+GAS IMPACT: None (test-only).
+
+TEAM NOTES: These tests identify the [first; N] array init pattern as a target.
+The same-block case is already handled; the loop-overwrite case (init 32 elements,
+then overwrite in a for loop) is the one causing merkle's overhead.
