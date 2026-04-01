@@ -1,0 +1,13 @@
+---
+source: crates/codegen/tests/opt_pipeline.rs
+input_file: test_files/opt_pipeline/g1point_scalarize.sntn
+---
+target = "evm-ethereum-osaka"
+
+type @G1 = {i256, i256};
+
+func public %test(v0.i256, v1.i256) -> i256 {
+    block0:
+        v9.i256 = add v0 v1;
+        return v9;
+}

@@ -234,9 +234,9 @@ fn size_inliner_config() -> InlinerConfig {
         single_use_bonus: 8,
         leaf_bonus: 2,
         loop_penalty: 32,
-        max_multi_use_object_helper_blocks: 2,
-        max_multi_use_object_helper_insts: 10,
-        max_multi_use_object_helper_call_count: 3,
+        max_multi_use_object_helper_blocks: 3,
+        max_multi_use_object_helper_insts: 20,
+        max_multi_use_object_helper_call_count: 10,
         object_scalarization_bonus_cap: 8,
         object_helper_cluster_bonus: 3,
         ..InlinerConfig::default()
@@ -264,8 +264,8 @@ fn speed_inliner_config() -> InlinerConfig {
         loop_penalty: 32,
         multi_block_multi_use_penalty: 0,
         max_multi_use_object_helper_blocks: 3,
-        max_multi_use_object_helper_insts: 14,
-        max_multi_use_object_helper_call_count: 5,
+        max_multi_use_object_helper_insts: 24,
+        max_multi_use_object_helper_call_count: 12,
         object_scalarization_bonus_cap: 12,
         object_helper_cluster_bonus: 5,
         ..InlinerConfig::default()

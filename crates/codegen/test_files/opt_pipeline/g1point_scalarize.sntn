@@ -1,0 +1,18 @@
+target = "evm-ethereum-osaka"
+
+type @G1 = {i256, i256};
+
+func public %test(v0.i256, v1.i256) -> i256 {
+    block0:
+        v2.objref<@G1> = obj.alloc @G1;
+        v3.objref<i256> = obj.proj v2 0.i8;
+        obj.store v3 v0;
+        v4.objref<i256> = obj.proj v2 1.i8;
+        obj.store v4 v1;
+        v5.objref<i256> = obj.proj v2 0.i8;
+        v6.i256 = obj.load v5;
+        v7.objref<i256> = obj.proj v2 1.i8;
+        v8.i256 = obj.load v7;
+        v9.i256 = add v6 v8;
+        return v9;
+}
