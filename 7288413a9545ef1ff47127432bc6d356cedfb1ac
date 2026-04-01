@@ -1,0 +1,13 @@
+WHAT: Folds phi nodes that merge constants 0 and 1 from conditional
+branches into the branch condition itself (or its negation).
+
+WHY: Fe generates patterns like 'if cond { true } else { false }' which
+lower to a branch + phi selecting between 0 and 1. This fold recognizes
+the pattern and replaces the phi with the condition directly.
+
+GAS IMPACT: None on rosetta contracts. Fe's bool handling was already
+improved in earlier compiler work (Ne instead of double-negation).
+
+TEAM NOTES: Another correct-but-inapplicable optimization. The pattern
+would help if Fe still generated redundant bool round-trips, but that
+was already fixed at the Fe level.
