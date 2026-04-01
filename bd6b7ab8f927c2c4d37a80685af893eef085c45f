@@ -1,0 +1,21 @@
+WHAT: Further increases speed-mode inliner aggressiveness. Raises multi-use
+inlining limits and reduces multi_block_multi_use_penalty from 12 to 6.
+
+WHY: Building on step 3's success, targeting governance functions that still
+had uninlined helpers. The reduced penalty means multi-block functions used
+from multiple call sites are more likely to be inlined.
+
+GAS IMPACT: -414 gas total.
+  governance/delegate: -138
+  governance/propose: -138
+  governance/vote: -138
+  Other contracts: no change.
+
+CODEGEN IMPACT: Only governance benefited. The delegate/propose/vote functions
+have deeper call chains that the previous limits didn't reach.
+
+TEAM NOTES: Diminishing returns from inliner tuning. Steps 3 and 4 together
+saved ~876 gas, mostly on governance. Math, escrow, amm/swap, and merkle
+didn't improve — their bottlenecks are elsewhere (ABI decode patterns, stack
+scheduling, array init overhead). Further inliner tuning hits a ceiling
+when the underlying IR patterns are inefficient.
