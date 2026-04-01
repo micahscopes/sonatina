@@ -1,0 +1,16 @@
+---
+source: crates/codegen/tests/opt_pipeline.rs
+input_file: test_files/opt_pipeline/remat_constants.sntn
+---
+target = "evm-ethereum-osaka"
+
+func public %f(v0.i256) -> i256 {
+    block0:
+        v19.i256 = add 32.i256 v0;
+        v20.i256 = mul v19 2.i256;
+        v21.i256 = add v20 v0;
+        v22.i256 = mul v21 v0;
+        v23.i256 = add v22 v0;
+        v6.i256 = add v19 v23;
+        return v6;
+}
