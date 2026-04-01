@@ -1,0 +1,12 @@
+WHAT: Adds egraph rules for algebraic inverses: (x+y)-y=x, (x+y)-x=y, (x-y)+y=x.
+Also runs the optimization pipeline one more time at the end.
+
+WHY: These patterns appear in address arithmetic and offset calculations.
+Eliminating them reduces instruction count.
+
+GAS IMPACT: None on rosetta contracts. These patterns don't appear in
+Fe-generated code for the benchmark suite.
+
+TEAM NOTES: Correct but inapplicable optimization. This was part of a
+tangent exploring algebraic simplification that didn't yield gas wins.
+The patterns may help future contracts with more complex arithmetic.
