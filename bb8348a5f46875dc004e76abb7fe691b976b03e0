@@ -1,0 +1,31 @@
+=== Fuzz Test Results ===
+--- erc20 ---
+[PASS] testFuzz_transfer_eq(uint256,uint256) (runs: 1024, μ: 111421, ~: 118645)
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 3.51s (32.20ms CPU time)
+
+--- math ---
+[PASS] testFuzz_mulDivRoundingUp_equivalence(uint256,uint256,uint256) (runs: 1024, μ: 11083, ~: 12408)
+[PASS] testFuzz_mulDiv_equivalence(uint256,uint256,uint256) (runs: 1024, μ: 10884, ~: 12249)
+Suite result: ok. 2 passed; 0 failed; 0 skipped; finished in 29.61s (31.27ms CPU time)
+
+--- amm ---
+[PASS] testFuzz_swapAForB_eq(uint256) (runs: 1024, μ: 22549, ~: 34622)
+Suite result: ok. 1 passed; 0 failed; 0 skipped; finished in 30.92s (12.34ms CPU time)
+
+--- escrow ---
+[PASS] testFuzz_deposit_balance_eq(uint256) (runs: 1025, μ: 105357, ~: 105357)
+[PASS] testFuzz_double_deposit_reverts(uint256,uint256) (runs: 1025, μ: 119924, ~: 119924)
+[PASS] testFuzz_release_returns_amount(uint256) (runs: 1025, μ: 81592, ~: 81603)
+Suite result: ok. 3 passed; 0 failed; 0 skipped; finished in 3.31s (221.06ms CPU time)
+
+--- governance ---
+[PASS] testFuzz_delegation_eq(uint256) (runs: 1024, μ: 206790, ~: 206790)
+[PASS] testFuzz_transfer_eq(uint256) (runs: 1024, μ: 48657, ~: 49032)
+[PASS] testFuzz_vote_weight_eq(uint256) (runs: 1024, μ: 372895, ~: 372895)
+Suite result: ok. 3 passed; 0 failed; 0 skipped; finished in 5.15s (194.18ms CPU time)
+
+--- merkle ---
+[PASS] testFuzz_computeRoot_eq_depth1(uint256,uint256) (runs: 1024, μ: 17251, ~: 17254)
+[PASS] testFuzz_computeRoot_eq_depth3(uint256,uint256,uint256,uint256) (runs: 1024, μ: 17984, ~: 17983)
+[PASS] testFuzz_verify_eq_depth3(uint256,uint256,uint256,uint256) (runs: 1024, μ: 30716, ~: 30719)
+Suite result: ok. 3 passed; 0 failed; 0 skipped; finished in 2.42s (116.87ms CPU time)
