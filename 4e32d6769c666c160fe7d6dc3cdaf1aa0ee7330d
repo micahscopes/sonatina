@@ -1,0 +1,15 @@
+WHAT: Detects alloca instructions whose memory is only written to
+(stored but never loaded) and eliminates them as dead.
+
+WHY: Temporary aggregates that are constructed but never read waste
+memory allocation and store instructions.
+
+GAS IMPACT: None on rosetta contracts. Fe's allocation patterns use
+obj.alloc rather than raw alloca for most temporaries, and the object
+load/store pass already handles dead object stores.
+
+TEAM NOTES: This optimization targets a pattern that Fe doesn't generate
+for the benchmark contracts. The real dead-store issue is in Fe's std
+library [first; N] array initialization, which generates 31 provably
+dead obj.stores — a different pattern that requires either Fe source
+changes or loop-aware OLS.
