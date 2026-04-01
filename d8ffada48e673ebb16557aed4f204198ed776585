@@ -1,0 +1,14 @@
+WHAT: Adds egraph rules to cancel PtrToInt(IntToPtr(x)) and
+IntToPtr(PtrToInt(x)) round-trips.
+
+WHY: Fe's type-safe lowering sometimes inserts pointer-integer casts
+that are immediately reversed. Eliminating the round-trip saves 2
+instructions per occurrence.
+
+GAS IMPACT: None on rosetta contracts. Fe's object reference system
+doesn't generate these patterns — it uses typed objrefs throughout.
+
+TEAM NOTES: Another correct optimization for a pattern that doesn't
+appear in practice. The lesson from steps 7-10 is clear: adding
+optimizer rules for patterns not present in the actual codebase doesn't
+help. The remaining gas overhead is structural, not pattern-matching.
