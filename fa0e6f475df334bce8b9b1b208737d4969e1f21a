@@ -1,0 +1,11 @@
+WHAT: Raises speed inliner growth budget from 320 to 640, and per-caller
+growth from 64 to 128.
+
+WHY: After handler inlining (step 21) created larger caller functions, the
+growth budget was being exhausted before all beneficial inlining could occur.
+
+GAS IMPACT: None on any contract.
+
+TEAM NOTES: The growth budget wasn't the bottleneck. Despite doubling the
+budget, no additional functions were inlined. The remaining uninlined
+functions are either too large or the cost model correctly rejects them.
