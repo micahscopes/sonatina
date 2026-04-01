@@ -1,0 +1,14 @@
+WHAT: Adds LoadStore and CheckedArithElim to the post-dead-arg cleanup passes.
+
+WHY: After dead argument elimination creates new opportunities, running
+LoadStore (object load/store optimization) and CheckedArithElim (checked
+arithmetic elimination) might catch patterns that were previously hidden.
+
+GAS IMPACT: None on rosetta contracts.
+
+TEAM NOTES: Like step 5, this is theoretically sound but hits diminishing
+returns. The stubborn contracts (math, escrow, AMM) have fundamental patterns
+that require different solutions — not more optimizer passes on the same IR.
+Steps 3-6 as a group show that inliner tuning and pipeline expansion have
+a ceiling. The next wins require changing what the compiler generates (Fe
+lowering) or how it schedules instructions (stackifier).
