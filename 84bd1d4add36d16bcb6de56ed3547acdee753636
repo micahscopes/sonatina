@@ -1,0 +1,26 @@
+WHAT: Relaxed the speed-mode inliner limits for multi-use small functions.
+Increased max_multi_use_inlinee_blocks from 1 to 3, max_multi_use_inlinee_insts
+from 6 to 12.
+
+WHY: ABI decoder bounds-check helper functions weren't being inlined because
+they're called from multiple sites. These are small (1-2 blocks) but the
+strict multi-use limit prevented inlining. Once inlined, constant propagation
+can eliminate trivially-dead bounds checks.
+
+GAS IMPACT: -462 gas total across affected contracts.
+  erc20/transfer: -92, erc20/approve: -46
+  governance: -21 to -46 across 6 functions
+  amm/addLiquidity: -77
+
+CODEGEN IMPACT: More compact PUSH instructions, eliminated jumps. Even with
+slightly more total opcodes, the eliminated function call overhead and
+subsequent constant folding produce smaller runtime gas.
+
+TEAM NOTES: This is the first of several inliner tuning commits. The pattern
+is: relax inliner limits → more functions get inlined → downstream passes
+(constant prop, dead code elimination) can clean up what was previously
+hidden behind call boundaries. The inliner is the gatekeeper for most
+other optimizations.
+
+CROSS-CUTTING: Helped erc20, amm, and governance despite targeting ABI
+decoder helpers. Any contract that decodes calldata benefits.
