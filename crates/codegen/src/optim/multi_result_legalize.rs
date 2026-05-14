@@ -42,7 +42,7 @@ pub fn legalize_multi_result(func: &mut Function) -> bool {
 
             let add_inst = func
                 .dfg
-                .make_inst(Add::new(is.has_add().unwrap(), lhs, rhs));
+                .make_inst(Add::new(is, lhs, rhs));
             func.layout.insert_inst_before(add_inst, inst);
             let add_result = func.dfg.make_value(Value::Inst {
                 inst: add_inst,
@@ -53,7 +53,7 @@ pub fn legalize_multi_result(func: &mut Function) -> bool {
 
             let lt_inst = func
                 .dfg
-                .make_inst(Lt::new(is.has_lt().unwrap(), add_result, lhs));
+                .make_inst(Lt::new(is, add_result, lhs));
             func.layout.insert_inst_before(lt_inst, inst);
             let lt_result = func.dfg.make_value(Value::Inst {
                 inst: lt_inst,

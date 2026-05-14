@@ -860,14 +860,10 @@ impl ObjectAggregateAbi {
             }
         }
 
-        let return_inst = function
-            .inst_set()
-            .has_return()
-            .expect("target ISA must support `return`");
         function.dfg.replace_inst(
             inst,
             Box::new(control_flow::Return::new(
-                return_inst,
+                function.inst_set(),
                 direct_returns.into(),
             )),
         );
@@ -1183,10 +1179,7 @@ impl ObjectAggregateAbi {
         let new_call = pre_call.insert_inst_data(
             function,
             control_flow::Call::new(
-                function
-                    .inst_set()
-                    .has_call()
-                    .expect("target ISA must support `call`"),
+                function.inst_set(),
                 *call.callee(),
                 new_args,
             ),

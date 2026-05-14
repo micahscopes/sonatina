@@ -291,9 +291,7 @@ fn prepend_const_ref(
     ty: Type,
 ) -> PrependedValue {
     let inst = func.dfg.make_inst(data::ConstRef::new(
-        func.inst_set()
-            .has_const_ref()
-            .expect("target ISA should support const.ref"),
+        func.inst_set(),
         global.into(),
     ));
     let value = func.dfg.make_value(Value::Inst {
@@ -327,9 +325,7 @@ fn prepend_const_proj(
         .dfg
         .make_imm_value(Immediate::I64(i64::try_from(idx).expect("index overflow")));
     let inst = func.dfg.make_inst(data::ConstProj::new(
-        func.inst_set()
-            .has_const_proj()
-            .expect("target ISA should support const.proj"),
+        func.inst_set(),
         smallvec![base.value, index],
     ));
     let value = func.dfg.make_value(Value::Inst {
@@ -356,9 +352,7 @@ fn prepend_const_index(
         .dfg
         .make_imm_value(Immediate::I64(i64::try_from(idx).expect("index overflow")));
     let inst = func.dfg.make_inst(data::ConstIndex::new(
-        func.inst_set()
-            .has_const_index()
-            .expect("target ISA should support const.index"),
+        func.inst_set(),
         base.value,
         index,
     ));
@@ -380,10 +374,7 @@ fn rewrite_call_callee(function: &mut Function, inst: sonatina_ir::InstId, clone
     function.dfg.replace_inst_preserving_results(
         inst,
         Box::new(control_flow::Call::new(
-            function
-                .inst_set()
-                .has_call()
-                .expect("target ISA should support call"),
+            function.inst_set(),
             clone,
             args,
         )),

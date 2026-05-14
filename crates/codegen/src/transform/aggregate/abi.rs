@@ -242,9 +242,7 @@ impl AggregateExpandAbi {
                 func.dfg.replace_inst(
                     inst,
                     Box::new(control_flow::Return::new(
-                        func.inst_set()
-                            .has_return()
-                            .expect("target ISA must support `return`"),
+                        func.inst_set(),
                         new_args.into(),
                     )),
                 );
@@ -293,9 +291,7 @@ impl AggregateExpandAbi {
         let new_call = cursor.insert_inst_data(
             func,
             control_flow::Call::new(
-                func.inst_set()
-                    .has_call()
-                    .expect("target ISA must support `call`"),
+                func.inst_set(),
                 *call.callee(),
                 new_args,
             ),

@@ -616,13 +616,13 @@ impl SccpSolver {
                             }
                         } else if idx == 0
                             && inst_results.len() == 1
-                            && let Some(bitcast) = func.inst_set().has_bitcast()
+                            && func.inst_set().has_bitcast().is_some()
                             && func.dfg.ctx.size_of(src_ty).ok()
                                 == func.dfg.ctx.size_of(result_ty).ok()
                         {
                             func.dfg.replace_inst(
                                 inst,
-                                Box::new(cast::Bitcast::new(bitcast, src, result_ty)),
+                                Box::new(cast::Bitcast::new(func.inst_set(), src, result_ty)),
                             );
                             return true;
                         }
@@ -631,10 +631,10 @@ impl SccpSolver {
                         if idx == 0
                             && inst_results.len() == 1
                             && func.dfg.value_ty(result) == Type::I1
-                            && let Some(is_zero) = func.inst_set().has_is_zero()
+                            && func.inst_set().has_is_zero().is_some()
                         {
                             func.dfg
-                                .replace_inst(inst, Box::new(cmp::IsZero::new(is_zero, arg)));
+                                .replace_inst(inst, Box::new(cmp::IsZero::new(func.inst_set(), arg)));
                             return true;
                         }
                     }
@@ -1426,10 +1426,7 @@ block0:
         let base_ptr = fb.insert_inst(IntToPtr::new(is, base_word, ptr_outer_ty), ptr_outer_ty);
         let zero = fb.make_imm_value(Immediate::zero(Type::I8));
         let gep = fb.insert_inst(
-            Gep::new(
-                is.has_gep().expect("inst set has gep"),
-                smallvec![base_ptr, zero, zero],
-            ),
+            Gep::new(is, smallvec![base_ptr, zero, zero]),
             ptr_i256_ty,
         );
         let roundtrip = fb.insert_inst(PtrToInt::new(is, gep, Type::I256), Type::I256);
