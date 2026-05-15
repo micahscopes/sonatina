@@ -997,7 +997,7 @@ fn compute_alloc_size(ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> u32 {
     size.max(8) as u32
 }
 
-fn compute_element_size(obj_ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> usize {
+pub(crate) fn compute_element_size(obj_ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> usize {
     if let Some(cmpd) = obj_ty.resolve_compound(ctx) {
         match cmpd {
             sonatina_ir::types::CompoundType::Array { elem, .. } => {
