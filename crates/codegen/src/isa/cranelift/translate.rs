@@ -77,6 +77,8 @@ fn sonatina_type_to_clif(ty: Type) -> Option<clif::Type> {
         Type::I32 => Some(clif::types::I32),
         Type::I64 => Some(clif::types::I64),
         Type::I128 => Some(clif::types::I128),
+        // I256: represent as pointer to 32 bytes on stack
+        Type::I256 => Some(clif::types::I64),
         // Compound types (objref, constref, ptr) → native pointer
         Type::Compound(_) => Some(clif::types::I64),
         _ => None,
