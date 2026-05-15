@@ -280,17 +280,17 @@ fn translate_function(
                     value_map.insert(result, result_val);
                 }
             } else if let Some(lt) = <&sonatina_ir::inst::cmp::Lt as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::UnsignedLessThan, *lt.lhs(), *lt.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::UnsignedLessThan, *lt.lhs(), *lt.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(gt) = <&sonatina_ir::inst::cmp::Gt as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::UnsignedGreaterThan, *gt.lhs(), *gt.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::UnsignedGreaterThan, *gt.lhs(), *gt.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(le) = <&sonatina_ir::inst::cmp::Le as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::UnsignedLessThanOrEqual, *le.lhs(), *le.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::UnsignedLessThanOrEqual, *le.lhs(), *le.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(ge) = <&sonatina_ir::inst::cmp::Ge as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::UnsignedGreaterThanOrEqual, *ge.lhs(), *ge.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::UnsignedGreaterThanOrEqual, *ge.lhs(), *ge.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(slt) = <&sonatina_ir::inst::cmp::Slt as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::SignedLessThan, *slt.lhs(), *slt.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::SignedLessThan, *slt.lhs(), *slt.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(sgt) = <&sonatina_ir::inst::cmp::Sgt as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::SignedGreaterThan, *sgt.lhs(), *sgt.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::SignedGreaterThan, *sgt.lhs(), *sgt.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(eq) = <&sonatina_ir::inst::cmp::Eq as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let lhs_ty = function.dfg.value_ty(*eq.lhs());
                 if lhs_ty == Type::I256 {
@@ -310,10 +310,10 @@ fn translate_function(
                         value_map.insert(result, bool_result);
                     }
                 } else {
-                    translate_icmp(IntCC::Equal, *eq.lhs(), *eq.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                    translate_icmp(IntCC::Equal, *eq.lhs(), *eq.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
                 }
             } else if let Some(ne) = <&sonatina_ir::inst::cmp::Ne as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::NotEqual, *ne.lhs(), *ne.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::NotEqual, *ne.lhs(), *ne.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(is_zero) = <&sonatina_ir::inst::cmp::IsZero as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let val = resolve_value(function, *is_zero.lhs(), &value_map, &mut builder)?;
                 let val_ty = function.dfg.value_ty(*is_zero.lhs());
@@ -324,9 +324,9 @@ fn translate_function(
                     value_map.insert(result, result_val);
                 }
             } else if let Some(sle) = <&sonatina_ir::inst::cmp::Sle as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::SignedLessThanOrEqual, *sle.lhs(), *sle.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::SignedLessThanOrEqual, *sle.lhs(), *sle.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(sge) = <&sonatina_ir::inst::cmp::Sge as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::SignedGreaterThanOrEqual, *sge.lhs(), *sge.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                translate_icmp(IntCC::SignedGreaterThanOrEqual, *sge.lhs(), *sge.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(sext) = <&sonatina_ir::inst::cast::Sext as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let val = resolve_value(function, *sext.from(), &value_map, &mut builder)?;
                 let to_ty = sonatina_type_to_clif_or_err(*sext.ty())?;
@@ -610,7 +610,7 @@ fn translate_function(
                         builder.ins().load(clif::types::I64, cranelift_codegen::ir::MemFlags::new(), raw, 0)
                     }
                 } else {
-                    resolve_value(function, index_val_id, &value_map, &mut builder)?
+                    resolve_scalar_value(module, function, index_val_id, &value_map, &mut builder)?
                 };
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     let obj_ty = function.dfg.value_ty(*obj_index.object());
@@ -651,6 +651,27 @@ fn translate_function(
     }
 
     Ok(())
+}
+
+fn resolve_scalar_value(
+    module: &Module,
+    function: &Function,
+    value_id: ValueId,
+    value_map: &HashMap<ValueId, clif::Value>,
+    builder: &mut FunctionBuilder,
+) -> Result<clif::Value, String> {
+    let ty = function.dfg.value_ty(value_id);
+    let val = resolve_value(function, value_id, value_map, builder)?;
+    if ty.is_obj_ref(&module.ctx) {
+        if let Some(inner) = ty.resolve_compound(&module.ctx) {
+            if let sonatina_ir::types::CompoundType::ObjRef(elem) = inner {
+                if let Some(clif_ty) = sonatina_type_to_clif(elem) {
+                    return Ok(builder.ins().load(clif_ty, cranelift_codegen::ir::MemFlags::new(), val, 0));
+                }
+            }
+        }
+    }
+    Ok(val)
 }
 
 fn resolve_value(
@@ -725,12 +746,13 @@ fn translate_icmp(
     lhs: ValueId,
     rhs: ValueId,
     inst_id: sonatina_ir::inst::InstId,
+    module: &Module,
     function: &Function,
     value_map: &mut HashMap<ValueId, clif::Value>,
     builder: &mut FunctionBuilder,
 ) -> Result<(), String> {
-    let lhs_val = resolve_value(function, lhs, value_map, builder)?;
-    let rhs_val = resolve_value(function, rhs, value_map, builder)?;
+    let lhs_val = resolve_scalar_value(module, function, lhs, value_map, builder)?;
+    let rhs_val = resolve_scalar_value(module, function, rhs, value_map, builder)?;
     let result_val = builder.ins().icmp(cc, lhs_val, rhs_val);
     if let Some(result) = function.dfg.inst_result(inst_id) {
         value_map.insert(result, result_val);
