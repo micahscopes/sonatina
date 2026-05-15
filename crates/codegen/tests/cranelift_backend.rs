@@ -4,7 +4,7 @@ use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
-    inst::{arith, control_flow},
+    inst::{arith, cmp, control_flow, data},
     isa::{Isa, native::Native},
     module::ModuleCtx,
 };
@@ -140,4 +140,130 @@ fn cranelift_through_generic_compile_pipeline() {
 
     assert_eq!(f(42), 42);
     assert_eq!(f(-1), -1);
+}
+
+#[test]
+fn cranelift_array_index() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    // Build: fn get_elem(idx: i64) -> i64 {
+    //   let arr: [i64; 3] = [10, 20, 30]
+    //   return arr[idx]
+    // }
+    let sig = Signature::new_single("get_elem", Linkage::Public, &[Type::I64], Type::I64);
+    let func_ref = mb.declare_function(sig).unwrap();
+
+    let arr_ty = mb.declare_array_type(Type::I64, 3);
+    let arr_objref_ty = mb.objref_type(arr_ty);
+    let elem_objref_ty = mb.objref_type(Type::I64);
+
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let idx = fb.args()[0];
+
+    // obj.alloc [i64; 3]
+    let arr = fb.insert_inst(data::ObjAlloc::new(is, arr_ty), arr_objref_ty);
+
+    // Store elements: arr[0]=10, arr[1]=20, arr[2]=30
+    let imm0 = fb.make_imm_value(0i64);
+    let imm1 = fb.make_imm_value(1i64);
+    let imm2 = fb.make_imm_value(2i64);
+
+    let val10 = fb.make_imm_value(10i64);
+    let val20 = fb.make_imm_value(20i64);
+    let val30 = fb.make_imm_value(30i64);
+
+    let p0 = fb.insert_inst(data::ObjIndex::new(is, arr, imm0), elem_objref_ty);
+    fb.insert_inst_no_result(data::ObjStore::new(is, p0, val10));
+
+    let p1 = fb.insert_inst(data::ObjIndex::new(is, arr, imm1), elem_objref_ty);
+    fb.insert_inst_no_result(data::ObjStore::new(is, p1, val20));
+
+    let p2 = fb.insert_inst(data::ObjIndex::new(is, arr, imm2), elem_objref_ty);
+    fb.insert_inst_no_result(data::ObjStore::new(is, p2, val30));
+
+    // Dynamic index: val = arr[idx]
+    let pi = fb.insert_inst(data::ObjIndex::new(is, arr, idx), elem_objref_ty);
+    let val = fb.insert_inst(data::ObjLoad::new(is, pi), Type::I64);
+
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, val));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend.compile_module(&module).expect("compilation failed");
+
+    let f: fn(i64) -> i64 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn(i64) -> i64>("get_elem").unwrap();
+        std::mem::transmute(ptr)
+    };
+
+    assert_eq!(f(0), 10);
+    assert_eq!(f(1), 20);
+    assert_eq!(f(2), 30);
+}
+
+#[test]
+fn cranelift_array_sum() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    // Build: fn sum_arr() -> i64 {
+    //   let arr: [i64; 4] = [100, 200, 300, 400]
+    //   return arr[0] + arr[1] + arr[2] + arr[3]
+    // }
+    let sig = Signature::new_single("sum_arr", Linkage::Public, &[], Type::I64);
+    let func_ref = mb.declare_function(sig).unwrap();
+
+    let arr_ty = mb.declare_array_type(Type::I64, 4);
+    let arr_objref_ty = mb.objref_type(arr_ty);
+    let elem_objref_ty = mb.objref_type(Type::I64);
+
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let arr = fb.insert_inst(data::ObjAlloc::new(is, arr_ty), arr_objref_ty);
+
+    // Store 4 elements
+    for (i, val) in [100i64, 200, 300, 400].iter().enumerate() {
+        let idx = fb.make_imm_value(i as i64);
+        let imm_val = fb.make_imm_value(*val);
+        let p = fb.insert_inst(data::ObjIndex::new(is, arr, idx), elem_objref_ty);
+        fb.insert_inst_no_result(data::ObjStore::new(is, p, imm_val));
+    }
+
+    // Load and sum
+    let mut acc = {
+        let idx = fb.make_imm_value(0i64);
+        let p = fb.insert_inst(data::ObjIndex::new(is, arr, idx), elem_objref_ty);
+        fb.insert_inst(data::ObjLoad::new(is, p), Type::I64)
+    };
+    for i in 1..4 {
+        let idx = fb.make_imm_value(i as i64);
+        let p = fb.insert_inst(data::ObjIndex::new(is, arr, idx), elem_objref_ty);
+        let elem = fb.insert_inst(data::ObjLoad::new(is, p), Type::I64);
+        acc = fb.insert_inst(arith::Add::new(is, acc, elem), Type::I64);
+    }
+
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, acc));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend.compile_module(&module).expect("compilation failed");
+
+    let f: fn() -> i64 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn() -> i64>("sum_arr").unwrap();
+        std::mem::transmute(ptr)
+    };
+
+    assert_eq!(f(), 1000);
 }

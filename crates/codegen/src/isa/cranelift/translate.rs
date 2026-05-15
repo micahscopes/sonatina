@@ -485,17 +485,23 @@ fn translate_function(
             } else if let Some(extract) = <&sonatina_ir::inst::data::ExtractValue as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let base = resolve_value(function, *extract.dest(), &value_map, &mut builder)?;
                 let idx_val = function.dfg.value_imm(*extract.idx())
-                    .map(|imm| match imm { Immediate::I8(v) => v as i32, Immediate::I32(v) => v, Immediate::I64(v) => v as i32, _ => 0 })
+                    .map(|imm| match imm {
+                        Immediate::I8(v) => v as i32,
+                        Immediate::I32(v) => v,
+                        Immediate::I64(v) => v as i32,
+                        Immediate::I256(v) => v.to_u256().low_u64() as i32,
+                        _ => 0,
+                    })
                     .unwrap_or(0);
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     let result_ty = function.dfg.value_ty(result);
-                    if result_ty == Type::I256 {
-                        // For i256 fields: the result is a pointer into the struct
-                        // For field 0 of {i256}, offset is 0 — just use the base pointer
-                        value_map.insert(result, base);
+                    let elem_size = module.ctx.size_of_unchecked(result_ty) as i32;
+                    let offset = idx_val * elem_size;
+                    if result_ty == Type::I256 || matches!(result_ty, Type::Compound(_)) {
+                        let addr = builder.ins().iadd_imm(base, offset as i64);
+                        value_map.insert(result, addr);
                     } else {
                         let clif_ty = sonatina_type_to_clif_or_err(result_ty)?;
-                        let offset = idx_val * 8; // simplified offset calculation
                         let loaded = builder.ins().load(clif_ty, cranelift_codegen::ir::MemFlags::new(), base, offset);
                         value_map.insert(result, loaded);
                     }
@@ -572,9 +578,9 @@ fn translate_function(
             } else if let Some(obj_alloc) = <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     let result_ty = function.dfg.value_ty(result);
-                    // Allocate stack space for the object
+                    let alloc_size = compute_alloc_size(result_ty, &module.ctx);
                     let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 32, 0,
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot, alloc_size, 0,
                     ));
                     let addr = builder.ins().stack_addr(clif::types::I64, slot, 0);
                     value_map.insert(result, addr);
@@ -583,9 +589,48 @@ fn translate_function(
                 let vals = obj_proj.values();
                 let base = resolve_value(function, vals[0], &value_map, &mut builder)?;
                 if let Some(result) = function.dfg.inst_result(inst_id) {
-                    // For MVP, assume field offset 0 (first field of struct)
                     value_map.insert(result, base);
                 }
+            } else if let Some(obj_index) = <&sonatina_ir::inst::data::ObjIndex as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let base = resolve_value(function, *obj_index.object(), &value_map, &mut builder)?;
+                let index_val_id = *obj_index.index();
+                let index_ty = function.dfg.value_ty(index_val_id);
+                let index = if index_ty == Type::I256 {
+                    if let Some(imm) = function.dfg.value_imm(index_val_id) {
+                        let idx_i64 = match imm {
+                            Immediate::I256(v) => {
+                                let u = v.to_u256();
+                                u.low_u64() as i64
+                            }
+                            _ => 0,
+                        };
+                        builder.ins().iconst(clif::types::I64, idx_i64)
+                    } else {
+                        let raw = resolve_value(function, index_val_id, &value_map, &mut builder)?;
+                        builder.ins().load(clif::types::I64, cranelift_codegen::ir::MemFlags::new(), raw, 0)
+                    }
+                } else {
+                    resolve_value(function, index_val_id, &value_map, &mut builder)?
+                };
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    let obj_ty = function.dfg.value_ty(*obj_index.object());
+                    let elem_size = compute_element_size(obj_ty, &module.ctx);
+                    let stride = builder.ins().iconst(clif::types::I64, elem_size as i64);
+                    let offset = builder.ins().imul(index, stride);
+                    let addr = builder.ins().iadd(base, offset);
+                    value_map.insert(result, addr);
+                }
+            } else if let Some(evm_umod) = <&sonatina_ir::inst::evm::EvmUmod as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *evm_umod.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *evm_umod.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().urem(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if <&sonatina_ir::inst::evm::EvmRevert as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
+                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(2).unwrap());
+            } else if <&sonatina_ir::inst::evm::EvmStop as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
+                builder.ins().return_(&[]);
             } else if <&sonatina_ir::inst::control_flow::Unreachable as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
                 builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             } else {
@@ -757,6 +802,45 @@ fn emit_u256_intrinsic_call(
         builder.ins().call(func_ref, args);
         Ok(builder.ins().iconst(ptr_ty, 0))
     }
+}
+
+fn compute_alloc_size(ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> u32 {
+    if let Type::Compound(_) = ty {
+        if let Some(cmpd) = ty.resolve_compound(ctx) {
+            match cmpd {
+                sonatina_ir::types::CompoundType::Array { elem, len } => {
+                    let elem_size = ctx.size_of_unchecked(elem);
+                    return (elem_size * len).max(8) as u32;
+                }
+                sonatina_ir::types::CompoundType::ObjRef(inner) => {
+                    return compute_alloc_size(inner, ctx);
+                }
+                sonatina_ir::types::CompoundType::Struct(s) => {
+                    let total: usize = s.fields.iter().map(|f| ctx.size_of_unchecked(*f)).sum();
+                    return total.max(8) as u32;
+                }
+                _ => {}
+            }
+        }
+    }
+    let size = ctx.size_of_unchecked(ty);
+    size.max(8) as u32
+}
+
+fn compute_element_size(obj_ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> usize {
+    if let Some(cmpd) = obj_ty.resolve_compound(ctx) {
+        match cmpd {
+            sonatina_ir::types::CompoundType::Array { elem, .. } => {
+                return ctx.size_of_unchecked(elem);
+            }
+            sonatina_ir::types::CompoundType::ObjRef(inner) => {
+                return compute_element_size(inner, ctx);
+            }
+            _ => {}
+        }
+    }
+    // Fallback: 32 bytes (i256 size)
+    32
 }
 
 fn collect_phi_args_for_block(
