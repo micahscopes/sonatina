@@ -650,6 +650,62 @@ fn translate_function(
                 builder.ins().trap(cranelift_codegen::ir::TrapCode::user(2).unwrap());
             } else if <&sonatina_ir::inst::evm::EvmStop as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
                 builder.ins().return_(&[]);
+            } else if let Some(const_ref) = <&sonatina_ir::inst::data::ConstRef as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    let gv_ref = const_ref.global().gv();
+                    let result_ty = function.dfg.value_ty(result);
+                    let data_size = compute_alloc_size(result_ty, &module.ctx);
+                    let slot = builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot, data_size, 0,
+                        ),
+                    );
+                    let addr = builder.ins().stack_addr(clif::types::I64, slot, 0);
+                    let init_data = module.ctx.with_gv_store(|store| store.init_data(gv_ref).cloned());
+                    if let Some(init) = init_data {
+                        let gv_ty = module.ctx.with_gv_store(|store| store.ty(gv_ref));
+                        materialize_gv_initializer(&init, gv_ty, addr, 0, &module.ctx, &mut builder);
+                    }
+                    value_map.insert(result, addr);
+                }
+            } else if let Some(const_index) = <&sonatina_ir::inst::data::ConstIndex as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let base = resolve_value(function, *const_index.object(), &value_map, &mut builder)?;
+                let index_val_id = *const_index.index();
+                let index_ty = function.dfg.value_ty(index_val_id);
+                let index = if index_ty == Type::I256 {
+                    if let Some(imm) = function.dfg.value_imm(index_val_id) {
+                        let idx = match imm {
+                            Immediate::I256(v) => v.to_u256().low_u64() as i64,
+                            _ => 0,
+                        };
+                        builder.ins().iconst(clif::types::I64, idx)
+                    } else {
+                        let raw = resolve_value(function, index_val_id, &value_map, &mut builder)?;
+                        builder.ins().load(clif::types::I64, cranelift_codegen::ir::MemFlags::new(), raw, 0)
+                    }
+                } else {
+                    resolve_scalar_value(module, function, index_val_id, &value_map, &mut builder)?
+                };
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    let obj_ty = function.dfg.value_ty(*const_index.object());
+                    let elem_size = compute_element_size(obj_ty, &module.ctx);
+                    let stride = builder.ins().iconst(clif::types::I64, elem_size as i64);
+                    let offset = builder.ins().imul(index, stride);
+                    let ptr = builder.ins().iadd(base, offset);
+                    value_map.insert(result, ptr);
+                }
+            } else if let Some(const_load) = <&sonatina_ir::inst::data::ConstLoad as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let addr = resolve_value(function, *const_load.object(), &value_map, &mut builder)?;
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    let result_ty = function.dfg.value_ty(result);
+                    if result_ty == Type::I256 || matches!(result_ty, Type::Compound(_)) {
+                        value_map.insert(result, addr);
+                    } else {
+                        let clif_ty = sonatina_type_to_clif_or_err(result_ty)?;
+                        let loaded = builder.ins().load(clif_ty, cranelift_codegen::ir::MemFlags::new(), addr, 0);
+                        value_map.insert(result, loaded);
+                    }
+                }
             } else if <&sonatina_ir::inst::control_flow::Unreachable as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
                 builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             } else {
@@ -845,6 +901,72 @@ fn emit_u256_intrinsic_call(
     }
 }
 
+fn materialize_gv_initializer(
+    init: &sonatina_ir::global_variable::GvInitializer,
+    ty: Type,
+    base: clif::Value,
+    offset: i32,
+    ctx: &sonatina_ir::module::ModuleCtx,
+    builder: &mut FunctionBuilder,
+) {
+    use sonatina_ir::global_variable::GvInitializer;
+    match init {
+        GvInitializer::Immediate(imm) => {
+            match imm {
+                Immediate::I8(v) => {
+                    let val = builder.ins().iconst(clif::types::I8, *v as i64);
+                    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, base, offset);
+                }
+                Immediate::I16(v) => {
+                    let val = builder.ins().iconst(clif::types::I16, *v as i64);
+                    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, base, offset);
+                }
+                Immediate::I32(v) => {
+                    let val = builder.ins().iconst(clif::types::I32, *v as i64);
+                    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, base, offset);
+                }
+                Immediate::I64(v) => {
+                    let val = builder.ins().iconst(clif::types::I64, *v);
+                    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, base, offset);
+                }
+                Immediate::I256(v) => {
+                    let u = v.to_u256();
+                    let bytes = u.to_little_endian();
+                    for i in 0..4 {
+                        let limb = u64::from_le_bytes(bytes[i*8..(i+1)*8].try_into().unwrap());
+                        let val = builder.ins().iconst(clif::types::I64, limb as i64);
+                        builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, base, offset + (i * 8) as i32);
+                    }
+                }
+                _ => {}
+            }
+        }
+        GvInitializer::Array(elems) => {
+            if let Some(cmpd) = ty.resolve_compound(ctx) {
+                if let sonatina_ir::types::CompoundType::Array { elem, .. }
+                    | sonatina_ir::types::CompoundType::ConstRef(elem) = cmpd
+                {
+                    let elem_size = ctx.size_of_unchecked(elem) as i32;
+                    for (i, elem_init) in elems.iter().enumerate() {
+                        materialize_gv_initializer(elem_init, elem, base, offset + i as i32 * elem_size, ctx, builder);
+                    }
+                }
+            }
+        }
+        GvInitializer::Struct(fields) => {
+            if let Some(cmpd) = ty.resolve_compound(ctx) {
+                if let sonatina_ir::types::CompoundType::Struct(s) = cmpd {
+                    let mut field_offset = offset;
+                    for (i, (field_init, &field_ty)) in fields.iter().zip(s.fields.iter()).enumerate() {
+                        materialize_gv_initializer(field_init, field_ty, base, field_offset, ctx, builder);
+                        field_offset += ctx.size_of_unchecked(field_ty) as i32;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn compute_alloc_size(ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> u32 {
     if let Type::Compound(_) = ty {
         if let Some(cmpd) = ty.resolve_compound(ctx) {
@@ -853,7 +975,8 @@ fn compute_alloc_size(ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> u32 {
                     let elem_size = ctx.size_of_unchecked(elem);
                     return (elem_size * len).max(8) as u32;
                 }
-                sonatina_ir::types::CompoundType::ObjRef(inner) => {
+                sonatina_ir::types::CompoundType::ObjRef(inner)
+                | sonatina_ir::types::CompoundType::ConstRef(inner) => {
                     return compute_alloc_size(inner, ctx);
                 }
                 sonatina_ir::types::CompoundType::Struct(s) => {
@@ -874,7 +997,8 @@ fn compute_element_size(obj_ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> u
             sonatina_ir::types::CompoundType::Array { elem, .. } => {
                 return ctx.size_of_unchecked(elem);
             }
-            sonatina_ir::types::CompoundType::ObjRef(inner) => {
+            sonatina_ir::types::CompoundType::ObjRef(inner)
+            | sonatina_ir::types::CompoundType::ConstRef(inner) => {
                 return compute_element_size(inner, ctx);
             }
             _ => {}

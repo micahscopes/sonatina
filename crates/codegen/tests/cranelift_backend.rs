@@ -4,6 +4,7 @@ use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
+    global_variable::{GlobalVariableData, GvInitializer},
     inst::{arith, cmp, control_flow, data},
     isa::{Isa, native::Native},
     module::ModuleCtx,
@@ -266,4 +267,65 @@ fn cranelift_array_sum() {
     };
 
     assert_eq!(f(), 1000);
+}
+
+#[test]
+fn cranelift_const_ref_array() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    // Declare a global constant array: [i64; 4] = [10, 20, 30, 40]
+    let arr_ty = mb.declare_array_type(Type::I64, 4);
+    let gv = mb.declare_gv(GlobalVariableData::constant(
+        "ROUND_CONSTANTS".to_string(),
+        arr_ty,
+        Linkage::Private,
+        GvInitializer::Array(vec![
+            GvInitializer::Immediate(sonatina_ir::Immediate::I64(10)),
+            GvInitializer::Immediate(sonatina_ir::Immediate::I64(20)),
+            GvInitializer::Immediate(sonatina_ir::Immediate::I64(30)),
+            GvInitializer::Immediate(sonatina_ir::Immediate::I64(40)),
+        ]),
+    ));
+
+    // fn sum_consts(idx: i64) -> i64 { ROUND_CONSTANTS[idx] }
+    let sig = Signature::new_single("get_const", Linkage::Public, &[Type::I64], Type::I64);
+    let func_ref = mb.declare_function(sig).unwrap();
+
+    let constref_ty = mb.make_compound(sonatina_ir::types::CompoundType::ConstRef(arr_ty));
+    let constref_type = Type::Compound(constref_ty);
+    let elem_constref_ty = mb.make_compound(sonatina_ir::types::CompoundType::ConstRef(Type::I64));
+    let elem_constref_type = Type::Compound(elem_constref_ty);
+
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let idx = fb.args()[0];
+
+    // const.ref → pointer to global array
+    let arr_ref = fb.insert_inst(data::ConstRef::new(is, gv.into()), constref_type);
+    // const.index → pointer to element
+    let elem_ref = fb.insert_inst(data::ConstIndex::new(is, arr_ref, idx), elem_constref_type);
+    // const.load → load the element value
+    let val = fb.insert_inst(data::ConstLoad::new(is, elem_ref), Type::I64);
+
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, val));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend.compile_module(&module).expect("compilation failed");
+
+    let f: fn(i64) -> i64 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn(i64) -> i64>("get_const").unwrap();
+        std::mem::transmute(ptr)
+    };
+
+    assert_eq!(f(0), 10);
+    assert_eq!(f(1), 20);
+    assert_eq!(f(2), 30);
+    assert_eq!(f(3), 40);
 }
