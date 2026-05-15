@@ -96,7 +96,18 @@ impl Backend for CraneliftBackend {
         }
 
         let isa = self.build_isa().map_err(|e| vec![e])?;
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+
+        // Register u256 runtime intrinsics
+        builder.symbol("__u256_add", u256_runtime::__u256_add as *const u8);
+        builder.symbol("__u256_sub", u256_runtime::__u256_sub as *const u8);
+        builder.symbol("__u256_mul", u256_runtime::__u256_mul as *const u8);
+        builder.symbol("__u256_eq", u256_runtime::__u256_eq as *const u8);
+        builder.symbol("__u256_lt", u256_runtime::__u256_lt as *const u8);
+        builder.symbol("__u256_is_zero", u256_runtime::__u256_is_zero as *const u8);
+        builder.symbol("__u256_addmod", u256_runtime::__u256_addmod as *const u8);
+        builder.symbol("__u256_mulmod", u256_runtime::__u256_mulmod as *const u8);
+
         let mut jit = JITModule::new(builder);
 
         let func_map = translate::translate_module(module, &mut jit)
