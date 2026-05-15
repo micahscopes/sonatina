@@ -1,0 +1,132 @@
+#! Overflow checks on EVM-bounded values should be eliminated.
+
+target = "evm-ethereum-osaka"
+
+# evm_calldata_size is bounded by [0, 2^24], so adding 32 cannot overflow i256.
+# regex: SUM=\bv\d+\b
+# check: func public %calldata_size_add(v0.i256) -> i256 {
+# check: $SUM.i256 = add
+# not: uaddo
+# not: 999.i256
+func public %calldata_size_add(v0.i256) -> i256 {
+block0:
+    v1.i256 = evm_calldata_size;
+    (v2.i256, v3.i1) = uaddo v1 32.i256;
+    br v3 block1 block2;
+
+block1:
+    return 999.i256;
+
+block2:
+    return v2;
+}
+
+# evm_return_data_size is bounded, so offset arithmetic is safe.
+# regex: RDS=\bv\d+\b
+# check: func public %return_data_size_add() -> i256 {
+# check: $RDS.i256 = add
+# not: uaddo
+# not: 888.i256
+func public %return_data_size_add() -> i256 {
+block0:
+    v0.i256 = evm_return_data_size;
+    (v1.i256, v2.i1) = uaddo v0 64.i256;
+    br v2 block1 block2;
+
+block1:
+    return 888.i256;
+
+block2:
+    return v1;
+}
+
+# Adding two evm_calldata_size values (both bounded by 2^24) cannot overflow.
+# regex: DS=\bv\d+\b
+# check: func public %two_sizes_add() -> i256 {
+# check: $DS.i256 = add
+# not: uaddo
+# not: 777.i256
+func public %two_sizes_add() -> i256 {
+block0:
+    v0.i256 = evm_calldata_size;
+    v1.i256 = evm_code_size;
+    (v2.i256, v3.i1) = uaddo v0 v1;
+    br v3 block1 block2;
+
+block1:
+    return 777.i256;
+
+block2:
+    return v2;
+}
+
+# evm_malloc pointer arithmetic: ptr_to_int(evm_malloc(n)) + 4 cannot overflow.
+# regex: MSUM=\bv\d+\b
+# check: func public %malloc_ptr_add() -> i256 {
+# check: $MSUM.i256 = add
+# not: uaddo
+# not: 666.i256
+func public %malloc_ptr_add() -> i256 {
+block0:
+    v0.*i8 = evm_malloc 36.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    (v2.i256, v3.i1) = uaddo v1 4.i256;
+    br v3 block1 block2;
+
+block1:
+    return 666.i256;
+
+block2:
+    return v2;
+}
+
+# Chained overflow checks: after the first uaddo guard passes, the
+# range of the sum is narrowed so the second uaddo can be eliminated.
+# regex: S1=\bv\d+\b
+# regex: S2=\bv\d+\b
+# check: func public %chained_uaddo(v0.i256) -> i256 {
+# check: $S1.i256 = add v0 100.i256;
+# check: $S2.i256 = add $S1 200.i256;
+# not: uaddo
+# not: 888.i256
+# not: 999.i256
+func public %chained_uaddo(v0.i256) -> i256 {
+block0:
+    v1.i1 = lt v0 1000.i256;
+    br v1 block1 block4;
+
+block1:
+    (v2.i256, v3.i1) = uaddo v0 100.i256;
+    br v3 block2 block3;
+
+block2:
+    return 888.i256;
+
+block3:
+    (v4.i256, v5.i1) = uaddo v2 200.i256;
+    br v5 block5 block6;
+
+block4:
+    return 0.i256;
+
+block5:
+    return 999.i256;
+
+block6:
+    return v4;
+}
+
+# Full-range values still produce uaddo (not eliminated).
+# check: func public %full_range_preserved(v0.i256, v1.i256) -> i256 {
+# check: uaddo v0 v1;
+func public %full_range_preserved(v0.i256, v1.i256) -> i256 {
+block0:
+    (v2.i256, v3.i1) = uaddo v0 v1;
+    br v3 block1 block2;
+
+block1:
+    return 9.i256;
+
+block2:
+    return v2;
+}

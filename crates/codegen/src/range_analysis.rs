@@ -7,7 +7,11 @@ use sonatina_ir::{
     ValueId,
     inst::{
         BinaryInstKind, CastInstKind, InstClassKind, UnaryInstKind, control_flow::BranchKind,
-        evm::EvmMalloc,
+        downcast,
+        evm::{
+            EvmAddress, EvmCalldataSize, EvmCaller, EvmCodeSize, EvmGas, EvmMalloc, EvmMsize,
+            EvmOrigin, EvmReturnDataSize,
+        },
     },
 };
 
@@ -307,8 +311,18 @@ pub(crate) fn transfer_inst(func: &Function, env: &mut RangeEnv, inst: InstId) {
             transfer_bool_unary_inst(func, env, inst, kind)
         }
         InstClassKind::Binary(kind) => transfer_binary_inst(func, env, inst, kind),
-        _ => clear_inst_results(func, env, inst),
+        _ => transfer_opaque_inst(func, env, inst),
     }
+}
+
+fn transfer_opaque_inst(func: &Function, env: &mut RangeEnv, inst: InstId) {
+    if let Some(fact) = evm_opaque_fact(func, inst)
+        && let Some(result) = func.dfg.inst_result(inst)
+    {
+        set_env_fact(func, env, result, fact);
+        return;
+    }
+    clear_inst_results(func, env, inst);
 }
 
 pub(crate) fn checked_value_fact(
@@ -539,6 +553,12 @@ fn refine_br_edge(
                     value,
                     RangeFact::singleton(Immediate::from(effective)),
                 );
+                // When the overflow flag of a checked arithmetic op is known
+                // false on this edge, narrow the operands so that subsequent
+                // uses see a tighter range.
+                if !effective {
+                    refine_checked_arith_operands(func, &mut refined, value);
+                }
                 Some(refined)
             } else {
                 Some(env.clone())
@@ -871,6 +891,122 @@ fn refine_not_equal_immediate_edge(
     }
 
     set_env_fact(func, env, value, updated);
+}
+
+/// When a checked-arithmetic overflow flag is known to be false on this edge,
+/// narrow the operands and result values of that instruction.
+///
+/// For `(sum, ovfl) = uaddo a b` with `ovfl = false`:
+///   a.hi <= max - b.lo  and  b.hi <= max - a.lo
+/// and the result `sum` gets the tightened addition range.
+fn refine_checked_arith_operands(func: &Function, env: &mut RangeEnv, overflow_value: ValueId) {
+    let Some((inst, result_idx)) = func.dfg.value_inst_result(overflow_value) else {
+        return;
+    };
+    // Must be the overflow flag (result index 1).
+    if result_idx != 1 {
+        return;
+    }
+
+    let kind = func.dfg.inst(inst).kind();
+    let args = func.dfg.inst(inst).collect_values();
+    let [lhs, rhs] = args.as_slice() else {
+        return;
+    };
+
+    let lhs_fact = fact_for_value(func, env, *lhs);
+    let rhs_fact = fact_for_value(func, env, *rhs);
+
+    let Some(value_result) = func.dfg.inst_result_at(inst, 0) else {
+        return;
+    };
+    let ty = func.dfg.value_ty(value_result);
+    if !supports_range_facts(ty) {
+        return;
+    }
+
+    match kind {
+        InstClassKind::Binary(BinaryInstKind::Uaddo) => {
+            let max = unsigned_max(ty);
+            // a.hi + b.hi <= max  =>  a.hi <= max - b.lo, b.hi <= max - a.lo
+            let new_lhs_hi = max.saturating_sub(rhs_fact.unsigned.lo);
+            let new_rhs_hi = max.saturating_sub(lhs_fact.unsigned.lo);
+
+            let new_lhs_unsigned = UnsignedInterval {
+                lo: lhs_fact.unsigned.lo,
+                hi: lhs_fact.unsigned.hi.min(new_lhs_hi),
+            };
+            let new_rhs_unsigned = UnsignedInterval {
+                lo: rhs_fact.unsigned.lo,
+                hi: rhs_fact.unsigned.hi.min(new_rhs_hi),
+            };
+
+            if new_lhs_unsigned != lhs_fact.unsigned {
+                set_env_unsigned(func, env, *lhs, lhs_fact, new_lhs_unsigned);
+            }
+            if new_rhs_unsigned != rhs_fact.unsigned {
+                set_env_unsigned(func, env, *rhs, rhs_fact, new_rhs_unsigned);
+            }
+
+            // Also tighten the sum result.
+            let new_lhs_fact = RangeFact {
+                unsigned: new_lhs_unsigned,
+                signed: lhs_fact.signed,
+            };
+            let new_rhs_fact = RangeFact {
+                unsigned: new_rhs_unsigned,
+                signed: rhs_fact.signed,
+            };
+            set_env_fact(
+                func,
+                env,
+                value_result,
+                plain_add_fact(new_lhs_fact, new_rhs_fact, ty),
+            );
+        }
+        InstClassKind::Binary(BinaryInstKind::Usubo) => {
+            // (diff, ovfl) = usubo a b  with ovfl=false  =>  a >= b
+            // => a.lo >= b.lo, b.hi <= a.hi
+            let new_lhs_lo = lhs_fact.unsigned.lo.max(rhs_fact.unsigned.lo);
+            let new_rhs_hi = rhs_fact.unsigned.hi.min(lhs_fact.unsigned.hi);
+
+            let new_lhs_unsigned = UnsignedInterval {
+                lo: new_lhs_lo,
+                hi: lhs_fact.unsigned.hi,
+            };
+            let new_rhs_unsigned = UnsignedInterval {
+                lo: rhs_fact.unsigned.lo,
+                hi: new_rhs_hi,
+            };
+
+            if new_lhs_unsigned.lo <= new_lhs_unsigned.hi && new_lhs_unsigned != lhs_fact.unsigned {
+                set_env_unsigned(func, env, *lhs, lhs_fact, new_lhs_unsigned);
+            }
+            if new_rhs_unsigned.lo <= new_rhs_unsigned.hi && new_rhs_unsigned != rhs_fact.unsigned {
+                set_env_unsigned(func, env, *rhs, rhs_fact, new_rhs_unsigned);
+            }
+
+            let new_lhs_fact = RangeFact {
+                unsigned: new_lhs_unsigned,
+                signed: lhs_fact.signed,
+            };
+            let new_rhs_fact = RangeFact {
+                unsigned: new_rhs_unsigned,
+                signed: rhs_fact.signed,
+            };
+            if new_lhs_unsigned.lo <= new_lhs_unsigned.hi
+                && new_rhs_unsigned.lo <= new_rhs_unsigned.hi
+            {
+                set_env_fact(
+                    func,
+                    env,
+                    value_result,
+                    plain_sub_fact(new_lhs_fact, new_rhs_fact, ty),
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 fn refine_unsigned_lt(
@@ -1613,6 +1749,63 @@ fn set_env_signed(
             signed,
         },
     );
+}
+
+/// Return a range fact for EVM instructions that produce inherently bounded
+/// results. These axioms are sound because the EVM execution model places
+/// hard limits on various quantities:
+///
+/// - `calldatasize` / `codesize` / `returndatasize`: bounded by the 16 MB
+///   EVM message size limits, well under 2^24.
+/// - `msize` / `gas`: bounded by gas costs -- no contract can reach 2^64.
+/// - `address` / `origin` / `caller`: Ethereum addresses are 160-bit.
+fn evm_opaque_fact(func: &Function, inst: InstId) -> Option<RangeFact> {
+    let is = func.inst_set();
+    let dinst = func.dfg.inst(inst);
+
+    // Size-class instructions: values bounded by EVM message/code limits.
+    // 2^24 = 16 777 216 -- generous upper bound for calldata, code,
+    // and return data sizes.
+    if downcast::<&EvmCalldataSize>(is, dinst).is_some()
+        || downcast::<&EvmCodeSize>(is, dinst).is_some()
+        || downcast::<&EvmReturnDataSize>(is, dinst).is_some()
+    {
+        let upper = U256::one() << 24;
+        return Some(make_nonneg_fact(upper));
+    }
+
+    // Memory/gas-class: bounded by quadratic gas costs, well under 2^64.
+    if downcast::<&EvmMsize>(is, dinst).is_some() || downcast::<&EvmGas>(is, dinst).is_some() {
+        let upper = U256::one() << 64;
+        return Some(make_nonneg_fact(upper));
+    }
+
+    // Address-class: Ethereum addresses are 160-bit unsigned values.
+    if downcast::<&EvmAddress>(is, dinst).is_some()
+        || downcast::<&EvmOrigin>(is, dinst).is_some()
+        || downcast::<&EvmCaller>(is, dinst).is_some()
+    {
+        let upper = U256::one() << 160;
+        return Some(make_nonneg_fact(upper));
+    }
+
+    None
+}
+
+/// Build a non-negative range fact `[0, upper]` for both unsigned and signed
+/// interpretations. Caller must ensure `upper` fits in the positive signed
+/// half (i.e. `upper < 2^255`).
+fn make_nonneg_fact(upper: U256) -> RangeFact {
+    RangeFact {
+        unsigned: UnsignedInterval {
+            lo: U256::zero(),
+            hi: upper,
+        },
+        signed: SignedInterval {
+            lo: I256::zero(),
+            hi: I256::from(upper),
+        },
+    }
 }
 
 fn set_env_fact(func: &Function, env: &mut RangeEnv, value: ValueId, fact: RangeFact) {
