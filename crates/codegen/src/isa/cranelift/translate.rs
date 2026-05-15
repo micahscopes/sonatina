@@ -77,6 +77,8 @@ fn sonatina_type_to_clif(ty: Type) -> Option<clif::Type> {
         Type::I32 => Some(clif::types::I32),
         Type::I64 => Some(clif::types::I64),
         Type::I128 => Some(clif::types::I128),
+        // Compound types (objref, constref, ptr) → native pointer
+        Type::Compound(_) => Some(clif::types::I64),
         _ => None,
     }
 }
@@ -310,8 +312,29 @@ fn translate_function(
                 for (ir_result, clif_result) in ir_results.iter().zip(results.iter()) {
                     value_map.insert(*ir_result, *clif_result);
                 }
+            } else if let Some(uaddo) = <&sonatina_ir::inst::arith::Uaddo as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *uaddo.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *uaddo.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().iadd(lhs, rhs);
+                let ir_results = function.dfg.inst_results(inst_id);
+                if ir_results.len() >= 1 {
+                    value_map.insert(ir_results[0], result_val);
+                }
+                if ir_results.len() >= 2 {
+                    // Overflow: result < lhs (unsigned overflow detection)
+                    let overflow = builder.ins().icmp(IntCC::UnsignedLessThan, result_val, lhs);
+                    value_map.insert(ir_results[1], overflow);
+                }
+            } else if let Some(obj_load) = <&sonatina_ir::inst::data::ObjLoad as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let addr = resolve_value(function, *obj_load.object(), &value_map, &mut builder)?;
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    let result_ty = function.dfg.value_ty(result);
+                    let clif_ty = sonatina_type_to_clif_or_err(result_ty)?;
+                    let loaded = builder.ins().load(clif_ty, cranelift_codegen::ir::MemFlags::new(), addr, 0);
+                    value_map.insert(result, loaded);
+                }
             } else if <&sonatina_ir::inst::control_flow::Unreachable as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
-                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             } else {
                 return Err(format!(
                     "unsupported instruction for CraneliftBackend: {:?}",
