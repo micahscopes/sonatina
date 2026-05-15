@@ -329,3 +329,108 @@ fn cranelift_const_ref_array() {
     assert_eq!(f(2), 30);
     assert_eq!(f(3), 40);
 }
+
+#[test]
+fn cranelift_poseidon_loop_with_const_array() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    // Global constant round array: [i64; 4] = [3, 5, 7, 11]
+    let arr_ty = mb.declare_array_type(Type::I64, 4);
+    let gv = mb.declare_gv(GlobalVariableData::constant(
+        "ROUND_CONSTS".to_string(),
+        arr_ty,
+        Linkage::Private,
+        GvInitializer::Array(vec![
+            GvInitializer::Immediate(sonatina_ir::Immediate::I64(3)),
+            GvInitializer::Immediate(sonatina_ir::Immediate::I64(5)),
+            GvInitializer::Immediate(sonatina_ir::Immediate::I64(7)),
+            GvInitializer::Immediate(sonatina_ir::Immediate::I64(11)),
+        ]),
+    ));
+
+    // fn poseidon_sum() -> i64 {
+    //   let C = ROUND_CONSTS;  // const array
+    //   let mut acc: i64 = 1;
+    //   for i in 0..4 {
+    //     let c = C[i];
+    //     acc = (acc + c) * (acc + c) + (acc + c);  // sigma(acc + c)
+    //   }
+    //   return acc;
+    // }
+    let sig = Signature::new_single("poseidon_sum", Linkage::Public, &[], Type::I64);
+    let func_ref = mb.declare_function(sig).unwrap();
+
+    let constref_ty = mb.make_compound(sonatina_ir::types::CompoundType::ConstRef(arr_ty));
+    let constref_type = Type::Compound(constref_ty);
+    let elem_constref_ty = mb.make_compound(sonatina_ir::types::CompoundType::ConstRef(Type::I64));
+    let elem_constref_type = Type::Compound(elem_constref_ty);
+
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let loop_header = fb.append_block();
+    let loop_body = fb.append_block();
+    let exit = fb.append_block();
+
+    // entry: jump to loop with (acc=1, i=0)
+    fb.switch_to_block(entry);
+    let init_acc = fb.make_imm_value(1i64);
+    let init_i = fb.make_imm_value(0i64);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
+
+    // loop_header: phi(acc, i), check i < 4
+    fb.switch_to_block(loop_header);
+    let acc_phi = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(init_acc, entry)]),
+        Type::I64,
+    );
+    let i_phi = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(init_i, entry)]),
+        Type::I64,
+    );
+    let four = fb.make_imm_value(4i64);
+    let cond = fb.insert_inst(cmp::Lt::new(is, i_phi, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, loop_body, exit));
+
+    // loop_body: c = C[i], sigma(acc + c), i++
+    fb.switch_to_block(loop_body);
+    let arr_ref = fb.insert_inst(data::ConstRef::new(is, gv.into()), constref_type);
+    let elem_ref = fb.insert_inst(data::ConstIndex::new(is, arr_ref, i_phi), elem_constref_type);
+    let c = fb.insert_inst(data::ConstLoad::new(is, elem_ref), Type::I64);
+    let sum = fb.insert_inst(arith::Add::new(is, acc_phi, c), Type::I64);
+    let sq = fb.insert_inst(arith::Mul::new(is, sum, sum), Type::I64);
+    let new_acc = fb.insert_inst(arith::Add::new(is, sq, sum), Type::I64);
+    let one = fb.make_imm_value(1i64);
+    let new_i = fb.insert_inst(arith::Add::new(is, i_phi, one), Type::I64);
+
+    // Update phis and jump back
+    fb.append_phi_arg(acc_phi, new_acc, loop_body);
+    fb.append_phi_arg(i_phi, new_i, loop_body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
+
+    // exit: return acc
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, acc_phi));
+
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend.compile_module(&module).expect("compilation failed");
+
+    let f: fn() -> i64 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn() -> i64>("poseidon_sum").unwrap();
+        std::mem::transmute(ptr)
+    };
+
+    // Manual computation:
+    // i=0: acc=1, c=3, sum=4, sq=16, new_acc=20
+    // i=1: acc=20, c=5, sum=25, sq=625, new_acc=650
+    // i=2: acc=650, c=7, sum=657, sq=431649, new_acc=432306
+    // i=3: acc=432306, c=11, sum=432317, sq=186897988489, new_acc=186898420806
+    let result = f();
+    assert_eq!(result, 186898420806, "poseidon_sum with const array rounds");
+}
