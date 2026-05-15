@@ -469,6 +469,25 @@ fn translate_function(
                     let overflow = builder.ins().icmp(IntCC::UnsignedLessThan, result_val, lhs);
                     value_map.insert(ir_results[1], overflow);
                 }
+            } else if let Some(umulo) = <&sonatina_ir::inst::arith::Umulo as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *umulo.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *umulo.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().imul(lhs, rhs);
+                let ir_results = function.dfg.inst_results(inst_id);
+                if ir_results.len() >= 1 {
+                    value_map.insert(ir_results[0], result_val);
+                }
+                if ir_results.len() >= 2 {
+                    // Overflow: check if result / lhs != rhs (when lhs != 0)
+                    let lhs_ty = builder.func.dfg.value_type(lhs);
+                    let zero = builder.ins().iconst(lhs_ty, 0);
+                    let lhs_zero = builder.ins().icmp(IntCC::Equal, lhs, zero);
+                    let div = builder.ins().udiv(result_val, lhs);
+                    let not_eq = builder.ins().icmp(IntCC::NotEqual, div, rhs);
+                    let lhs_nonzero = builder.ins().bnot(lhs_zero);
+                    let overflow = builder.ins().band(not_eq, lhs_nonzero);
+                    value_map.insert(ir_results[1], overflow);
+                }
             } else if let Some(obj_load) = <&sonatina_ir::inst::data::ObjLoad as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let addr = resolve_value(function, *obj_load.object(), &value_map, &mut builder)?;
                 if let Some(result) = function.dfg.inst_result(inst_id) {
