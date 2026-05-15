@@ -36,13 +36,10 @@ pub(super) fn translate_module(
         func_id_map.insert(func_ref, func_id);
     }
 
-    // Known intrinsics: skip their translation (they're intercepted at call sites)
-    let intrinsic_names: std::collections::HashSet<&str> =
-        ["addmod", "mulmod"].into_iter().collect();
-
     for &func_ref in &funcs {
         let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
-        if intrinsic_names.contains(name.as_str()) {
+        // Skip intrinsic functions (intercepted at call sites as runtime calls)
+        if name.contains("addmod") || name.contains("mulmod") {
             continue;
         }
 
@@ -334,9 +331,11 @@ fn translate_function(
                 let callee = *call.callee();
                 let callee_name = module.ctx.func_sig(callee, |sig| sig.name().to_string());
 
-                // Intercept known u256 intrinsic functions
-                if callee_name == "addmod" || callee_name == "mulmod" {
-                    let intrinsic_name = if callee_name == "addmod" { "__u256_addmod" } else { "__u256_mulmod" };
+                // Intercept known u256 intrinsic functions (name may be mangled)
+                let is_addmod = callee_name == "addmod" || callee_name.contains("addmod");
+                let is_mulmod = callee_name == "mulmod" || callee_name.contains("mulmod");
+                if is_addmod || is_mulmod {
+                    let intrinsic_name = if is_addmod { "__u256_addmod" } else { "__u256_mulmod" };
                     let args: Result<Vec<_>, _> = call.args()
                         .iter()
                         .map(|v| resolve_value(function, *v, &value_map, &mut builder))
@@ -385,6 +384,40 @@ fn translate_function(
                     if result_ty == Type::I256 {
                         // For i256: the value IS the pointer — obj.load of i256 means
                         // "the 32 bytes at this address are a u256 value"
+                        value_map.insert(result, addr);
+                    } else {
+                        let clif_ty = sonatina_type_to_clif_or_err(result_ty)?;
+                        let loaded = builder.ins().load(clif_ty, cranelift_codegen::ir::MemFlags::new(), addr, 0);
+                        value_map.insert(result, loaded);
+                    }
+                }
+            } else if let Some(alloca) = <&sonatina_ir::inst::data::Alloca as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    let slot = builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 32, 0,
+                        ),
+                    );
+                    let addr = builder.ins().stack_addr(clif::types::I64, slot, 0);
+                    value_map.insert(result, addr);
+                }
+            } else if let Some(mstore) = <&sonatina_ir::inst::data::Mstore as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let addr = resolve_value(function, *mstore.addr(), &value_map, &mut builder)?;
+                let val = resolve_value(function, *mstore.value(), &value_map, &mut builder)?;
+                let store_ty = function.dfg.value_ty(*mstore.value());
+                if store_ty == Type::I256 {
+                    for i in 0..4 {
+                        let limb = builder.ins().load(clif::types::I64, cranelift_codegen::ir::MemFlags::new(), val, (i * 8) as i32);
+                        builder.ins().store(cranelift_codegen::ir::MemFlags::new(), limb, addr, (i * 8) as i32);
+                    }
+                } else {
+                    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, addr, 0);
+                }
+            } else if let Some(mload) = <&sonatina_ir::inst::data::Mload as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let addr = resolve_value(function, *mload.addr(), &value_map, &mut builder)?;
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    let result_ty = function.dfg.value_ty(result);
+                    if result_ty == Type::I256 {
                         value_map.insert(result, addr);
                     } else {
                         let clif_ty = sonatina_type_to_clif_or_err(result_ty)?;
