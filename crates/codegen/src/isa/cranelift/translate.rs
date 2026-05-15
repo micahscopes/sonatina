@@ -313,6 +313,19 @@ fn translate_function(
                 }
             } else if let Some(ne) = <&sonatina_ir::inst::cmp::Ne as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 translate_icmp(IntCC::NotEqual, *ne.lhs(), *ne.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+            } else if let Some(is_zero) = <&sonatina_ir::inst::cmp::IsZero as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let val = resolve_value(function, *is_zero.lhs(), &value_map, &mut builder)?;
+                let val_ty = function.dfg.value_ty(*is_zero.lhs());
+                let clif_ty = sonatina_type_to_clif(val_ty).unwrap_or(clif::types::I64);
+                let zero = builder.ins().iconst(clif_ty, 0);
+                let result_val = builder.ins().icmp(IntCC::Equal, val, zero);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(sle) = <&sonatina_ir::inst::cmp::Sle as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                translate_icmp(IntCC::SignedLessThanOrEqual, *sle.lhs(), *sle.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+            } else if let Some(sge) = <&sonatina_ir::inst::cmp::Sge as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                translate_icmp(IntCC::SignedGreaterThanOrEqual, *sge.lhs(), *sge.rhs(), inst_id, function, &mut value_map, &mut builder)?;
             } else if let Some(sext) = <&sonatina_ir::inst::cast::Sext as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let val = resolve_value(function, *sext.from(), &value_map, &mut builder)?;
                 let to_ty = sonatina_type_to_clif_or_err(*sext.ty())?;
