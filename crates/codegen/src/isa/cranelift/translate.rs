@@ -417,7 +417,16 @@ fn translate_function(
             } else if let Some(obj_store) = <&sonatina_ir::inst::data::ObjStore as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let dest = resolve_value(function, *obj_store.object(), &value_map, &mut builder)?;
                 let val = resolve_value(function, *obj_store.value(), &value_map, &mut builder)?;
-                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, dest, 0);
+                let val_ty = function.dfg.value_ty(*obj_store.value());
+                if val_ty == Type::I256 {
+                    // i256 store: copy 32 bytes from val (pointer) to dest (pointer)
+                    for i in 0..4 {
+                        let limb = builder.ins().load(clif::types::I64, cranelift_codegen::ir::MemFlags::new(), val, (i * 8) as i32);
+                        builder.ins().store(cranelift_codegen::ir::MemFlags::new(), limb, dest, (i * 8) as i32);
+                    }
+                } else {
+                    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, dest, 0);
+                }
             } else if let Some(obj_alloc) = <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     let result_ty = function.dfg.value_ty(result);
