@@ -478,13 +478,14 @@ fn translate_function(
                     value_map.insert(ir_results[0], result_val);
                 }
                 if ir_results.len() >= 2 {
-                    // Overflow: check if result / lhs != rhs (when lhs != 0)
+                    // Overflow: result/lhs != rhs when lhs != 0; no overflow when lhs == 0
                     let lhs_ty = builder.func.dfg.value_type(lhs);
                     let zero = builder.ins().iconst(lhs_ty, 0);
-                    let lhs_zero = builder.ins().icmp(IntCC::Equal, lhs, zero);
-                    let div = builder.ins().udiv(result_val, lhs);
+                    let lhs_nonzero = builder.ins().icmp(IntCC::NotEqual, lhs, zero);
+                    let one = builder.ins().iconst(lhs_ty, 1);
+                    let safe_divisor = builder.ins().select(lhs_nonzero, lhs, one);
+                    let div = builder.ins().udiv(result_val, safe_divisor);
                     let not_eq = builder.ins().icmp(IntCC::NotEqual, div, rhs);
-                    let lhs_nonzero = builder.ins().bnot(lhs_zero);
                     let overflow = builder.ins().band(not_eq, lhs_nonzero);
                     value_map.insert(ir_results[1], overflow);
                 }
