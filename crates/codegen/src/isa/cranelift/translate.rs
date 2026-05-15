@@ -37,12 +37,17 @@ pub(super) fn translate_module(
     }
 
     for &func_ref in &funcs {
-        module.func_store.try_view(func_ref, |function| {
+        let translated = module.func_store.try_view(func_ref, |function| {
+            if function.layout.entry_block().is_none() {
+                return Ok(());
+            }
             let func_id = func_id_map[&func_ref];
-            let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
             translate_function(module, function, func_ref, func_id, &func_id_map, jit)
-                .map_err(|e| format!("error translating function {name}: {e}"))
-        }).ok_or_else(|| format!("function {:?} has no body", func_ref))??;
+        });
+        if let Some(result) = translated {
+            let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
+            result.map_err(|e| format!("error translating function {name}: {e}"))?;
+        }
     }
 
     Ok(func_map)
