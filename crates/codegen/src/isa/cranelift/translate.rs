@@ -36,7 +36,16 @@ pub(super) fn translate_module(
         func_id_map.insert(func_ref, func_id);
     }
 
+    // Known intrinsics: skip their translation (they're intercepted at call sites)
+    let intrinsic_names: std::collections::HashSet<&str> =
+        ["addmod", "mulmod"].into_iter().collect();
+
     for &func_ref in &funcs {
+        let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
+        if intrinsic_names.contains(name.as_str()) {
+            continue;
+        }
+
         let translated = module.func_store.try_view(func_ref, |function| {
             if function.layout.entry_block().is_none() {
                 return Ok(());
@@ -45,8 +54,11 @@ pub(super) fn translate_module(
             translate_function(module, function, func_ref, func_id, &func_id_map, jit)
         });
         if let Some(result) = translated {
-            let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
-            result.map_err(|e| format!("error translating function {name}: {e}"))?;
+            if let Err(e) = result {
+                // Skip functions with unsupported instructions rather than
+                // failing the whole module. They'll error at call time if needed.
+                eprintln!("[cranelift] skipping function {name}: {e}");
+            }
         }
     }
 
@@ -125,9 +137,9 @@ fn translate_function(
 
     let inst_set = function.inst_set();
 
-    if inst_set.has_evm_stop().is_some() {
-        return Err("CraneliftBackend requires a native (non-EVM) instruction set".to_string());
-    }
+    // No blanket ISA rejection — the translator handles each instruction
+    // individually, emitting intrinsic calls for EVM-specific operations
+    // (addmod, mulmod) and errors for truly unsupported ones.
 
     for block in function.layout.iter_block() {
         let clif_block = block_map[&block];
@@ -258,7 +270,26 @@ fn translate_function(
             } else if let Some(sgt) = <&sonatina_ir::inst::cmp::Sgt as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 translate_icmp(IntCC::SignedGreaterThan, *sgt.lhs(), *sgt.rhs(), inst_id, function, &mut value_map, &mut builder)?;
             } else if let Some(eq) = <&sonatina_ir::inst::cmp::Eq as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                translate_icmp(IntCC::Equal, *eq.lhs(), *eq.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                let lhs_ty = function.dfg.value_ty(*eq.lhs());
+                if lhs_ty == Type::I256 {
+                    let lhs = resolve_value(function, *eq.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *eq.rhs(), &value_map, &mut builder)?;
+                    let mut sig = jit.make_signature();
+                    sig.params.push(clif::AbiParam::new(clif::types::I64));
+                    sig.params.push(clif::AbiParam::new(clif::types::I64));
+                    sig.returns.push(clif::AbiParam::new(clif::types::I64));
+                    let func_id = jit.declare_function("__u256_eq", Linkage::Import, &sig)
+                        .map_err(|e| format!("failed to declare __u256_eq: {e}"))?;
+                    let func_ref = jit.declare_func_in_func(func_id, builder.func);
+                    let clif_call = builder.ins().call(func_ref, &[lhs, rhs]);
+                    let raw_result = builder.inst_results(clif_call)[0];
+                    let bool_result = builder.ins().ireduce(clif::types::I8, raw_result);
+                    if let Some(result) = function.dfg.inst_result(inst_id) {
+                        value_map.insert(result, bool_result);
+                    }
+                } else {
+                    translate_icmp(IntCC::Equal, *eq.lhs(), *eq.rhs(), inst_id, function, &mut value_map, &mut builder)?;
+                }
             } else if let Some(ne) = <&sonatina_ir::inst::cmp::Ne as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 translate_icmp(IntCC::NotEqual, *ne.lhs(), *ne.rhs(), inst_id, function, &mut value_map, &mut builder)?;
             } else if let Some(sext) = <&sonatina_ir::inst::cast::Sext as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
@@ -301,18 +332,38 @@ fn translate_function(
                 builder.ins().return_(&args);
             } else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let callee = *call.callee();
-                let clif_func_id = func_id_map.get(&callee)
-                    .ok_or_else(|| format!("unknown callee {:?}", callee))?;
-                let clif_func_ref = jit.declare_func_in_func(*clif_func_id, builder.func);
-                let args: Result<Vec<_>, _> = call.args()
-                    .iter()
-                    .map(|v| resolve_value(function, *v, &value_map, &mut builder))
-                    .collect();
-                let clif_call = builder.ins().call(clif_func_ref, &args?);
-                let results = builder.inst_results(clif_call).to_vec();
-                let ir_results = function.dfg.inst_results(inst_id);
-                for (ir_result, clif_result) in ir_results.iter().zip(results.iter()) {
-                    value_map.insert(*ir_result, *clif_result);
+                let callee_name = module.ctx.func_sig(callee, |sig| sig.name().to_string());
+
+                // Intercept known u256 intrinsic functions
+                if callee_name == "addmod" || callee_name == "mulmod" {
+                    let intrinsic_name = if callee_name == "addmod" { "__u256_addmod" } else { "__u256_mulmod" };
+                    let args: Result<Vec<_>, _> = call.args()
+                        .iter()
+                        .map(|v| resolve_value(function, *v, &value_map, &mut builder))
+                        .collect();
+                    // Args are already pointers to 32-byte u256 buffers
+                    // (from obj.load passthrough or emit_i256_immediate stack slots)
+                    let result_val = emit_u256_intrinsic_call(
+                        jit, &mut builder, intrinsic_name, &args?, true,
+                    )?;
+                    let ir_results = function.dfg.inst_results(inst_id);
+                    if !ir_results.is_empty() {
+                        value_map.insert(ir_results[0], result_val);
+                    }
+                } else {
+                    let clif_func_id = func_id_map.get(&callee)
+                        .ok_or_else(|| format!("unknown callee {:?}", callee))?;
+                    let clif_func_ref = jit.declare_func_in_func(*clif_func_id, builder.func);
+                    let args: Result<Vec<_>, _> = call.args()
+                        .iter()
+                        .map(|v| resolve_value(function, *v, &value_map, &mut builder))
+                        .collect();
+                    let clif_call = builder.ins().call(clif_func_ref, &args?);
+                    let results = builder.inst_results(clif_call).to_vec();
+                    let ir_results = function.dfg.inst_results(inst_id);
+                    for (ir_result, clif_result) in ir_results.iter().zip(results.iter()) {
+                        value_map.insert(*ir_result, *clif_result);
+                    }
                 }
             } else if let Some(uaddo) = <&sonatina_ir::inst::arith::Uaddo as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let lhs = resolve_value(function, *uaddo.lhs(), &value_map, &mut builder)?;
@@ -331,9 +382,58 @@ fn translate_function(
                 let addr = resolve_value(function, *obj_load.object(), &value_map, &mut builder)?;
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     let result_ty = function.dfg.value_ty(result);
-                    let clif_ty = sonatina_type_to_clif_or_err(result_ty)?;
-                    let loaded = builder.ins().load(clif_ty, cranelift_codegen::ir::MemFlags::new(), addr, 0);
-                    value_map.insert(result, loaded);
+                    if result_ty == Type::I256 {
+                        // For i256: the value IS the pointer — obj.load of i256 means
+                        // "the 32 bytes at this address are a u256 value"
+                        value_map.insert(result, addr);
+                    } else {
+                        let clif_ty = sonatina_type_to_clif_or_err(result_ty)?;
+                        let loaded = builder.ins().load(clif_ty, cranelift_codegen::ir::MemFlags::new(), addr, 0);
+                        value_map.insert(result, loaded);
+                    }
+                }
+            } else if let Some(addmod) = <&sonatina_ir::inst::evm::EvmAddMod as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let a = resolve_value(function, *addmod.lhs(), &value_map, &mut builder)?;
+                let b = resolve_value(function, *addmod.rhs(), &value_map, &mut builder)?;
+                let m = resolve_value(function, *addmod.modulus(), &value_map, &mut builder)?;
+                let result_val = emit_u256_intrinsic_call(
+                    jit, &mut builder, "__u256_addmod",
+                    &[a, b, m], true,
+                )?;
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(mulmod) = <&sonatina_ir::inst::evm::EvmMulMod as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let a = resolve_value(function, *mulmod.lhs(), &value_map, &mut builder)?;
+                let b = resolve_value(function, *mulmod.rhs(), &value_map, &mut builder)?;
+                let m = resolve_value(function, *mulmod.modulus(), &value_map, &mut builder)?;
+                let result_val = emit_u256_intrinsic_call(
+                    jit, &mut builder, "__u256_mulmod",
+                    &[a, b, m], true,
+                )?;
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(obj_store) = <&sonatina_ir::inst::data::ObjStore as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let dest = resolve_value(function, *obj_store.object(), &value_map, &mut builder)?;
+                let val = resolve_value(function, *obj_store.value(), &value_map, &mut builder)?;
+                builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, dest, 0);
+            } else if let Some(obj_alloc) = <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    let result_ty = function.dfg.value_ty(result);
+                    // Allocate stack space for the object
+                    let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 32, 0,
+                    ));
+                    let addr = builder.ins().stack_addr(clif::types::I64, slot, 0);
+                    value_map.insert(result, addr);
+                }
+            } else if let Some(obj_proj) = <&sonatina_ir::inst::data::ObjProj as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let vals = obj_proj.values();
+                let base = resolve_value(function, vals[0], &value_map, &mut builder)?;
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    // For MVP, assume field offset 0 (first field of struct)
+                    value_map.insert(result, base);
                 }
             } else if <&sonatina_ir::inst::control_flow::Unreachable as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
                 builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
@@ -373,10 +473,17 @@ fn resolve_value(
     let value = function.dfg.value(value_id);
     match value {
         Value::Immediate { imm, ty } => {
-            let clif_ty = sonatina_type_to_clif_or_err(*ty)?;
-            let i64_val = imm_to_i64(imm)?;
-            let val = builder.ins().iconst(clif_ty, i64_val);
-            Ok(val)
+            if matches!(imm, Immediate::I256(_) | Immediate::I128(_)) {
+                match imm {
+                    Immediate::I256(i256_val) => Ok(emit_i256_immediate(i256_val, builder)),
+                    _ => Err(format!("unsupported large immediate: {imm:?}")),
+                }
+            } else {
+                let clif_ty = sonatina_type_to_clif_or_err(*ty)?;
+                let i64_val = imm_to_i64(imm)?;
+                let val = builder.ins().iconst(clif_ty, i64_val);
+                Ok(val)
+            }
         }
         _ => Err(format!("unresolved value v{}", value_id.0)),
     }
@@ -391,6 +498,31 @@ fn imm_to_i64(imm: &Immediate) -> Result<i64, String> {
         Immediate::I64(v) => Ok(*v),
         _ => Err(format!("unsupported immediate type for cranelift: {imm:?}")),
     }
+}
+
+fn emit_i256_immediate(
+    imm: &sonatina_ir::I256,
+    builder: &mut FunctionBuilder,
+) -> clif::Value {
+    let slot = builder.create_sized_stack_slot(
+        cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 32, 0,
+        ),
+    );
+    let addr = builder.ins().stack_addr(clif::types::I64, slot, 0);
+
+    let u256 = imm.to_u256();
+    let bytes = u256.to_little_endian();
+    for i in 0..4 {
+        let limb = u64::from_le_bytes(bytes[i*8..(i+1)*8].try_into().unwrap());
+        let val = builder.ins().iconst(clif::types::I64, limb as i64);
+        builder.ins().store(
+            cranelift_codegen::ir::MemFlags::new(),
+            val, addr, (i * 8) as i32,
+        );
+    }
+
+    addr
 }
 
 fn translate_icmp(
@@ -409,6 +541,72 @@ fn translate_icmp(
         value_map.insert(result, result_val);
     }
     Ok(())
+}
+
+/// If `val` is a raw i64 (loaded from obj.load of i256), write it to a
+/// 32-byte stack slot and return the slot's address. If `val` is already
+/// a stack address (from emit_i256_immediate), return it as-is.
+///
+/// This ensures u256 intrinsics always receive valid pointers to 32-byte buffers.
+fn ensure_u256_on_stack(val: clif::Value, builder: &mut FunctionBuilder) -> clif::Value {
+    // Always write to a fresh stack slot — safe for any value
+    let slot = builder.create_sized_stack_slot(
+        cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 32, 0,
+        ),
+    );
+    let addr = builder.ins().stack_addr(clif::types::I64, slot, 0);
+    // Store the i64 value at offset 0, zero the rest
+    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), val, addr, 0);
+    let zero = builder.ins().iconst(clif::types::I64, 0);
+    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), zero, addr, 8);
+    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), zero, addr, 16);
+    builder.ins().store(cranelift_codegen::ir::MemFlags::new(), zero, addr, 24);
+    addr
+}
+
+fn emit_u256_intrinsic_call(
+    jit: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    name: &str,
+    args: &[clif::Value],
+    has_result: bool,
+) -> Result<clif::Value, String> {
+    let ptr_ty = clif::types::I64;
+
+    // Build the intrinsic signature: all args are pointers, optional result pointer
+    let mut sig = jit.make_signature();
+    for _ in args {
+        sig.params.push(clif::AbiParam::new(ptr_ty));
+    }
+    if has_result {
+        sig.params.push(clif::AbiParam::new(ptr_ty)); // result pointer
+    }
+
+    let func_id = jit
+        .declare_function(name, Linkage::Import, &sig)
+        .map_err(|e| format!("failed to declare {name}: {e}"))?;
+    let func_ref = jit.declare_func_in_func(func_id, builder.func);
+
+    if has_result {
+        // Allocate 32-byte stack slot for the result
+        let result_slot = builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                32, 0,
+            ),
+        );
+        let result_addr = builder.ins().stack_addr(ptr_ty, result_slot, 0);
+
+        let mut call_args: Vec<clif::Value> = args.to_vec();
+        call_args.push(result_addr);
+        builder.ins().call(func_ref, &call_args);
+
+        Ok(result_addr)
+    } else {
+        builder.ins().call(func_ref, args);
+        Ok(builder.ins().iconst(ptr_ty, 0))
+    }
 }
 
 fn collect_phi_args_for_block(

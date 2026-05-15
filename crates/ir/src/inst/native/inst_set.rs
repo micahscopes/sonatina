@@ -88,4 +88,9 @@ pub struct NativeInstSet(
     logic::And,
     logic::Or,
     logic::Xor,
+    // EVM arithmetic instructions included for cross-target compilation.
+    // On native targets, these are lowered to runtime intrinsic calls
+    // by the CraneliftBackend rather than single opcodes.
+    evm::EvmAddMod,
+    evm::EvmMulMod,
 );
