@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use cranelift_codegen::ir::{self as clif, InstBuilder, instructions::BlockArg};
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Linkage, Module as ClifModule};
 use cranelift_jit::JITModule;
 
@@ -130,6 +130,8 @@ fn translate_function(
 
     let mut block_map: HashMap<BlockId, clif::Block> = HashMap::new();
     let mut value_map: HashMap<ValueId, clif::Value> = HashMap::new();
+    let mut var_map: HashMap<ValueId, Variable> = HashMap::new();
+    let mut next_var: u32 = 0;
 
     for block in function.layout.iter_block() {
         let clif_block = builder.create_block();
@@ -142,7 +144,6 @@ fn translate_function(
     let clif_entry = block_map[&entry];
     builder.append_block_params_for_function_params(clif_entry);
     builder.switch_to_block(clif_entry);
-    builder.seal_block(clif_entry);
 
     let sret_ptr = if has_sret {
         Some(builder.block_params(clif_entry)[0])
@@ -341,9 +342,15 @@ fn translate_function(
                     value_map.insert(result, result_val);
                 }
             } else if let Some(trunc) = <&sonatina_ir::inst::cast::Trunc as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let from_ty = function.dfg.value_ty(*trunc.from());
                 let val = resolve_value(function, *trunc.from(), &value_map, &mut builder)?;
                 let to_ty = sonatina_type_to_clif_or_err(*trunc.ty())?;
-                let result_val = builder.ins().ireduce(to_ty, val);
+                let result_val = if from_ty == Type::I256 {
+                    // i256 values are pointers — load the target-sized value from the pointer
+                    builder.ins().load(to_ty, cranelift_codegen::ir::MemFlags::new(), val, 0)
+                } else {
+                    builder.ins().ireduce(to_ty, val)
+                };
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
                 }
@@ -590,16 +597,13 @@ fn translate_function(
         }
     }
 
-    for block in function.layout.iter_block() {
-        if block != entry {
-            builder.seal_block(block_map[&block]);
-        }
-    }
-
+    builder.seal_all_blocks();
     builder.finalize();
 
-    jit.define_function(func_id, &mut ctx)
-        .map_err(|e| format!("cranelift define_function failed: {e}"))?;
+    if let Err(e) = jit.define_function(func_id, &mut ctx) {
+        eprintln!("[cranelift] CLIF IR:\n{}", ctx.func.display());
+        return Err(format!("cranelift define_function failed: {e}"));
+    }
 
     Ok(())
 }
@@ -613,6 +617,8 @@ fn resolve_value(
     if let Some(&clif_val) = value_map.get(&value_id) {
         return Ok(clif_val);
     }
+    // Check if there's a Variable for this (phi values in loops)
+    // Variables are looked up via the FunctionBuilder's SSA system
 
     let value = function.dfg.value(value_id);
     match value {
