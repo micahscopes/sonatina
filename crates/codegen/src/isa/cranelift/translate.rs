@@ -721,8 +721,13 @@ fn translate_function(
     builder.seal_all_blocks();
     builder.finalize();
 
+    if std::env::var("DUMP_CLIF").is_ok() {
+        let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
+        eprintln!("[cranelift] CLIF IR for {name}:\n{}", ctx.func.display());
+    }
+
     if let Err(e) = jit.define_function(func_id, &mut ctx) {
-        eprintln!("[cranelift] CLIF IR:\n{}", ctx.func.display());
+        eprintln!("[cranelift] CLIF IR (error):\n{}", ctx.func.display());
         return Err(format!("cranelift define_function failed: {e}"));
     }
 
