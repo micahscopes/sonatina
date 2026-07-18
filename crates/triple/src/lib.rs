@@ -71,6 +71,7 @@ pub enum Architecture {
     X86_64,
     Aarch64,
     Riscv64im,
+    Wasm32,
 }
 
 impl Architecture {
@@ -80,6 +81,7 @@ impl Architecture {
             "x86_64" => Ok(Self::X86_64),
             "aarch64" => Ok(Self::Aarch64),
             "riscv64im" => Ok(Self::Riscv64im),
+            "wasm32" => Ok(Self::Wasm32),
             _ => Err(InvalidTriple::ArchitectureNotSupported),
         }
     }
@@ -92,6 +94,7 @@ impl Display for Architecture {
             Self::X86_64 => write!(f, "x86_64"),
             Self::Aarch64 => write!(f, "aarch64"),
             Self::Riscv64im => write!(f, "riscv64im"),
+            Self::Wasm32 => write!(f, "wasm32"),
         }
     }
 }
@@ -151,7 +154,10 @@ impl OperatingSystem {
                 };
                 Ok(Self::Evm(evm_version))
             }
-            (Architecture::X86_64 | Architecture::Aarch64, Vendor::Unknown) => match s {
+            (
+                Architecture::X86_64 | Architecture::Aarch64 | Architecture::Wasm32,
+                Vendor::Unknown,
+            ) => match s {
                 "native" => Ok(Self::Native),
                 _ => Err(InvalidTriple::OsNotSupported),
             },
@@ -250,6 +256,7 @@ mod tests {
         for (target, architecture) in [
             ("x86_64-unknown-native", Architecture::X86_64),
             ("aarch64-unknown-native", Architecture::Aarch64),
+            ("wasm32-unknown-native", Architecture::Wasm32),
         ] {
             let triple = TargetTriple::parse(target).unwrap();
             assert_eq!(triple.architecture, architecture);
