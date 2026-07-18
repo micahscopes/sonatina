@@ -6,6 +6,8 @@
 
 mod translate;
 
+use std::collections::HashMap;
+
 use sonatina_ir::Module;
 
 use crate::backend::Backend;
@@ -34,11 +36,30 @@ pub struct WasmArtifact {
     pub func_names: Vec<String>,
 }
 
-pub struct WasmBackend;
+pub struct WasmBackend {
+    /// Per-import-symbol wasm import MODULE names, keyed by the Sonatina function
+    /// symbol (which becomes the import field name). An external declaration whose
+    /// symbol is absent from this table falls back to the `"fe"` v0 convention, so
+    /// an empty table reproduces the pre-attribute behavior exactly. This is a
+    /// SIDE TABLE consulted only in import emission; it touches no Sonatina IR
+    /// type and no symbol interning.
+    import_modules: HashMap<String, String>,
+}
 
 impl WasmBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            import_modules: HashMap::new(),
+        }
+    }
+
+    /// Attach a symbol -> import-module table. A frontend that names an
+    /// `extern` block's import module (e.g. Fe's `#[wasm_import(module = "...")]`)
+    /// passes it here so the emitted import lands as `(<module>, <symbol>)`
+    /// instead of the flat `("fe", <symbol>)` default.
+    pub fn with_import_modules(mut self, import_modules: HashMap<String, String>) -> Self {
+        self.import_modules = import_modules;
+        self
     }
 }
 
@@ -47,7 +68,7 @@ impl Backend for WasmBackend {
     type Error = WasmError;
 
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        let (wasm_module, func_names) = translate::translate_module(module)
+        let (wasm_module, func_names) = translate::translate_module(module, &self.import_modules)
             .map_err(|e| vec![WasmError::Translation(e)])?;
 
         let bytes = wasm_module

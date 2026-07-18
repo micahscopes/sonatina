@@ -471,9 +471,9 @@ fn cross_target_loop_cranelift_vs_wasm() {
 // ---------------------------------------------------------------------------
 
 /// Build a Wasm32 module with an EXTERNAL declaration `host_add(i64, i64) ->
-/// i64` (no body) and a defined `compute(a, b) = host_add(a, b)` that calls
-/// it, then translate it to wasm bytes. Shared by the two R3.1 tests below.
-fn build_import_demo_wasm() -> Vec<u8> {
+/// i64` (no body) and a defined `compute(a, b) = host_add(a, b)` that calls it.
+/// Shared by the import tests below (each chooses how to compile it).
+fn build_import_demo_module() -> sonatina_ir::Module {
     let isa = Wasm32::new(wasm32_triple());
     let is = isa.inst_set();
     let mb = wasm32_module_builder();
@@ -506,9 +506,14 @@ fn build_import_demo_wasm() -> Vec<u8> {
         fb.finish();
     }
 
-    let module = mb.build();
+    mb.build()
+}
+
+/// Translate the import demo module to wasm bytes with the default (empty)
+/// import-module table. Shared by the two R3.1 tests below.
+fn build_import_demo_wasm() -> Vec<u8> {
     WasmBackend::new()
-        .compile_module(&module)
+        .compile_module(&build_import_demo_module())
         .expect("WASM compilation failed")
         .bytes
 }
@@ -596,5 +601,61 @@ fn wasm32_isa_import_precedes_defined_in_index_space() {
         compute_index >= num_func_imports,
         "defined `compute` at index {compute_index} must not fall in the import \
          range [0, {num_func_imports})"
+    );
+}
+
+/// Scan the emitted wasm and return the `(module, name)` of every func import.
+fn scan_func_imports(bytes: &[u8]) -> Vec<(String, String)> {
+    use wasmparser::{Payload, TypeRef};
+    let mut imports = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        if let Payload::ImportSection(reader) = payload.expect("valid wasm payload") {
+            for group in reader {
+                for entry in group.expect("valid import group") {
+                    let (_idx, import) = entry.expect("valid import entry");
+                    if let TypeRef::Func(_) = import.ty {
+                        imports.push((import.module.to_string(), import.name.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    imports
+}
+
+/// R3.3: `WasmBackend::with_import_modules` names an external declaration's wasm
+/// import MODULE from a symbol -> module side table, so the import lands as
+/// `("fe:host", "host_add")` instead of the flat `("fe", "host_add")` default. A
+/// symbol absent from the table keeps the `"fe"` fallback (no Sonatina IR change,
+/// no symbol interning touched: the field name stays the symbol).
+#[test]
+fn wasm32_import_module_from_side_table() {
+    // With the side table: the import module is the supplied name.
+    let mut table = std::collections::HashMap::new();
+    table.insert("host_add".to_string(), "fe:host".to_string());
+    let bytes = WasmBackend::new()
+        .with_import_modules(table)
+        .compile_module(&build_import_demo_module())
+        .expect("WASM compilation failed")
+        .bytes;
+    wasmparser::validate(&bytes).expect("produced invalid WASM");
+    assert!(
+        scan_func_imports(&bytes).contains(&("fe:host".to_string(), "host_add".to_string())),
+        "expected a (\"fe:host\", \"host_add\") func import, found {:?}",
+        scan_func_imports(&bytes)
+    );
+
+    // A table that does NOT list this symbol leaves the flat "fe" default.
+    let mut other = std::collections::HashMap::new();
+    other.insert("some_other_symbol".to_string(), "fe:webgpu".to_string());
+    let bytes = WasmBackend::new()
+        .with_import_modules(other)
+        .compile_module(&build_import_demo_module())
+        .expect("WASM compilation failed")
+        .bytes;
+    assert!(
+        scan_func_imports(&bytes).contains(&("fe".to_string(), "host_add".to_string())),
+        "an unlisted symbol must keep the \"fe\" default, found {:?}",
+        scan_func_imports(&bytes)
     );
 }

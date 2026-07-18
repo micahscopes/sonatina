@@ -30,6 +30,7 @@ fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
 
 pub(super) fn translate_module(
     module: &Module,
+    import_modules: &HashMap<String, String>,
 ) -> Result<(WaffleModule<'static>, Vec<String>), String> {
     let mut wmod = WaffleModule::empty();
     let mut func_names = Vec::new();
@@ -111,8 +112,15 @@ pub(super) fn translate_module(
 
         let wsig = wmod.signatures.push(sig_data);
         let wfunc = wmod.funcs.push(FuncDecl::Import(wsig, name.clone()));
+        // The import module: the frontend-supplied name for this symbol, or the
+        // flat `"fe"` v0 convention when the symbol is not in the side table (an
+        // attribute-less `extern`). The import FIELD name stays the symbol.
+        let import_module = import_modules
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| "fe".to_string());
         wmod.imports.push(waffle::Import {
-            module: "fe".to_string(),
+            module: import_module,
             name,
             kind: waffle::ImportKind::Func(wfunc),
         });
