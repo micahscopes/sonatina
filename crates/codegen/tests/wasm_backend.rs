@@ -465,3 +465,136 @@ fn cross_target_loop_cranelift_vs_wasm() {
         assert_eq!(cl_result, n * (n - 1) / 2, "sum_to({n}) formula check");
     }
 }
+
+// ---------------------------------------------------------------------------
+// R3.1: WAFFLE import emission (external declarations -> wasm imports).
+// ---------------------------------------------------------------------------
+
+/// Build a Wasm32 module with an EXTERNAL declaration `host_add(i64, i64) ->
+/// i64` (no body) and a defined `compute(a, b) = host_add(a, b)` that calls
+/// it, then translate it to wasm bytes. Shared by the two R3.1 tests below.
+fn build_import_demo_wasm() -> Vec<u8> {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+
+    // External host function: declared, no body -> a wasm import.
+    let host_sig = Signature::new_single(
+        "host_add",
+        Linkage::External,
+        &[Type::I64, Type::I64],
+        Type::I64,
+    );
+    let host_ref = mb.declare_function(host_sig).unwrap();
+
+    // Defined function calling the import: compute(a, b) = host_add(a, b).
+    let compute_sig =
+        Signature::new_single("compute", Linkage::Public, &[Type::I64, Type::I64], Type::I64);
+    let compute_ref = mb.declare_function(compute_sig).unwrap();
+    {
+        let mut fb = mb.func_builder::<InstInserter>(compute_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let a = fb.args()[0];
+        let b = fb.args()[1];
+        let called = fb.insert_inst(
+            control_flow::Call::new(is, host_ref, [a, b].into_iter().collect()),
+            Type::I64,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, called));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let module = mb.build();
+    WasmBackend::new()
+        .compile_module(&module)
+        .expect("WASM compilation failed")
+        .bytes
+}
+
+/// R3.1 (a): the emitted import is genuinely wired and executable. wasmtime
+/// satisfies the `("fe", "host_add")` import through a `Linker` binding and
+/// the defined `compute` returns the host result. Because `host_add` has no
+/// body, the only way `compute` can translate at all is via the emitted
+/// import (the `Call` arm fails closed otherwise), so a passing run proves
+/// the import path end to end.
+#[test]
+fn wasm32_isa_import_host_add_wasmtime() {
+    let bytes = build_import_demo_wasm();
+    wasmparser::validate(&bytes).expect("produced invalid WASM");
+
+    let engine = wasmtime::Engine::default();
+    let wm = wasmtime::Module::new(&engine, &bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let mut linker = wasmtime::Linker::new(&engine);
+    linker
+        .func_wrap("fe", "host_add", |a: i64, b: i64| a + b)
+        .unwrap();
+    let inst = linker.instantiate(&mut store, &wm).unwrap();
+    let f = inst
+        .get_typed_func::<(i64, i64), i64>(&mut store, "compute")
+        .expect("compute export");
+    assert_eq!(f.call(&mut store, (2, 3)).unwrap(), 5);
+    assert_eq!(f.call(&mut store, (40, 2)).unwrap(), 42);
+}
+
+/// R3.1 (b): scan the emitted bytes and assert the wasm import section holds
+/// the `("fe", "host_add")` func import, and that imported function indices
+/// precede defined ones (imports occupy the low slots of the index space).
+/// Asserted from the bytes, not assumed from WAFFLE.
+#[test]
+fn wasm32_isa_import_precedes_defined_in_index_space() {
+    use wasmparser::{ExternalKind, Payload, TypeRef};
+
+    let bytes = build_import_demo_wasm();
+
+    let mut func_imports: Vec<(String, String)> = Vec::new();
+    let mut compute_index: Option<u32> = None;
+
+    for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+        match payload.expect("valid wasm payload") {
+            Payload::ImportSection(reader) => {
+                // wasmparser groups imports; each group iterates to (idx, Import).
+                for group in reader {
+                    let group = group.expect("valid import group");
+                    for entry in group {
+                        let (_idx, import) = entry.expect("valid import entry");
+                        if let TypeRef::Func(_) = import.ty {
+                            func_imports
+                                .push((import.module.to_string(), import.name.to_string()));
+                        }
+                    }
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.expect("valid export entry");
+                    if export.kind == ExternalKind::Func && export.name == "compute" {
+                        compute_index = Some(export.index);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // The ("fe", "host_add") func import is present.
+    assert!(
+        func_imports.contains(&("fe".to_string(), "host_add".to_string())),
+        "expected a (\"fe\", \"host_add\") func import, found {func_imports:?}"
+    );
+    let num_func_imports = func_imports.len() as u32;
+    assert_eq!(num_func_imports, 1, "exactly one func import expected");
+
+    // Index-space invariant: func imports occupy [0, num_func_imports), so
+    // every DEFINED function index is >= num_func_imports. Check it against the
+    // concrete defined function `compute` (index resolved via its export)
+    // rather than trusting WAFFLE to have ordered the arena.
+    let compute_index = compute_index.expect("compute must be an exported func");
+    assert!(
+        compute_index >= num_func_imports,
+        "defined `compute` at index {compute_index} must not fall in the import \
+         range [0, {num_func_imports})"
+    );
+}

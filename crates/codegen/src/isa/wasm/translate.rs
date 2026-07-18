@@ -12,8 +12,8 @@ use waffle::{
 };
 
 use sonatina_ir::{
-    BlockId, Function, Immediate, Inst, InstDowncast, InstSetBase, Module, Signature, Type, Value,
-    ValueId,
+    BlockId, Function, Immediate, Inst, InstDowncast, InstSetBase, Linkage, Module, Signature, Type,
+    Value, ValueId,
     module::FuncRef,
 };
 
@@ -49,13 +49,81 @@ pub(super) fn translate_module(
     let intrinsic_names: std::collections::HashSet<&str> =
         ["addmod", "mulmod"].into_iter().collect();
 
-    // Pass 1: declare every translatable function up front (placeholder bodies),
-    // recording the Sonatina `FuncRef` -> WAFFLE `Func` mapping. Doing this
-    // before any body is translated is what lets `Call` resolve its callee's
-    // WAFFLE function index regardless of definition order.
     let mut func_map: HashMap<FuncRef, Func> = HashMap::new();
     let mut pending: Vec<(FuncRef, Func, waffle::Signature, String)> = Vec::new();
 
+    // Pass 0: emit a wasm import for every external declaration (a function
+    // with `Linkage::External` and no body). WAFFLE requires imported functions
+    // to occupy the lowest slots of the `funcs` arena, so this MUST run before
+    // pass 1 pushes any defined body: the wasm function index space then lays
+    // imports out before defined functions, and the existing `Call` arm resolves
+    // an imported callee through `func_map` with no special case.
+    for &func_ref in &funcs {
+        let has_body = module
+            .func_store
+            .try_view(func_ref, |f| f.layout.entry_block().is_some())
+            .unwrap_or(false);
+        if has_body {
+            continue;
+        }
+        if module.ctx.func_linkage(func_ref) != Linkage::External {
+            // A bodyless non-external declaration is not an import; pass 1's
+            // has-body gate skips it, exactly as before this pass existed.
+            continue;
+        }
+
+        let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
+        // Do not race the addmod/mulmod intrinsic handling (op-matrix / R2
+        // territory): leave those names skipped exactly as pass 1 does.
+        if intrinsic_names.contains(name.as_str()) {
+            continue;
+        }
+
+        // Fail closed: an external signature that is not representable in wasm
+        // (e.g. i256) is an error, never a silently dropped param/result.
+        let sig_data = module.ctx.func_sig(func_ref, |sig| {
+            let mut params = Vec::with_capacity(sig.args().len());
+            for ty in sig.args() {
+                match sonatina_to_waffle_type(*ty) {
+                    Some(wty) => params.push(wty),
+                    None => {
+                        return Err(format!(
+                            "wasm import `{name}`: parameter type `{ty:?}` is \
+                             not representable in wasm"
+                        ));
+                    }
+                }
+            }
+            let mut returns = Vec::with_capacity(sig.ret_tys().len());
+            for ty in sig.ret_tys() {
+                match sonatina_to_waffle_type(*ty) {
+                    Some(wty) => returns.push(wty),
+                    None => {
+                        return Err(format!(
+                            "wasm import `{name}`: result type `{ty:?}` is not \
+                             representable in wasm"
+                        ));
+                    }
+                }
+            }
+            Ok(SignatureData { params, returns })
+        })?;
+
+        let wsig = wmod.signatures.push(sig_data);
+        let wfunc = wmod.funcs.push(FuncDecl::Import(wsig, name.clone()));
+        wmod.imports.push(waffle::Import {
+            module: "fe".to_string(),
+            name,
+            kind: waffle::ImportKind::Func(wfunc),
+        });
+
+        func_map.insert(func_ref, wfunc);
+    }
+
+    // Pass 1: declare every translatable defined function up front (placeholder
+    // bodies), recording the Sonatina `FuncRef` -> WAFFLE `Func` mapping. Doing
+    // this before any body is translated is what lets `Call` resolve its
+    // callee's WAFFLE function index regardless of definition order.
     for &func_ref in &funcs {
         let has_body = module
             .func_store
@@ -477,8 +545,9 @@ fn translate_function(
                     else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(inst_set, inst_data) {
                         let callee = *call.callee();
                         let wfunc = func_map.get(&callee).copied().ok_or_else(|| {
-                            "wasm translation: call to a function without a translated body \
-                             (imports/intrinsics are not supported yet)"
+                            "wasm translation: call to a callee that was neither translated as a \
+                             defined function nor emitted as an import (e.g. an intrinsic such as \
+                             addmod/mulmod, still handled by the op matrix)"
                                 .to_string()
                         })?;
                         let args: Vec<waffle::Value> = call
