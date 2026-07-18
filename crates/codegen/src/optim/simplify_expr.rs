@@ -3,8 +3,9 @@ use sonatina_ir::{
     inst::{BinaryInstKind, CastInstKind, InstClassKind, UnaryInstKind, cast, downcast},
 };
 
-use crate::analysis::known_bits::{
-    KnownBits, has_conflicting_known_bits, supports_known_bits, type_mask,
+use crate::{
+    analysis::known_bits::{KnownBits, has_conflicting_known_bits, supports_known_bits, type_mask},
+    range_analysis::RangeFact,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,9 @@ impl SimplifyExprResult {
 pub(crate) trait ExprFactProvider {
     fn known_imm(&self, v: ValueId) -> Option<Immediate>;
     fn known_bits(&self, func: &Function, v: ValueId) -> KnownBits;
+    fn range(&self, _v: ValueId) -> Option<RangeFact> {
+        None
+    }
     fn same_non_undef(&self, lhs: ValueId, rhs: ValueId) -> bool;
     fn may_be_undef(&self, v: ValueId) -> bool;
 }
@@ -533,6 +537,26 @@ pub(crate) fn simplify_binary_with_facts(
                 return SimplifyExprResult::Const(Immediate::one(Type::I1));
             }
         }
+        BinaryInstKind::Gt | BinaryInstKind::Lt | BinaryInstKind::Ge | BinaryInstKind::Le
+            if ty.is_integral() =>
+        {
+            let zero = Immediate::zero(ty);
+            match kind {
+                BinaryInstKind::Gt if lhs_imm == Some(zero) => {
+                    return SimplifyExprResult::Const(Immediate::zero(Type::I1));
+                }
+                BinaryInstKind::Lt if rhs_imm == Some(zero) => {
+                    return SimplifyExprResult::Const(Immediate::zero(Type::I1));
+                }
+                BinaryInstKind::Ge if rhs_imm == Some(zero) => {
+                    return SimplifyExprResult::Const(Immediate::one(Type::I1));
+                }
+                BinaryInstKind::Le if lhs_imm == Some(zero) => {
+                    return SimplifyExprResult::Const(Immediate::one(Type::I1));
+                }
+                _ => {}
+            }
+        }
         BinaryInstKind::Shl | BinaryInstKind::Shr | BinaryInstKind::Sar => {
             let value_ty = func.dfg.value_ty(rhs);
             let value_zero = Immediate::zero(value_ty);
@@ -733,6 +757,7 @@ fn simplify_and_copy_with_facts(
         facts,
         KnownBits::all_zero_in,
     )
+    .or_else(|| simplify_low_mask_copy_with_range(func, value, keep_mask, facts))
 }
 
 fn simplify_or_copy_with_facts(
@@ -793,6 +818,26 @@ fn simplify_mask_copy_with_facts(
     }
 
     keeps_mask(facts.known_bits(func, value), proved_mask).then_some(value)
+}
+
+fn simplify_low_mask_copy_with_range(
+    func: &Function,
+    value: ValueId,
+    keep_mask: U256,
+    facts: &impl ExprFactProvider,
+) -> Option<ValueId> {
+    let ty = func.dfg.value_ty(value);
+    if !ty.is_integral() || !is_low_ones_mask(keep_mask, ty) {
+        return None;
+    }
+
+    let range = facts.range(value)?;
+    (range.unsigned.hi <= keep_mask).then_some(value)
+}
+
+fn is_low_ones_mask(mask: U256, ty: Type) -> bool {
+    let type_mask = type_mask(ty);
+    mask == type_mask || mask & (mask + U256::one()) == U256::zero()
 }
 
 #[cfg(test)]
@@ -955,6 +1000,42 @@ mod tests {
         assert_eq!(
             simplify_binary_with_facts(&func, BinaryInstKind::Ne, lhs, rhs, &facts),
             SimplifyExprResult::Const(Immediate::I1(true))
+        );
+    }
+
+    #[test]
+    fn simplify_binary_with_facts_folds_unsigned_zero_bound_compares() {
+        let isa = test_isa();
+        let ctx = ModuleCtx::new(&isa);
+        let sig = Signature::new_single("f", Linkage::Private, &[Type::I256], Type::I1);
+        let mut func = Function::new(&ctx, &sig);
+        let value = func.arg_values[0];
+        let zero = func.dfg.make_imm_value(Immediate::zero(Type::I256));
+        let facts = MockFacts {
+            known_bits: Default::default(),
+            known_imm: [(zero, Immediate::zero(Type::I256))].into_iter().collect(),
+            may_be_undef: Default::default(),
+        };
+
+        assert_eq!(
+            simplify_binary_with_facts(&func, BinaryInstKind::Gt, zero, value, &facts),
+            SimplifyExprResult::Const(Immediate::I1(false))
+        );
+        assert_eq!(
+            simplify_binary_with_facts(&func, BinaryInstKind::Lt, value, zero, &facts),
+            SimplifyExprResult::Const(Immediate::I1(false))
+        );
+        assert_eq!(
+            simplify_binary_with_facts(&func, BinaryInstKind::Ge, value, zero, &facts),
+            SimplifyExprResult::Const(Immediate::I1(true))
+        );
+        assert_eq!(
+            simplify_binary_with_facts(&func, BinaryInstKind::Le, zero, value, &facts),
+            SimplifyExprResult::Const(Immediate::I1(true))
+        );
+        assert_eq!(
+            simplify_binary_with_facts(&func, BinaryInstKind::Sgt, zero, value, &facts),
+            SimplifyExprResult::NoChange
         );
     }
 

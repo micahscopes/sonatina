@@ -4,6 +4,7 @@ pub mod branch_canonicalize;
 pub(crate) mod call_purity;
 pub mod cfg_cleanup;
 pub mod checked_arith_elim;
+pub mod code_sink;
 pub(crate) mod const_eval;
 pub(crate) mod constref_specialize;
 pub mod dead_arg;
@@ -22,5 +23,6 @@ pub mod sccp;
 mod sccp_simplify;
 pub(crate) mod signature_rewrite;
 mod simplify_expr;
+pub(crate) mod uniform_const_arg;
 
 pub use pipeline::{Pass, Pipeline, Step};

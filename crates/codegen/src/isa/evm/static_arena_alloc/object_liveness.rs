@@ -1,4 +1,4 @@
-use cranelift_entity::SecondaryMap;
+use cranelift_entity::{SecondaryMap, entity_impl};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use sonatina_ir::{
@@ -9,9 +9,7 @@ use sonatina_ir::{
 
 use crate::bitset::BitSet;
 
-use super::{
-    super::memory_plan::FuncAnalysis, CallSiteObjects, LocalObjIdx, Provenance, StackObjId,
-};
+use super::{CallSiteObjects, LocalObjIdx, Provenance, StackObjId, StackObjectInput};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BlockLiveSegment {
@@ -20,9 +18,14 @@ pub(crate) struct BlockLiveSegment {
     pub(crate) end_boundary: u32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PhiEdgePoint(u32);
+entity_impl!(PhiEdgePoint);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LiveRegion {
     pub(crate) segments: SmallVec<[BlockLiveSegment; 4]>,
+    pub(crate) phi_edges: BitSet<PhiEdgePoint>,
     pub(crate) first_rank: u32,
     pub(crate) last_rank: u32,
 }
@@ -31,6 +34,7 @@ impl LiveRegion {
     pub(crate) fn empty() -> Self {
         Self {
             segments: SmallVec::new(),
+            phi_edges: BitSet::default(),
             first_rank: 0,
             last_rank: 0,
         }
@@ -39,6 +43,7 @@ impl LiveRegion {
     pub(crate) fn sort_only(rank: u32) -> Self {
         Self {
             segments: SmallVec::new(),
+            phi_edges: BitSet::default(),
             first_rank: rank,
             last_rank: rank,
         }
@@ -49,6 +54,10 @@ impl LiveRegion {
     }
 
     pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        if !self.phi_edges.is_disjoint(&other.phi_edges) {
+            return true;
+        }
+
         let mut lhs = 0usize;
         let mut rhs = 0usize;
         while lhs < self.segments.len() && rhs < other.segments.len() {
@@ -151,15 +160,18 @@ impl AllocaClosureCtx<'_> {
 struct ObjectEventIndex {
     phi_defs: SecondaryMap<BlockId, BitSet<LocalObjIdx>>,
     edge_phi_uses: FxHashMap<(BlockId, BlockId), BitSet<LocalObjIdx>>,
+    phi_edge_points: FxHashMap<(BlockId, BlockId), PhiEdgePoint>,
+    phi_edge_ranks: SecondaryMap<PhiEdgePoint, u32>,
     local_uses: SecondaryMap<InstId, BitSet<LocalObjIdx>>,
     local_defs: SecondaryMap<InstId, BitSet<LocalObjIdx>>,
     block_inst_count: SecondaryMap<BlockId, u32>,
     block_rank_base: SecondaryMap<BlockId, u32>,
     inst_index_in_block: FxHashMap<InstId, u32>,
+    next_phi_edge_point: u32,
 }
 
 pub(super) struct ComputeCtx<'a, 'b> {
-    pub(super) analysis: &'a FuncAnalysis,
+    pub(super) analysis: &'a StackObjectInput<'a>,
     pub(super) isa: &'a Evm,
     pub(super) prov: &'a SecondaryMap<ValueId, Provenance>,
     pub(super) spill_local_by_value: &'a SecondaryMap<ValueId, Option<LocalObjIdx>>,
@@ -186,6 +198,25 @@ impl ObjectEventIndex {
         self.block_rank_base[block]
             .checked_add(boundary_idx)
             .expect("boundary rank overflow")
+    }
+
+    fn ensure_phi_edge_point(&mut self, pred: BlockId, succ: BlockId) -> PhiEdgePoint {
+        if let Some(&point) = self.phi_edge_points.get(&(pred, succ)) {
+            return point;
+        }
+
+        let point = PhiEdgePoint::from_u32(self.next_phi_edge_point);
+        self.next_phi_edge_point = self
+            .next_phi_edge_point
+            .checked_add(1)
+            .expect("phi edge point overflow");
+        self.phi_edge_points.insert((pred, succ), point);
+        self.phi_edge_ranks[point] = self.boundary_rank(pred, self.block_inst_count[pred]);
+        point
+    }
+
+    fn phi_edge_rank(&self, edge: PhiEdgePoint) -> u32 {
+        self.phi_edge_ranks[edge]
     }
 }
 
@@ -261,6 +292,7 @@ fn build_object_event_index(
                     }
                 }
                 for (value, pred) in phi.args().iter() {
+                    events.ensure_phi_edge_point(*pred, block);
                     let raw_value = *value;
                     let value = ctx.analysis.canonicalize_value(raw_value);
                     if let Some(local_idx) = ctx.spill_local_by_value[value] {
@@ -428,6 +460,40 @@ fn push_region_segment(
     }
 }
 
+fn push_region_phi_edge(
+    regions: &mut [LiveRegion],
+    events: &ObjectEventIndex,
+    local_idx: LocalObjIdx,
+    edge: PhiEdgePoint,
+) {
+    let region = &mut regions[local_idx.as_u32() as usize];
+    if !region.phi_edges.insert(edge) {
+        return;
+    }
+
+    let rank = events.phi_edge_rank(edge);
+    if region.segments.is_empty() && region.phi_edges.len() == 1 {
+        region.first_rank = rank;
+        region.last_rank = rank;
+    } else {
+        region.first_rank = region.first_rank.min(rank);
+        region.last_rank = region.last_rank.max(rank);
+    }
+}
+
+fn add_phi_edge_points_to_regions(regions: &mut [LiveRegion], events: &ObjectEventIndex) {
+    for (&(pred, succ), &edge) in &events.phi_edge_points {
+        if let Some(uses) = events.edge_phi_uses.get(&(pred, succ)) {
+            for local_idx in uses.iter() {
+                push_region_phi_edge(regions, events, local_idx, edge);
+            }
+        }
+        for local_idx in events.phi_defs[succ].iter() {
+            push_region_phi_edge(regions, events, local_idx, edge);
+        }
+    }
+}
+
 fn coalesce_region_segments(region: &mut LiveRegion) {
     if region.segments.is_empty() {
         return;
@@ -502,6 +568,7 @@ fn emit_regions(
     for region in &mut regions {
         coalesce_region_segments(region);
     }
+    add_phi_edge_points_to_regions(&mut regions, events);
     regions
 }
 

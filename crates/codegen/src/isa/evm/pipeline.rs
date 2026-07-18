@@ -7,6 +7,7 @@ use crate::{
         constref_specialize::specialize_private_constrefs,
         dead_arg::{DeadArgElimConfig, run_dead_arg_elim},
         pipeline::{FuncPassOverrides, Pass, run_function_pass_round},
+        uniform_const_arg::run_uniform_const_arg_binding,
     },
     transform::{
         aggregate::{
@@ -261,7 +262,13 @@ impl EvmPipelineContext<'_> {
     }
 
     fn run_object_abi_and_type_lowering(&mut self) -> Result<(), String> {
-        ObjectLowerToMemory.run(self.module());
+        let object_effects = compute_object_effect_summaries(self.module());
+        let mut local_object_args =
+            collect_local_object_arg_info_with_effects(self.module(), &object_effects);
+        merge_local_object_arg_info(&mut local_object_args, &self.synthetic_out_args);
+        ObjectLowerToMemory.run_with_local_object_args(self.module(), &local_object_args);
+        self.object_effects = None;
+        self.local_object_args = None;
         AggregateExpandAbi::default().run(self.module());
         self.refresh_section_funcs();
         self.ensure_only_section_funcs_remain()?;
@@ -284,6 +291,19 @@ impl EvmPipelineContext<'_> {
             true,
             false,
         );
+        self.run_pass_round(
+            "uniform_const_arg_canonicalize",
+            &[
+                Pass::CfgCleanup,
+                Pass::ScalarCanonicalize,
+                Pass::KnownBitsSimplify,
+                Pass::Sccp,
+                Pass::CfgCleanup,
+            ],
+            false,
+            false,
+        );
+        run_uniform_const_arg_binding(self.work.module(), &self.funcs);
         run_dead_arg_elim(self.work.module(), DeadArgElimConfig::default());
         self.func_behavior_dirty = true;
         self.run_pass_round(

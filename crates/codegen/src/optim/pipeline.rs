@@ -32,6 +32,7 @@ use super::{
     branch_canonicalize::BranchCanonicalize,
     cfg_cleanup::CfgCleanup,
     checked_arith_elim::{CheckedArithElim, has_supported_checked_arith},
+    code_sink::CodeSink,
     dead_arg::{DeadArgElimConfig, run_dead_arg_elim},
     dead_func::{DeadFuncElimConfig, collect_object_roots, run_dead_func_elim},
     gvn::GvnSolver,
@@ -82,6 +83,8 @@ pub enum Pass {
     Licm,
     /// Loop strength reduction for affine memory addresses.
     LoopStrengthReduce,
+    /// Sink pure instructions into the blocks that use their results.
+    CodeSink,
     /// Complete Global Value Numbering (legacy sparse predicated solver).
     Gvn,
     /// Recompute `dfg.users` from layout-inserted instructions only.
@@ -176,6 +179,11 @@ impl Pass {
                 needs_func_behavior: false,
                 invalidates_func_behavior: true,
             },
+            Pass::CodeSink => PassInfo {
+                name: "code_sink",
+                needs_func_behavior: false,
+                invalidates_func_behavior: false,
+            },
             Pass::Gvn => PassInfo {
                 name: "gvn",
                 needs_func_behavior: true,
@@ -209,7 +217,7 @@ impl Pass {
     }
 
     const fn invalidates_object_facts(self) -> bool {
-        !matches!(self, Pass::RebuildUsers)
+        !matches!(self, Pass::CodeSink | Pass::RebuildUsers)
     }
 }
 
@@ -278,6 +286,7 @@ const PRIMARY_FUNC_PASSES: &[Pass] = &[
     Pass::KnownBitsSimplify,
     Pass::Sccp,
     Pass::BranchCanonicalize,
+    Pass::CodeSink,
     Pass::CfgCleanup,
 ];
 
@@ -294,6 +303,7 @@ const SECONDARY_FUNC_PASSES: &[Pass] = &[
     Pass::ScalarCanonicalize,
     Pass::Gvn,
     Pass::BranchCanonicalize,
+    Pass::CodeSink,
     Pass::CfgCleanup,
 ];
 
@@ -301,6 +311,17 @@ const POST_DEAD_ARG_CLEANUP_PASSES: &[Pass] = &[
     Pass::CfgCleanup,
     Pass::Sccp,
     Pass::BranchCanonicalize,
+    Pass::CodeSink,
+    Pass::CfgCleanup,
+];
+
+const POST_INLINE_CLEANUP_PASSES: &[Pass] = &[
+    Pass::CfgCleanup,
+    Pass::AggregateCombine,
+    Pass::BranchCanonicalize,
+    Pass::Sccp,
+    Pass::ScalarCanonicalize,
+    Pass::CodeSink,
     Pass::CfgCleanup,
 ];
 
@@ -313,20 +334,28 @@ fn size_inliner_config() -> InlinerConfig {
         splice_max_insts: 6,
         max_inlinee_blocks: 8,
         max_inlinee_insts: 48,
-        max_growth_per_caller: 32,
-        max_total_growth: 160,
+        max_growth_per_caller: 64,
+        max_total_growth: 320,
         max_inline_depth: 3,
         inline_threshold: 10,
         inline_threshold_cold: 5,
+        small_function_block_limit: 4,
+        small_function_inst_limit: 16,
+        small_function_bonus: 4,
+        callsite_known_arg_use_bonus: 6,
+        callsite_known_arg_bonus_cap: 32,
         single_use_bonus: 8,
         leaf_bonus: 2,
         call_overhead_bonus: 6,
+        call_return_overhead_bonus: 6,
+        call_arg_shuffle_bonus: 2,
+        call_result_shuffle_bonus: 2,
         duplicated_block_penalty: 1,
         multi_use_inst_free_allowance: 5,
         multi_use_excess_inst_penalty: 1,
         loop_penalty: 32,
-        object_scalarization_bonus_cap: 8,
-        object_helper_cluster_bonus: 3,
+        scalarization_bonus_cap: 8,
+        scalarization_helper_cluster_bonus: 3,
         ..InlinerConfig::default()
     }
 }
@@ -336,23 +365,31 @@ fn speed_inliner_config() -> InlinerConfig {
         // The speed-oriented mode stays more selective about inlining, because
         // on the EVM a smaller post-inline body often wins on runtime gas.
         enable_full_inliner: true,
-        splice_max_insts: 4,
+        splice_max_insts: 6,
         max_inlinee_blocks: 8,
         max_inlinee_insts: 32,
-        max_growth_per_caller: 24,
-        max_total_growth: 128,
+        max_growth_per_caller: 48,
+        max_total_growth: 256,
         max_inline_depth: 3,
         inline_threshold: 8,
         inline_threshold_cold: 4,
+        small_function_block_limit: 4,
+        small_function_inst_limit: 16,
+        small_function_bonus: 8,
+        callsite_known_arg_use_bonus: 8,
+        callsite_known_arg_bonus_cap: 64,
         single_use_bonus: 8,
         leaf_bonus: 2,
         call_overhead_bonus: 6,
+        call_return_overhead_bonus: 6,
+        call_arg_shuffle_bonus: 2,
+        call_result_shuffle_bonus: 2,
         duplicated_block_penalty: 1,
         multi_use_inst_free_allowance: 5,
         multi_use_excess_inst_penalty: 1,
         loop_penalty: 32,
-        object_scalarization_bonus_cap: 10,
-        object_helper_cluster_bonus: 4,
+        scalarization_bonus_cap: 10,
+        scalarization_helper_cluster_bonus: 4,
         ..InlinerConfig::default()
     }
 }
@@ -370,6 +407,8 @@ impl Pipeline {
         p.add_step(Step::DeadFuncElim);
         p.add_step(Step::Inline);
         p.add_step(Step::FuncPasses(SECONDARY_FUNC_PASSES.to_vec()));
+        p.add_step(Step::Inline);
+        p.add_step(Step::FuncPasses(POST_INLINE_CLEANUP_PASSES.to_vec()));
         p.add_step(Step::DeadFuncElim);
         p
     }
@@ -899,6 +938,24 @@ fn run_pass(
                 LoopStrengthReduce::new().run(func, &mut ctx.cfg, &mut ctx.domtree, &mut ctx.lpt)
             }
         }
+        Pass::CodeSink => {
+            let _span = trace_span!("sonatina.optim.pipeline.pass.code_sink").entered();
+            {
+                let _span = trace_span!("sonatina.optim.pipeline.code_sink.compute_cfg").entered();
+                ctx.cfg.compute(func);
+            }
+            {
+                let _span =
+                    trace_span!("sonatina.optim.pipeline.code_sink.compute_domtree").entered();
+                ctx.domtree.compute(&ctx.cfg);
+            }
+            {
+                let _span =
+                    trace_span!("sonatina.optim.pipeline.code_sink.compute_looptree").entered();
+                ctx.lpt.compute(&ctx.cfg, &ctx.domtree);
+            }
+            CodeSink::new().run(func, &ctx.cfg, &ctx.domtree, &ctx.lpt)
+        }
         Pass::Gvn => {
             let _span = trace_span!("sonatina.optim.pipeline.pass.gvn").entered();
             {
@@ -986,12 +1043,12 @@ mod tests {
             Pipeline::speed().inliner_config.splice_max_insts
         );
         assert_eq!(
-            Pipeline::default().inliner_config.splice_max_insts,
-            Pipeline::speed().inliner_config.splice_max_insts
+            pipeline.inliner_config.max_total_growth,
+            Pipeline::speed().inliner_config.max_total_growth
         );
         assert_ne!(
-            pipeline.inliner_config.splice_max_insts,
-            Pipeline::size().inliner_config.splice_max_insts
+            pipeline.inliner_config.max_total_growth,
+            Pipeline::size().inliner_config.max_total_growth
         );
     }
 
@@ -2312,13 +2369,23 @@ func private %entry(v0.i32, v1.i32) -> i32 {
 
         let speed = Pipeline::speed();
         assert!(speed.inliner_config.enable_full_inliner);
-        assert!(size.inliner_config.splice_max_insts > speed.inliner_config.splice_max_insts);
+        assert_eq!(
+            speed.inliner_config.splice_max_insts,
+            size.inliner_config.splice_max_insts
+        );
         assert!(speed.inliner_config.max_inlinee_blocks > 0);
         assert!(speed.inliner_config.max_inlinee_insts > 0);
         assert!(
             size.inliner_config.max_growth_per_caller >= speed.inliner_config.max_growth_per_caller
         );
         assert!(size.inliner_config.max_total_growth >= speed.inliner_config.max_total_growth);
+        assert!(
+            speed.inliner_config.small_function_bonus > size.inliner_config.small_function_bonus
+        );
+        assert!(
+            speed.inliner_config.callsite_known_arg_use_bonus
+                > size.inliner_config.callsite_known_arg_use_bonus
+        );
         assert_ne!(
             speed.inliner_config.inline_threshold,
             size.inliner_config.inline_threshold
@@ -2410,7 +2477,19 @@ func private %costly(v0.i1, v1.i32) -> i32 {
         v5.i32 = add v4 1.i32;
         v6.i32 = add v5 1.i32;
         v7.i32 = add v6 1.i32;
-        return v7;
+        v8.i32 = add v7 1.i32;
+        v9.i32 = add v8 1.i32;
+        v10.i32 = add v9 1.i32;
+        v11.i32 = add v10 1.i32;
+        v12.i32 = add v11 1.i32;
+        v13.i32 = add v12 1.i32;
+        v14.i32 = add v13 1.i32;
+        v15.i32 = add v14 1.i32;
+        v16.i32 = add v15 1.i32;
+        v17.i32 = add v16 1.i32;
+        v18.i32 = add v17 1.i32;
+        v19.i32 = add v18 1.i32;
+        return v19;
 }
 
 func public %caller(v0.i1, v1.i32) -> i32 {

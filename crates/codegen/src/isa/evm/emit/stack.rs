@@ -1,6 +1,6 @@
 use cranelift_entity::EntityList;
 use rustc_hash::FxHashSet;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use sonatina_ir::{BlockId, Immediate, Type, U256};
 
 use crate::{
@@ -11,7 +11,10 @@ use crate::{
     stackalloc::Action,
 };
 
-use super::super::{DYN_SP_SLOT, DynamicFrameLayout, FREE_PTR_SLOT, FrameLocalWord, OpCode};
+use super::super::{
+    DYN_SP_SLOT, DynamicFrameLayout, FREE_PTR_SLOT, FrameLocalWord, ImmediateMaterializationPlan,
+    OpCode, immediate_materialization_plan, u32_to_be, u256_to_be,
+};
 
 pub(crate) fn is_push_opcode(op: OpCode) -> bool {
     let byte = op as u8;
@@ -139,6 +142,14 @@ fn push_immediate_u256(vcode: &VCode<OpCode>, inst: VCodeInst) -> Option<U256> {
     let mut be = [0u8; 32];
     be[32 - bytes.len()..].copy_from_slice(bytes);
     Some(U256::from_big_endian(&be))
+}
+
+fn is_unlabeled_literal_push(
+    vcode: &VCode<OpCode>,
+    label_targets: &FxHashSet<VCodeInst>,
+    inst: VCodeInst,
+) -> bool {
+    !label_targets.contains(&inst) && push_immediate_u256(vcode, inst).is_some()
 }
 
 fn is_noop_stack_peephole_ops(ops: &[StackPeepholeOp]) -> bool {
@@ -307,6 +318,33 @@ pub(crate) fn prune_redundant_opcode_sequences(vcode: &mut VCode<OpCode>, block_
                 }
             }
 
+            if i + 4 < insts.len() {
+                let addr_push = insts[i];
+                let mload = insts[i + 1];
+                let imm_push = insts[i + 2];
+                let swap = insts[i + 3];
+                let sub = insts[i + 4];
+                // `PUSH addr; MLOAD; PUSH imm; SWAP1; SUB` and
+                // `PUSH imm; PUSH addr; MLOAD; SUB` present the same stack to `SUB`.
+                if is_unlabeled_literal_push(vcode, &label_targets, addr_push)
+                    && is_plain_inst(vcode, &label_targets, mload)
+                    && (vcode.insts[mload] as u8) == (OpCode::MLOAD as u8)
+                    && is_unlabeled_literal_push(vcode, &label_targets, imm_push)
+                    && is_plain_inst(vcode, &label_targets, swap)
+                    && (vcode.insts[swap] as u8) == (OpCode::SWAP1 as u8)
+                    && is_plain_inst(vcode, &label_targets, sub)
+                    && (vcode.insts[sub] as u8) == (OpCode::SUB as u8)
+                {
+                    kept.push(imm_push);
+                    kept.push(addr_push);
+                    kept.push(mload);
+                    kept.push(sub);
+                    changed = true;
+                    i += 5;
+                    continue;
+                }
+            }
+
             let run_limit = (i + MAX_STACK_PEEPHOLE_WINDOW).min(insts.len());
             let mut run_end = i;
             while run_end < run_limit
@@ -416,27 +454,7 @@ pub(crate) fn perform_action(
             ctx.push(swap_op(n));
         }
         Action::Push(imm) => {
-            if imm.is_zero() {
-                ctx.push(OpCode::PUSH0);
-            } else {
-                let bytes = match imm {
-                    Immediate::I1(v) => smallvec![v as u8],
-                    Immediate::I8(v) => SmallVec::from_slice(&v.to_be_bytes()),
-                    Immediate::I16(v) => shrink_bytes(&v.to_be_bytes()),
-                    Immediate::I32(v) => shrink_bytes(&v.to_be_bytes()),
-                    Immediate::I64(v) => shrink_bytes(&v.to_be_bytes()),
-                    Immediate::I128(v) => shrink_bytes(&v.to_be_bytes()),
-                    Immediate::I256(v) => shrink_bytes(&v.to_u256().to_big_endian()),
-                    Immediate::EnumTag { value, .. } => {
-                        shrink_bytes(&value.to_u256().to_big_endian())
-                    }
-                };
-                push_bytes(ctx, &bytes);
-                if imm.is_negative() && bytes.len() < 32 {
-                    push_bytes(ctx, &u32_to_be((bytes.len() - 1) as u32));
-                    ctx.push(OpCode::SIGNEXTEND);
-                }
-            }
+            emit_immediate_materialization(ctx, immediate_materialization_plan(imm));
         }
         Action::Pop => {
             ctx.push(OpCode::POP);
@@ -518,40 +536,29 @@ pub(crate) fn push_bytes(ctx: &mut Lower<OpCode>, bytes: &[u8]) {
     }
 }
 
-fn shrink_bytes(bytes: &[u8]) -> SmallVec<[u8; 8]> {
-    assert!(!bytes.is_empty());
-
-    let is_neg = bytes[0].leading_ones() > 0;
-    let skip = if is_neg { 0xff } else { 0x00 };
-    let mut bytes = bytes
-        .iter()
-        .copied()
-        .skip_while(|b| *b == skip)
-        .collect::<SmallVec<[u8; 8]>>();
-
-    if is_neg && bytes.first().map(|&b| b < 0x80).unwrap_or(true) {
-        bytes.insert(0, 0xff);
-    }
-    bytes
-}
-
-pub(crate) fn u32_to_be(num: u32) -> SmallVec<[u8; 4]> {
-    if num == 0 {
-        smallvec![0]
-    } else {
-        num.to_be_bytes()
-            .into_iter()
-            .skip_while(|b| *b == 0)
-            .collect()
-    }
-}
-
-pub(crate) fn u256_to_be(num: &U256) -> SmallVec<[u8; 8]> {
-    if num.is_zero() {
-        smallvec![0]
-    } else {
-        let b = num.to_big_endian();
-        b.into_iter().skip_while(|b| *b == 0).collect()
+fn emit_immediate_materialization(ctx: &mut Lower<OpCode>, plan: ImmediateMaterializationPlan) {
+    match plan {
+        ImmediateMaterializationPlan::Plain(bytes) => push_bytes(ctx, &bytes),
+        ImmediateMaterializationPlan::SignExtend(bytes) => {
+            push_bytes(ctx, &bytes);
+            push_bytes(ctx, &u32_to_be((bytes.len() - 1) as u32));
+            ctx.push(OpCode::SIGNEXTEND);
+        }
+        ImmediateMaterializationPlan::Not(bytes) => {
+            push_bytes(ctx, &bytes);
+            ctx.push(OpCode::NOT);
+        }
+        ImmediateMaterializationPlan::LowMask { shift } => {
+            push_bytes(ctx, &[0]);
+            ctx.push(OpCode::NOT);
+            push_bytes(ctx, &shift);
+            ctx.push(OpCode::SHR);
+        }
+        ImmediateMaterializationPlan::Shl { value, shift } => {
+            push_bytes(ctx, &value);
+            push_bytes(ctx, &shift);
+            ctx.push(OpCode::SHL);
+        }
     }
 }
 
@@ -672,45 +679,6 @@ fn emit_max_top_two(ctx: &mut Lower<OpCode>) {
     ctx.push(OpCode::POP);
 }
 
-fn emit_max_top_with_const(ctx: &mut Lower<OpCode>, constant: &[u8]) {
-    let constant = U256::from_big_endian(constant);
-    if constant.is_zero() {
-        return;
-    }
-
-    let compare_const = u256_to_be(&(constant - U256::from(1_u8)));
-    push_bytes(ctx, &compare_const);
-    ctx.push(OpCode::DUP2);
-    ctx.push(OpCode::GT);
-
-    let keep_x_push = ctx.push(OpCode::PUSH1);
-    ctx.push(OpCode::JUMPI);
-
-    ctx.push(OpCode::POP);
-    push_bytes(ctx, &u256_to_be(&constant));
-
-    let keep_x = ctx.push(OpCode::JUMPDEST);
-    ctx.add_label_reference(keep_x_push, Label::Insn(keep_x));
-}
-
-pub(crate) fn emit_malloc_base(
-    ctx: &mut Lower<OpCode>,
-    min_base_bytes: u32,
-    needs_dyn_sp_clamp: bool,
-) {
-    push_bytes(ctx, &[FREE_PTR_SLOT]);
-    ctx.push(OpCode::MLOAD);
-
-    if needs_dyn_sp_clamp {
-        push_bytes(ctx, &[DYN_SP_SLOT]);
-        ctx.push(OpCode::MLOAD);
-        emit_max_top_two(ctx);
-    }
-
-    let min_base = u32_to_be(min_base_bytes);
-    emit_max_top_with_const(ctx, &min_base);
-}
-
 pub(crate) fn init_dyn_sp(ctx: &mut Lower<OpCode>, dyn_base: u32) {
     push_bytes(ctx, &u32_to_be(dyn_base));
     push_bytes(ctx, &[DYN_SP_SLOT]);
@@ -720,20 +688,16 @@ pub(crate) fn init_dyn_sp(ctx: &mut Lower<OpCode>, dyn_base: u32) {
 pub(crate) fn ensure_dyn_sp_init(ctx: &mut Lower<OpCode>, dyn_base: u32) {
     push_bytes(ctx, &[DYN_SP_SLOT]);
     ctx.push(OpCode::MLOAD);
-    ctx.push(OpCode::DUP1);
 
     let skip_init_push = ctx.push(OpCode::PUSH1);
     ctx.push(OpCode::JUMPI);
 
-    ctx.push(OpCode::POP);
     push_bytes(ctx, &u32_to_be(dyn_base));
-    ctx.push(OpCode::DUP1);
     push_bytes(ctx, &[DYN_SP_SLOT]);
     ctx.push(OpCode::MSTORE);
 
     let skip_init = ctx.push(OpCode::JUMPDEST);
     ctx.add_label_reference(skip_init_push, Label::Insn(skip_init));
-    ctx.push(OpCode::POP);
 }
 
 pub(crate) fn enter_frame_initialized(ctx: &mut Lower<OpCode>, frame_layout: DynamicFrameLayout) {
@@ -858,5 +822,57 @@ pub(crate) fn push_op(bytes: usize) -> OpCode {
         31 => OpCode::PUSH31,
         32 => OpCode::PUSH32,
         _ => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_imm(vcode: &mut VCode<OpCode>, block: BlockId, bytes: &[u8]) -> VCodeInst {
+        let inst = vcode.add_inst_to_block(push_op(bytes.len()), None, block);
+        if !bytes.is_empty() {
+            vcode.inst_imm_bytes.insert((inst, bytes.into()));
+        }
+        inst
+    }
+
+    fn block_ops(vcode: &VCode<OpCode>, block: BlockId) -> Vec<u8> {
+        vcode
+            .block_insns(block)
+            .map(|inst| vcode.insts[inst] as u8)
+            .collect()
+    }
+
+    #[test]
+    fn prune_reorders_literal_mload_sub_to_drop_swap() {
+        let mut vcode = VCode::<OpCode>::default();
+        let block = BlockId(0);
+        push_imm(&mut vcode, block, &[0x80]);
+        vcode.add_inst_to_block(OpCode::MLOAD, None, block);
+        push_imm(&mut vcode, block, &[0x40]);
+        vcode.add_inst_to_block(OpCode::SWAP1, None, block);
+        vcode.add_inst_to_block(OpCode::SUB, None, block);
+
+        prune_redundant_opcode_sequences(&mut vcode, &[block]);
+
+        let insts: Vec<_> = vcode.block_insns(block).collect();
+        assert_eq!(
+            block_ops(&vcode, block),
+            vec![
+                OpCode::PUSH1 as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::MLOAD as u8,
+                OpCode::SUB as u8
+            ]
+        );
+        assert_eq!(
+            push_immediate_u256(&vcode, insts[0]),
+            Some(U256::from(0x40u8))
+        );
+        assert_eq!(
+            push_immediate_u256(&vcode, insts[1]),
+            Some(U256::from(0x80u8))
+        );
     }
 }

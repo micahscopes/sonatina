@@ -13,30 +13,23 @@ use revm::{
 };
 
 use sonatina_codegen::{
-    domtree::DomTree,
-    isa::evm::{
-        EvmBackend, ImmediateMaterializationMode, LateCleanupProfile, PushWidthPolicy,
-        canonicalize_alias_value,
-    },
-    liveness::Liveness,
+    isa::evm::{EvmBackend, ImmediateMaterializationMode, LateCleanupProfile, PushWidthPolicy},
     machinst::{
         lower::{LoweredFunction, SectionCodeUnit, SectionWorkModule},
-        vcode::{Label, VCodeFixup},
+        vcode::{Label, VCodeFixup, section_code_unit_label_name},
     },
     object::{CompileOptions, compile_all_objects},
     optim::{
         dead_func::{collect_object_roots, run_dead_func_elim},
         pipeline::Pipeline,
     },
-    stackalloc::{StackifyBuilder, StackifySearchProfile},
-    stackify_edge::StackifyEdgeSplitter,
+    stackalloc::StackifySearchProfile,
 };
 use sonatina_ir::{
-    BlockId, Function, U256 as IrU256,
-    cfg::ControlFlowGraph,
+    BlockId, U256 as IrU256,
     ir_writer::{FuncWriteCtx, FunctionSignature, IrWrite, ModuleWriter},
     isa::evm::Evm,
-    module::{Module, ModuleCtx},
+    module::Module,
 };
 use sonatina_parser::{ParsedModule, parse_module};
 use sonatina_triple::{Architecture, OperatingSystem, Vendor};
@@ -159,6 +152,7 @@ fn test_evm(fixture: Fixture<&str>) {
     let emit_stackify_trace = cfg.stackify_trace.unwrap_or(false);
     let emit_evm_trace = cfg.evm_trace.unwrap_or(false);
     let emit_observability = cfg.emit_observability.unwrap_or(false);
+    let emit_mem_plan_detail = cfg.mem_plan_detail.unwrap_or(false);
     let opt_pipeline = cfg.opt.unwrap_or(EvmOptPipeline::O0);
 
     let cases = evm_directives::parse_evm_cases(&parsed.debug.module_comments)
@@ -185,6 +179,12 @@ fn test_evm(fixture: Fixture<&str>) {
         })
         .collect();
 
+    let stackify_search_profile = match opt_pipeline {
+        EvmOptPipeline::O0 => StackifySearchProfile::Fast,
+        EvmOptPipeline::O1 => StackifySearchProfile::GreedyWide,
+        EvmOptPipeline::Os | EvmOptPipeline::O2 => StackifySearchProfile::Exact,
+    };
+
     let backend = EvmBackend::new(Evm::new(sonatina_triple::TargetTriple {
         architecture: Architecture::Evm,
         vendor: Vendor::Ethereum,
@@ -197,11 +197,8 @@ fn test_evm(fixture: Fixture<&str>) {
         EvmOptPipeline::Os => LateCleanupProfile::Size,
         EvmOptPipeline::O2 => LateCleanupProfile::Speed,
     })
-    .with_stackify_search_profile(match opt_pipeline {
-        EvmOptPipeline::O0 => StackifySearchProfile::Fast,
-        EvmOptPipeline::O1 => StackifySearchProfile::GreedyWide,
-        EvmOptPipeline::Os | EvmOptPipeline::O2 => StackifySearchProfile::Exact,
-    })
+    .with_stackify_search_profile(stackify_search_profile)
+    .with_stackify_trace_capture(emit_stackify_trace)
     .with_immediate_materialization_mode(match opt_pipeline {
         EvmOptPipeline::Os => ImmediateMaterializationMode::Size,
         EvmOptPipeline::O2 => ImmediateMaterializationMode::Balanced,
@@ -217,7 +214,11 @@ fn test_evm(fixture: Fixture<&str>) {
         ))
         .unwrap();
 
-    let mem_plan = backend.snapshot_mem_plan(&prepared);
+    let mem_plan = if emit_mem_plan_detail {
+        backend.snapshot_mem_plan_detail(&prepared)
+    } else {
+        backend.snapshot_mem_plan(&prepared)
+    };
     let (mem_plan_header, mem_plan_funcs) = parse_mem_plan_summary(&mem_plan);
 
     let mut lowered_funcs: Vec<_> = prepared
@@ -259,16 +260,13 @@ fn test_evm(fixture: Fixture<&str>) {
                 let ctx = FuncWriteCtx::with_debug_provider(function, *fref, &parsed.debug);
 
                 if emit_stackify_trace {
-                    let stackify = stackify_trace_for_fn(
-                        function,
-                        &prepared.module().ctx,
-                        &backend,
-                        stackify_reach_depth,
-                    );
+                    let stackify = prepared
+                        .stackify_trace(*fref)
+                        .unwrap_or_else(|| panic!("missing stackify trace for {name}"));
                     write!(&mut stackify_out, "// ").unwrap();
                     FunctionSignature.write(&mut stackify_out, &ctx).unwrap();
                     writeln!(&mut stackify_out).unwrap();
-                    write!(&mut stackify_out, "{}", fmt_stackify_trace(&stackify)).unwrap();
+                    write!(&mut stackify_out, "{}", fmt_stackify_trace(stackify)).unwrap();
                     writeln!(&mut stackify_out).unwrap();
                 }
 
@@ -313,9 +311,14 @@ fn test_evm(fixture: Fixture<&str>) {
     } else {
         format!(" opt={}", opt_pipeline.as_label())
     };
+    let mem_plan_detail_suffix = if emit_mem_plan_detail {
+        " mem_plan_detail=true"
+    } else {
+        ""
+    };
     writeln!(
         &mut out,
-        "evm.config: stack_reach={stackify_reach_depth} vcode={emit_vcode} bytecode_hex={emit_bytecode_hex} stackify_trace={emit_stackify_trace} evm_trace={emit_evm_trace} emit_observability={emit_observability}{opt_pipeline_suffix}",
+        "evm.config: stack_reach={stackify_reach_depth} vcode={emit_vcode} bytecode_hex={emit_bytecode_hex} stackify_trace={emit_stackify_trace} evm_trace={emit_evm_trace} emit_observability={emit_observability}{opt_pipeline_suffix}{mem_plan_detail_suffix}",
     )
     .unwrap();
     writeln!(&mut out).unwrap();
@@ -354,6 +357,10 @@ fn test_evm(fixture: Fixture<&str>) {
         )
         .unwrap();
         writeln!(&mut out, "    mem: {}", stat.mem).unwrap();
+    }
+    if emit_mem_plan_detail {
+        writeln!(&mut out, "\nmem plan detail:").unwrap();
+        writeln!(&mut out, "{mem_plan}").unwrap();
     }
     writeln!(&mut out).unwrap();
 
@@ -508,7 +515,9 @@ fn write_synthetic_section_unit<Op: fmt::Debug>(unit: &SectionCodeUnit<Op>, out:
                         write!(out, " `pc + ({offset})`").unwrap();
                     }
                     Label::Function(func) => write!(out, " {func:?}").unwrap(),
-                    Label::SectionCodeUnit(unit) => write!(out, " section_unit{}", unit.0).unwrap(),
+                    Label::SectionCodeUnit(unit) => {
+                        write!(out, " {}", section_code_unit_label_name(unit)).unwrap()
+                    }
                 }
             }
             writeln!(out).unwrap();
@@ -769,34 +778,6 @@ impl<W: Write, DB: revm::Database> revm::Inspector<DB> for TestInspector<W> {
     }
 }
 
-fn stackify_trace_for_fn(
-    function: &Function,
-    module_ctx: &ModuleCtx,
-    backend: &EvmBackend,
-    stackify_reach_depth: u8,
-) -> String {
-    let mut function = function.clone();
-    let mut cfg = ControlFlowGraph::new();
-    cfg.compute(&function);
-
-    StackifyEdgeSplitter::run(&mut function, &mut cfg);
-
-    let value_aliases = backend.compute_stackify_value_aliases(&function, module_ctx);
-
-    let mut liveness = Liveness::new();
-    liveness.compute_with_value_normalizer(&function, &cfg, |v| {
-        canonicalize_alias_value(&value_aliases, v)
-    });
-    let mut dom = DomTree::new();
-    dom.compute(&cfg);
-
-    let (_alloc, stackify) =
-        StackifyBuilder::new(&function, &cfg, &dom, &liveness, stackify_reach_depth)
-            .with_value_aliases(&value_aliases)
-            .compute_with_trace();
-    stackify
-}
-
 fn fmt_evm_stack(stack: &[U256]) -> String {
     const SHOW: usize = 6;
 
@@ -837,7 +818,7 @@ fn parse_mem_plan_summary(mem_plan: &str) -> (Option<String>, HashMap<String, St
         let Some(rest) = line.strip_prefix("evm mem plan: ") else {
             continue;
         };
-        if rest.starts_with("dyn_base=") {
+        if rest.starts_with("global_dyn_base=") {
             header = Some(rest.to_string());
             continue;
         }
