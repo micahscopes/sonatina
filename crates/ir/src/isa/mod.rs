@@ -4,6 +4,7 @@ use crate::{AddressSpaceInfo, InstSetBase, Type, module::ModuleCtx};
 
 pub mod evm;
 pub mod native;
+pub mod wasm32;
 
 pub trait Isa {
     type InstSet: InstSetBase + 'static;

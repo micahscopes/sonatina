@@ -68,6 +68,7 @@ pub enum Architecture {
     Evm,
     X86_64,
     Aarch64,
+    Wasm32,
 }
 
 impl Architecture {
@@ -76,6 +77,7 @@ impl Architecture {
             "evm" => Ok(Self::Evm),
             "x86_64" => Ok(Self::X86_64),
             "aarch64" => Ok(Self::Aarch64),
+            "wasm32" => Ok(Self::Wasm32),
             _ => Err(InvalidTriple::ArchitectureNotSupported),
         }
     }
@@ -87,6 +89,7 @@ impl Display for Architecture {
             Self::Evm => write!(f, "evm"),
             Self::X86_64 => write!(f, "x86_64"),
             Self::Aarch64 => write!(f, "aarch64"),
+            Self::Wasm32 => write!(f, "wasm32"),
         }
     }
 }
@@ -142,7 +145,10 @@ impl OperatingSystem {
                 };
                 Ok(Self::Evm(evm_version))
             }
-            (Architecture::X86_64 | Architecture::Aarch64, Vendor::Unknown) => match s {
+            (
+                Architecture::X86_64 | Architecture::Aarch64 | Architecture::Wasm32,
+                Vendor::Unknown,
+            ) => match s {
                 "native" => Ok(Self::Native),
                 _ => Err(InvalidTriple::OsNotSupported),
             },
@@ -244,6 +250,12 @@ mod tests {
         assert_eq!(triple.vendor, Vendor::Unknown);
         assert_eq!(triple.operating_system, OperatingSystem::Native);
         assert_eq!("aarch64-unknown-native", triple.to_string());
+
+        let triple = TargetTriple::parse("wasm32-unknown-native").unwrap();
+        assert_eq!(triple.architecture, Architecture::Wasm32);
+        assert_eq!(triple.vendor, Vendor::Unknown);
+        assert_eq!(triple.operating_system, OperatingSystem::Native);
+        assert_eq!("wasm32-unknown-native", triple.to_string());
     }
 
     #[test]

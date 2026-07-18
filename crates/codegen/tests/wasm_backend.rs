@@ -5,10 +5,124 @@ use sonatina_ir::{
     builder::ModuleBuilder,
     func_cursor::InstInserter,
     inst::{arith, cmp, control_flow},
-    isa::{Isa, native::Native},
+    isa::{Isa, native::Native, wasm32::Wasm32},
     module::ModuleCtx,
 };
 use sonatina_triple::{Architecture, OperatingSystem, TargetTriple, Vendor};
+
+fn wasm32_triple() -> TargetTriple {
+    TargetTriple::new(
+        Architecture::Wasm32,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    )
+}
+
+fn wasm32_module_builder() -> ModuleBuilder {
+    let isa = Wasm32::new(wasm32_triple());
+    let ctx = ModuleCtx::new(&isa);
+    ModuleBuilder::new(ctx)
+}
+
+/// The minted `Wasm32` ISA drives the same WAFFLE backend end to end:
+/// build `add(a,b)=a+b` under the Wasm32 target, compile, execute under
+/// wasmtime. This is the ISA the Fe wasm lowering targets.
+#[test]
+fn wasm32_isa_add_wasmtime() {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+
+    let sig = Signature::new_single("add", Linkage::Public, &[Type::I64, Type::I64], Type::I64);
+    let func_ref = mb.declare_function(sig).unwrap();
+
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let b = fb.args()[1];
+    let sum = fb.insert_inst(arith::Add::new(is, a, b), Type::I64);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let artifact = WasmBackend::new()
+        .compile_module(&module)
+        .expect("WASM compilation failed");
+    wasmparser::validate(&artifact.bytes).expect("produced invalid WASM");
+
+    let engine = wasmtime::Engine::default();
+    let wm = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let inst = wasmtime::Instance::new(&mut store, &wm, &[]).unwrap();
+    let f = inst
+        .get_typed_func::<(i64, i64), i64>(&mut store, "add")
+        .expect("add export");
+    assert_eq!(f.call(&mut store, (2, 3)).unwrap(), 5);
+}
+
+/// A two-function program: `caller(a,b)` calls `callee(a,b)=a+b`. Exercises the
+/// WAFFLE `Call` translation and the up-front `FuncRef -> Func` mapping.
+#[test]
+fn wasm32_isa_call_pair_wasmtime() {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+
+    let callee_sig =
+        Signature::new_single("callee", Linkage::Private, &[Type::I64, Type::I64], Type::I64);
+    let callee_ref = mb.declare_function(callee_sig).unwrap();
+
+    let caller_sig =
+        Signature::new_single("caller", Linkage::Public, &[Type::I64, Type::I64], Type::I64);
+    let caller_ref = mb.declare_function(caller_sig).unwrap();
+
+    // callee(a, b) = a + b
+    {
+        let mut fb = mb.func_builder::<InstInserter>(callee_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let a = fb.args()[0];
+        let b = fb.args()[1];
+        let sum = fb.insert_inst(arith::Add::new(is, a, b), Type::I64);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    // caller(a, b) = callee(a, b)
+    {
+        let mut fb = mb.func_builder::<InstInserter>(caller_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let a = fb.args()[0];
+        let b = fb.args()[1];
+        let ret = fb.insert_inst(
+            control_flow::Call::new(is, callee_ref, [a, b].into_iter().collect()),
+            Type::I64,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, ret));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let module = mb.build();
+    let artifact = WasmBackend::new()
+        .compile_module(&module)
+        .expect("WASM compilation failed");
+    wasmparser::validate(&artifact.bytes).expect("produced invalid WASM");
+
+    let engine = wasmtime::Engine::default();
+    let wm = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let inst = wasmtime::Instance::new(&mut store, &wm, &[]).unwrap();
+    let f = inst
+        .get_typed_func::<(i64, i64), i64>(&mut store, "caller")
+        .expect("caller export");
+    assert_eq!(f.call(&mut store, (2, 3)).unwrap(), 5);
+    assert_eq!(f.call(&mut store, (40, 2)).unwrap(), 42);
+}
 
 fn native_triple() -> TargetTriple {
     let arch = if cfg!(target_arch = "x86_64") {

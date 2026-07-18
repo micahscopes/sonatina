@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 
 use waffle::{
-    ExportKind, FuncDecl, FunctionBody, Module as WaffleModule, Operator, SignatureData,
+    ExportKind, Func, FuncDecl, FunctionBody, Module as WaffleModule, Operator, SignatureData,
     Terminator, Type as WType,
 };
 
 use sonatina_ir::{
-    BlockId, Function, Immediate, InstDowncast, InstSetBase, Module, Signature, Type, Value,
+    BlockId, Function, Immediate, Inst, InstDowncast, InstSetBase, Module, Signature, Type, Value,
     ValueId,
     module::FuncRef,
 };
@@ -49,6 +49,13 @@ pub(super) fn translate_module(
     let intrinsic_names: std::collections::HashSet<&str> =
         ["addmod", "mulmod"].into_iter().collect();
 
+    // Pass 1: declare every translatable function up front (placeholder bodies),
+    // recording the Sonatina `FuncRef` -> WAFFLE `Func` mapping. Doing this
+    // before any body is translated is what lets `Call` resolve its callee's
+    // WAFFLE function index regardless of definition order.
+    let mut func_map: HashMap<FuncRef, Func> = HashMap::new();
+    let mut pending: Vec<(FuncRef, Func, waffle::Signature, String)> = Vec::new();
+
     for &func_ref in &funcs {
         let has_body = module
             .func_store
@@ -78,20 +85,27 @@ pub(super) fn translate_module(
         });
 
         let sig_data = SignatureData {
-            params: params.clone(),
-            returns: results.clone(),
+            params,
+            returns: results,
         };
         let wsig = wmod.signatures.push(sig_data);
-
-        let body = translate_function(module, func_ref, &wmod, wsig, memory)?;
-        let wfunc = wmod.funcs.push(FuncDecl::Body(wsig, format!("{name}"), body));
+        let placeholder = FunctionBody::new(&wmod, wsig);
+        let wfunc = wmod.funcs.push(FuncDecl::Body(wsig, name.clone(), placeholder));
 
         wmod.exports.push(waffle::Export {
             name: name.clone(),
             kind: ExportKind::Func(wfunc),
         });
 
-        func_names.push(name);
+        func_map.insert(func_ref, wfunc);
+        func_names.push(name.clone());
+        pending.push((func_ref, wfunc, wsig, name));
+    }
+
+    // Pass 2: translate each body, now that every callee has a WAFFLE `Func`.
+    for (func_ref, wfunc, wsig, name) in pending {
+        let body = translate_function(module, func_ref, &wmod, wsig, memory, &func_map)?;
+        wmod.funcs[wfunc] = FuncDecl::Body(wsig, name, body);
     }
 
     Ok((wmod, func_names))
@@ -103,6 +117,7 @@ fn translate_function(
     wmod: &WaffleModule,
     wsig: waffle::Signature,
     memory: waffle::Memory,
+    func_map: &HashMap<FuncRef, Func>,
 ) -> Result<FunctionBody, String> {
     let mut body = FunctionBody::new(wmod, wsig);
     // Stack pointer for bump allocation in linear memory (starts at 1024 to leave space)
@@ -458,8 +473,36 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
-                    // Skip other instructions
-                    else {}
+                    // Call — direct call to another translated function.
+                    else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(inst_set, inst_data) {
+                        let callee = *call.callee();
+                        let wfunc = func_map.get(&callee).copied().ok_or_else(|| {
+                            "wasm translation: call to a function without a translated body \
+                             (imports/intrinsics are not supported yet)"
+                                .to_string()
+                        })?;
+                        let args: Vec<waffle::Value> = call
+                            .args()
+                            .iter()
+                            .filter_map(|v| resolve_value(function, *v, &value_map, &mut body, wb))
+                            .collect();
+                        let op = Operator::Call { function_index: wfunc };
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let ty = result_waffle_type(function, result);
+                            let wval = body.add_op(wb, op, &args, &[ty]);
+                            value_map.insert(result, wval);
+                        } else {
+                            body.add_op(wb, op, &args, &[]);
+                        }
+                    }
+                    // Fail closed: an unhandled instruction must be an error, never
+                    // a silent drop (which would miscompile). Real op coverage is R2.
+                    else {
+                        return Err(format!(
+                            "wasm translation: unsupported instruction `{}`",
+                            inst_data.as_text()
+                        ));
+                    }
                 }
 
                 // If no terminator was set, add an implicit return
