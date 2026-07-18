@@ -5,28 +5,36 @@ use sonatina_ir::{
     BlockId, ControlFlowGraph, Function, I256, Immediate, InstId, Type, Value, ValueId,
     func_cursor::{CursorLocation, FuncCursor, InstInserter},
     inst::{cast, control_flow, data, downcast},
-    types::EnumVariantRef,
+    types::{CompoundType, EnumVariantRef},
 };
 
 use super::{
+    ObjectEffectSummaryMap,
+    object_access::{ObjectAccessFacts, ObjectInstEffects},
+    object_initialization::value_initialization,
+    object_load_store::transfer_backward_effects,
     object_locality,
     object_state::{
-        LiveLeafMap, clear_live_slice, enum_write_variant_slices, is_pure_object_address_inst,
-        mark_live_slice, mark_root_live, observed_roots, slice_has_live_leaf,
-        tracked_root_total_leaves, union_live_leaf_maps,
+        LiveLeafMap, enum_write_variant_slices, slice_has_live_leaf, union_live_leaf_maps,
     },
     object_tracking::{
-        AggregateObjectFacts, ObjectSlice, TrackedObject, enum_tag_object_slice,
-        enum_variant_field_object_slice, objref_element_ty, slices_overlap,
+        ObjectSlice, TrackedObject, enum_tag_object_slice, enum_variant_field_object_slice,
+        objref_element_ty,
     },
-    provenance::{MayProvenance, MayRootSet, ProvenanceSnapshot, RootValue},
+    provenance::RootValue,
     reconstruct::AggregateValueReconstructor,
+    scalarize::enum_variant_tag_imm,
     shape,
 };
+
+mod value_facts;
+
+use value_facts::AggregateValueFacts;
 
 #[derive(Default)]
 pub struct AggregateCombine {
     changed: bool,
+    replacements: FxHashMap<ValueId, ValueId>,
     layout_cache: shape::AggregateLayoutCache,
 }
 
@@ -38,8 +46,12 @@ enum AggregateFieldLookup {
 }
 
 type EnumObjectFacts = FxHashMap<ExactEnumSlice, KnownEnumObjectState>;
-type PendingEnumWrites = FxHashMap<ExactEnumSlice, PendingEnumWrite>;
-type EnumLiveMap = LiveLeafMap;
+type PendingEnumWrites = FxHashMap<ExactEnumSlice, InstId>;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EnumFlowState {
+    facts: EnumObjectFacts,
+    observations: FxHashMap<ValueId, ExactEnumSlice>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ExactObjectSlice(ObjectSlice);
 impl ExactObjectSlice {
@@ -73,7 +85,8 @@ impl ExactEnumSlice {
 #[derive(Clone, Copy)]
 struct EnumAliasContext<'a> {
     tracked: &'a SecondaryMap<ValueId, Option<TrackedObject>>,
-    may: MayProvenance<'a>,
+    accesses: &'a ObjectAccessFacts,
+    effects: &'a FxHashMap<InstId, ObjectInstEffects>,
 }
 impl<'a> EnumAliasContext<'a> {
     fn exact_object(self, value: ValueId) -> Option<ExactObjectSlice> {
@@ -86,6 +99,7 @@ impl<'a> EnumAliasContext<'a> {
 
     fn exact_enum(self, func: &Function, value: ValueId) -> Option<ExactEnumSlice> {
         self.exact_object(value)
+            .filter(|slice| self.accesses.single_instance(slice.root()))
             .and_then(|slice| ExactEnumSlice::new(func, slice))
     }
 
@@ -98,85 +112,37 @@ impl<'a> EnumAliasContext<'a> {
         let slice = self.exact_enum(func, value)?;
         local_roots.contains(&slice.root().value()).then_some(slice)
     }
-
-    fn observed(self, value: ValueId) -> EnumAlias {
-        if let Some(tracked_object) = self.tracked[value].as_ref().copied() {
-            return match tracked_object {
-                TrackedObject::Exact(slice) => EnumAlias::Exact(ExactObjectSlice::new(slice)),
-                TrackedObject::RootUnknown { root, .. } => {
-                    EnumAlias::Roots(smallvec![RootValue::new(root)])
-                }
-            };
-        }
-
-        let roots = self.may_root_set(value);
-        if roots.has_unknown() {
-            return EnumAlias::Unknown;
-        }
-        let Some(roots) = roots
-            .exhaustive_known_roots()
-            .filter(|roots| !roots.is_empty())
-        else {
-            return EnumAlias::None;
-        };
-
-        let mut observed = SmallVec::new();
-        for root in roots.iter() {
-            if !observed.contains(&root) {
-                observed.push(root);
-            }
-        }
-        EnumAlias::Roots(observed)
-    }
-
-    fn may_root_set(self, value: ValueId) -> MayRootSet<'a> {
-        self.may.may_roots(value)
-    }
-}
-enum EnumAlias {
-    // Exact aliases stay object-typed because non-enum projections still need to conservatively
-    // kill overlapping enum state by slice.
-    Exact(ExactObjectSlice),
-    Roots(SmallVec<[RootValue; 4]>),
-    Unknown,
-    None,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct KnownEnumObjectState {
     variant: EnumVariantRef,
     payloads: SmallVec<[Option<ValueId>; 2]>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PendingEnumWriteKind {
-    SetTag,
-    WriteVariant,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PendingEnumWrite {
-    inst: InstId,
-    kind: PendingEnumWriteKind,
-    variant: EnumVariantRef,
-}
-fn collect_combine_enum_facts(
-    func: &Function,
-    layout_cache: &mut shape::AggregateLayoutCache,
-) -> AggregateObjectFacts {
-    let mut snapshot = ProvenanceSnapshot::new(func, None);
-    AggregateObjectFacts::for_all_objref_args(func, layout_cache, &mut snapshot)
-}
 impl AggregateCombine {
     pub fn run(&mut self, func: &mut Function) -> bool {
+        self.run_with_effects(func, None)
+    }
+
+    pub(crate) fn run_with_effects(
+        &mut self,
+        func: &mut Function,
+        object_effects: Option<&ObjectEffectSummaryMap>,
+    ) -> bool {
         self.changed = false;
         self.layout_cache.clear();
         func.rebuild_users();
 
         loop {
             let mut iter_changed = false;
-            let definitely_non_undef = compute_definitely_non_undef_aggregates(func);
-            let enum_facts = collect_combine_enum_facts(func, &mut self.layout_cache);
+            self.replacements.clear();
+            let value_facts = AggregateValueFacts::compute(func);
+            let accesses = ObjectAccessFacts::new(func, object_effects);
+            let tracked = accesses.tracked_all(func, &mut self.layout_cache);
+            let effects = accesses.effects_by_inst(func, object_effects);
             let enum_aliases = EnumAliasContext {
-                tracked: enum_facts.tracked(),
-                may: enum_facts.may(),
+                tracked: &tracked,
+                accesses: &accesses,
+                effects: &effects,
             };
             let enum_entry_facts = compute_enum_object_entry_facts(func, enum_aliases);
             let blocks: Vec<_> = func.layout.iter_block().collect();
@@ -198,13 +164,14 @@ impl AggregateCombine {
                     if !func.layout.is_inst_inserted(inst) {
                         continue;
                     }
-                    iter_changed |= self.try_rewrite_inst(func, inst, &definitely_non_undef);
+                    iter_changed |= self.try_rewrite_inst(func, inst, &value_facts);
                 }
             }
             if iter_changed {
                 func.rebuild_users();
             }
-            iter_changed |= remove_dead_local_enum_writes(func, &mut self.layout_cache);
+            iter_changed |=
+                remove_dead_local_enum_writes(func, &mut self.layout_cache, object_effects);
             if !iter_changed {
                 break;
             }
@@ -215,208 +182,123 @@ impl AggregateCombine {
         self.changed
     }
 
+    fn replace_with_alias(
+        &mut self,
+        func: &mut Function,
+        inst: InstId,
+        result: ValueId,
+        replacement: ValueId,
+    ) {
+        // Cached reconstruction sources refer to the immutable SSA snapshots
+        // from the start of this round, including values erased by earlier rewrites.
+        self.replacements.insert(result, replacement);
+        func.dfg.change_to_alias(result, replacement);
+        InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+    }
+
     fn try_rewrite_enum_object_inst(
         &mut self,
         func: &mut Function,
         inst: InstId,
-        enum_aliases: EnumAliasContext<'_>,
-        enum_facts: &mut EnumObjectFacts,
-        pending_enum_writes: &mut PendingEnumWrites,
+        aliases: EnumAliasContext<'_>,
+        state: &mut EnumFlowState,
+        pending: &mut PendingEnumWrites,
     ) -> bool {
-        if let Some(enum_get_tag) =
-            downcast::<&data::EnumGetTag>(func.inst_set(), func.dfg.inst(inst)).cloned()
+        let effects = &aliases.effects[&inst];
+        pending.retain(|object, _| {
+            !effects
+                .reads
+                .iter()
+                .any(|&read| aliases.accesses.may_overlap(read, object.slice()))
+        });
+        let data = func.dfg.inst(inst);
+        let mut replacement = None;
+        let mut tag_variant = None;
+        let mut written_object = None;
+        if let Some(tag) = downcast::<&data::EnumGetTag>(func.inst_set(), data) {
+            tag_variant = aliases
+                .exact_enum(func, *tag.object())
+                .and_then(|object| state.facts.get(&object))
+                .map(|fact| fact.variant);
+        } else if let Some(assertion) =
+            downcast::<&data::EnumAssertVariantRef>(func.inst_set(), data)
         {
-            clear_pending_enum_writes_for_alias(
-                pending_enum_writes,
-                enum_aliases,
-                *enum_get_tag.object(),
-            );
-
-            let Some(result) = func.dfg.inst_result(inst) else {
-                return false;
-            };
-            let Some(object) = enum_aliases.exact_enum(func, *enum_get_tag.object()) else {
-                return false;
-            };
-            let Some(state) = enum_facts.get(&object) else {
-                return false;
-            };
-            let tag = func.dfg.make_imm_value(enum_variant_tag_imm(state.variant));
-            func.dfg.change_to_alias(result, tag);
-            InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+            if aliases
+                .exact_enum(func, *assertion.object())
+                .and_then(|object| state.facts.get(&object))
+                .is_some_and(|fact| {
+                    fact.variant == *assertion.variant()
+                        && fact.payloads.iter().all(|payload| {
+                            payload.is_some_and(|value| self.payload_is_readable(func, value))
+                        })
+                })
+            {
+                replacement = Some(*assertion.object());
+            }
+        } else if let Some(load) = downcast::<&data::ObjLoad>(func.inst_set(), data) {
+            if let Some(projection) = enum_proj_of_value(func, *load.object())
+                && let Some(object) = aliases.exact_enum(func, *projection.object())
+                && let Some(field) = inst_const_index(func, *projection.field())
+                && let Some(value) =
+                    enum_payload_value(&state.facts, object, *projection.variant(), field)
+                && self.payload_is_readable(func, value)
+                && func
+                    .dfg
+                    .inst_result(inst)
+                    .is_some_and(|result| func.dfg.value_ty(result) == func.dfg.value_ty(value))
+            {
+                replacement = Some(value);
+            }
+        } else if let Some(tag) = downcast::<&data::EnumSetTag>(func.inst_set(), data) {
+            written_object = aliases.exact_enum(func, *tag.object());
+        } else if let Some(write) = downcast::<&data::EnumWriteVariant>(func.inst_set(), data) {
+            written_object = aliases.exact_enum(func, *write.object());
+        }
+        let removed = written_object.is_some_and(|object| {
+            remove_dead_overwritten_enum_write(func, pending, object, inst, aliases)
+        });
+        pending.retain(|object, _| {
+            !effects
+                .writes
+                .iter()
+                .any(|&write| aliases.accesses.may_overlap(write, object.slice()))
+        });
+        if let Some(object) = written_object {
+            pending.insert(object, inst);
+        }
+        transfer_enum_object_facts(func, inst, aliases, state);
+        if let Some(variant) = tag_variant {
+            replacement = Some(func.dfg.make_imm_value(enum_variant_tag_imm(
+                variant,
+                Type::EnumTag(variant.enum_ty()),
+            )));
+        }
+        if let Some(value) = replacement
+            && let Some(result) = func.dfg.inst_result(inst)
+        {
+            self.replace_with_alias(func, inst, result, value);
             return true;
         }
+        removed
+    }
 
-        if let Some(enum_assert_ref) =
-            downcast::<&data::EnumAssertVariantRef>(func.inst_set(), func.dfg.inst(inst)).cloned()
-        {
-            clear_pending_enum_writes_for_alias(
-                pending_enum_writes,
-                enum_aliases,
-                *enum_assert_ref.object(),
-            );
-            let Some(object) = enum_aliases.exact_enum(func, *enum_assert_ref.object()) else {
-                return false;
-            };
-            let redundant = enum_facts.get(&object).is_some_and(|state| {
-                state.variant == *enum_assert_ref.variant()
-                    && state.payloads.iter().all(Option::is_some)
-            });
-            update_enum_assert_fact(func, enum_facts, object, *enum_assert_ref.variant());
-
-            if redundant {
-                if let Some(result) = func.dfg.inst_result(inst) {
-                    func.dfg.change_to_alias(result, *enum_assert_ref.object());
-                }
-                InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
-                return true;
-            }
-            return false;
-        }
-
-        if let Some(obj_load) =
-            downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst)).cloned()
-            && let Some(enum_proj) = enum_proj_of_value(func, *obj_load.object())
-        {
-            clear_pending_enum_writes_for_alias(
-                pending_enum_writes,
-                enum_aliases,
-                *enum_proj.object(),
-            );
-            let Some(object) = enum_aliases.exact_enum(func, *enum_proj.object()) else {
-                return false;
-            };
-
-            let changed = if let Some(result) = func.dfg.inst_result(inst)
-                && let Some(field_idx) = inst_const_index(func, *enum_proj.field())
-                && let Some(replacement) =
-                    enum_payload_value(enum_facts, object, *enum_proj.variant(), field_idx)
-                && func.dfg.value_ty(replacement) == func.dfg.value_ty(result)
-            {
-                func.dfg.change_to_alias(result, replacement);
-                InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
-                true
-            } else {
-                false
-            };
-            return changed;
-        }
-
-        if let Some(obj_store) =
-            downcast::<&data::ObjStore>(func.inst_set(), func.dfg.inst(inst)).cloned()
-            && let Some(enum_proj) = enum_proj_of_value(func, *obj_store.object())
-        {
-            if let Some(object) = enum_aliases.exact_enum(func, *enum_proj.object())
-                && let Some(field_idx) = inst_const_index(func, *enum_proj.field())
-            {
-                kill_overlapping_enum_state_except(enum_facts, pending_enum_writes, object);
-                update_enum_store_fact(
-                    enum_facts,
-                    object,
-                    *enum_proj.variant(),
-                    field_idx,
-                    *obj_store.value(),
-                );
-            } else {
-                kill_enum_state_for_alias(
-                    enum_facts,
-                    pending_enum_writes,
-                    enum_aliases,
-                    *enum_proj.object(),
-                );
-            }
-            return false;
-        }
-
-        if let Some(enum_set_tag) =
-            downcast::<&data::EnumSetTag>(func.inst_set(), func.dfg.inst(inst)).cloned()
-        {
-            let Some(object) = enum_aliases.exact_enum(func, *enum_set_tag.object()) else {
-                kill_enum_state_for_alias(
-                    enum_facts,
-                    pending_enum_writes,
-                    enum_aliases,
-                    *enum_set_tag.object(),
-                );
-                return false;
-            };
-            let changed = remove_dead_overwritten_enum_write(
-                func,
-                pending_enum_writes,
-                object,
-                PendingEnumWriteKind::SetTag,
-                *enum_set_tag.variant(),
-            );
-            kill_overlapping_enum_state_except(enum_facts, pending_enum_writes, object);
-            pending_enum_writes.insert(
-                object,
-                PendingEnumWrite {
-                    inst,
-                    kind: PendingEnumWriteKind::SetTag,
-                    variant: *enum_set_tag.variant(),
-                },
-            );
-            update_enum_set_tag_fact(func, enum_facts, object, *enum_set_tag.variant());
-            return changed;
-        }
-
-        if let Some(enum_write_variant) =
-            downcast::<&data::EnumWriteVariant>(func.inst_set(), func.dfg.inst(inst)).cloned()
-        {
-            let Some(object) = enum_aliases.exact_enum(func, *enum_write_variant.object()) else {
-                kill_enum_state_for_alias(
-                    enum_facts,
-                    pending_enum_writes,
-                    enum_aliases,
-                    *enum_write_variant.object(),
-                );
-                return false;
-            };
-            let changed = remove_dead_overwritten_enum_write(
-                func,
-                pending_enum_writes,
-                object,
-                PendingEnumWriteKind::WriteVariant,
-                *enum_write_variant.variant(),
-            );
-            kill_overlapping_enum_state_except(enum_facts, pending_enum_writes, object);
-            pending_enum_writes.insert(
-                object,
-                PendingEnumWrite {
-                    inst,
-                    kind: PendingEnumWriteKind::WriteVariant,
-                    variant: *enum_write_variant.variant(),
-                },
-            );
-            update_enum_write_variant_fact(
-                enum_facts,
-                object,
-                *enum_write_variant.variant(),
-                enum_write_variant.values(),
-            );
-            return changed;
-        }
-
-        if let Some(enum_proj) =
-            downcast::<&data::EnumProj>(func.inst_set(), func.dfg.inst(inst)).cloned()
-        {
-            clear_pending_enum_writes_for_alias(
-                pending_enum_writes,
-                enum_aliases,
-                *enum_proj.object(),
-            );
-            return false;
-        }
-
-        kill_touched_enum_object_facts(func, inst, enum_aliases, enum_facts, pending_enum_writes);
-        false
+    fn payload_is_readable(&mut self, func: &Function, value: ValueId) -> bool {
+        // Readability is not scalar definedness. Typed undef and scalar SSA
+        // values retain their existing contract. An aggregate snapshot needs
+        // its own evidence; a later assertion cannot initialize the old SSA value.
+        !matches!(
+            func.dfg.value_ty(value).resolve_compound(func.ctx()),
+            Some(CompoundType::Struct(_) | CompoundType::Array { .. } | CompoundType::Enum(_))
+        ) || is_explicit_undef(func, value)
+            || value_initialization(func, value, &FxHashMap::default(), &mut self.layout_cache)
+                .defined(func.ctx())
     }
 
     fn try_rewrite_inst(
         &mut self,
         func: &mut Function,
         inst: InstId,
-        definitely_non_undef: &SecondaryMap<ValueId, bool>,
+        facts: &AggregateValueFacts,
     ) -> bool {
         if downcast::<&data::EnumTag>(func.inst_set(), func.dfg.inst(inst)).is_some() {
             self.try_rewrite_enum_tag(func, inst)
@@ -427,9 +309,9 @@ impl AggregateCombine {
         } else if downcast::<&data::ExtractValue>(func.inst_set(), func.dfg.inst(inst)).is_some() {
             self.try_rewrite_extract(func, inst)
         } else if downcast::<&data::InsertValue>(func.inst_set(), func.dfg.inst(inst)).is_some() {
-            self.try_rewrite_insert(func, inst, definitely_non_undef)
+            self.try_rewrite_insert(func, inst, facts)
         } else if downcast::<&control_flow::Phi>(func.inst_set(), func.dfg.inst(inst)).is_some() {
-            self.try_rewrite_phi(func, inst, definitely_non_undef)
+            self.try_rewrite_phi(func, inst, &facts.definitely_non_undef)
         } else {
             false
         }
@@ -450,8 +332,7 @@ impl AggregateCombine {
             enum_ty: enum_make.variant().enum_ty(),
             value: I256::from(u64::from(enum_make.variant().index())),
         });
-        func.dfg.change_to_alias(result, tag);
-        InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+        self.replace_with_alias(func, inst, result, tag);
         true
     }
 
@@ -470,8 +351,7 @@ impl AggregateCombine {
         let folded = func
             .dfg
             .make_imm_value(*enum_make.variant() == *enum_is_variant.variant());
-        func.dfg.change_to_alias(result, folded);
-        InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+        self.replace_with_alias(func, inst, result, folded);
         true
     }
 
@@ -499,8 +379,7 @@ impl AggregateCombine {
         if func.dfg.value_ty(payload) != func.dfg.value_ty(result) {
             return false;
         }
-        func.dfg.change_to_alias(result, payload);
-        InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+        self.replace_with_alias(func, inst, result, payload);
         true
     }
 
@@ -524,8 +403,7 @@ impl AggregateCombine {
                         func, inst, &extract, result, target_idx,
                     );
                 }
-                func.dfg.change_to_alias(result, found);
-                InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+                self.replace_with_alias(func, inst, result, found);
                 true
             }
             AggregateFieldLookup::BaseNeedsExtract(base) if base != *extract.dest() => {
@@ -539,8 +417,7 @@ impl AggregateCombine {
                     return false;
                 }
                 let undef = func.dfg.make_undef_value(field_ty);
-                func.dfg.change_to_alias(result, undef);
-                InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+                self.replace_with_alias(func, inst, result, undef);
                 true
             }
             AggregateFieldLookup::BaseNeedsExtract(_) | AggregateFieldLookup::Unknown => self
@@ -616,8 +493,7 @@ impl AggregateCombine {
         if func.dfg.value_ty(replacement) != func.dfg.value_ty(result) {
             return false;
         }
-        func.dfg.change_to_alias(result, replacement);
-        InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+        self.replace_with_alias(func, inst, result, replacement);
         true
     }
 
@@ -625,7 +501,7 @@ impl AggregateCombine {
         &mut self,
         func: &mut Function,
         inst: InstId,
-        definitely_non_undef: &SecondaryMap<ValueId, bool>,
+        facts: &AggregateValueFacts,
     ) -> bool {
         let Some(insert) = downcast::<&data::InsertValue>(func.inst_set(), func.dfg.inst(inst))
         else {
@@ -637,12 +513,11 @@ impl AggregateCombine {
         };
 
         // AC5: insert identical field back into aggregate.
-        if is_identical_field_reinsert(func, &insert, definitely_non_undef) {
+        if is_identical_field_reinsert(func, &insert, &facts.definitely_non_undef) {
             if func.dfg.value_ty(*insert.dest()) != func.dfg.value_ty(result) {
                 return false;
             }
-            func.dfg.change_to_alias(result, *insert.dest());
-            InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+            self.replace_with_alias(func, inst, result, *insert.dest());
             return true;
         }
 
@@ -663,12 +538,16 @@ impl AggregateCombine {
         }
 
         // AC6: full reconstruction reuse.
-        if let Some(source) = try_reconstruct_original_aggregate(func, result) {
-            if func.dfg.value_ty(source) != func.dfg.value_ty(result) {
+        if let Some(mut source) = facts.reconstructed[result] {
+            while let Some(&replacement) = self.replacements.get(&source) {
+                source = replacement;
+            }
+            if is_explicit_undef(func, source)
+                || func.dfg.value_ty(source) != func.dfg.value_ty(result)
+            {
                 return false;
             }
-            func.dfg.change_to_alias(result, source);
-            InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+            self.replace_with_alias(func, inst, result, source);
             return true;
         }
 
@@ -711,7 +590,7 @@ impl AggregateCombine {
         let agg_ty = func.dfg.value_ty(*first_extract.dest());
         let res_ty = func.dfg.value_ty(result);
 
-        let mut agg_args = vec![(*first_extract.dest(), first_pred)];
+        let mut agg_args = smallvec![(*first_extract.dest(), first_pred)];
         for &(incoming, pred) in phi.args().iter().skip(1) {
             let Some(extract_inst) = func.dfg.value_inst(incoming) else {
                 return false;
@@ -742,8 +621,7 @@ impl AggregateCombine {
             res_ty,
         );
 
-        func.dfg.change_to_alias(result, new_extract);
-        InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+        self.replace_with_alias(func, inst, result, new_extract);
         true
     }
 
@@ -782,8 +660,8 @@ impl AggregateCombine {
         let payload_ty = func.dfg.value_ty(*first_insert.value());
         let result_ty = func.dfg.value_ty(result);
 
-        let mut base_args = vec![(*first_insert.dest(), first_pred)];
-        let mut payload_args = vec![(*first_insert.value(), first_pred)];
+        let mut base_args = smallvec![(*first_insert.dest(), first_pred)];
+        let mut payload_args = smallvec![(*first_insert.value(), first_pred)];
 
         for &(incoming, pred) in phi.args().iter().skip(1) {
             let Some(insert_inst) = func.dfg.value_inst(incoming) else {
@@ -820,64 +698,52 @@ impl AggregateCombine {
             result_ty,
         );
 
-        func.dfg.change_to_alias(result, new_insert);
-        InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+        self.replace_with_alias(func, inst, result, new_insert);
         true
     }
 }
 fn compute_enum_object_entry_facts(
     func: &Function,
-    enum_aliases: EnumAliasContext<'_>,
-) -> SecondaryMap<BlockId, EnumObjectFacts> {
+    aliases: EnumAliasContext<'_>,
+) -> SecondaryMap<BlockId, EnumFlowState> {
     let mut cfg = ControlFlowGraph::new();
     cfg.compute(func);
     let reachable = cfg.reachable_blocks();
     let mut order: Vec<_> = cfg.post_order().collect();
     order.reverse();
-
-    let mut in_states = SecondaryMap::<BlockId, EnumObjectFacts>::default();
-    let mut out_states = SecondaryMap::<BlockId, EnumObjectFacts>::default();
-
+    let mut in_states = SecondaryMap::<BlockId, EnumFlowState>::default();
+    let mut out_states = SecondaryMap::<BlockId, EnumFlowState>::default();
+    let mut valid = SecondaryMap::<BlockId, bool>::default();
     loop {
         let mut changed = false;
         for &block in &order {
             if !reachable[block] {
                 continue;
             }
-
-            let next_in = meet_enum_object_facts(
-                cfg.preds_of(block)
-                    .copied()
-                    .filter(|pred| reachable[*pred])
-                    .map(|pred| {
-                        edge_enum_object_facts(func, pred, block, &out_states[pred], enum_aliases)
-                    }),
-            );
+            let next_in = if Some(block) == func.layout.entry_block() {
+                EnumFlowState::default()
+            } else {
+                meet_enum_object_facts(
+                    cfg.preds_of(block)
+                        .copied()
+                        .filter(|pred| reachable[*pred] && valid[*pred])
+                        .map(|pred| edge_enum_object_facts(func, pred, block, &out_states[pred])),
+                )
+            };
             if next_in != in_states[block] {
                 in_states[block] = next_in.clone();
                 changed = true;
             }
-
             let mut state = next_in;
-            let mut pending_writes = PendingEnumWrites::default();
             for inst in func.layout.iter_inst(block) {
-                if func.layout.is_inst_inserted(inst) {
-                    transfer_enum_object_facts(
-                        func,
-                        inst,
-                        enum_aliases,
-                        &mut state,
-                        &mut pending_writes,
-                    );
-                }
+                transfer_enum_object_facts(func, inst, aliases, &mut state);
             }
-
-            if state != out_states[block] {
+            if !valid[block] || state != out_states[block] {
                 out_states[block] = state;
+                valid[block] = true;
                 changed = true;
             }
         }
-
         if !changed {
             return in_states;
         }
@@ -886,23 +752,28 @@ fn compute_enum_object_entry_facts(
 fn remove_dead_local_enum_writes(
     func: &mut Function,
     layout_cache: &mut shape::AggregateLayoutCache,
+    summaries: Option<&ObjectEffectSummaryMap>,
 ) -> bool {
     let local_roots = collect_local_object_roots(func);
     if local_roots.is_empty() {
         return false;
     }
 
-    let facts = collect_combine_enum_facts(func, layout_cache);
+    let accesses = ObjectAccessFacts::new(func, summaries);
+    let tracked = accesses.tracked_all(func, layout_cache);
+    let local_tracked = accesses.tracked_for_roots(func, &local_roots, layout_cache);
+    let effects = accesses.effects_by_inst(func, summaries);
     let enum_aliases = EnumAliasContext {
-        tracked: facts.tracked(),
-        may: facts.may(),
+        tracked: &tracked,
+        accesses: &accesses,
+        effects: &effects,
     };
     let mut cfg = ControlFlowGraph::new();
     cfg.compute(func);
     let reachable = cfg.reachable_blocks();
     let order: Vec<_> = cfg.post_order().collect();
-    let mut in_states = SecondaryMap::<BlockId, EnumLiveMap>::new();
-    let mut out_states = SecondaryMap::<BlockId, EnumLiveMap>::new();
+    let mut in_states = SecondaryMap::<BlockId, LiveLeafMap>::new();
+    let mut out_states = SecondaryMap::<BlockId, LiveLeafMap>::new();
 
     loop {
         let mut changed = false;
@@ -931,7 +802,13 @@ fn remove_dead_local_enum_writes(
                 .rev()
             {
                 if func.layout.is_inst_inserted(inst) {
-                    transfer_backward_enum_live(func, inst, &local_roots, enum_aliases, &mut live);
+                    transfer_backward_effects(
+                        func,
+                        &local_tracked,
+                        &accesses,
+                        &effects[&inst],
+                        &mut live,
+                    );
                 }
             }
 
@@ -967,7 +844,13 @@ fn remove_dead_local_enum_writes(
                 try_remove_dead_local_enum_write(func, inst, &local_roots, enum_aliases, &live);
             changed |= removed;
             if !removed {
-                transfer_backward_enum_live(func, inst, &local_roots, enum_aliases, &mut live);
+                transfer_backward_effects(
+                    func,
+                    &local_tracked,
+                    &accesses,
+                    &effects[&inst],
+                    &mut live,
+                );
             }
         }
     }
@@ -998,264 +881,14 @@ fn collect_local_object_roots(func: &Function) -> FxHashSet<ValueId> {
 }
 fn object_root_stays_local(func: &Function, root: ValueId) -> bool {
     let local_object_args = FxHashMap::default();
-    object_locality::object_root_stays_local(
-        func,
-        root,
-        func.dfg.value_ty(root),
-        &local_object_args,
-        false,
-    )
-}
-fn kill_pending_enum_writes_for_root(pending_enum_writes: &mut PendingEnumWrites, root: RootValue) {
-    pending_enum_writes.retain(|slice, _| slice.root() != root);
-}
-fn kill_overlapping_pending_enum_writes(
-    pending_enum_writes: &mut PendingEnumWrites,
-    slice: ExactObjectSlice,
-) {
-    pending_enum_writes.retain(|other, _| !slices_overlap(other.slice(), slice.slice()));
-}
-fn clear_pending_enum_writes_for_alias(
-    pending_enum_writes: &mut PendingEnumWrites,
-    enum_aliases: EnumAliasContext<'_>,
-    value: ValueId,
-) {
-    match enum_aliases.observed(value) {
-        EnumAlias::Exact(slice) => kill_overlapping_pending_enum_writes(pending_enum_writes, slice),
-        EnumAlias::Roots(roots) => {
-            for root in roots {
-                kill_pending_enum_writes_for_root(pending_enum_writes, root);
-            }
-        }
-        EnumAlias::Unknown => pending_enum_writes.clear(),
-        EnumAlias::None => {}
-    }
-}
-fn kill_root_enum_state(
-    enum_facts: &mut EnumObjectFacts,
-    pending_enum_writes: &mut PendingEnumWrites,
-    root: RootValue,
-) {
-    enum_facts.retain(|slice, _| slice.root() != root);
-    pending_enum_writes.retain(|slice, _| slice.root() != root);
-}
-fn kill_overlapping_enum_state(
-    enum_facts: &mut EnumObjectFacts,
-    pending_enum_writes: &mut PendingEnumWrites,
-    slice: ExactObjectSlice,
-) {
-    enum_facts.retain(|other, _| !slices_overlap(other.slice(), slice.slice()));
-    pending_enum_writes.retain(|other, _| !slices_overlap(other.slice(), slice.slice()));
-}
-fn kill_overlapping_enum_state_except(
-    enum_facts: &mut EnumObjectFacts,
-    pending_enum_writes: &mut PendingEnumWrites,
-    slice: ExactEnumSlice,
-) {
-    enum_facts.retain(|other, _| *other == slice || !slices_overlap(other.slice(), slice.slice()));
-    pending_enum_writes
-        .retain(|other, _| *other == slice || !slices_overlap(other.slice(), slice.slice()));
-}
-fn kill_enum_state_for_alias(
-    enum_facts: &mut EnumObjectFacts,
-    pending_enum_writes: &mut PendingEnumWrites,
-    enum_aliases: EnumAliasContext<'_>,
-    value: ValueId,
-) {
-    match enum_aliases.observed(value) {
-        EnumAlias::Exact(slice) => {
-            kill_overlapping_enum_state(enum_facts, pending_enum_writes, slice)
-        }
-        EnumAlias::Roots(roots) => {
-            for root in roots {
-                kill_root_enum_state(enum_facts, pending_enum_writes, root);
-            }
-        }
-        EnumAlias::Unknown => {
-            enum_facts.clear();
-            pending_enum_writes.clear();
-        }
-        EnumAlias::None => {}
-    }
-}
-fn is_enum_state_passthrough_inst(func: &Function, inst: InstId) -> bool {
-    is_pure_object_address_inst(func, inst)
-        || downcast::<&control_flow::Jump>(func.inst_set(), func.dfg.inst(inst)).is_some()
-        || downcast::<&control_flow::Br>(func.inst_set(), func.dfg.inst(inst)).is_some()
-        || downcast::<&control_flow::BrTable>(func.inst_set(), func.dfg.inst(inst)).is_some()
-}
-fn observed_object_roots(
-    func: &Function,
-    inst: InstId,
-    enum_aliases: EnumAliasContext<'_>,
-    skip: &[ValueId],
-) -> (Vec<RootValue>, bool) {
-    if is_enum_state_passthrough_inst(func, inst) {
-        return (Vec::new(), false);
-    }
-
-    let (roots, observed_unknown) = observed_roots(func, inst, enum_aliases.may, skip);
-    (
-        roots.into_iter().map(RootValue::new).collect(),
-        observed_unknown,
-    )
-}
-fn transfer_backward_enum_live(
-    func: &Function,
-    inst: InstId,
-    local_roots: &FxHashSet<ValueId>,
-    enum_aliases: EnumAliasContext<'_>,
-    live: &mut EnumLiveMap,
-) {
-    if is_enum_state_passthrough_inst(func, inst) {
-        return;
-    }
-
-    if let Some(obj_load) = downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst)) {
-        if let Some((object, variant, field)) = enum_field_of_value(func, *obj_load.object())
-            && let Some(base_slice) = enum_aliases.exact_local(func, local_roots, object)
-            && let Some(field_slice) =
-                enum_variant_field_object_slice(func.ctx(), base_slice.slice(), variant, field)
-        {
-            mark_live_slice(live, field_slice);
-        } else {
-            mark_live_may_roots(
-                local_roots,
-                enum_aliases,
-                live,
-                enum_aliases.may_root_set(*obj_load.object()),
-            );
-        }
-        mark_observed_local_roots_live(
-            func,
-            inst,
-            local_roots,
-            enum_aliases,
-            live,
-            &[*obj_load.object()],
-        );
-        return;
-    }
-
-    if let Some(obj_store) = downcast::<&data::ObjStore>(func.inst_set(), func.dfg.inst(inst)) {
-        mark_observed_local_roots_live(
-            func,
-            inst,
-            local_roots,
-            enum_aliases,
-            live,
-            &[*obj_store.object()],
-        );
-        if let Some((object, variant, field)) = enum_field_of_value(func, *obj_store.object())
-            && let Some(base_slice) = enum_aliases.exact_local(func, local_roots, object)
-            && let Some(field_slice) =
-                enum_variant_field_object_slice(func.ctx(), base_slice.slice(), variant, field)
-        {
-            clear_live_slice(live, field_slice);
-        } else {
-            mark_live_may_roots(
-                local_roots,
-                enum_aliases,
-                live,
-                enum_aliases.may_root_set(*obj_store.object()),
-            );
-        }
-        return;
-    }
-
-    if let Some(enum_get_tag) = downcast::<&data::EnumGetTag>(func.inst_set(), func.dfg.inst(inst))
-    {
-        if let Some(tag_slice) = enum_aliases
-            .exact_local(func, local_roots, *enum_get_tag.object())
-            .and_then(|slice| enum_tag_object_slice(func.ctx(), slice.slice()))
-        {
-            mark_live_slice(live, tag_slice);
-        } else {
-            mark_live_may_roots(
-                local_roots,
-                enum_aliases,
-                live,
-                enum_aliases.may_root_set(*enum_get_tag.object()),
-            );
-        }
-        return;
-    }
-
-    if let Some(enum_assert_ref) =
-        downcast::<&data::EnumAssertVariantRef>(func.inst_set(), func.dfg.inst(inst))
-    {
-        if let Some(tag_slice) = enum_aliases
-            .exact_local(func, local_roots, *enum_assert_ref.object())
-            .and_then(|slice| enum_tag_object_slice(func.ctx(), slice.slice()))
-        {
-            mark_live_slice(live, tag_slice);
-        } else {
-            mark_live_may_roots(
-                local_roots,
-                enum_aliases,
-                live,
-                enum_aliases.may_root_set(*enum_assert_ref.object()),
-            );
-        }
-        return;
-    }
-
-    if let Some(enum_set_tag) = downcast::<&data::EnumSetTag>(func.inst_set(), func.dfg.inst(inst))
-    {
-        if let Some(tag_slice) = enum_aliases
-            .exact_local(func, local_roots, *enum_set_tag.object())
-            .and_then(|slice| enum_tag_object_slice(func.ctx(), slice.slice()))
-        {
-            clear_live_slice(live, tag_slice);
-        } else {
-            mark_live_may_roots(
-                local_roots,
-                enum_aliases,
-                live,
-                enum_aliases.may_root_set(*enum_set_tag.object()),
-            );
-        }
-        return;
-    }
-
-    if let Some(enum_write_variant) =
-        downcast::<&data::EnumWriteVariant>(func.inst_set(), func.dfg.inst(inst))
-    {
-        if let Some(base_slice) =
-            enum_aliases.exact_local(func, local_roots, *enum_write_variant.object())
-        {
-            for slice in
-                enum_write_variant_slices(func.ctx(), base_slice.slice(), enum_write_variant)
-            {
-                clear_live_slice(live, slice);
-            }
-        } else {
-            mark_live_may_roots(
-                local_roots,
-                enum_aliases,
-                live,
-                enum_aliases.may_root_set(*enum_write_variant.object()),
-            );
-        }
-        mark_observed_local_roots_live(
-            func,
-            inst,
-            local_roots,
-            enum_aliases,
-            live,
-            &[*enum_write_variant.object()],
-        );
-        return;
-    }
-
-    mark_observed_local_roots_live(func, inst, local_roots, enum_aliases, live, &[]);
+    object_locality::object_root_stays_local(func, root, &local_object_args, false)
 }
 fn try_remove_dead_local_enum_write(
     func: &mut Function,
     inst: InstId,
     local_roots: &FxHashSet<ValueId>,
     enum_aliases: EnumAliasContext<'_>,
-    live: &EnumLiveMap,
+    live: &LiveLeafMap,
 ) -> bool {
     if let Some(obj_store) = downcast::<&data::ObjStore>(func.inst_set(), func.dfg.inst(inst))
         && let Some((object, variant, field)) = enum_field_of_value(func, *obj_store.object())
@@ -1300,72 +933,17 @@ fn enum_field_of_value(func: &Function, value: ValueId) -> Option<(ValueId, Enum
         inst_const_index(func, *enum_proj.field())?,
     ))
 }
-fn mark_observed_local_roots_live(
-    func: &Function,
-    inst: InstId,
-    local_roots: &FxHashSet<ValueId>,
-    enum_aliases: EnumAliasContext<'_>,
-    live: &mut EnumLiveMap,
-    skip: &[ValueId],
-) {
-    let (roots, observed_unknown) = observed_object_roots(func, inst, enum_aliases, skip);
-    if observed_unknown {
-        mark_all_local_roots_live(local_roots, enum_aliases, live);
-        return;
-    }
-    for root in roots {
-        if local_roots.contains(&root.value()) {
-            mark_root_live(
-                live,
-                root.value(),
-                tracked_root_total_leaves(enum_aliases.tracked, root.value()),
-            );
-        }
-    }
-}
-fn mark_live_may_roots(
-    local_roots: &FxHashSet<ValueId>,
-    enum_aliases: EnumAliasContext<'_>,
-    live: &mut EnumLiveMap,
-    roots: MayRootSet<'_>,
-) {
-    if roots.has_unknown() {
-        mark_all_local_roots_live(local_roots, enum_aliases, live);
-        return;
-    }
-    for root in roots.observed().iter() {
-        if local_roots.contains(&root.value()) {
-            mark_root_live(
-                live,
-                root.value(),
-                tracked_root_total_leaves(enum_aliases.tracked, root.value()),
-            );
-        }
-    }
-}
-fn mark_all_local_roots_live(
-    local_roots: &FxHashSet<ValueId>,
-    enum_aliases: EnumAliasContext<'_>,
-    live: &mut EnumLiveMap,
-) {
-    for &root in local_roots {
-        mark_root_live(
-            live,
-            root,
-            tracked_root_total_leaves(enum_aliases.tracked, root),
-        );
-    }
-}
-
-fn meet_enum_object_facts(states: impl Iterator<Item = EnumObjectFacts>) -> EnumObjectFacts {
+fn meet_enum_object_facts(states: impl Iterator<Item = EnumFlowState>) -> EnumFlowState {
     let mut states = states;
     let Some(mut out) = states.next() else {
-        return EnumObjectFacts::default();
+        return EnumFlowState::default();
     };
 
     for state in states {
-        out.retain(|object, fact| {
-            let Some(other) = state.get(object) else {
+        out.observations
+            .retain(|value, object| state.observations.get(value) == Some(object));
+        out.facts.retain(|object, fact| {
+            let Some(other) = state.facts.get(object) else {
                 return false;
             };
             let Some(merged) = meet_known_enum_object_state(fact, other) else {
@@ -1403,18 +981,18 @@ fn edge_enum_object_facts(
     func: &Function,
     pred: BlockId,
     succ: BlockId,
-    out_state: &EnumObjectFacts,
-    enum_aliases: EnumAliasContext<'_>,
-) -> EnumObjectFacts {
+    out_state: &EnumFlowState,
+) -> EnumFlowState {
     let mut edge_state = out_state.clone();
     let Some(term) = func.layout.last_inst_of(pred) else {
         return edge_state;
     };
 
     if let Some(br_table) = downcast::<&control_flow::BrTable>(func.inst_set(), func.dfg.inst(term))
-        && let Some((object, variant)) = br_table_edge_variant(func, br_table, succ, enum_aliases)
+        && let Some((object, variant)) =
+            br_table_edge_variant(func, br_table, succ, &out_state.observations)
     {
-        update_enum_assert_fact(func, &mut edge_state, object, variant);
+        update_known_enum_variant_fact(func, &mut edge_state.facts, object, variant);
         return edge_state;
     }
 
@@ -1425,10 +1003,9 @@ fn br_table_edge_variant(
     func: &Function,
     br_table: &control_flow::BrTable,
     succ: BlockId,
-    enum_aliases: EnumAliasContext<'_>,
+    observations: &FxHashMap<ValueId, ExactEnumSlice>,
 ) -> Option<(ExactEnumSlice, EnumVariantRef)> {
-    let enum_get_tag = enum_get_tag_of_value(func, *br_table.scrutinee())?;
-    let object = enum_aliases.exact_enum(func, *enum_get_tag.object())?;
+    let object = *observations.get(br_table.scrutinee())?;
     let Type::EnumTag(enum_ty) = func.dfg.value_ty(*br_table.scrutinee()) else {
         return None;
     };
@@ -1443,23 +1020,14 @@ fn br_table_edge_variant(
             matched.push(variant);
         }
     }
-    if matched.len() == 1 {
-        return Some((object, matched[0]));
+    if *br_table.default() == Some(succ) {
+        for variant in remaining_br_table_variants(func, enum_ty, br_table)? {
+            if !matched.contains(&variant) {
+                matched.push(variant);
+            }
+        }
     }
-    if !matched.is_empty() {
-        return None;
-    }
-
-    if *br_table.default() != Some(succ) {
-        return None;
-    }
-
-    let remaining = remaining_br_table_variants(func, enum_ty, br_table)?;
-    if remaining.len() == 1 {
-        Some((object, remaining[0]))
-    } else {
-        None
-    }
+    (matched.len() == 1).then(|| (object, matched[0]))
 }
 
 fn remaining_br_table_variants(
@@ -1503,143 +1071,78 @@ fn enum_variant_for_tag_value(
 fn transfer_enum_object_facts(
     func: &Function,
     inst: InstId,
-    enum_aliases: EnumAliasContext<'_>,
-    enum_facts: &mut EnumObjectFacts,
-    pending_enum_writes: &mut PendingEnumWrites,
+    aliases: EnumAliasContext<'_>,
+    state: &mut EnumFlowState,
 ) {
-    if let Some(enum_get_tag) = downcast::<&data::EnumGetTag>(func.inst_set(), func.dfg.inst(inst))
+    let effects = &aliases.effects[&inst];
+    let data = func.dfg.inst(inst);
+    let is = func.inst_set();
+    let tag = downcast::<&data::EnumSetTag>(is, data);
+    let write = downcast::<&data::EnumWriteVariant>(is, data);
+    let field_store = downcast::<&data::ObjStore>(is, data).and_then(|store| {
+        let (object, variant, field) = enum_field_of_value(func, *store.object())?;
+        Some((
+            aliases.exact_enum(func, object)?,
+            variant,
+            field,
+            *store.value(),
+        ))
+    });
+    let target = tag
+        .and_then(|tag| aliases.exact_enum(func, *tag.object()))
+        .or_else(|| write.and_then(|write| aliases.exact_enum(func, *write.object())))
+        .or_else(|| field_store.map(|(object, ..)| object));
+    let preserved = target.and_then(|target| {
+        state
+            .facts
+            .get(&target)
+            .cloned()
+            .map(|facts| (target, facts))
+    });
+    state.facts.retain(|object, _| {
+        !effects
+            .writes
+            .iter()
+            .chain(&effects.unreadable)
+            .any(|&write| aliases.accesses.may_overlap(write, object.slice()))
+    });
+    state.observations.retain(|_, object| {
+        let tag = enum_tag_object_slice(func.ctx(), object.slice()).expect("enum has a tag");
+        !effects
+            .writes
+            .iter()
+            .any(|&write| aliases.accesses.may_overlap(write, tag))
+            && !effects
+                .unreadable
+                .iter()
+                .any(|&write| aliases.accesses.may_overlap(write, object.slice()))
+    });
+    if let Some((object, facts)) = preserved {
+        state.facts.insert(object, facts);
+    }
+    if let Some(assertion) = downcast::<&data::EnumAssertVariantRef>(is, data)
+        && let Some(object) = aliases.exact_enum(func, *assertion.object())
     {
-        clear_pending_enum_writes_for_alias(
-            pending_enum_writes,
-            enum_aliases,
-            *enum_get_tag.object(),
-        );
-        return;
-    }
-
-    if let Some(enum_assert_ref) =
-        downcast::<&data::EnumAssertVariantRef>(func.inst_set(), func.dfg.inst(inst))
+        update_known_enum_variant_fact(func, &mut state.facts, object, *assertion.variant());
+    } else if let Some(tag) = tag
+        && let Some(object) = target
     {
-        clear_pending_enum_writes_for_alias(
-            pending_enum_writes,
-            enum_aliases,
-            *enum_assert_ref.object(),
-        );
-        if let Some(object) = enum_aliases.exact_enum(func, *enum_assert_ref.object()) {
-            update_enum_assert_fact(func, enum_facts, object, *enum_assert_ref.variant());
-        }
-        return;
-    }
-
-    if let Some(enum_proj) = downcast::<&data::EnumProj>(func.inst_set(), func.dfg.inst(inst)) {
-        clear_pending_enum_writes_for_alias(pending_enum_writes, enum_aliases, *enum_proj.object());
-        return;
-    }
-
-    if let Some(enum_set_tag) = downcast::<&data::EnumSetTag>(func.inst_set(), func.dfg.inst(inst))
+        update_known_enum_variant_fact(func, &mut state.facts, object, *tag.variant());
+    } else if let Some(write) = write
+        && let Some(object) = target
     {
-        if let Some(object) = enum_aliases.exact_enum(func, *enum_set_tag.object()) {
-            kill_overlapping_enum_state_except(enum_facts, pending_enum_writes, object);
-            pending_enum_writes.insert(
-                object,
-                PendingEnumWrite {
-                    inst,
-                    kind: PendingEnumWriteKind::SetTag,
-                    variant: *enum_set_tag.variant(),
-                },
-            );
-            update_enum_set_tag_fact(func, enum_facts, object, *enum_set_tag.variant());
-        } else {
-            kill_enum_state_for_alias(
-                enum_facts,
-                pending_enum_writes,
-                enum_aliases,
-                *enum_set_tag.object(),
-            );
-        }
-        return;
-    }
-
-    if let Some(enum_write_variant) =
-        downcast::<&data::EnumWriteVariant>(func.inst_set(), func.dfg.inst(inst))
+        update_enum_write_variant_fact(&mut state.facts, object, *write.variant(), write.values());
+    } else if let Some((object, variant, field, value)) = field_store {
+        update_enum_store_fact(&mut state.facts, object, variant, field, value);
+    } else if let Some(tag) = downcast::<&data::EnumGetTag>(is, data)
+        && let Some(object) = aliases.exact_enum(func, *tag.object())
+        && let Some(result) = func.dfg.inst_result(inst)
     {
-        if let Some(object) = enum_aliases.exact_enum(func, *enum_write_variant.object()) {
-            kill_overlapping_enum_state_except(enum_facts, pending_enum_writes, object);
-            pending_enum_writes.insert(
-                object,
-                PendingEnumWrite {
-                    inst,
-                    kind: PendingEnumWriteKind::WriteVariant,
-                    variant: *enum_write_variant.variant(),
-                },
-            );
-            update_enum_write_variant_fact(
-                enum_facts,
-                object,
-                *enum_write_variant.variant(),
-                enum_write_variant.values(),
-            );
-        } else {
-            kill_enum_state_for_alias(
-                enum_facts,
-                pending_enum_writes,
-                enum_aliases,
-                *enum_write_variant.object(),
-            );
-        }
-        return;
+        state.observations.insert(result, object);
     }
-
-    if let Some(obj_load) = downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
-        && let Some(enum_proj) = enum_proj_of_value(func, *obj_load.object())
-    {
-        clear_pending_enum_writes_for_alias(pending_enum_writes, enum_aliases, *enum_proj.object());
-        return;
-    }
-
-    if let Some(obj_store) = downcast::<&data::ObjStore>(func.inst_set(), func.dfg.inst(inst))
-        && let Some(enum_proj) = enum_proj_of_value(func, *obj_store.object())
-    {
-        if let Some(object) = enum_aliases.exact_enum(func, *enum_proj.object())
-            && let Some(field_idx) = inst_const_index(func, *enum_proj.field())
-        {
-            kill_overlapping_enum_state_except(enum_facts, pending_enum_writes, object);
-            update_enum_store_fact(
-                enum_facts,
-                object,
-                *enum_proj.variant(),
-                field_idx,
-                *obj_store.value(),
-            );
-        } else {
-            kill_enum_state_for_alias(
-                enum_facts,
-                pending_enum_writes,
-                enum_aliases,
-                *enum_proj.object(),
-            );
-        }
-        return;
-    }
-
-    kill_touched_enum_object_facts(func, inst, enum_aliases, enum_facts, pending_enum_writes);
 }
 
-fn update_enum_assert_fact(
-    func: &Function,
-    enum_facts: &mut EnumObjectFacts,
-    object: ExactEnumSlice,
-    variant: EnumVariantRef,
-) {
-    let payloads = enum_facts
-        .get(&object)
-        .filter(|state| state.variant == variant)
-        .map(|state| state.payloads.clone())
-        .unwrap_or_else(|| unknown_variant_payloads(func, variant));
-    enum_facts.insert(object, KnownEnumObjectState { variant, payloads });
-}
-
-fn update_enum_set_tag_fact(
+fn update_known_enum_variant_fact(
     func: &Function,
     enum_facts: &mut EnumObjectFacts,
     object: ExactEnumSlice,
@@ -1724,92 +1227,32 @@ fn unknown_variant_payloads(
 
 fn remove_dead_overwritten_enum_write(
     func: &mut Function,
-    pending_enum_writes: &mut PendingEnumWrites,
+    pending: &mut PendingEnumWrites,
     object: ExactEnumSlice,
-    next_kind: PendingEnumWriteKind,
-    next_variant: EnumVariantRef,
+    next: InstId,
+    aliases: EnumAliasContext<'_>,
 ) -> bool {
-    let Some(prev) = pending_enum_writes.remove(&object) else {
+    let Some(previous) = pending.remove(&object) else {
         return false;
     };
-    if !func.layout.is_inst_inserted(prev.inst) {
+    if !func.layout.is_inst_inserted(previous) {
         return false;
     }
-
-    let removable = prev.kind == PendingEnumWriteKind::SetTag
-        || (prev.kind == PendingEnumWriteKind::WriteVariant
-            && next_kind == PendingEnumWriteKind::WriteVariant
-            && prev.variant == next_variant);
-    if !removable {
-        pending_enum_writes.insert(object, prev);
+    let previous_effects = &aliases.effects[&previous];
+    let next_effects = &aliases.effects[&next];
+    if previous_effects.overwrites.is_empty()
+        || !previous_effects.overwrites.iter().all(|&old| {
+            let slice = aliases.accesses.write_slice(old);
+            next_effects
+                .overwrites
+                .iter()
+                .any(|&new| aliases.accesses.write_covers(new, slice))
+        })
+    {
         return false;
     }
-
-    InstInserter::at_location(CursorLocation::At(prev.inst)).remove_inst(func);
+    InstInserter::at_location(CursorLocation::At(previous)).remove_inst(func);
     true
-}
-
-fn kill_touched_enum_object_facts(
-    func: &Function,
-    inst: InstId,
-    enum_aliases: EnumAliasContext<'_>,
-    enum_facts: &mut EnumObjectFacts,
-    pending_enum_writes: &mut PendingEnumWrites,
-) {
-    if is_enum_state_passthrough_inst(func, inst) {
-        return;
-    }
-
-    let mut touched_slices = SmallVec::<[ExactObjectSlice; 4]>::new();
-    let mut touched_roots = SmallVec::<[RootValue; 4]>::new();
-    let mut saw_unknown = false;
-    for value in func.dfg.inst(inst).collect_values() {
-        append_touched_enum_object(
-            value,
-            enum_aliases,
-            &mut touched_slices,
-            &mut touched_roots,
-            &mut saw_unknown,
-        );
-    }
-
-    if saw_unknown {
-        enum_facts.clear();
-        pending_enum_writes.clear();
-        return;
-    }
-
-    for slice in touched_slices {
-        kill_overlapping_enum_state(enum_facts, pending_enum_writes, slice);
-    }
-    for root in touched_roots {
-        kill_root_enum_state(enum_facts, pending_enum_writes, root);
-    }
-}
-
-fn append_touched_enum_object(
-    value: ValueId,
-    enum_aliases: EnumAliasContext<'_>,
-    touched_slices: &mut SmallVec<[ExactObjectSlice; 4]>,
-    touched_roots: &mut SmallVec<[RootValue; 4]>,
-    saw_unknown: &mut bool,
-) {
-    match enum_aliases.observed(value) {
-        EnumAlias::Exact(slice) => {
-            if !touched_slices.contains(&slice) {
-                touched_slices.push(slice);
-            }
-        }
-        EnumAlias::Roots(roots) => {
-            for root in roots {
-                if !touched_roots.contains(&root) {
-                    touched_roots.push(root);
-                }
-            }
-        }
-        EnumAlias::Unknown => *saw_unknown = true,
-        EnumAlias::None => {}
-    }
 }
 
 fn is_enum_compound_ty(ctx: &sonatina_ir::module::ModuleCtx, ty: Type) -> bool {
@@ -1831,18 +1274,6 @@ fn enum_variant_count(
     ctx.with_ty_store(|store| store.enum_data(enum_ty).map(|data| data.variants.len()))
 }
 
-fn enum_variant_tag_imm(variant: EnumVariantRef) -> Immediate {
-    Immediate::EnumTag {
-        enum_ty: variant.enum_ty(),
-        value: I256::from(u64::from(variant.index())),
-    }
-}
-
-fn enum_get_tag_of_value(func: &Function, value: ValueId) -> Option<data::EnumGetTag> {
-    let inst = func.dfg.value_inst(value)?;
-    downcast::<&data::EnumGetTag>(func.inst_set(), func.dfg.inst(inst)).cloned()
-}
-
 fn enum_proj_of_value(func: &Function, value: ValueId) -> Option<data::EnumProj> {
     let inst = func.dfg.value_inst(value)?;
     downcast::<&data::EnumProj>(func.inst_set(), func.dfg.inst(inst)).cloned()
@@ -1852,7 +1283,7 @@ fn append_phi_at_block_top(
     func: &mut Function,
     block: BlockId,
     ty: Type,
-    args: Vec<(ValueId, BlockId)>,
+    args: control_flow::PhiArgs,
 ) -> ValueId {
     let phi = control_flow::Phi::new_unchecked(func.inst_set(), args);
     let mut cursor = InstInserter::at_location(CursorLocation::BlockTop(block));
@@ -1917,108 +1348,6 @@ fn is_explicit_undef(func: &Function, v: ValueId) -> bool {
     matches!(func.dfg.value(v), Value::Undef { .. })
 }
 
-fn compute_definitely_non_undef_aggregates(func: &Function) -> SecondaryMap<ValueId, bool> {
-    let mut definitely_non_undef = SecondaryMap::default();
-    for value in func.dfg.value_ids() {
-        let ty = func.dfg.value_ty(value);
-        if shape::is_supported_aggregate_ty(func.ctx(), ty) {
-            definitely_non_undef[value] = !is_explicit_undef(func, value);
-        }
-    }
-
-    loop {
-        let mut changed = false;
-        for value in func.dfg.value_ids() {
-            let ty = func.dfg.value_ty(value);
-            if !shape::is_supported_aggregate_ty(func.ctx(), ty) {
-                continue;
-            }
-
-            let next = aggregate_is_definitely_non_undef(func, value, &definitely_non_undef);
-            if definitely_non_undef[value] != next {
-                definitely_non_undef[value] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            return definitely_non_undef;
-        }
-    }
-}
-
-fn aggregate_is_definitely_non_undef(
-    func: &Function,
-    value: ValueId,
-    definitely_non_undef: &SecondaryMap<ValueId, bool>,
-) -> bool {
-    if is_explicit_undef(func, value) {
-        return false;
-    }
-
-    let ty = func.dfg.value_ty(value);
-    let Some(inst) = func.dfg.value_inst(value) else {
-        return true;
-    };
-
-    if let Some(insert) = downcast::<&data::InsertValue>(func.inst_set(), func.dfg.inst(inst)) {
-        if value_is_definitely_non_undef(func, *insert.dest(), definitely_non_undef) {
-            return true;
-        }
-
-        let Some(field_count) = shape::aggregate_child_count(func.ctx(), ty) else {
-            return false;
-        };
-        let Some(assignments) = collect_insert_assignments(func, value) else {
-            return false;
-        };
-        return assignments.len() == field_count
-            && (0..field_count).all(|idx| {
-                let Some(idx_u32) = u32::try_from(idx).ok() else {
-                    return false;
-                };
-                let Some(field) = assignments.get(&idx_u32).copied() else {
-                    return false;
-                };
-                let Some(field_ty) = shape::aggregate_child_ty(func.ctx(), ty, idx_u32) else {
-                    return false;
-                };
-                func.dfg.value_ty(field) == field_ty
-                    && value_is_definitely_non_undef(func, field, definitely_non_undef)
-            });
-    }
-
-    if let Some(phi) = downcast::<&control_flow::Phi>(func.inst_set(), func.dfg.inst(inst)) {
-        return phi.args().iter().any(|&(arg, _)| arg != value)
-            && phi.args().iter().all(|&(arg, _)| {
-                func.dfg.value_ty(arg) == ty
-                    && value_is_definitely_non_undef(func, arg, definitely_non_undef)
-            });
-    }
-
-    if let Some(extract) = downcast::<&data::ExtractValue>(func.inst_set(), func.dfg.inst(inst)) {
-        return value_is_definitely_non_undef(func, *extract.dest(), definitely_non_undef);
-    }
-
-    if let Some(bitcast) = downcast::<&cast::Bitcast>(func.inst_set(), func.dfg.inst(inst)) {
-        return value_is_definitely_non_undef(func, *bitcast.from(), definitely_non_undef);
-    }
-
-    false
-}
-
-fn value_is_definitely_non_undef(
-    func: &Function,
-    value: ValueId,
-    definitely_non_undef: &SecondaryMap<ValueId, bool>,
-) -> bool {
-    let ty = func.dfg.value_ty(value);
-    if shape::is_supported_aggregate_ty(func.ctx(), ty) {
-        definitely_non_undef[value]
-    } else {
-        !is_explicit_undef(func, value)
-    }
-}
-
 fn is_identical_field_reinsert(
     func: &Function,
     insert: &data::InsertValue,
@@ -2077,118 +1406,11 @@ fn walk_insert_chain_for_field(
     walk_insert_chain_for_field(func, *insert.dest(), target_idx)
 }
 
-fn try_reconstruct_original_aggregate(func: &Function, value: ValueId) -> Option<ValueId> {
-    let agg_ty = func.dfg.value_ty(value);
-    let field_count = shape::aggregate_child_count(func.ctx(), agg_ty)?;
-    if field_count == 0 {
-        return None;
-    }
-
-    let assignments = collect_insert_assignments(func, value)?;
-    if assignments.len() != field_count {
-        return None;
-    }
-
-    let mut source: Option<ValueId> = None;
-    for idx in 0..field_count {
-        let idx_u32 = u32::try_from(idx).ok()?;
-        let field_val = *assignments.get(&idx_u32)?;
-        let mut path = vec![idx_u32];
-        let field_source = source_for_path_value(func, field_val, &mut path)?;
-        if source.is_none() {
-            source = Some(field_source);
-        } else if source != Some(field_source) {
-            return None;
-        }
-    }
-
-    let source = source?;
-    (!is_explicit_undef(func, source) && func.dfg.value_ty(source) == agg_ty).then_some(source)
-}
-
-fn collect_insert_assignments(func: &Function, value: ValueId) -> Option<FxHashMap<u32, ValueId>> {
-    let mut assignments: FxHashMap<u32, ValueId> = FxHashMap::default();
-    let mut current = value;
-    while let Some(inst) = func.dfg.value_inst(current) {
-        let Some(insert) = downcast::<&data::InsertValue>(func.inst_set(), func.dfg.inst(inst))
-        else {
-            break;
-        };
-        let idx = inst_const_index(func, *insert.idx())?;
-        assignments.entry(idx).or_insert(*insert.value());
-        current = *insert.dest();
-    }
-    Some(assignments)
-}
-
-fn source_for_path_value(func: &Function, value: ValueId, path: &mut Vec<u32>) -> Option<ValueId> {
-    if let Some(source) = extract_chain_source(func, value, path) {
-        return Some(source);
-    }
-
-    let value_ty = func.dfg.value_ty(value);
-    let child_count = shape::aggregate_child_count(func.ctx(), value_ty)?;
-    if child_count == 0 {
-        return None;
-    }
-
-    let assignments = collect_insert_assignments(func, value)?;
-    if assignments.len() != child_count {
-        return None;
-    }
-
-    let mut source: Option<ValueId> = None;
-    for idx in 0..child_count {
-        let idx_u32 = u32::try_from(idx).ok()?;
-        let field_val = *assignments.get(&idx_u32)?;
-        path.push(idx_u32);
-        let field_source = source_for_path_value(func, field_val, path)?;
-        path.pop();
-        if source.is_none() {
-            source = Some(field_source);
-        } else if source != Some(field_source) {
-            return None;
-        }
-    }
-
-    source
-}
-
-fn extract_chain_source(func: &Function, mut value: ValueId, path: &[u32]) -> Option<ValueId> {
-    for &idx in path.iter().rev() {
-        let inst = func.dfg.value_inst(value)?;
-        let extract = downcast::<&data::ExtractValue>(func.inst_set(), func.dfg.inst(inst))?;
-        if inst_const_index(func, *extract.idx()) != Some(idx) {
-            return None;
-        }
-        value = *extract.dest();
-    }
-    Some(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sonatina_ir::{Module, inst::control_flow, ir_writer::FuncWriter, module::FuncRef};
-    use sonatina_parser::parse_module;
-
-    fn parse_test_module(src: &str) -> Module {
-        parse_module(src).expect("parse should succeed").module
-    }
-
-    fn lookup_func(module: &Module, name: &str) -> FuncRef {
-        module
-            .funcs()
-            .into_iter()
-            .find(|&func_ref| module.ctx.func_sig(func_ref, |sig| sig.name() == name))
-            .expect("function should exist")
-    }
-
-    fn dump_func(module: &Module, func_ref: FuncRef) -> String {
-        module.func_store.view(func_ref, |func| {
-            FuncWriter::new(func_ref, func).dump_string()
-        })
-    }
+    use crate::test_support::{dump_func, lookup_func, parse_test_module};
+    use sonatina_ir::inst::control_flow;
 
     #[test]
     fn combine_rewrites_extracts_through_compatible_aggregate_bitcasts() {

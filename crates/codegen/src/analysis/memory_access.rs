@@ -1,34 +1,37 @@
-use std::hash::{Hash, Hasher};
+use std::ops::ControlFlow;
 
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use sonatina_ir::{
-    AccessLoc, AddressSpaceId, Function, GlobalVariableRef, I256, Immediate, InstDowncast, InstId,
-    Type, Value, ValueId,
+    AccessKind, AccessLoc, AddressSpaceId, Function, GlobalVariableRef, I256, Immediate,
+    InstDowncast, InstId, Type, Value, ValueId,
     inst::{
         arith::{Add, Sub},
         cast::{Bitcast, IntToPtr, PtrToInt},
         control_flow::Phi,
         data::{Alloca, Gep},
-        equiv::{InstClassKind, InstKeyExt},
-        evm::EvmMalloc,
+        equiv::{InstClassKind, InstKeyExt, OwnedInstKey},
+        evm::{EvmKeccak256Words, EvmMalloc},
     },
     types::CompoundType,
 };
 
 use crate::{isa::evm::STATIC_BASE, transform::aggregate::shape};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum ValueKey {
-    Imm(Immediate),
-    // Exact keyed forwarding is only sound for runtime-invariant leaves. Raw SSA identities are
-    // not stable enough across loop backedges or merged control flow, so the only symbolic leaf
-    // we preserve directly is a formal argument.
-    Arg(ValueId),
-    Expr(Box<KeyExpr>),
-}
+/// A key: a handle to a node interned by `MemoryAccessAnalysis`. Structurally equal keys are
+/// one handle, so a key is copied, hashed and compared in constant time, and an expression the
+/// IR shares is stored once however often it is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ValueKey(u32);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum KeyExpr {
+pub enum KeyNode {
+    Imm(Immediate),
+    // Exact keyed forwarding is only sound for runtime-invariant leaves. Raw SSA identities are
+    // not stable enough across loop backedges or merged control flow: a later store to the same
+    // name in the next iteration is a store to another slot. The symbolic leaves are formal
+    // arguments and reads of immutable spaces (`KeyNode::ImmutableRead`).
+    Arg(ValueId),
     Unary {
         opcode: &'static str,
         result_idx: u16,
@@ -48,6 +51,18 @@ pub enum KeyExpr {
         result_idx: u16,
         ty: Type,
         arg: ValueKey,
+    },
+    /// A read of a space nothing writes, such as calldata or code, at an invariant location: it
+    /// yields the same value everywhere in a function.
+    ImmutableRead {
+        space: AddressSpaceId,
+        addr: ValueKey,
+        bytes: u32,
+        ty: Type,
+    },
+    /// `evm_keccak256_words`, a value of its words alone.
+    Keccak256Words {
+        words: SmallVec<[ValueKey; 2]>,
     },
 }
 
@@ -70,12 +85,29 @@ pub struct LinearLocKey {
     pub ty: Type,
 }
 
+impl LinearLocKey {
+    pub fn range(&self) -> LinearRangeKey {
+        LinearRangeKey {
+            space: self.space,
+            base: self.base.clone(),
+            offset: self.offset,
+            bytes: i64::from(self.bytes),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LinearRangeKey {
     pub space: AddressSpaceId,
     pub base: BaseObject,
     pub offset: i64,
     pub bytes: i64,
+}
+
+impl LinearRangeKey {
+    pub fn absolute_interval(&self) -> Option<(i64, i64)> {
+        absolute_byte_range(&self.base, self.offset, self.bytes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +134,15 @@ pub enum TrackedLocKey {
     Keyed(KeyedLocKey),
 }
 
+impl TrackedLocKey {
+    pub fn space(&self) -> AddressSpaceId {
+        match self {
+            TrackedLocKey::Linear(key) => key.space,
+            TrackedLocKey::Keyed(key) => key.space,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasResult {
     NoAlias,
@@ -110,9 +151,9 @@ pub enum AliasResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CanonicalAddr {
-    base: BaseObject,
-    offset: i64,
+pub(crate) struct CanonicalAddr {
+    pub(crate) base: BaseObject,
+    pub(crate) offset: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,9 +162,23 @@ pub struct ExactLocalAddr {
     pub offset_bytes: i64,
 }
 
+/// How a value's canonical address derives from the address of the operand being resolved.
+enum AddrFrame {
+    /// The operand's address, displaced by a constant byte offset.
+    Offset(i64),
+    /// The address all phi operands share, or unknown if they differ. `first` is the first
+    /// operand's address once resolved; `rest` holds the operands still to resolve, last first.
+    Phi {
+        first: Option<CanonicalAddr>,
+        rest: SmallVec<[ValueId; 4]>,
+    },
+}
+
 pub struct MemoryAccessAnalysis {
     canonical_addrs: FxHashMap<ValueId, CanonicalAddr>,
     value_keys: FxHashMap<ValueId, Option<ValueKey>>,
+    key_nodes: Vec<KeyNode>,
+    key_ids: FxHashMap<KeyNode, ValueKey>,
 }
 
 impl MemoryAccessAnalysis {
@@ -131,12 +186,55 @@ impl MemoryAccessAnalysis {
         Self {
             canonical_addrs: FxHashMap::default(),
             value_keys: FxHashMap::default(),
+            key_nodes: Vec::new(),
+            key_ids: FxHashMap::default(),
         }
     }
 
+    /// Forgets what values map to, which an IR rewrite can change. Interned keys stay: the
+    /// dataflow states of a pass hold them across rewrites.
     pub fn clear(&mut self) {
         self.canonical_addrs.clear();
         self.value_keys.clear();
+    }
+
+    pub fn key_node(&self, key: ValueKey) -> &KeyNode {
+        &self.key_nodes[key.0 as usize]
+    }
+
+    /// Whether every argument `key` is built from still exists.
+    pub fn key_is_live(&self, func: &Function, key: ValueKey) -> bool {
+        let mut stack = vec![key];
+        let mut seen = FxHashSet::default();
+        while let Some(key) = stack.pop() {
+            if !seen.insert(key) {
+                continue;
+            }
+            match self.key_node(key) {
+                KeyNode::Imm(_) => {}
+                KeyNode::Arg(value) => {
+                    if !func.dfg.has_value(*value) {
+                        return false;
+                    }
+                }
+                KeyNode::Unary { arg, .. }
+                | KeyNode::Cast { arg, .. }
+                | KeyNode::ImmutableRead { addr: arg, .. } => stack.push(*arg),
+                KeyNode::Binary { lhs, rhs, .. } => stack.extend([*lhs, *rhs]),
+                KeyNode::Keccak256Words { words } => stack.extend(words.iter().copied()),
+            }
+        }
+        true
+    }
+
+    fn intern(&mut self, node: KeyNode) -> ValueKey {
+        if let Some(&key) = self.key_ids.get(&node) {
+            return key;
+        }
+        let key = ValueKey(u32::try_from(self.key_nodes.len()).expect("too many keys"));
+        self.key_nodes.push(node.clone());
+        self.key_ids.insert(node, key);
+        key
     }
 
     pub fn trackable_exact_loc(
@@ -214,9 +312,13 @@ impl MemoryAccessAnalysis {
 
     pub fn range_may_alias_key(&self, range: &LinearRangeKey, key: &TrackedLocKey) -> bool {
         match key {
-            TrackedLocKey::Linear(key) => self.range_may_alias_linear(range, key),
+            TrackedLocKey::Linear(key) => self.ranges_may_alias(range, &key.range()),
             TrackedLocKey::Keyed(_) => false,
         }
+    }
+
+    pub fn ranges_may_alias(&self, lhs: &LinearRangeKey, rhs: &LinearRangeKey) -> bool {
+        self.write_coverage(lhs, rhs) != RangeCoverage::NoOverlap
     }
 
     pub fn access_may_alias_key(
@@ -225,12 +327,7 @@ impl MemoryAccessAnalysis {
         access: &sonatina_ir::MemoryAccess,
         key: &TrackedLocKey,
     ) -> bool {
-        if access.space
-            != match key {
-                TrackedLocKey::Linear(key) => key.space,
-                TrackedLocKey::Keyed(key) => key.space,
-            }
-        {
+        if access.space != key.space() {
             return false;
         }
 
@@ -253,6 +350,18 @@ impl MemoryAccessAnalysis {
             ) => self
                 .trackable_exact_loc(func, access)
                 .is_none_or(|other| self.alias(key, &other) != AliasResult::NoAlias),
+        }
+    }
+
+    pub(crate) fn exact_malloc_addr(
+        &mut self,
+        func: &Function,
+        value: ValueId,
+    ) -> Option<(InstId, i64)> {
+        let canonical = self.canonical_linear_addr(func, value);
+        match canonical.base {
+            BaseObject::Malloc(root) => Some((root, canonical.offset)),
+            _ => None,
         }
     }
 
@@ -321,63 +430,55 @@ impl MemoryAccessAnalysis {
             return AliasResult::MustAlias;
         }
 
-        match (&lhs.key, &rhs.key) {
-            (ValueKey::Imm(lhs), ValueKey::Imm(rhs)) if lhs != rhs => AliasResult::NoAlias,
+        match (self.key_node(lhs.key), self.key_node(rhs.key)) {
+            (KeyNode::Imm(lhs), KeyNode::Imm(rhs)) if lhs != rhs => AliasResult::NoAlias,
             _ => AliasResult::MayAlias,
         }
     }
 
-    fn range_may_alias_linear(&self, range: &LinearRangeKey, key: &LinearLocKey) -> bool {
-        !matches!(
-            self.exact_write_coverage(range, key),
-            RangeCoverage::NoOverlap
-        )
-    }
-
-    pub fn exact_write_coverage(
-        &self,
-        range: &LinearRangeKey,
-        key: &LinearLocKey,
-    ) -> RangeCoverage {
-        if range.space != key.space || range.bytes == 0 || key.bytes == 0 {
+    /// How much of `range` a write of all of `write` overwrites.
+    pub fn write_coverage(&self, range: &LinearRangeKey, write: &LinearRangeKey) -> RangeCoverage {
+        if range.space != write.space || range.bytes == 0 || write.bytes == 0 {
             return RangeCoverage::NoOverlap;
         }
 
-        if let Some(((range_start, range_end), (key_start, key_end))) =
-            absolute_byte_range(&range.base, range.offset, range.bytes).zip(absolute_byte_range(
-                &key.base,
-                key.offset,
-                i64::from(key.bytes),
-            ))
+        if let Some(((range_start, range_end), (write_start, write_end))) =
+            range.absolute_interval().zip(write.absolute_interval())
         {
-            return self.coverage_from_intervals(range, range_start, range_end, key_start, key_end);
+            return self.coverage_from_intervals(
+                range,
+                range_start,
+                range_end,
+                write_start,
+                write_end,
+            );
         }
 
         if reserved_meta_shortcut_applies(
             &range.base,
             range.offset,
             range.bytes,
-            &key.base,
-            key.offset,
-            i64::from(key.bytes),
+            &write.base,
+            write.offset,
+            write.bytes,
         ) {
             return RangeCoverage::NoOverlap;
         }
 
-        match self.alias_linear_bases(&range.base, &key.base) {
+        match self.alias_linear_bases(&range.base, &write.base) {
             AliasResult::NoAlias => RangeCoverage::NoOverlap,
             AliasResult::MayAlias => RangeCoverage::Unknown,
             AliasResult::MustAlias => range
                 .offset
                 .checked_add(range.bytes)
-                .zip(key.offset.checked_add(i64::from(key.bytes)))
-                .map_or(RangeCoverage::Unknown, |(range_end, key_end)| {
+                .zip(write.offset.checked_add(write.bytes))
+                .map_or(RangeCoverage::Unknown, |(range_end, write_end)| {
                     self.coverage_from_intervals(
                         range,
                         range.offset,
                         range_end,
-                        key.offset,
-                        key_end,
+                        write.offset,
+                        write_end,
                     )
                 }),
         }
@@ -458,136 +559,162 @@ impl MemoryAccessAnalysis {
         }
     }
 
-    fn canonical_linear_addr(&mut self, func: &Function, addr: ValueId) -> CanonicalAddr {
-        self.canonical_linear_addr_rec(func, addr, &mut FxHashSet::default())
-    }
-
-    fn canonical_linear_addr_rec(
+    pub(crate) fn canonical_linear_addr(
         &mut self,
         func: &Function,
         addr: ValueId,
-        visiting: &mut FxHashSet<ValueId>,
     ) -> CanonicalAddr {
-        if let Some(canonical) = self.canonical_addrs.get(&addr) {
-            return canonical.clone();
-        }
+        // A depth-first walk over the values each address is derived from. Address chains through
+        // phis and arithmetic can be arbitrarily long, so pending values live on an explicit stack
+        // rather than the call stack. A value reached again while it is still being resolved is on
+        // a cycle, and its address is unknown.
+        let mut visiting = FxHashSet::default();
+        let mut frames: Vec<(ValueId, AddrFrame)> = Vec::new();
+        let mut next = addr;
+        loop {
+            let mut canonical = if let Some(canonical) = self.canonical_addrs.get(&next) {
+                canonical.clone()
+            } else if !visiting.insert(next) {
+                CanonicalAddr::unknown(next)
+            } else {
+                match self.canonical_addr_step(func, next) {
+                    ControlFlow::Break(canonical) => {
+                        visiting.remove(&next);
+                        self.canonical_addrs.insert(next, canonical.clone());
+                        canonical
+                    }
+                    ControlFlow::Continue((operand, frame)) => {
+                        frames.push((next, frame));
+                        next = operand;
+                        continue;
+                    }
+                }
+            };
 
-        if !visiting.insert(addr) {
-            return CanonicalAddr::unknown(addr);
-        }
-
-        let canonical = match func.dfg.get_value(addr) {
-            Some(Value::Immediate { imm, .. }) => CanonicalAddr {
-                base: BaseObject::Absolute(*imm),
-                offset: 0,
-            },
-            Some(Value::Global { gv, .. }) => CanonicalAddr {
-                base: BaseObject::Global(*gv),
-                offset: 0,
-            },
-            Some(Value::Arg { .. }) => CanonicalAddr {
-                base: BaseObject::Arg(addr),
-                offset: 0,
-            },
-            Some(Value::Inst { inst, .. }) => {
-                self.canonical_addr_from_inst(func, addr, *inst, visiting)
+            // Hand the resolved address to the values waiting on it.
+            loop {
+                let Some((value, frame)) = frames.last_mut() else {
+                    return canonical;
+                };
+                let value = *value;
+                let resolved = match frame {
+                    AddrFrame::Offset(offset) => canonical
+                        .with_offset(*offset)
+                        .unwrap_or_else(|| CanonicalAddr::unknown(value)),
+                    AddrFrame::Phi { first, rest } => {
+                        if first.as_ref().is_some_and(|first| *first != canonical) {
+                            CanonicalAddr::unknown(value)
+                        } else if let Some(operand) = rest.pop() {
+                            first.get_or_insert(canonical);
+                            next = operand;
+                            break;
+                        } else {
+                            first.take().unwrap_or(canonical)
+                        }
+                    }
+                };
+                frames.pop();
+                visiting.remove(&value);
+                self.canonical_addrs.insert(value, resolved.clone());
+                canonical = resolved;
             }
-            Some(Value::Undef { .. }) | None => CanonicalAddr::unknown(addr),
-        };
-
-        visiting.remove(&addr);
-        self.canonical_addrs.insert(addr, canonical.clone());
-        canonical
+        }
     }
 
-    fn canonical_addr_from_inst(
-        &mut self,
+    /// Resolves `value`'s canonical address directly, or continues with the operand the address
+    /// derives from.
+    fn canonical_addr_step(
+        &self,
         func: &Function,
         value: ValueId,
-        inst: InstId,
-        visiting: &mut FxHashSet<ValueId>,
-    ) -> CanonicalAddr {
+    ) -> ControlFlow<CanonicalAddr, (ValueId, AddrFrame)> {
+        let inst = match func.dfg.get_value(value) {
+            Some(Value::Immediate { imm, .. }) => {
+                return ControlFlow::Break(CanonicalAddr {
+                    base: BaseObject::Absolute(*imm),
+                    offset: 0,
+                });
+            }
+            Some(Value::Global { gv, .. }) => {
+                return ControlFlow::Break(CanonicalAddr {
+                    base: BaseObject::Global(*gv),
+                    offset: 0,
+                });
+            }
+            Some(Value::Arg { .. }) => {
+                return ControlFlow::Break(CanonicalAddr {
+                    base: BaseObject::Arg(value),
+                    offset: 0,
+                });
+            }
+            Some(Value::Inst { inst, .. }) => *inst,
+            Some(Value::Undef { .. }) | None => {
+                return ControlFlow::Break(CanonicalAddr::unknown(value));
+            }
+        };
         let inst_data = func.dfg.inst(inst);
         let is = func.inst_set();
 
         if <&Alloca as InstDowncast>::downcast(is, inst_data).is_some() {
-            return CanonicalAddr {
+            return ControlFlow::Break(CanonicalAddr {
                 base: BaseObject::Alloca(inst),
                 offset: 0,
-            };
+            });
         }
 
         if <&EvmMalloc as InstDowncast>::downcast(is, inst_data).is_some() {
-            return CanonicalAddr {
+            return ControlFlow::Break(CanonicalAddr {
                 base: BaseObject::Malloc(inst),
                 offset: 0,
-            };
+            });
         }
 
-        if let Some(gep) = <&Gep as InstDowncast>::downcast(is, inst_data) {
-            let Some((&base, indices)) = gep.values().split_first() else {
-                return CanonicalAddr::unknown(value);
-            };
-            let Some(offset) = self.const_gep_offset(func, base, indices) else {
-                return CanonicalAddr::unknown(value);
-            };
-            let base = self.canonical_linear_addr_rec(func, base, visiting);
-            return base
-                .with_offset(offset)
-                .unwrap_or_else(|| CanonicalAddr::unknown(value));
+        if let Some(gep) = <&Gep as InstDowncast>::downcast(is, inst_data)
+            && let Some((&base, indices)) = gep.values().split_first()
+            && let Some(offset) = self.const_gep_offset(func, base, indices)
+        {
+            return ControlFlow::Continue((base, AddrFrame::Offset(offset)));
         }
 
         if let Some(bitcast) = <&Bitcast as InstDowncast>::downcast(is, inst_data) {
-            return self.canonical_linear_addr_rec(func, *bitcast.from(), visiting);
+            return ControlFlow::Continue((*bitcast.from(), AddrFrame::Offset(0)));
         }
 
         if let Some(int_to_ptr) = <&IntToPtr as InstDowncast>::downcast(is, inst_data) {
-            return self.canonical_linear_addr_rec(func, *int_to_ptr.from(), visiting);
+            return ControlFlow::Continue((*int_to_ptr.from(), AddrFrame::Offset(0)));
         }
 
         if let Some(ptr_to_int) = <&PtrToInt as InstDowncast>::downcast(is, inst_data) {
-            return self.canonical_linear_addr_rec(func, *ptr_to_int.from(), visiting);
+            return ControlFlow::Continue((*ptr_to_int.from(), AddrFrame::Offset(0)));
         }
 
         if let Some(add) = <&Add as InstDowncast>::downcast(is, inst_data) {
             if let Some(offset) = self.value_const_i64(func, *add.rhs()) {
-                return self
-                    .canonical_linear_addr_rec(func, *add.lhs(), visiting)
-                    .with_offset(offset)
-                    .unwrap_or_else(|| CanonicalAddr::unknown(value));
+                return ControlFlow::Continue((*add.lhs(), AddrFrame::Offset(offset)));
             }
             if let Some(offset) = self.value_const_i64(func, *add.lhs()) {
-                return self
-                    .canonical_linear_addr_rec(func, *add.rhs(), visiting)
-                    .with_offset(offset)
-                    .unwrap_or_else(|| CanonicalAddr::unknown(value));
+                return ControlFlow::Continue((*add.rhs(), AddrFrame::Offset(offset)));
             }
-            return CanonicalAddr::unknown(value);
         }
 
-        if let Some(sub) = <&Sub as InstDowncast>::downcast(is, inst_data) {
-            if let Some(offset) = self.value_const_i64(func, *sub.rhs()) {
-                return self
-                    .canonical_linear_addr_rec(func, *sub.lhs(), visiting)
-                    .with_offset(-offset)
-                    .unwrap_or_else(|| CanonicalAddr::unknown(value));
-            }
-            return CanonicalAddr::unknown(value);
+        // A representable operand can have an unrepresentable negation. Such displacements must
+        // remain unknown to the address analysis.
+        if let Some(sub) = <&Sub as InstDowncast>::downcast(is, inst_data)
+            && let Some(offset) = self
+                .value_const_i64(func, *sub.rhs())
+                .and_then(i64::checked_neg)
+        {
+            return ControlFlow::Continue((*sub.lhs(), AddrFrame::Offset(offset)));
         }
 
-        if let Some(phi) = <&Phi as InstDowncast>::downcast(is, inst_data) {
-            let mut args = phi.args().iter().map(|(value, _)| *value);
-            let Some(first) = args.next() else {
-                return CanonicalAddr::unknown(value);
-            };
-            let first = self.canonical_linear_addr_rec(func, first, visiting);
-            if args.all(|arg| self.canonical_linear_addr_rec(func, arg, visiting) == first) {
-                return first;
-            }
-            return CanonicalAddr::unknown(value);
+        if let Some(phi) = <&Phi as InstDowncast>::downcast(is, inst_data)
+            && let Some((&(first, _), rest)) = phi.args().split_first()
+        {
+            let rest = rest.iter().rev().map(|&(arg, _)| arg).collect();
+            return ControlFlow::Continue((first, AddrFrame::Phi { first: None, rest }));
         }
 
-        CanonicalAddr::unknown(value)
+        ControlFlow::Break(CanonicalAddr::unknown(value))
     }
 
     fn trackable_value_key(&mut self, func: &Function, value: ValueId) -> Option<ValueKey> {
@@ -600,8 +727,8 @@ impl MemoryAccessAnalysis {
         value: ValueId,
         visiting: &mut FxHashSet<ValueId>,
     ) -> Option<ValueKey> {
-        if let Some(key) = self.value_keys.get(&value) {
-            return key.clone();
+        if let Some(&key) = self.value_keys.get(&value) {
+            return key;
         }
 
         if !visiting.insert(value) {
@@ -612,8 +739,8 @@ impl MemoryAccessAnalysis {
         // out of exact keyed forwarding. Structural expression equality is not enough once phi
         // nodes or loop-carried values can vary across executions.
         let key = match func.dfg.get_value(value) {
-            Some(Value::Immediate { imm, .. }) => Some(ValueKey::Imm(*imm)),
-            Some(Value::Arg { .. }) => Some(ValueKey::Arg(value)),
+            Some(Value::Immediate { imm, .. }) => Some(self.intern(KeyNode::Imm(*imm))),
+            Some(Value::Arg { .. }) => Some(self.intern(KeyNode::Arg(value))),
             Some(Value::Inst {
                 inst,
                 result_idx,
@@ -623,7 +750,7 @@ impl MemoryAccessAnalysis {
         };
 
         visiting.remove(&value);
-        self.value_keys.insert(value, key.clone());
+        self.value_keys.insert(value, key);
         key
     }
 
@@ -653,40 +780,38 @@ impl MemoryAccessAnalysis {
                 let arg = key
                     .unary_arg()
                     .and_then(|arg| self.trackable_value_key_rec(func, arg, visiting))?;
-                Some(ValueKey::Expr(Box::new(KeyExpr::Unary {
+                Some(self.intern(KeyNode::Unary {
                     opcode: key.opcode_text(),
                     result_idx,
                     ty,
                     arg,
-                })))
+                }))
             }
             InstClassKind::Binary(_) => {
                 let (lhs, rhs) = key.binary_args()?;
                 let mut lhs = self.trackable_value_key_rec(func, lhs, visiting)?;
                 let mut rhs = self.trackable_value_key_rec(func, rhs, visiting)?;
-                if key.is_commutative_binary()
-                    && value_key_fingerprint(&rhs) < value_key_fingerprint(&lhs)
-                {
+                if key.is_commutative_binary() && rhs < lhs {
                     std::mem::swap(&mut lhs, &mut rhs);
                 }
-                Some(ValueKey::Expr(Box::new(KeyExpr::Binary {
+                Some(self.intern(KeyNode::Binary {
                     opcode: key.opcode_text(),
                     result_idx,
                     ty,
                     extra_ty: key.extra_ty(),
                     lhs,
                     rhs,
-                })))
+                }))
             }
             InstClassKind::Cast(_) => {
                 let (arg, _) = key.cast_arg_ty()?;
                 let arg = self.trackable_value_key_rec(func, arg, visiting)?;
-                Some(ValueKey::Expr(Box::new(KeyExpr::Cast {
+                Some(self.intern(KeyNode::Cast {
                     opcode: key.opcode_text(),
                     result_idx,
                     ty,
                     arg,
-                })))
+                }))
             }
             InstClassKind::Phi => {
                 let phi_args = key.phi_args()?;
@@ -694,14 +819,67 @@ impl MemoryAccessAnalysis {
                     .iter()
                     .map(|(arg, _)| self.trackable_value_key_rec(func, *arg, visiting));
                 let first = args.next().flatten()?;
-                if args.all(|arg| arg.as_ref() == Some(&first)) {
+                if args.all(|arg| arg == Some(first)) {
                     Some(first)
                 } else {
                     None
                 }
             }
-            InstClassKind::Opaque => None,
+            InstClassKind::Opaque => self.opaque_value_key(func, inst, &key, visiting),
         }
+    }
+
+    /// The key of a single-result opaque instruction whose operands determine its result within
+    /// a function: a word hash, or a must-happen exact read of an immutable space.
+    fn opaque_value_key(
+        &mut self,
+        func: &Function,
+        inst: InstId,
+        key: &OwnedInstKey,
+        visiting: &mut FxHashSet<ValueId>,
+    ) -> Option<ValueKey> {
+        if key.result_tys().len() != 1 {
+            return None;
+        }
+        if <&EvmKeccak256Words as InstDowncast>::downcast(func.inst_set(), func.dfg.inst(inst))
+            .is_some()
+        {
+            let words = key
+                .values()
+                .iter()
+                .map(|&word| self.trackable_value_key_rec(func, word, visiting))
+                .collect::<Option<_>>()?;
+            return Some(self.intern(KeyNode::Keccak256Words { words }));
+        }
+
+        let effects = func.dfg.effects(inst);
+        let [access] = effects.accesses.as_slice() else {
+            return None;
+        };
+        if !effects.other.is_empty()
+            || access.kind != AccessKind::Read
+            || !access.must_happen
+            || !func.ctx().address_spaces().desc(access.space).immutable
+        {
+            return None;
+        }
+        let (addr, bytes, ty) = match access.loc {
+            AccessLoc::LinearExact { addr, bytes, ty } => (
+                self.trackable_value_key_rec(func, addr, visiting)?,
+                bytes,
+                ty,
+            ),
+            AccessLoc::LinearExactImm { addr, bytes, ty } => {
+                (self.intern(KeyNode::Imm(addr)), bytes, ty)
+            }
+            _ => return None,
+        };
+        Some(self.intern(KeyNode::ImmutableRead {
+            space: access.space,
+            addr,
+            bytes,
+            ty,
+        }))
     }
 
     fn const_gep_offset(&self, func: &Function, base: ValueId, indices: &[ValueId]) -> Option<i64> {
@@ -770,7 +948,11 @@ impl CanonicalAddr {
     }
 }
 
-fn absolute_byte_range(base: &BaseObject, offset: i64, bytes: i64) -> Option<(i64, i64)> {
+pub(crate) fn absolute_byte_range(
+    base: &BaseObject,
+    offset: i64,
+    bytes: i64,
+) -> Option<(i64, i64)> {
     let BaseObject::Absolute(base) = base else {
         return None;
     };
@@ -829,12 +1011,6 @@ fn byte_ranges_overlap(lhs_start: i64, lhs_end: i64, rhs_start: i64, rhs_end: i6
     lhs_start < rhs_end && rhs_start < lhs_end
 }
 
-fn value_key_fingerprint(key: &ValueKey) -> u64 {
-    let mut hasher = FxHasher::default();
-    key.hash(&mut hasher);
-    hasher.finish()
-}
-
 fn immediate_i64(imm: Immediate) -> Option<i64> {
     let value = imm.as_i256();
     if value < I256::from(i64::MIN) || value > I256::from(i64::MAX) {
@@ -862,17 +1038,20 @@ mod tests {
         isa::Isa,
     };
 
-    fn single_key(func: &Function, inst: InstId) -> TrackedLocKey {
-        let mut analysis = MemoryAccessAnalysis::new();
-        let effects = func.dfg.effects(inst);
-        let access = effects.accesses.first().expect("expected one access");
-        analysis
-            .trackable_exact_loc(func, access)
-            .expect("access should be trackable")
+    /// Keys are interned: compare them only through the analysis that made them.
+    fn single_key(
+        analysis: &mut MemoryAccessAnalysis,
+        func: &Function,
+        inst: InstId,
+    ) -> TrackedLocKey {
+        maybe_single_key(analysis, func, inst).expect("access should be trackable")
     }
 
-    fn maybe_single_key(func: &Function, inst: InstId) -> Option<TrackedLocKey> {
-        let mut analysis = MemoryAccessAnalysis::new();
+    fn maybe_single_key(
+        analysis: &mut MemoryAccessAnalysis,
+        func: &Function,
+        inst: InstId,
+    ) -> Option<TrackedLocKey> {
         let effects = func.dfg.effects(inst);
         let access = effects.accesses.first().expect("expected one access");
         analysis.trackable_exact_loc(func, access)
@@ -961,6 +1140,45 @@ mod tests {
     }
 
     #[test]
+    fn subtraction_canonicalization_checks_signed_displacement_bounds() {
+        for kind in [AllocatorBaseKind::Alloca, AllocatorBaseKind::Malloc] {
+            for (delta, expected) in [
+                (i64::MIN, None),
+                (i64::MIN + 1, Some(i64::MAX)),
+                (i64::MAX, Some(i64::MIN + 1)),
+                (-32, Some(32)),
+                (32, Some(-32)),
+            ] {
+                let mb = test_module_builder();
+                let (evm, mut builder) = test_func_builder(&mb, &[], Type::Unit);
+                let is = evm.inst_set();
+                let block = builder.append_block();
+                builder.switch_to_block(block);
+                let ptr_ty = builder.ptr_type(Type::I8);
+                let base = insert_allocator_base(&mut builder, is, kind, ptr_ty);
+                let addr =
+                    builder.insert_inst_with(|| PtrToInt::new(is, base, Type::I256), Type::I256);
+                let delta_value = builder.make_imm_value(I256::from(delta));
+                let shifted =
+                    builder.insert_inst_with(|| Sub::new(is, addr, delta_value), Type::I256);
+                builder.insert_inst_no_result_with(|| Return::new_unit(is));
+                builder.seal_all();
+                let mut analysis = MemoryAccessAnalysis::new();
+                let canonical = analysis.canonical_linear_addr(&builder.func, shifted);
+                if let Some(offset) = expected {
+                    assert_eq!(
+                        canonical.base,
+                        analysis.canonical_linear_addr(&builder.func, base).base
+                    );
+                    assert_eq!(canonical.offset, offset, "delta {delta}");
+                } else {
+                    assert_eq!(canonical, CanonicalAddr::unknown(shifted));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn alias_distinguishes_allocas() {
         let mb = test_module_builder();
         let (evm, mut builder) = test_func_builder(&mb, &[], Type::Unit);
@@ -979,13 +1197,11 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let key0 = single_key(&builder.func, insts[2]);
-        let key1 = single_key(&builder.func, insts[3]);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let key0 = single_key(&mut analysis, &builder.func, insts[2]);
+        let key1 = single_key(&mut analysis, &builder.func, insts[3]);
 
-        assert_eq!(
-            MemoryAccessAnalysis::new().alias(&key0, &key1),
-            AliasResult::NoAlias
-        );
+        assert_eq!(analysis.alias(&key0, &key1), AliasResult::NoAlias);
     }
 
     #[test]
@@ -1007,10 +1223,10 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let key0 = single_key(&builder.func, insts[0]);
-        let key1 = single_key(&builder.func, insts[1]);
-        let key2 = single_key(&builder.func, insts[2]);
-        let analysis = MemoryAccessAnalysis::new();
+        let mut analysis = MemoryAccessAnalysis::new();
+        let key0 = single_key(&mut analysis, &builder.func, insts[0]);
+        let key1 = single_key(&mut analysis, &builder.func, insts[1]);
+        let key2 = single_key(&mut analysis, &builder.func, insts[2]);
 
         assert_eq!(analysis.alias(&key0, &key1), AliasResult::MustAlias);
         assert_eq!(analysis.alias(&key0, &key2), AliasResult::NoAlias);
@@ -1054,6 +1270,33 @@ mod tests {
     }
 
     #[test]
+    fn exact_local_addr_follows_long_address_chains() {
+        // Each step adds a value to resolve before reaching the alloca, far more than the native
+        // stack could hold as nested calls.
+        const STEPS: i64 = 100_000;
+        let mb = test_module_builder();
+        let ptr_ty = mb.ptr_type(Type::I256);
+        let (evm, mut builder) = test_func_builder(&mb, &[], Type::Unit);
+        let is = evm.inst_set();
+        let block = builder.append_block();
+        builder.switch_to_block(block);
+
+        let base = builder.insert_inst_with(|| Alloca::new(is, Type::I256), ptr_ty);
+        let one = builder.make_imm_value(I256::from(1));
+        let mut addr = builder.insert_inst_with(|| PtrToInt::new(is, base, Type::I256), Type::I256);
+        for _ in 0..STEPS {
+            addr = builder.insert_inst_with(|| Add::new(is, addr, one), Type::I256);
+        }
+        builder.insert_inst_no_result_with(|| Return::new_unit(is));
+        builder.seal_all();
+
+        let exact = MemoryAccessAnalysis::new()
+            .exact_local_addr(&builder.func, addr)
+            .expect("expected exact local addr");
+        assert_eq!(exact.offset_bytes, STEPS);
+    }
+
+    #[test]
     fn exact_local_addr_accepts_identical_phi_paths() {
         let mb = test_module_builder();
         let ptr_ty = mb.ptr_type(Type::I256);
@@ -1076,8 +1319,10 @@ mod tests {
         builder.insert_inst_no_result_with(|| Jump::new(is, join));
 
         builder.switch_to_block(join);
-        let phi =
-            builder.insert_inst_with(|| Phi::new(is, vec![(base, left), (base, right)]), ptr_ty);
+        let phi = builder.insert_inst_with(
+            || Phi::new(is, smallvec![(base, left), (base, right)]),
+            ptr_ty,
+        );
         let addr = builder.insert_inst_with(|| PtrToInt::new(is, phi, Type::I256), Type::I256);
         builder.insert_inst_no_result_with(|| Return::new_unit(is));
         builder.seal_all();
@@ -1139,13 +1384,11 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let key0 = single_key(&builder.func, insts[0]);
-        let key1 = single_key(&builder.func, insts[1]);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let key0 = single_key(&mut analysis, &builder.func, insts[0]);
+        let key1 = single_key(&mut analysis, &builder.func, insts[1]);
 
-        assert_eq!(
-            MemoryAccessAnalysis::new().alias(&key0, &key1),
-            AliasResult::MayAlias
-        );
+        assert_eq!(analysis.alias(&key0, &key1), AliasResult::MayAlias);
     }
 
     #[test]
@@ -1167,11 +1410,12 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let memory_key = single_key(&builder.func, insts[1]);
-        let storage_key = single_key(&builder.func, insts[2]);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let memory_key = single_key(&mut analysis, &builder.func, insts[1]);
+        let storage_key = single_key(&mut analysis, &builder.func, insts[2]);
 
         assert_eq!(
-            MemoryAccessAnalysis::new().alias(&memory_key, &storage_key),
+            analysis.alias(&memory_key, &storage_key),
             AliasResult::NoAlias
         );
     }
@@ -1194,7 +1438,8 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        assert!(maybe_single_key(&builder.func, insts[1]).is_none());
+        let mut analysis = MemoryAccessAnalysis::new();
+        assert!(maybe_single_key(&mut analysis, &builder.func, insts[1]).is_none());
     }
 
     #[test]
@@ -1216,9 +1461,9 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let key0 = single_key(&builder.func, insts[1]);
-        let key1 = single_key(&builder.func, insts[2]);
-        let analysis = MemoryAccessAnalysis::new();
+        let mut analysis = MemoryAccessAnalysis::new();
+        let key0 = single_key(&mut analysis, &builder.func, insts[1]);
+        let key1 = single_key(&mut analysis, &builder.func, insts[2]);
 
         assert_eq!(analysis.alias(&key0, &key1), AliasResult::MustAlias);
     }
@@ -1264,7 +1509,8 @@ mod tests {
             .dfg
             .value_inst(load)
             .expect("loop load should stay defined by a load");
-        assert!(maybe_single_key(&builder.func, load_inst).is_none());
+        let mut analysis = MemoryAccessAnalysis::new();
+        assert!(maybe_single_key(&mut analysis, &builder.func, load_inst).is_none());
     }
 
     #[test]
@@ -1287,13 +1533,11 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let key0 = single_key(&builder.func, insts[2]);
-        let key1 = single_key(&builder.func, insts[3]);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let key0 = single_key(&mut analysis, &builder.func, insts[2]);
+        let key1 = single_key(&mut analysis, &builder.func, insts[3]);
 
-        assert_eq!(
-            MemoryAccessAnalysis::new().alias(&key0, &key1),
-            AliasResult::MustAlias
-        );
+        assert_eq!(analysis.alias(&key0, &key1), AliasResult::MustAlias);
     }
 
     #[test]
@@ -1317,13 +1561,11 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let key0 = single_key(&builder.func, insts[2]);
-        let key1 = single_key(&builder.func, insts[3]);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let key0 = single_key(&mut analysis, &builder.func, insts[2]);
+        let key1 = single_key(&mut analysis, &builder.func, insts[3]);
 
-        assert_eq!(
-            MemoryAccessAnalysis::new().alias(&key0, &key1),
-            AliasResult::MayAlias
-        );
+        assert_eq!(analysis.alias(&key0, &key1), AliasResult::MayAlias);
     }
 
     #[test]
@@ -1342,9 +1584,9 @@ mod tests {
         builder.seal_all();
 
         let inst = builder.func.layout.first_inst_of(block).expect("load");
-        let key = single_key(&builder.func, inst);
-        let zero = builder.make_imm_value(I256::from(0));
         let mut analysis = MemoryAccessAnalysis::new();
+        let key = single_key(&mut analysis, &builder.func, inst);
+        let zero = builder.make_imm_value(I256::from(0));
         let range = analysis
             .trackable_linear_range(
                 &builder.func,
@@ -1412,10 +1654,10 @@ mod tests {
         builder.seal_all();
 
         let inst = builder.func.layout.first_inst_of(block).expect("load");
-        let key = single_key(&builder.func, inst);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let key = single_key(&mut analysis, &builder.func, inst);
         let range_addr = builder.make_imm_value(I256::from(0));
         let range_len = builder.make_imm_value(I256::from(32));
-        let mut analysis = MemoryAccessAnalysis::new();
         let range = analysis
             .trackable_linear_range(
                 &builder.func,
@@ -1446,9 +1688,9 @@ mod tests {
         builder.seal_all();
 
         let inst = builder.func.layout.first_inst_of(block).expect("load");
-        let key = single_key(&builder.func, inst);
-        let range_len = builder.make_imm_value(I256::from(32));
         let mut analysis = MemoryAccessAnalysis::new();
+        let key = single_key(&mut analysis, &builder.func, inst);
+        let range_len = builder.make_imm_value(I256::from(32));
         let range = analysis
             .trackable_linear_range(
                 &builder.func,
@@ -1507,9 +1749,10 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let malloc_key = single_key(&builder.func, insts[1]);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let malloc_key = single_key(&mut analysis, &builder.func, insts[1]);
         let free_ptr = Immediate::from_i256(I256::from(64), Type::I256);
-        let absolute_key = MemoryAccessAnalysis::new()
+        let absolute_key = analysis
             .trackable_exact_loc(
                 &builder.func,
                 &exact_imm_access(
@@ -1520,7 +1763,7 @@ mod tests {
             .expect("free pointer access should be trackable");
 
         assert_eq!(
-            MemoryAccessAnalysis::new().alias(&malloc_key, &absolute_key),
+            analysis.alias(&malloc_key, &absolute_key),
             AliasResult::NoAlias
         );
     }
@@ -1547,9 +1790,10 @@ mod tests {
             .dfg
             .value_inst(load)
             .expect("load should stay defined by an instruction");
-        let alloca_key = single_key(&builder.func, load_inst);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let alloca_key = single_key(&mut analysis, &builder.func, load_inst);
         let free_ptr = Immediate::from_i256(I256::from(64), Type::I256);
-        let absolute_key = MemoryAccessAnalysis::new()
+        let absolute_key = analysis
             .trackable_exact_loc(
                 &builder.func,
                 &exact_imm_access(
@@ -1560,7 +1804,7 @@ mod tests {
             .expect("free pointer access should be trackable");
 
         assert_eq!(
-            MemoryAccessAnalysis::new().alias(&alloca_key, &absolute_key),
+            analysis.alias(&alloca_key, &absolute_key),
             AliasResult::NoAlias
         );
     }
@@ -1583,9 +1827,10 @@ mod tests {
         builder.seal_all();
 
         let insts: Vec<_> = builder.func.layout.iter_inst(block).collect();
-        let malloc_key = single_key(&builder.func, insts[1]);
+        let mut analysis = MemoryAccessAnalysis::new();
+        let malloc_key = single_key(&mut analysis, &builder.func, insts[1]);
         let heap_addr = Immediate::from_i256(I256::from(STATIC_BASE), Type::I256);
-        let absolute_key = MemoryAccessAnalysis::new()
+        let absolute_key = analysis
             .trackable_exact_loc(
                 &builder.func,
                 &exact_imm_access(
@@ -1596,7 +1841,7 @@ mod tests {
             .expect("heap access should be trackable");
 
         assert_eq!(
-            MemoryAccessAnalysis::new().alias(&malloc_key, &absolute_key),
+            analysis.alias(&malloc_key, &absolute_key),
             AliasResult::MayAlias
         );
     }
@@ -1630,8 +1875,9 @@ mod tests {
             .dfg
             .value_inst(load)
             .expect("load should stay defined by an instruction");
-        let malloc_key = single_key(&builder.func, load_inst);
-        let absolute_key = MemoryAccessAnalysis::new()
+        let mut analysis = MemoryAccessAnalysis::new();
+        let malloc_key = single_key(&mut analysis, &builder.func, load_inst);
+        let absolute_key = analysis
             .trackable_exact_loc(
                 &builder.func,
                 &exact_imm_access(
@@ -1642,7 +1888,7 @@ mod tests {
             .expect("absolute meta access should be trackable");
 
         assert_eq!(
-            MemoryAccessAnalysis::new().alias(&malloc_key, &absolute_key),
+            analysis.alias(&malloc_key, &absolute_key),
             AliasResult::MayAlias
         );
     }
@@ -1676,10 +1922,10 @@ mod tests {
             .dfg
             .value_inst(load)
             .expect("load should stay defined by an instruction");
-        let TrackedLocKey::Linear(key) = single_key(&builder.func, load_inst) else {
+        let mut analysis = MemoryAccessAnalysis::new();
+        let TrackedLocKey::Linear(key) = single_key(&mut analysis, &builder.func, load_inst) else {
             panic!("expected a linear key");
         };
-        let mut analysis = MemoryAccessAnalysis::new();
         let range_addr = builder.make_imm_value(I256::from(64));
         let range_len = builder.make_imm_value(I256::from(32));
         let range = analysis
@@ -1694,7 +1940,7 @@ mod tests {
             .expect("absolute meta range should be trackable");
 
         assert_eq!(
-            analysis.exact_write_coverage(&range, &key),
+            analysis.write_coverage(&range, &key.range()),
             RangeCoverage::Unknown
         );
     }
@@ -1721,10 +1967,11 @@ mod tests {
                 .dfg
                 .value_inst(load)
                 .expect("load should stay defined by an instruction");
-            let TrackedLocKey::Linear(key) = single_key(&builder.func, load_inst) else {
+            let mut analysis = MemoryAccessAnalysis::new();
+            let TrackedLocKey::Linear(key) = single_key(&mut analysis, &builder.func, load_inst)
+            else {
                 panic!("expected a linear key");
             };
-            let mut analysis = MemoryAccessAnalysis::new();
             let range_addr = builder.make_imm_value(I256::from(64));
             let range_len = builder.make_imm_value(I256::from(32));
             let range = analysis
@@ -1739,7 +1986,7 @@ mod tests {
                 .expect("absolute meta range should be trackable");
 
             assert_eq!(
-                analysis.exact_write_coverage(&range, &key),
+                analysis.write_coverage(&range, &key.range()),
                 RangeCoverage::NoOverlap
             );
         }
@@ -1767,8 +2014,9 @@ mod tests {
             .dfg
             .value_inst(load)
             .expect("load should stay defined by an instruction");
-        let alloca_key = single_key(&builder.func, load_inst);
-        let absolute_key = MemoryAccessAnalysis::new()
+        let mut analysis = MemoryAccessAnalysis::new();
+        let alloca_key = single_key(&mut analysis, &builder.func, load_inst);
+        let absolute_key = analysis
             .trackable_exact_loc(
                 &builder.func,
                 &exact_imm_access(
@@ -1779,7 +2027,7 @@ mod tests {
             .expect("absolute meta access should be trackable");
 
         assert_eq!(
-            MemoryAccessAnalysis::new().alias(&alloca_key, &absolute_key),
+            analysis.alias(&alloca_key, &absolute_key),
             AliasResult::MayAlias
         );
     }
@@ -1806,10 +2054,10 @@ mod tests {
             .dfg
             .value_inst(load)
             .expect("load should stay defined by an instruction");
-        let TrackedLocKey::Linear(key) = single_key(&builder.func, load_inst) else {
+        let mut analysis = MemoryAccessAnalysis::new();
+        let TrackedLocKey::Linear(key) = single_key(&mut analysis, &builder.func, load_inst) else {
             panic!("expected a linear key");
         };
-        let mut analysis = MemoryAccessAnalysis::new();
         let range_addr = builder.make_imm_value(I256::from(64));
         let range_len = builder.make_imm_value(I256::from(32));
         let range = analysis
@@ -1824,7 +2072,7 @@ mod tests {
             .expect("absolute meta range should be trackable");
 
         assert_eq!(
-            analysis.exact_write_coverage(&range, &key),
+            analysis.write_coverage(&range, &key.range()),
             RangeCoverage::Unknown
         );
     }
@@ -1845,11 +2093,11 @@ mod tests {
         builder.seal_all();
 
         let inst = builder.func.layout.first_inst_of(block).expect("load");
-        let TrackedLocKey::Linear(key) = single_key(&builder.func, inst) else {
+        let mut analysis = MemoryAccessAnalysis::new();
+        let TrackedLocKey::Linear(key) = single_key(&mut analysis, &builder.func, inst) else {
             panic!("expected a linear key");
         };
         let range_len = builder.make_imm_value(I256::from(32));
-        let mut analysis = MemoryAccessAnalysis::new();
         let range = analysis
             .trackable_linear_range(
                 &builder.func,
@@ -1862,7 +2110,7 @@ mod tests {
             .expect("range should be trackable");
 
         assert_eq!(
-            analysis.exact_write_coverage(&range, &key),
+            analysis.write_coverage(&range, &key.range()),
             RangeCoverage::FullyCovered
         );
     }
@@ -1883,12 +2131,12 @@ mod tests {
         builder.seal_all();
 
         let inst = builder.func.layout.first_inst_of(block).expect("load");
-        let TrackedLocKey::Linear(key) = single_key(&builder.func, inst) else {
+        let mut analysis = MemoryAccessAnalysis::new();
+        let TrackedLocKey::Linear(key) = single_key(&mut analysis, &builder.func, inst) else {
             panic!("expected a linear key");
         };
         let range_addr = builder.make_imm_value(I256::from(64));
         let range_len = builder.make_imm_value(I256::from(32));
-        let mut analysis = MemoryAccessAnalysis::new();
         let range = analysis
             .trackable_linear_range(
                 &builder.func,
@@ -1901,7 +2149,7 @@ mod tests {
             .expect("range should be trackable");
 
         assert_eq!(
-            analysis.exact_write_coverage(&range, &key),
+            analysis.write_coverage(&range, &key.range()),
             RangeCoverage::PartiallyCovered {
                 before: Some(LinearRangeKey {
                     space: range.space,
@@ -1930,12 +2178,12 @@ mod tests {
         builder.seal_all();
 
         let inst = builder.func.layout.first_inst_of(block).expect("load");
-        let TrackedLocKey::Linear(key) = single_key(&builder.func, inst) else {
+        let mut analysis = MemoryAccessAnalysis::new();
+        let TrackedLocKey::Linear(key) = single_key(&mut analysis, &builder.func, inst) else {
             panic!("expected a linear key");
         };
         let range_addr = builder.make_imm_value(I256::from(64));
         let range_len = builder.make_imm_value(I256::from(32));
-        let mut analysis = MemoryAccessAnalysis::new();
         let range = analysis
             .trackable_linear_range(
                 &builder.func,
@@ -1948,7 +2196,7 @@ mod tests {
             .expect("range should be trackable");
 
         assert_eq!(
-            analysis.exact_write_coverage(&range, &key),
+            analysis.write_coverage(&range, &key.range()),
             RangeCoverage::NoOverlap
         );
     }

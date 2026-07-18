@@ -18,19 +18,23 @@ use smallvec::SmallVec;
 use sonatina_ir::{
     BlockId, Function, InstId, Type, ValueId,
     cfg::ControlFlowGraph,
+    effects::AccessKind,
     inst::{cast, control_flow, data, downcast},
     module::{FuncRef, ModuleCtx},
     types::CompoundType,
 };
 
 use super::{
-    ObjectEffectSummaryMap, ObjectReturnEffect, SliceSet,
+    ObjectEffectSummaryMap, ObjectReturnEffect,
     capture_state::{
         CaptureRelevantInst, RootCaptureMap as SharedRootCaptureMap, RootCapturePayload,
         capture_relevant_inst, compute_capture_states_for_blocks as compute_block_capture_states,
-        kill_capture_access as kill_capture_projection_access,
-        kill_capture_slice_set as kill_capture_exact_slice_set, slices_overlap_relative,
+        kill_capture_access as kill_capture_projection_access, kill_enum_variant_captures,
     },
+    object_alias::ObjectAliasFacts,
+    object_effects::ObjectEffectSummary,
+    object_reachability::{ObjectReachability, raw_access_may_reach_objects, reference_bearing},
+    object_tracking::single_result_value,
     shape,
 };
 
@@ -113,7 +117,8 @@ pub(crate) struct CompleteProvenance<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct MayProvenance<'a> {
-    facts: &'a ProvenanceFacts,
+    possible_roots: &'a SecondaryMap<ValueId, FxHashSet<ValueId>>,
+    maybe_unknown: &'a SecondaryMap<ValueId, bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +128,17 @@ pub(crate) enum CompleteRootSet<'a> {
 }
 
 impl<'a> CompleteRootSet<'a> {
+    #[cfg(feature = "cranelift")]
+    pub(crate) fn iter(self) -> impl Iterator<Item = RootValue> + 'a {
+        let (single, multiple) = match self {
+            Self::Single(root) => (Some(root), None),
+            Self::Multiple(roots) => (None, Some(roots)),
+        };
+        single
+            .into_iter()
+            .chain(multiple.into_iter().flat_map(KnownRoots::iter))
+    }
+
     pub(crate) fn contains(self, root: RootValue) -> bool {
         match self {
             Self::Single(candidate) => candidate == root,
@@ -151,6 +167,7 @@ impl<'a> MayRootSet<'a> {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct ExactProjectionMap(SecondaryMap<ValueId, Option<Projection>>);
 
 impl ExactProjectionMap {
@@ -213,7 +230,10 @@ impl ProvenanceFacts {
     }
 
     pub(crate) fn may(&self) -> MayProvenance<'_> {
-        MayProvenance { facts: self }
+        MayProvenance {
+            possible_roots: &self.possible_roots,
+            maybe_unknown: &self.maybe_unknown,
+        }
     }
 
     pub(crate) fn into_exact_projection_map(mut self) -> ExactProjectionMap {
@@ -286,8 +306,8 @@ impl<'a> CompleteProvenance<'a> {
 impl<'a> MayProvenance<'a> {
     pub(crate) fn may_roots(self, value: ValueId) -> MayRootSet<'a> {
         MayRootSet {
-            roots: KnownRoots(&self.facts.possible_roots[value]),
-            has_unknown: self.facts.maybe_unknown[value],
+            roots: KnownRoots(&self.possible_roots[value]),
+            has_unknown: self.maybe_unknown[value],
         }
     }
 }
@@ -301,6 +321,8 @@ enum ExactState {
 
 #[derive(Clone, Copy)]
 struct CaptureStateView<'a> {
+    reachability: &'a ObjectReachability,
+    aliases: &'a ObjectAliasFacts,
     exact_states: &'a SecondaryMap<ValueId, Option<ExactState>>,
     possible_roots: &'a SecondaryMap<ValueId, FxHashSet<ValueId>>,
     maybe_unknown: &'a SecondaryMap<ValueId, bool>,
@@ -318,11 +340,12 @@ enum ProjectionTransferInst<'a> {
 }
 
 #[derive(Clone, Copy)]
-enum CallReturnTransferKind {
+enum CallReturnTransferKind<'a> {
     Arg {
         index: usize,
         exact_projection: bool,
     },
+    BorrowedArgs(&'a [usize]),
     FreshObject,
     Unknown,
 }
@@ -352,6 +375,7 @@ fn secondary_value_map<V: Clone + Default>(value_capacity: usize) -> SecondaryMa
 }
 
 pub(crate) struct ProvenanceSnapshot<'a> {
+    aliases: ObjectAliasFacts,
     value_capacity: usize,
     single_result_insts: Vec<(InstId, ValueId)>,
     possible_root_transfers: PossibleRootTransfers,
@@ -374,6 +398,7 @@ impl<'a> ProvenanceSnapshot<'a> {
         cfg.compute(func);
         let reachable = cfg.reachable_blocks();
         Self {
+            aliases: ObjectAliasFacts::new(func, &cfg, object_effects),
             value_capacity,
             single_result_insts,
             possible_root_transfers,
@@ -388,6 +413,17 @@ impl<'a> ProvenanceSnapshot<'a> {
 
     pub(crate) fn object_effects(&self) -> Option<&'a ObjectEffectSummaryMap> {
         self.object_effects
+    }
+
+    /// The alias facts, CFG, and reachable blocks of the snapshot's function.
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ObjectAliasFacts,
+        ControlFlowGraph,
+        SecondaryMap<BlockId, bool>,
+    ) {
+        (self.aliases, self.cfg, self.reachable)
     }
 
     pub(crate) fn collect_root_provenance(
@@ -406,6 +442,33 @@ impl<'a> ProvenanceSnapshot<'a> {
                 root_value: RootValue::new(root_value),
                 slice,
             }));
+        }
+
+        // An aggregate may carry aliases despite having no object root itself.
+        // Seed every value producer, including formals and multi-result calls,
+        // so all call-effect consumers see the same conservative boundary.
+        let mut reference_aggregates = FxHashMap::default();
+        for value in func.dfg.value_ids() {
+            let ty = func.dfg.value_ty(value);
+            if *reference_aggregates
+                .entry(ty)
+                .or_insert_with(|| shape::is_reference_aggregate(module, ty))
+            {
+                provenance.maybe_unknown[value] = true;
+            }
+            if reference_element_ty(module, ty).is_some()
+                && !root_slices.contains_key(&value)
+                && func.dfg.value_inst(value).is_none_or(|inst| {
+                    self.possible_root_transfers[value].is_none()
+                        && downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
+                            .is_none()
+                })
+            {
+                // Missing origins and unsupported producers are contributors,
+                // not an exhaustive empty set. Loads are refined below from
+                // point-sensitive capture state before unresolved bottom widens.
+                provenance.maybe_unknown[value] = true;
+            }
         }
 
         compute_possible_roots(
@@ -673,6 +736,14 @@ fn possible_root_transfer_for_inst(
         return Some(PossibleRootTransfer::source(result, *bitcast.from()));
     }
 
+    // Stack materialization exposes the same storage. Preserve its possible
+    // roots so raw-pointer GEPs, casts, and phis remain visible to alias checks.
+    if let Some(materialize) =
+        downcast::<&data::ObjMaterializeStack>(func.inst_set(), func.dfg.inst(inst))
+    {
+        return Some(PossibleRootTransfer::source(result, *materialize.object()));
+    }
+
     if let Some(obj_proj) = downcast::<&data::ObjProj>(func.inst_set(), func.dfg.inst(inst)) {
         return obj_proj
             .values()
@@ -696,6 +767,17 @@ fn possible_root_transfer_for_inst(
             result,
             *enum_assert_ref.object(),
         ));
+    }
+
+    // SSA aggregate fields are not represented in the object capture map. An
+    // extracted reference can alias an existing root, even though no root was
+    // recorded for the aggregate value itself. An empty known set is not a
+    // proof that this reference is disjoint from every tracked object.
+    if (downcast::<&data::ExtractValue>(func.inst_set(), func.dfg.inst(inst)).is_some()
+        || downcast::<&data::EnumExtract>(func.inst_set(), func.dfg.inst(inst)).is_some())
+        && reference_element_ty(func.ctx(), func.dfg.value_ty(result)).is_some()
+    {
+        return Some(PossibleRootTransfer::unknown(result));
     }
 
     if let Some(call) = downcast::<&control_flow::Call>(func.inst_set(), func.dfg.inst(inst)) {
@@ -723,6 +805,13 @@ fn call_possible_root_transfer(
             .get(index)
             .copied()
             .map(|source| PossibleRootTransfer::source(result, source)),
+        CallReturnTransferKind::BorrowedArgs(indices) => {
+            let sources = indices
+                .iter()
+                .map(|&index| call.args().get(index).copied())
+                .collect::<Option<SmallVec<[_; 4]>>>()?;
+            Some(PossibleRootTransfer::sources(result, sources))
+        }
         CallReturnTransferKind::FreshObject => Some(PossibleRootTransfer::fresh_root(result)),
         CallReturnTransferKind::Unknown => {
             reference_element_ty(func.ctx(), func.dfg.value_ty(result))
@@ -862,11 +951,38 @@ fn refine_possible_roots_from_objref_loads(
     possible_roots: &mut SecondaryMap<ValueId, FxHashSet<ValueId>>,
     maybe_unknown: &mut SecondaryMap<ValueId, bool>,
 ) {
+    let has_reference_load = snapshot.single_result_insts.iter().any(|&(inst, result)| {
+        reference_element_ty(func.ctx(), func.dfg.value_ty(result)).is_some()
+            && downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst)).is_some()
+    });
+    if !has_reference_load {
+        if widen_unresolved_references(func, possible_roots, maybe_unknown) {
+            compute_possible_roots(
+                func,
+                &snapshot.possible_root_transfers,
+                &snapshot.possible_root_users,
+                possible_roots,
+                maybe_unknown,
+            );
+        }
+        return;
+    }
     loop {
         let mut changed = false;
         let possible_roots_snapshot = possible_roots.clone();
         let maybe_unknown_snapshot = maybe_unknown.clone();
+        let reachability = ObjectReachability::new(
+            func,
+            snapshot.object_effects,
+            snapshot.aliases.clone(),
+            MayProvenance {
+                possible_roots: &possible_roots_snapshot,
+                maybe_unknown: &maybe_unknown_snapshot,
+            },
+        );
         let capture_state = CaptureStateView {
+            reachability: &reachability,
+            aliases: &snapshot.aliases,
             exact_states,
             possible_roots: &possible_roots_snapshot,
             maybe_unknown: &maybe_unknown_snapshot,
@@ -906,9 +1022,8 @@ fn refine_possible_roots_from_objref_loads(
 
                 if let Some(obj_load) =
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
-                    && reference_element_ty(func.ctx(), func.dfg.value_ty(*obj_load.object()))
-                        .is_some()
                     && let Some(result) = single_result_value(func, inst)
+                    && reference_element_ty(func.ctx(), func.dfg.value_ty(result)).is_some()
                     && union_capture_roots_for_value(
                         *obj_load.object(),
                         capture_state,
@@ -931,9 +1046,33 @@ fn refine_possible_roots_from_objref_loads(
         }
 
         if !changed {
-            return;
+            // A closed reference cycle or an integer-to-pointer source chain
+            // can settle at bottom. Widen its unresolved direct references and
+            // propagate again so a join cannot silently discard an alternative.
+            changed = widen_unresolved_references(func, possible_roots, maybe_unknown);
+            if !changed {
+                return;
+            }
         }
     }
+}
+
+fn widen_unresolved_references(
+    func: &Function,
+    possible_roots: &SecondaryMap<ValueId, FxHashSet<ValueId>>,
+    maybe_unknown: &mut SecondaryMap<ValueId, bool>,
+) -> bool {
+    let mut changed = false;
+    for value in func.dfg.value_ids() {
+        if reference_element_ty(func.ctx(), func.dfg.value_ty(value)).is_some()
+            && possible_roots[value].is_empty()
+            && !maybe_unknown[value]
+        {
+            maybe_unknown[value] = true;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn compute_capture_states_for_blocks(
@@ -943,10 +1082,39 @@ fn compute_capture_states_for_blocks(
     cfg: &ControlFlowGraph,
     reachable: &SecondaryMap<BlockId, bool>,
 ) -> SecondaryMap<BlockId, RootCaptureMap> {
-    let (block_entry_captures, _) =
-        compute_block_capture_states(func, cfg, reachable, |inst, exit_captures| {
+    // I7: absence of a store on a predecessor is an unknown alternative,
+    // not an exhaustive empty reference set. Seed only demanded cells; exact
+    // covering stores can replace these entries without enumerating shapes.
+    let mut initial_captures = RootCaptureMap::default();
+    for block in func.layout.iter_block().filter(|&block| reachable[block]) {
+        for inst in func.layout.iter_inst(block) {
+            if let Some(load) = downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
+                && let Some(result) = single_result_value(func, inst)
+                && reference_element_ty(func.ctx(), func.dfg.value_ty(result)).is_some()
+            {
+                for (root, dst_slice) in
+                    capture_destinations_for_value(*load.object(), None, capture_state)
+                {
+                    initial_captures
+                        .entry(root)
+                        .or_default()
+                        .push(RootCaptureSource {
+                            dst_slice,
+                            src_root: None,
+                        });
+                }
+            }
+        }
+    }
+    let (block_entry_captures, _) = compute_block_capture_states(
+        func,
+        cfg,
+        reachable,
+        &initial_captures,
+        |inst, exit_captures| {
             apply_inst_capture_transfer(func, inst, capture_state, object_effects, exit_captures);
-        });
+        },
+    );
     block_entry_captures
 }
 
@@ -963,8 +1131,13 @@ fn apply_inst_capture_transfer(
 
     match capture_relevant_inst(func, inst) {
         Some(CaptureRelevantInst::ObjStore(obj_store)) => {
+            if !reference_bearing(func, *obj_store.value())
+                || capture_state.maybe_unknown[*obj_store.object()]
+            {
+                widen_typed_capture_write(root_captures, *obj_store.object(), None, capture_state);
+            }
             kill_capture_access(root_captures, *obj_store.object(), None, capture_state);
-            if reference_element_ty(func.ctx(), func.dfg.value_ty(*obj_store.value())).is_some() {
+            if reference_bearing(func, *obj_store.value()) {
                 record_root_capture_sources(
                     root_captures,
                     capture_destinations_for_value(*obj_store.object(), None, capture_state),
@@ -973,7 +1146,16 @@ fn apply_inst_capture_transfer(
                 );
             }
         }
+        Some(CaptureRelevantInst::ObjInitConst(init)) => {
+            // Const data contains no references, but an unrelated incoming
+            // coordinate system may describe bytes of a captured-reference cell.
+            widen_typed_capture_write(root_captures, *init.object(), None, capture_state);
+            kill_capture_access(root_captures, *init.object(), None, capture_state);
+        }
         Some(CaptureRelevantInst::EnumSetTag(enum_set_tag)) => {
+            let tag = reference_element_ty(func.ctx(), func.dfg.value_ty(*enum_set_tag.object()))
+                .and_then(|ty| shape::enum_tag_slice(func.ctx(), ty));
+            widen_typed_capture_write(root_captures, *enum_set_tag.object(), tag, capture_state);
             kill_capture_access(
                 root_captures,
                 *enum_set_tag.object(),
@@ -982,11 +1164,34 @@ fn apply_inst_capture_transfer(
             );
         }
         Some(CaptureRelevantInst::EnumWriteVariant(enum_write_variant)) => {
-            kill_capture_access(
+            let object = *enum_write_variant.object();
+            let enum_ty = reference_element_ty(func.ctx(), func.dfg.value_ty(object));
+            let tag = enum_ty.and_then(|ty| shape::enum_tag_slice(func.ctx(), ty));
+            widen_typed_capture_write(root_captures, object, tag, capture_state);
+            for (index, &value) in enum_write_variant.values().iter().enumerate() {
+                if !reference_bearing(func, value) || capture_state.maybe_unknown[object] {
+                    let field = enum_ty.and_then(|ty| {
+                        shape::enum_variant_field_slice(
+                            func.ctx(),
+                            ty,
+                            *enum_write_variant.variant(),
+                            u32::try_from(index).ok()?,
+                        )
+                    });
+                    widen_typed_capture_write(root_captures, object, field, capture_state);
+                }
+            }
+            kill_enum_variant_captures(
                 root_captures,
-                *enum_write_variant.object(),
-                None,
-                capture_state,
+                capture_state.aliases,
+                func.ctx(),
+                exact_projection_of(
+                    capture_state.exact_states,
+                    capture_state.maybe_unknown,
+                    *enum_write_variant.object(),
+                ),
+                *enum_write_variant.variant(),
+                enum_write_variant.values().len(),
             );
             record_enum_variant_capture_sources(
                 func,
@@ -998,9 +1203,145 @@ fn apply_inst_capture_transfer(
             );
         }
         Some(CaptureRelevantInst::Call) => {
+            widen_interfering_captures(func, inst, capture_state, object_effects, root_captures);
             merge_call_capture_roots(func, inst, capture_state, object_effects, root_captures);
         }
-        None => {}
+        None => {
+            widen_interfering_captures(func, inst, capture_state, object_effects, root_captures)
+        }
+    }
+}
+
+fn widen_typed_capture_write(
+    captures: &mut RootCaptureMap,
+    object: ValueId,
+    relative: Option<shape::AggregateSlice>,
+    state: CaptureStateView<'_>,
+) {
+    let destinations = capture_destinations_for_value(object, relative, state);
+    let unresolved = state.maybe_unknown[object] || destinations.is_empty();
+    for (&root, sources) in captures.iter_mut() {
+        let mut unknowns = Vec::new();
+        for source in sources.iter() {
+            let target = Projection {
+                root_value: root,
+                slice: source.dst_slice,
+            };
+            if unresolved && state.reachability.may_reach(object, root)
+                || destinations.iter().any(|&(root_value, slice)| {
+                    state
+                        .aliases
+                        .may_overlap(Projection { root_value, slice }, target)
+                })
+            {
+                unknowns.push(RootCaptureSource {
+                    dst_slice: source.dst_slice,
+                    src_root: None,
+                });
+            }
+        }
+        for unknown in unknowns {
+            if !sources.contains(&unknown) {
+                sources.push(unknown);
+            }
+        }
+    }
+}
+
+fn widen_interfering_captures(
+    func: &Function,
+    inst: InstId,
+    state: CaptureStateView<'_>,
+    summaries: Option<&ObjectEffectSummaryMap>,
+    captures: &mut RootCaptureMap,
+) {
+    let call = downcast::<&control_flow::Call>(func.inst_set(), func.dfg.inst(inst));
+    let fallback;
+    let summary = if let Some(call) = call {
+        Some(
+            if let Some(summary) = summaries.and_then(|summaries| summaries.get(call.callee())) {
+                summary
+            } else {
+                fallback = ObjectEffectSummary::conservative_unknown(
+                    func.ctx(),
+                    *call.callee(),
+                    &mut shape::AggregateLayoutCache::default(),
+                );
+                &fallback
+            },
+        )
+    } else {
+        None
+    };
+    let raw_write = summary.is_none()
+        && func.dfg.effects(inst).accesses.iter().any(|access| {
+            access.kind == AccessKind::Write && raw_access_may_reach_objects(func, access)
+        });
+    if summary.is_none() && !raw_write {
+        return;
+    }
+    for (&root, sources) in captures.iter_mut() {
+        let mut unknowns = Vec::new();
+        for capture in sources.iter() {
+            let target = Projection {
+                root_value: root,
+                slice: capture.dst_slice,
+            };
+            let interferes = if let Some((call, summary)) = call.zip(summary) {
+                summary.non_arg.unknown.writes
+                    || summary.non_arg.external.writes && state.reachability.exposed(root)
+                    || call
+                        .args()
+                        .iter()
+                        .zip(&summary.arg_effects)
+                        .any(|(&arg, effect)| {
+                            if effect.writes.is_empty() || !state.reachability.may_reach(arg, root)
+                            {
+                                return false;
+                            }
+                            let Some(projection) =
+                                exact_projection_of(state.exact_states, state.maybe_unknown, arg)
+                            else {
+                                return true;
+                            };
+                            if effect.writes.is_whole_root()
+                                || effect.writes.total_leaves() != projection.slice.leaf_count
+                            {
+                                return state.aliases.may_overlap(projection, target);
+                            }
+                            effect.writes.exact_leaves().is_none_or(|leaves| {
+                                leaves.iter().any(|&leaf| {
+                                    state.aliases.may_overlap(
+                                        Projection {
+                                            root_value: projection.root_value,
+                                            slice: shape::AggregateSlice {
+                                                first_leaf: projection.slice.first_leaf + leaf,
+                                                leaf_count: 1,
+                                                ty: projection.slice.ty,
+                                            },
+                                        },
+                                        target,
+                                    )
+                                })
+                            })
+                        })
+            } else {
+                raw_write && state.reachability.exposed(root)
+            };
+            if interferes {
+                unknowns.push(RootCaptureSource {
+                    dst_slice: capture.dst_slice,
+                    src_root: None,
+                });
+            }
+        }
+        // I6/I7: may-writes add an unknown replacement; old alternatives survive.
+        // Summary captures are observed replacements, not a completeness proof.
+        for unknown in unknowns {
+            if !sources.contains(&unknown) {
+                sources.push(unknown);
+            }
+        }
     }
 }
 
@@ -1017,13 +1358,7 @@ fn merge_call_capture_roots(
         return;
     };
 
-    for (idx, &arg) in call.args().iter().enumerate() {
-        let Some(effect) = summary.arg_effects.get(idx) else {
-            continue;
-        };
-        kill_capture_slice_set(root_captures, arg, &effect.writes, capture_state);
-    }
-
+    // I6: callee writes are may-effects, so old containment survives.
     let call_result = single_result_value(func, inst);
     for capture in &summary.captures {
         let Some(&src_arg) = call.args().get(capture.src_arg) else {
@@ -1066,7 +1401,7 @@ fn record_root_capture_sources(
             }
             entry.push(capture);
         }
-        if src_maybe_unknown {
+        if src_maybe_unknown || src_roots.is_empty() {
             let entry = root_captures.entry(root).or_default();
             let capture = RootCaptureSource {
                 dst_slice,
@@ -1093,7 +1428,7 @@ fn record_enum_variant_capture_sources(
     };
     let mut layout_cache = shape::AggregateLayoutCache::default();
     for (field_idx, &value) in values.iter().enumerate() {
-        if reference_element_ty(func.ctx(), func.dfg.value_ty(value)).is_none() {
+        if !reference_bearing(func, value) {
             continue;
         }
         let Some(field_slice) = layout_cache.enum_variant_field_slice(
@@ -1131,19 +1466,11 @@ fn kill_capture_access(
             leaf_count,
         })
     });
-    kill_capture_projection_access(root_captures, projection, relative_slice);
-}
-
-fn kill_capture_slice_set(
-    root_captures: &mut RootCaptureMap,
-    value: ValueId,
-    slices: &SliceSet,
-    capture_state: CaptureStateView<'_>,
-) {
-    kill_capture_exact_slice_set(
+    kill_capture_projection_access(
         root_captures,
-        exact_capture_destination_for_value(value, None, capture_state),
-        slices,
+        capture_state.aliases,
+        projection,
+        relative_slice,
     );
 }
 
@@ -1174,21 +1501,6 @@ fn capture_destinations_for_value(
     .collect()
 }
 
-fn exact_capture_destination_for_value(
-    value: ValueId,
-    relative_slice: Option<shape::AggregateSlice>,
-    capture_state: CaptureStateView<'_>,
-) -> Option<(RootValue, shape::AggregateSlice)> {
-    exact_capture_destination(
-        exact_projection_of(
-            capture_state.exact_states,
-            capture_state.maybe_unknown,
-            value,
-        ),
-        relative_slice,
-    )
-}
-
 fn union_capture_roots_for_value(
     value: ValueId,
     capture_state: CaptureStateView<'_>,
@@ -1200,12 +1512,22 @@ fn union_capture_roots_for_value(
     let old_unknown = *dst_maybe_unknown;
     *dst_maybe_unknown |= capture_state.maybe_unknown[value];
 
-    for (root, access_slice) in capture_destinations_for_value(value, None, capture_state) {
-        let Some(captures) = root_captures.get(&root) else {
-            continue;
-        };
+    let destinations = capture_destinations_for_value(value, None, capture_state);
+    let unknown_destination = capture_state.maybe_unknown[value] || destinations.is_empty();
+    *dst_maybe_unknown |= unknown_destination;
+    for (&root, captures) in root_captures {
         for capture in captures {
-            if slices_overlap_relative(access_slice, capture.dst_slice) {
+            let target = Projection {
+                root_value: root,
+                slice: capture.dst_slice,
+            };
+            if unknown_destination
+                || destinations.iter().any(|&(root_value, slice)| {
+                    capture_state
+                        .aliases
+                        .may_overlap(Projection { root_value, slice }, target)
+                })
+            {
                 if let Some(src_root) = capture.src_root {
                     dst_roots.insert(src_root.value());
                 } else {
@@ -1374,7 +1696,21 @@ fn derive_possible_projections(
 
     downcast::<&control_flow::Phi>(func.inst_set(), func.dfg.inst(inst))
         .map(|phi| {
-            derive_phi_projection_candidates(func, result, phi, possible_projections, root_value)
+            let candidates = join_projection_candidates(
+                phi.args().iter().map(|&(arg, _)| arg),
+                possible_projections,
+                possible_roots,
+                root_value,
+            );
+            map_projection_candidates_for_result(
+                func,
+                result,
+                root_value,
+                possible_roots,
+                maybe_unknown,
+                &candidates,
+                Some,
+            )
         })
         .unwrap_or_default()
 }
@@ -1456,22 +1792,23 @@ fn derive_phi_state(
     }
 }
 
-fn derive_phi_projection_candidates(
-    func: &Function,
-    result: ValueId,
-    phi: &control_flow::Phi,
+/// Joins the candidates of every alternative that may designate `root_value`.
+/// An alternative without candidates can designate any slice of the root.
+fn join_projection_candidates(
+    alternatives: impl IntoIterator<Item = ValueId>,
     possible_projections: &SecondaryMap<ValueId, Vec<Projection>>,
+    possible_roots: &SecondaryMap<ValueId, FxHashSet<ValueId>>,
     root_value: ValueId,
 ) -> Vec<Projection> {
-    let result_ty = func.dfg.value_ty(result);
     let mut candidates = Vec::new();
-    for &(arg, _) in phi.args() {
-        for &projection in &possible_projections[arg] {
-            if projection.root_value != RootValue::new(root_value)
-                || !projection_value_ty_matches(result_ty, projection.slice.ty, func.ctx())
-            {
-                continue;
-            }
+    for value in alternatives {
+        if !possible_roots[value].contains(&root_value) {
+            continue;
+        }
+        if possible_projections[value].is_empty() {
+            return Vec::new();
+        }
+        for &projection in &possible_projections[value] {
             push_unique_projection(&mut candidates, projection);
         }
     }
@@ -1673,6 +2010,8 @@ fn derive_call_exact_state(
             fresh_call_root_projection(func, result, inst, object_effects, layout_cache)
                 .map_or(ExactState::Blocked, ExactState::Exact)
         }
+        // A union identifies possible roots, never an exact alias or field.
+        CallReturnTransferKind::BorrowedArgs(_) => ExactState::Blocked,
         CallReturnTransferKind::Unknown => {
             exact_state_or_unknown(exact_states, possible_roots, maybe_unknown, result)
         }
@@ -1702,8 +2041,8 @@ fn fresh_call_root_projection(
             ty: pointee_ty,
             first_leaf: 0,
             leaf_count: layout_cache
-                .shape(func.ctx(), pointee_ty)
-                .map_or(1, |shape| shape.leaves.len()),
+                .shape_leaf_count(func.ctx(), pointee_ty)
+                .unwrap_or(1),
         },
     })
 }
@@ -1745,6 +2084,25 @@ fn derive_call_possible_projections(
                 .into_iter()
                 .collect()
         }
+        CallReturnTransferKind::BorrowedArgs(indices) => {
+            let projections = join_projection_candidates(
+                indices
+                    .iter()
+                    .filter_map(|&index| call.args().get(index).copied()),
+                possible_projections,
+                possible_roots,
+                root_value,
+            );
+            map_projection_candidates_for_result(
+                func,
+                result,
+                root_value,
+                possible_roots,
+                maybe_unknown,
+                &projections,
+                Some,
+            )
+        }
         CallReturnTransferKind::Unknown => Vec::new(),
     }
 }
@@ -1764,15 +2122,15 @@ fn map_projection_candidates_for_result(
     let result_ty = func.dfg.value_ty(result);
     let mut mapped = Vec::new();
     for &projection in projections {
-        let Some(mapped_projection) = map(projection) else {
-            continue;
+        // Candidates must be exhaustive: an alternative that cannot be mapped
+        // leaves no list, so consumers fall back to the whole root.
+        let Some(mapped_projection) = map(projection).filter(|mapped_projection| {
+            mapped_projection.root_value == RootValue::new(root_value)
+                && possible_roots[result].contains(&mapped_projection.root_value.value())
+                && projection_value_ty_matches(result_ty, mapped_projection.slice.ty, func.ctx())
+        }) else {
+            return Vec::new();
         };
-        if mapped_projection.root_value != RootValue::new(root_value)
-            || !possible_roots[result].contains(&mapped_projection.root_value.value())
-            || !projection_value_ty_matches(result_ty, mapped_projection.slice.ty, func.ctx())
-        {
-            continue;
-        }
         push_unique_projection(&mut mapped, mapped_projection);
     }
     mapped
@@ -1904,7 +2262,7 @@ fn offset_projection(projection: Projection, sub: shape::AggregateSlice) -> Proj
 fn call_return_transfer_kind(
     object_effects: Option<&ObjectEffectSummaryMap>,
     callee: FuncRef,
-) -> Option<CallReturnTransferKind> {
+) -> Option<CallReturnTransferKind<'_>> {
     let summary = object_effects?.get(&callee)?;
     Some(match summary.ret_effect {
         ObjectReturnEffect::SameAsArg { index } => CallReturnTransferKind::Arg {
@@ -1915,6 +2273,9 @@ fn call_return_transfer_kind(
             index,
             exact_projection: false,
         },
+        ObjectReturnEffect::BorrowedArgs { ref indices } => {
+            CallReturnTransferKind::BorrowedArgs(indices)
+        }
         ObjectReturnEffect::FreshObject => CallReturnTransferKind::FreshObject,
         ObjectReturnEffect::None | ObjectReturnEffect::Unknown => CallReturnTransferKind::Unknown,
     })
@@ -1937,13 +2298,6 @@ fn push_unique_projection(projections: &mut Vec<Projection>, projection: Project
     if !projections.contains(&projection) {
         projections.push(projection);
     }
-}
-
-fn single_result_value(func: &Function, inst: InstId) -> Option<ValueId> {
-    let [result] = func.dfg.inst_results(inst) else {
-        return None;
-    };
-    Some(*result)
 }
 
 fn dfs_postorder(
@@ -2059,22 +2413,34 @@ fn projection_view_leaf_tys(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::aggregate::compute_object_effect_summaries;
-    use sonatina_ir::{Module, module::FuncRef};
-    use sonatina_parser::parse_module;
+    use crate::{
+        test_support::{lookup_func, parse_test_module},
+        transform::aggregate::compute_object_effect_summaries,
+    };
+    use sonatina_ir::Module;
 
     use super::super::object_tracking::{collect_root_slices, whole_root_slice};
 
-    fn parse_test_module(src: &str) -> Module {
-        parse_module(src).expect("parse should succeed").module
-    }
-
-    fn lookup_func(module: &Module, name: &str) -> FuncRef {
-        module
-            .funcs()
-            .into_iter()
-            .find(|&func_ref| module.ctx.func_sig(func_ref, |sig| sig.name() == name))
-            .expect("function should exist")
+    /// Builds `%f`'s root provenance the way every test here builds it, with
+    /// callee effect summaries in play, and hands it to `check`.
+    fn with_provenance<R>(
+        module: &Module,
+        check: impl FnOnce(&Function, &ProvenanceFacts) -> R,
+    ) -> R {
+        let func_ref = lookup_func(module, "f");
+        let object_effects = compute_object_effect_summaries(module);
+        module.func_store.view(func_ref, |func| {
+            let mut layout_cache = shape::AggregateLayoutCache::default();
+            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
+            let provenance = collect_root_provenance(
+                func,
+                func.ctx(),
+                &root_slices,
+                &mut layout_cache,
+                Some(&object_effects),
+            );
+            check(func, &provenance)
+        })
     }
 
     fn sorted_known_roots(roots: KnownRoots<'_>) -> Vec<ValueId> {
@@ -2108,6 +2474,131 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_extracted_reference_has_unknown_provenance() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+type @Selection = { objref<i256>, i256 };
+declare external %select() -> @Selection;
+
+func private %f() -> objref<i256> {
+block0:
+    v0.@Selection = call %select;
+    v1.objref<i256> = extract_value v0 0.i256;
+    return v1;
+}
+"#,
+        );
+        module.func_store.view(lookup_func(&module, "f"), |func| {
+            let mut layout_cache = shape::AggregateLayoutCache::default();
+            let root_slices = collect_root_slices(func, None, &mut layout_cache);
+            let provenance =
+                collect_root_provenance(func, func.ctx(), &root_slices, &mut layout_cache, None);
+            let extracted = func
+                .layout
+                .iter_all_insts()
+                .find_map(|inst| {
+                    downcast::<&data::ExtractValue>(func.inst_set(), func.dfg.inst(inst))
+                        .and_then(|_| func.dfg.inst_result(inst))
+                })
+                .expect("reference extraction should exist");
+            assert_eq!(provenance.complete().complete_roots(extracted), None);
+            assert_known_and_unknown(provenance.may().may_roots(extracted), &[]);
+        });
+    }
+
+    #[test]
+    fn enum_extracted_reference_has_unknown_provenance() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+type @Selection = enum { #None, #Some(objref<i256>) };
+declare private %select() -> @Selection;
+
+func private %f() -> objref<i256> {
+block0:
+    v0.@Selection = call %select;
+    enum.assert_variant v0 #Some;
+    v1.objref<i256> = enum.extract v0 #Some 0.i256;
+    return v1;
+}
+"#,
+        );
+        module.func_store.view(lookup_func(&module, "f"), |func| {
+            let mut layout_cache = shape::AggregateLayoutCache::default();
+            let root_slices = collect_root_slices(func, None, &mut layout_cache);
+            let provenance =
+                collect_root_provenance(func, func.ctx(), &root_slices, &mut layout_cache, None);
+            let extracted = func
+                .layout
+                .iter_all_insts()
+                .find_map(|inst| {
+                    downcast::<&data::EnumExtract>(func.inst_set(), func.dfg.inst(inst))
+                        .and_then(|_| func.dfg.inst_result(inst))
+                })
+                .expect("reference extraction should exist");
+            assert_eq!(provenance.complete().complete_roots(extracted), None);
+            assert_known_and_unknown(provenance.may().may_roots(extracted), &[]);
+        });
+    }
+
+    #[test]
+    fn materialized_stack_pointer_preserves_known_and_unknown_roots() {
+        for unknown_source in [false, true] {
+            let source = format!(
+                r#"
+target = "evm-ethereum-osaka"
+declare external %unknown() -> objref<[i64; 2]>;
+func private %f(v0.i1, v1.objref<[i64; 2]>, v2.objref<[i64; 2]>) -> *i64 {{
+block0:
+    br v0 block1 block2;
+block1:
+    jump block3;
+block2:
+    {unknown}
+    jump block3;
+block3:
+    v4.objref<[i64; 2]> = phi (v1 block1) ({other} block2);
+    v5.*[i64; 2] = obj.materialize.stack v4;
+    v6.*i64 = gep v5 0.i64 1.i64;
+    v7.*i8 = bitcast v6 *i8;
+    v8.*i64 = bitcast v7 *i64;
+    return v8;
+}}
+"#,
+                unknown = if unknown_source {
+                    "v3.objref<[i64; 2]> = call %unknown;"
+                } else {
+                    ""
+                },
+                other = if unknown_source { "v3" } else { "v2" },
+            );
+            let module = parse_test_module(&source);
+            module.func_store.view(lookup_func(&module, "f"), |func| {
+                let mut cache = shape::AggregateLayoutCache::default();
+                let roots = collect_root_slices_with_arg_roots(func, &mut cache);
+                let provenance =
+                    collect_root_provenance(func, func.ctx(), &roots, &mut cache, None);
+                for inst in func.layout.iter_all_insts() {
+                    let inst_data = func.dfg.inst(inst);
+                    if downcast::<&data::ObjMaterializeStack>(func.inst_set(), inst_data).is_some()
+                        || downcast::<&data::Gep>(func.inst_set(), inst_data).is_some()
+                        || downcast::<&cast::Bitcast>(func.inst_set(), inst_data).is_some()
+                    {
+                        let result = func.dfg.inst_result(inst).unwrap();
+                        let roots = provenance.may().may_roots(result);
+                        if unknown_source {
+                            assert_known_and_unknown(roots, &[func.arg_values[1]]);
+                        } else {
+                            assert_known_only(roots, &func.arg_values[1..]);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
     fn exact_known_root_uses_complete_and_may_views() {
         let module = parse_test_module(
             r#"
@@ -2131,8 +2622,7 @@ block0:
             let may = provenance.may();
             let root = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjAlloc>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2174,23 +2664,10 @@ block0:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
-
+        with_provenance(&module, |func, provenance| {
             let loaded = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2199,8 +2676,7 @@ block0:
 
             let source_root = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjAlloc>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2244,23 +2720,10 @@ block2:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
-
+        with_provenance(&module, |func, provenance| {
             let loaded = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2297,23 +2760,10 @@ block0:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
-
+        with_provenance(&module, |func, provenance| {
             let loads: Vec<_> = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2324,8 +2774,7 @@ block0:
             };
             let roots: Vec<_> = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter_map(|inst| {
                     downcast::<&data::ObjAlloc>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2375,23 +2824,10 @@ block3:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
-
+        with_provenance(&module, |func, provenance| {
             let loaded = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2399,8 +2835,7 @@ block3:
                 .expect("load result should exist");
             let roots: FxHashSet<_> = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter_map(|inst| {
                     downcast::<&data::ObjAlloc>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2454,23 +2889,10 @@ block0:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
-
+        with_provenance(&module, |func, provenance| {
             let loads: Vec<_> = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2481,8 +2903,7 @@ block0:
             };
             let roots: Vec<_> = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter_map(|inst| {
                     downcast::<&data::ObjAlloc>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2502,7 +2923,7 @@ block0:
     }
 
     #[test]
-    fn call_write_kills_stale_captured_root_provenance() {
+    fn call_may_write_retains_old_captured_root_provenance() {
         let module = parse_test_module(
             r#"
 target = "evm-ethereum-osaka"
@@ -2530,23 +2951,10 @@ block0:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
-
+        with_provenance(&module, |func, provenance| {
             let loads: Vec<_> = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2557,23 +2965,18 @@ block0:
             };
             let roots: Vec<_> = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter_map(|inst| {
                     downcast::<&data::ObjAlloc>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
                         .filter(|&result| func.dfg.value_ty(result) == func.dfg.value_ty(*loaded))
                 })
                 .collect();
-            let [_, overwritten_root] = roots.as_slice() else {
-                panic!("expected exactly two array roots");
-            };
-
-            let complete = provenance.complete();
-            assert_eq!(
-                complete.complete_roots(*loaded),
-                Some(CompleteRootSet::Single(RootValue::new(*overwritten_root)))
-            );
+            assert_eq!(roots.len(), 2);
+            // Summaries are may-effects, even when this helper happens to write
+            // unconditionally. No must-write proof authorizes removing the old root,
+            // and observed captures do not certify exhaustive replacement contents.
+            assert_known_and_unknown(provenance.may().may_roots(*loaded), &roots);
         });
     }
 
@@ -2619,22 +3022,10 @@ block3:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
+        with_provenance(&module, |func, provenance| {
             let loaded = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2646,7 +3037,9 @@ block3:
             let expected = vec![func.arg_values[1], func.arg_values[2]];
             let may = provenance.may();
 
-            assert_known_only(may.may_roots(loaded), &expected);
+            // Capture summaries enumerate possibilities, not a must-initialized
+            // cell. Weak stores cannot remove its unknown incoming alternative.
+            assert_known_and_unknown(may.may_roots(loaded), &expected);
         });
     }
 
@@ -2672,22 +3065,10 @@ block0:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
+        with_provenance(&module, |func, provenance| {
             let [projected, call_result] = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter_map(|inst| func.dfg.inst_result(inst))
                 .filter(|&result| {
                     func.dfg.value_ty(result) != func.dfg.value_ty(func.arg_values[0])
@@ -2726,22 +3107,10 @@ block0:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
+        with_provenance(&module, |func, provenance| {
             let call_result = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&control_flow::Call>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2803,22 +3172,10 @@ block3:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
+        with_provenance(&module, |func, provenance| {
             let loaded = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2830,7 +3187,9 @@ block3:
             let expected = vec![func.arg_values[1], func.arg_values[2]];
             let may = provenance.may();
 
-            assert_known_only(may.may_roots(loaded), &expected);
+            // Capture summaries enumerate possibilities, not a must-initialized
+            // cell. Weak stores cannot remove its unknown incoming alternative.
+            assert_known_and_unknown(may.may_roots(loaded), &expected);
         });
     }
 
@@ -2871,22 +3230,10 @@ block3:
 "#,
         );
 
-        let func_ref = lookup_func(&module, "f");
-        let object_effects = compute_object_effect_summaries(&module);
-        module.func_store.view(func_ref, |func| {
-            let mut layout_cache = shape::AggregateLayoutCache::default();
-            let root_slices = collect_root_slices_with_arg_roots(func, &mut layout_cache);
-            let provenance = collect_root_provenance(
-                func,
-                func.ctx(),
-                &root_slices,
-                &mut layout_cache,
-                Some(&object_effects),
-            );
+        with_provenance(&module, |func, provenance| {
             let loaded = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2937,8 +3284,7 @@ block3:
                 collect_root_provenance(func, func.ctx(), &root_slices, &mut layout_cache, None);
             let projected = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjProj>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -2946,8 +3292,7 @@ block3:
                 .expect("projection result should exist");
             let phi_result = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&control_flow::Phi>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -3016,8 +3361,7 @@ block3:
 
             let phi_result = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&control_flow::Phi>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -3025,8 +3369,7 @@ block3:
                 .expect("phi result should exist");
             let known_root = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&data::ObjAlloc>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -3075,8 +3418,7 @@ block0:
             );
             let call_result = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find_map(|inst| {
                     downcast::<&control_flow::Call>(func.inst_set(), func.dfg.inst(inst))
                         .and_then(|_| func.dfg.inst_result(inst))
@@ -3088,5 +3430,95 @@ block0:
             assert_eq!(complete.complete_roots(call_result), None);
             assert_known_and_unknown(may.may_roots(call_result), &[]);
         });
+    }
+
+    #[test]
+    fn unmapped_alternative_leaves_no_partial_projection_candidates() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+
+type @S = { objref<i256>, [objref<i256>; 2] };
+
+func private %choose(v0.i1, v1.objref<objref<i256>>, v2.objref<objref<i256>>) -> objref<objref<i256>> {
+block0:
+    br v0 block1 block2;
+block1:
+    jump block2;
+block2:
+    v3.objref<objref<i256>> = phi (v1 block0) (v2 block1);
+    return v3;
+}
+
+func private %phi_alternative(v0.i256, v1.i1) -> objref<objref<i256>> {
+block0:
+    v2.objref<@S> = obj.alloc @S;
+    v3.objref<[objref<i256>; 2]> = obj.proj v2 1.i8;
+    v4.objref<objref<i256>> = obj.index v3 v0;
+    v5.objref<objref<i256>> = obj.proj v2 0.i8;
+    br v1 block1 block2;
+block1:
+    jump block2;
+block2:
+    v6.objref<objref<i256>> = phi (v4 block0) (v5 block1);
+    return v6;
+}
+
+func private %borrowed_alternative(v0.i256, v1.i1) -> objref<objref<i256>> {
+block0:
+    v2.objref<@S> = obj.alloc @S;
+    v3.objref<[objref<i256>; 2]> = obj.proj v2 1.i8;
+    v4.objref<objref<i256>> = obj.index v3 v0;
+    v5.objref<objref<i256>> = obj.proj v2 0.i8;
+    v6.objref<objref<i256>> = call %choose v1 v4 v5;
+    return v6;
+}
+"#,
+        );
+
+        let object_effects = compute_object_effect_summaries(&module);
+        for name in ["phi_alternative", "borrowed_alternative"] {
+            module.func_store.view(lookup_func(&module, name), |func| {
+                let mut layout_cache = shape::AggregateLayoutCache::default();
+                let root_slices = collect_root_slices(func, None, &mut layout_cache);
+                let provenance = collect_root_provenance(
+                    func,
+                    func.ctx(),
+                    &root_slices,
+                    &mut layout_cache,
+                    Some(&object_effects),
+                );
+                let insts: Vec<_> = func
+                    .layout
+                    .iter_block()
+                    .flat_map(|block| func.layout.iter_inst(block))
+                    .collect();
+                let root = insts
+                    .iter()
+                    .find_map(|&inst| {
+                        downcast::<&data::ObjAlloc>(func.inst_set(), func.dfg.inst(inst))
+                            .and_then(|_| func.dfg.inst_result(inst))
+                    })
+                    .expect("alloc root should exist");
+                let returned = insts
+                    .iter()
+                    .find_map(|&inst| {
+                        downcast::<&control_flow::Return>(func.inst_set(), func.dfg.inst(inst))
+                            .and_then(|ret| ret.arg().copied())
+                    })
+                    .expect("returned value should exist");
+
+                // The dynamic index can designate any element, so the one
+                // mapped alternative must not stand for the whole set.
+                assert_eq!(
+                    provenance
+                        .complete()
+                        .possible_slices_for_root(returned, RootValue::new(root))
+                        .as_deref(),
+                    Some(&[root_slices[&root]][..]),
+                    "{name}"
+                );
+            });
+        }
     }
 }

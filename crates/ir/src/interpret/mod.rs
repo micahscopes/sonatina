@@ -12,6 +12,8 @@ mod control_flow;
 mod data;
 mod evm;
 mod logic;
+#[cfg(test)]
+mod test_state;
 
 pub type EvalResults = SmallVec<[EvalValue; 1]>;
 
@@ -58,6 +60,7 @@ pub trait Interpret {
         inst::logic::And,
         inst::logic::Or,
         inst::logic::Xor,
+        inst::logic::Bswap,
         inst::cast::Sext,
         inst::cast::Zext,
         inst::cast::Trunc,
@@ -77,6 +80,7 @@ pub trait Interpret {
         inst::cmp::IsZero,
         inst::data::Mload,
         inst::data::Mstore,
+        inst::data::BlackBox,
         inst::data::Gep,
         inst::data::GetFunctionPtr,
         inst::data::Alloca,
@@ -110,6 +114,7 @@ pub trait Interpret {
         inst::evm::EvmExp,
         inst::evm::EvmSignExtend,
         inst::evm::EvmByte,
+        inst::evm::EvmKeccak256Words,
     );
 }
 

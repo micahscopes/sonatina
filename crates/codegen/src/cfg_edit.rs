@@ -55,6 +55,21 @@ impl<'f> CfgEditor<'f> {
         })
     }
 
+    fn branch_terminator(&self, block: BlockId) -> InstId {
+        let Some(term) = self.func.layout.last_inst_of(block) else {
+            panic!("block {block:?} has no terminator");
+        };
+        assert!(
+            self.func.dfg.is_terminator(term),
+            "block {block:?} does not end with a terminator"
+        );
+        assert!(
+            self.func.dfg.branch_info(term).is_some(),
+            "terminator {term:?} has no branch info"
+        );
+        term
+    }
+
     pub fn truncate_block_from_inst(&mut self, first_inst: InstId) -> BlockId {
         assert!(self.func.layout.is_inst_inserted(first_inst));
         let block = self.func.layout.inst_block(first_inst);
@@ -154,17 +169,8 @@ impl<'f> CfgEditor<'f> {
     pub fn retain_out_edges(&mut self, from: BlockId, keep_mask: &[bool]) -> bool {
         assert!(self.func.layout.is_block_inserted(from));
 
-        let Some(term) = self.func.layout.last_inst_of(from) else {
-            panic!("block {from:?} has no terminator");
-        };
-        assert!(
-            self.func.dfg.is_terminator(term),
-            "block {from:?} does not end with a terminator"
-        );
-
-        let Some(branch_info) = self.func.dfg.branch_info(term) else {
-            panic!("terminator {term:?} has no branch info");
-        };
+        let term = self.branch_terminator(from);
+        let branch_info = self.func.dfg.branch_info(term).unwrap();
         let old_dests = branch_info.dests();
         assert_eq!(
             keep_mask.len(),
@@ -216,17 +222,8 @@ impl<'f> CfgEditor<'f> {
         assert!(self.func.layout.is_block_inserted(from));
         assert!(self.func.layout.is_block_inserted(new_to));
 
-        let Some(term) = self.func.layout.last_inst_of(from) else {
-            panic!("block {from:?} has no terminator");
-        };
-        assert!(
-            self.func.dfg.is_terminator(term),
-            "block {from:?} does not end with a terminator"
-        );
-
-        let Some(branch_info) = self.func.dfg.branch_info(term) else {
-            panic!("terminator {term:?} has no branch info");
-        };
+        let term = self.branch_terminator(from);
+        let branch_info = self.func.dfg.branch_info(term).unwrap();
         let old_dests = branch_info.dests();
         let old_to = *old_dests
             .get(edge_idx)
@@ -338,34 +335,53 @@ impl<'f> CfgEditor<'f> {
         (from, new_block)
     }
 
-    pub fn split_edge(&mut self, from: BlockId, to: BlockId) -> BlockId {
+    fn insert_edge_block(&mut self, to: BlockId) -> BlockId {
+        let mid = self.func.dfg.make_block();
+        if self.func.layout.entry_block() == Some(to) {
+            // Splitting an edge whose destination is the entry block (e.g. a multiway self-loop
+            // on the entry): inserting `mid` immediately before `to` would make `mid` the new
+            // entry, because `Layout::insert_block_before` reassigns `entry_block` when `before`
+            // has no predecessor in the layout. Keep `to` as the entry by placing `mid` after it;
+            // layout order past the entry is only a fallthrough hint and is recomputed by later
+            // analyses.
+            self.func.layout.insert_block_after(mid, to);
+        } else {
+            self.func.layout.insert_block_before(mid, to);
+        }
+        let mut cursor = InstInserter::at_location(CursorLocation::BlockTop(mid));
+        cursor.append_inst_data(self.func, Jump::new(self.func.dfg.inst_set().jump(), to));
+
+        mid
+    }
+
+    /// Split one outgoing branch edge slot through its own new jump block.
+    ///
+    /// Phi nodes are keyed by predecessor block rather than edge slot. If another parallel edge
+    /// from `from` to the same target remains, its incoming value is copied for the new block;
+    /// otherwise the predecessor label is moved from `from` to the new block.
+    pub fn split_out_edge(&mut self, from: BlockId, edge_idx: usize) -> BlockId {
         assert!(self.func.layout.is_block_inserted(from));
+
+        let term = self.branch_terminator(from);
+        let branch_info = self.func.dfg.branch_info(term).unwrap();
+        let dests = branch_info.dests();
+        let to = *dests
+            .get(edge_idx)
+            .unwrap_or_else(|| panic!("outgoing edge index out of bounds: {edge_idx}"));
         assert!(self.func.layout.is_block_inserted(to));
 
-        let Some(term) = self.func.layout.last_inst_of(from) else {
-            panic!("block {from:?} has no terminator");
-        };
-        assert!(
-            self.func.dfg.is_terminator(term),
-            "block {from:?} does not end with a terminator"
-        );
+        let has_parallel_edge = dests
+            .iter()
+            .enumerate()
+            .any(|(other_idx, &dest)| other_idx != edge_idx && dest == to);
+        let mid = self.insert_edge_block(to);
+        self.func.dfg.rewrite_branch_edge_dest(term, edge_idx, mid);
 
-        let Some(branch_info) = self.func.dfg.branch_info(term) else {
-            panic!("terminator {term:?} has no branch info");
-        };
-        assert!(
-            branch_info.dests().into_iter().any(|dest| dest == to),
-            "edge {from:?} -> {to:?} does not exist"
-        );
-
-        let mid = self.func.dfg.make_block();
-        let mut cursor = InstInserter::at_location(CursorLocation::BlockTop(to));
-        cursor.insert_block_before(self.func, mid);
-        cursor.set_location(CursorLocation::BlockTop(mid));
-        cursor.append_inst_data(self.func, Jump::new(self.func.inst_set(), to));
-
-        self.func.dfg.rewrite_branch_edges_to_block(term, to, mid);
-        replace_phi_incoming_block(self.func, to, from, mid);
+        if has_parallel_edge {
+            copy_phi_incoming_block(self.func, to, from, mid);
+        } else {
+            replace_phi_incoming_block(self.func, to, from, mid);
+        }
 
         self.recompute_cfg();
         mid
@@ -416,17 +432,8 @@ impl<'f> CfgEditor<'f> {
                 "preheader predecessor {pred:?} is not inserted"
             );
 
-            let Some(last_inst) = self.func.layout.last_inst_of(pred) else {
-                panic!("block {pred:?} has no terminator");
-            };
-            assert!(
-                self.func.dfg.is_terminator(last_inst),
-                "block {pred:?} does not end with a terminator"
-            );
-
-            let Some(branch_info) = self.func.dfg.branch_info(last_inst) else {
-                panic!("terminator {last_inst:?} has no branch info");
-            };
+            let term = self.branch_terminator(pred);
+            let branch_info = self.func.dfg.branch_info(term).unwrap();
             assert!(
                 branch_info
                     .dests()
@@ -437,7 +444,7 @@ impl<'f> CfgEditor<'f> {
 
             self.func
                 .dfg
-                .rewrite_branch_edges_to_block(last_inst, lp_header, new_preheader);
+                .rewrite_branch_edges_to_block(term, lp_header, new_preheader);
         }
 
         self.rewrite_loop_header_phis_for_preheader(lp_header, outside_preds, new_preheader);
@@ -801,7 +808,7 @@ impl<'f> CfgEditor<'f> {
 
     /// Replace successor `old_to` with `new_to`.
     ///
-    /// Unlike [`replace_succ`], this variant allows retargeting to a destination that
+    /// Unlike [`Self::replace_succ`], this variant allows retargeting to a destination that
     /// already has `from` as a predecessor. In that case, `phi_inputs` must be empty.
     pub fn replace_succ_allow_existing_pred(
         &mut self,
@@ -831,17 +838,8 @@ impl<'f> CfgEditor<'f> {
             panic!("branch target {old_to:?} is not inserted");
         }
 
-        let Some(term) = self.func.layout.last_inst_of(from) else {
-            panic!("block {from:?} has no terminator");
-        };
-        assert!(
-            self.func.dfg.is_terminator(term),
-            "block {from:?} does not end with a terminator"
-        );
-
-        let Some(branch_info) = self.func.dfg.branch_info(term) else {
-            panic!("terminator {term:?} has no branch info");
-        };
+        let term = self.branch_terminator(from);
+        let branch_info = self.func.dfg.branch_info(term).unwrap();
         if !branch_info.dests().into_iter().any(|dest| dest == old_to) {
             return false;
         }
@@ -895,16 +893,17 @@ impl<'f> CfgEditor<'f> {
                 .unwrap_or_else(|| panic!("phi {phi_inst_id:?} has no result"));
             let phi_ty = self.func.dfg.value_ty(phi_result);
 
-            let mut new_phi = self.func.dfg.make_phi(vec![]);
-            self.func.dfg.untrack_inst(phi_inst_id);
-            let old_phi = self.func.dfg.cast_phi_mut(phi_inst_id).unwrap();
-
-            for &pred in outside_preds {
-                let value = old_phi.remove_phi_arg(pred).unwrap_or_else(|| {
-                    panic!("phi {phi_inst_id:?} in {lp_header:?} missing incoming from {pred:?}")
-                });
-                new_phi.append_phi_arg(value, pred);
-            }
+            let mut new_phi = self.func.dfg.make_phi(SmallVec::new());
+            self.func.dfg.edit_phi(phi_inst_id, |old_phi| {
+                for &pred in outside_preds {
+                    let value = old_phi.remove_phi_arg(pred).unwrap_or_else(|| {
+                        panic!(
+                            "phi {phi_inst_id:?} in {lp_header:?} missing incoming from {pred:?}"
+                        )
+                    });
+                    new_phi.append_phi_arg(value, pred);
+                }
+            });
 
             let preheader_phi_result = match inserted_phis.get(&new_phi) {
                 Some(&value) => value,
@@ -973,16 +972,15 @@ fn append_phi_inputs_for_new_pred(
     assert_eq!(expected, provided, "phi mapping is incomplete");
 
     for &(phi_inst, incoming) in phi_inputs {
-        func.dfg.untrack_inst(phi_inst);
-        let phi = func.dfg.cast_phi_mut(phi_inst).unwrap();
-        assert!(
-            !phi.args()
-                .iter()
-                .any(|(_, existing_pred)| *existing_pred == pred),
-            "phi {phi_inst:?} already has incoming from {pred:?}"
-        );
-        phi.append_phi_arg(incoming, pred);
-        func.dfg.attach_user(phi_inst);
+        func.dfg.edit_phi(phi_inst, |phi| {
+            assert!(
+                !phi.args()
+                    .iter()
+                    .any(|(_, existing_pred)| *existing_pred == pred),
+                "phi {phi_inst:?} already has incoming from {pred:?}"
+            );
+            phi.append_phi_arg(incoming, pred);
+        });
     }
 }
 
@@ -998,10 +996,7 @@ fn iter_phis_in_block(func: &Function, block: BlockId) -> impl Iterator<Item = I
 
 pub(crate) fn remove_phi_incoming_from(func: &mut Function, block: BlockId, pred: BlockId) {
     for phi_inst in iter_phis_in_block(func, block).collect::<Vec<_>>() {
-        func.dfg.untrack_inst(phi_inst);
-        let phi = func.dfg.cast_phi_mut(phi_inst).unwrap();
-        phi.retain(|b| b != pred);
-        func.dfg.attach_user(phi_inst);
+        func.dfg.edit_phi(phi_inst, |phi| phi.retain(|b| b != pred));
     }
 }
 
@@ -1012,23 +1007,51 @@ fn replace_phi_incoming_block(
     new_pred: BlockId,
 ) {
     for phi_inst in iter_phis_in_block(func, block).collect::<Vec<_>>() {
-        let phi = func.dfg.cast_phi_mut(phi_inst).unwrap();
-        assert!(
-            !phi.args().iter().any(|(_, pred)| *pred == new_pred),
-            "phi {phi_inst:?} already has incoming from {new_pred:?}"
-        );
-        let mut replaced = false;
-        for (_, pred) in phi.args_mut() {
-            if *pred == old_pred {
-                *pred = new_pred;
-                replaced = true;
+        func.dfg.edit_phi(phi_inst, |phi| {
+            assert!(
+                !phi.args().iter().any(|(_, pred)| *pred == new_pred),
+                "phi {phi_inst:?} already has incoming from {new_pred:?}"
+            );
+            let mut replaced = false;
+            for (_, pred) in phi.args_mut() {
+                if *pred == old_pred {
+                    *pred = new_pred;
+                    replaced = true;
+                }
             }
-        }
-        assert!(
-            replaced,
-            "phi {phi_inst:?} in {block:?} missing incoming from {old_pred:?}"
-        );
+            assert!(
+                replaced,
+                "phi {phi_inst:?} in {block:?} missing incoming from {old_pred:?}"
+            );
+        });
     }
+}
+
+fn copy_phi_incoming_block(
+    func: &mut Function,
+    block: BlockId,
+    old_pred: BlockId,
+    new_pred: BlockId,
+) {
+    let phi_inputs = iter_phis_in_block(func, block)
+        .map(|phi_inst| {
+            let phi = func.dfg.cast_phi(phi_inst).unwrap();
+            let mut incoming = phi
+                .args()
+                .iter()
+                .filter(|(_, pred)| *pred == old_pred)
+                .map(|(value, _)| *value);
+            let value = incoming.next().unwrap_or_else(|| {
+                panic!("phi {phi_inst:?} in {block:?} missing incoming from {old_pred:?}")
+            });
+            assert!(
+                incoming.next().is_none(),
+                "phi {phi_inst:?} in {block:?} has duplicate incoming from {old_pred:?}"
+            );
+            (phi_inst, value)
+        })
+        .collect::<Vec<_>>();
+    append_phi_inputs_for_new_pred(func, block, new_pred, &phi_inputs);
 }
 
 pub(crate) fn simplify_trivial_phis_in_block(func: &mut Function, block: BlockId) -> bool {
@@ -1090,15 +1113,11 @@ pub fn prune_phi_to_preds(
     let mut changed = false;
 
     for phi_inst in iter_phis_in_block(func, block).collect::<Vec<_>>() {
-        func.dfg.untrack_inst(phi_inst);
-        let phi_result = func.dfg.inst_result(phi_inst).expect("phi has no result");
-        let ty = func.dfg.value_ty(phi_result);
-        let mut missing = Vec::new();
-        {
-            let phi = func.dfg.cast_phi_mut(phi_inst).unwrap();
+        let (removed_any, missing) = func.dfg.edit_phi(phi_inst, |phi| {
+            let mut missing = Vec::new();
             let old_len = phi.args().len();
             phi.retain(|pred| preds.binary_search(&pred).is_ok());
-            changed |= phi.args().len() != old_len;
+            let removed_any = phi.args().len() != old_len;
 
             let mut seen = Vec::with_capacity(phi.args().len());
             for &(_, pred) in phi.args() {
@@ -1122,18 +1141,18 @@ pub fn prune_phi_to_preds(
                     CleanupMode::RepairWithUndef => missing.push(pred),
                 }
             }
-        }
+            (removed_any, missing)
+        });
+        changed |= removed_any;
 
-        if matches!(mode, CleanupMode::RepairWithUndef) && !missing.is_empty() {
-            let undef = func.dfg.make_undef_value(ty);
-            let phi = func.dfg.cast_phi_mut(phi_inst).unwrap();
+        if !missing.is_empty() {
+            let phi_result = func.dfg.inst_result(phi_inst).expect("phi has no result");
+            let undef = func.dfg.make_undef_value(func.dfg.value_ty(phi_result));
             for pred in missing {
-                phi.append_phi_arg(undef, pred);
+                func.dfg.append_phi_arg(phi_inst, undef, pred);
             }
             changed = true;
         }
-
-        func.dfg.attach_user(phi_inst);
     }
 
     changed
@@ -1141,10 +1160,12 @@ pub fn prune_phi_to_preds(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::parse_test_module;
     use std::collections::BTreeSet;
 
+    use smallvec::{SmallVec, smallvec};
     use sonatina_ir::{
-        Immediate, Module, Type, Value,
+        Immediate, Type, Value,
         builder::test_util::{dump_func, test_func_builder, test_module_builder},
         inst::{
             arith::{Add, Sub},
@@ -1153,13 +1174,8 @@ mod tests {
         },
         isa::Isa,
     };
-    use sonatina_parser::parse_module;
 
     use super::{CfgEditor, CleanupMode, simplify_trivial_phis_in_block};
-
-    fn parse_test_module(src: &str) -> Module {
-        parse_module(src).expect("parse should succeed").module
-    }
 
     #[test]
     fn replace_succ_allow_existing_pred_does_not_duplicate_phi_inputs() {
@@ -1181,7 +1197,8 @@ mod tests {
         builder.switch_to_block(b2);
         let one = builder.make_imm_value(1i32);
         let two = builder.make_imm_value(2i32);
-        let phi = builder.insert_inst_with(|| Phi::new(is, vec![(one, b0), (two, b1)]), Type::I32);
+        let phi =
+            builder.insert_inst_with(|| Phi::new(is, smallvec![(one, b0), (two, b1)]), Type::I32);
         builder.insert_inst_no_result_with(|| Return::new_single(is, phi));
 
         builder.seal_all();
@@ -1240,7 +1257,7 @@ block2:
 
             let phi_inst = editor.func().layout.first_inst_of(*b1).unwrap();
             let phi = editor.func().dfg.cast_phi(phi_inst).unwrap();
-            assert_eq!(phi.args(), &[(phi.args()[0].0, *b0)]);
+            assert_eq!(phi.args().as_slice(), &[(phi.args()[0].0, *b0)]);
             assert_eq!(editor.cfg().pred_edges_as_slice(*b1).len(), 1);
             assert_eq!(editor.cfg().preds_as_slice(*b1), &[*b0]);
         });
@@ -1363,6 +1380,53 @@ block2:
     }
 
     #[test]
+    fn split_out_edge_preserves_parallel_phi_inputs() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+
+func private %f() -> i32 {
+block0:
+    br_table 0.i8 block1 (0.i8 block1) (1.i8 block2);
+
+block1:
+    v0.i32 = phi (7.i32 block0);
+    return v0;
+
+block2:
+    return 9.i32;
+}
+"#,
+        );
+        let func_ref = module.funcs()[0];
+        module.func_store.modify(func_ref, |func| {
+            let blocks: Vec<_> = func.layout.iter_block().collect();
+            let [b0, b1, b2] = blocks.as_slice() else {
+                panic!("expected three blocks");
+            };
+
+            let phi_inst = func.layout.first_inst_of(*b1).unwrap();
+            let incoming = func.dfg.cast_phi(phi_inst).unwrap().args()[0].0;
+            let mut editor = CfgEditor::new(func, CleanupMode::Strict);
+            let first_mid = editor.split_out_edge(*b0, 0);
+            let second_mid = editor.split_out_edge(*b0, 1);
+
+            let term = editor.func().layout.last_inst_of(*b0).unwrap();
+            let dests = editor.func().dfg.branch_info(term).unwrap().dests();
+            assert_eq!(dests.as_slice(), &[first_mid, second_mid, *b2]);
+
+            let phi = editor.func().dfg.cast_phi(phi_inst).unwrap();
+            assert_eq!(phi.args().len(), 2);
+            assert!(phi.args().iter().all(
+                |&(value, pred)| value == incoming && (pred == first_mid || pred == second_mid)
+            ));
+            assert_eq!(editor.cfg().preds_as_slice(*b1).len(), 2);
+            assert!(editor.cfg().preds_of(*b1).any(|&pred| pred == first_mid));
+            assert!(editor.cfg().preds_of(*b1).any(|&pred| pred == second_mid));
+        });
+    }
+
+    #[test]
     fn truncate_block_from_inst_and_append_inst_with_result_rebuild_tail() {
         let mb = test_module_builder();
         let (evm, mut builder) = test_func_builder(&mb, &[Type::I32], Type::I32);
@@ -1439,7 +1503,7 @@ block2:
         let phi_seed_1 = builder.make_imm_value(1i32);
         let phi_seed_2 = builder.make_imm_value(2i32);
         let v4 = builder.insert_inst_with(
-            || Phi::new(is, vec![(phi_seed_1, b1), (phi_seed_2, b2)]),
+            || Phi::new(is, smallvec![(phi_seed_1, b1), (phi_seed_2, b2)]),
             Type::I32,
         );
         builder.insert_inst_no_result_with(|| Jump::new(is, b4));
@@ -1553,7 +1617,7 @@ block2:
         let b2 = builder.append_block();
 
         builder.switch_to_block(b0);
-        let phi = builder.insert_inst_with(|| Phi::new(is, vec![]), Type::I32);
+        let phi = builder.insert_inst_with(|| Phi::new(is, SmallVec::new()), Type::I32);
         builder.insert_inst_no_result_with(|| Jump::new(is, b1));
 
         builder.switch_to_block(b1);
@@ -1597,7 +1661,7 @@ block2:
         builder.insert_inst_no_result_with(|| Jump::new(is, b1));
 
         builder.switch_to_block(b1);
-        let phi = builder.insert_inst_with(|| Phi::new(is, vec![(seed, b0)]), Type::I32);
+        let phi = builder.insert_inst_with(|| Phi::new(is, smallvec![(seed, b0)]), Type::I32);
         builder.insert_inst_no_result_with(|| Br::new(is, cond, b2, b3));
 
         builder.switch_to_block(b2);
@@ -1654,7 +1718,8 @@ block2:
         builder.insert_inst_no_result_with(|| Jump::new(is, b3));
 
         builder.switch_to_block(b3);
-        let phi = builder.insert_inst_with(|| Phi::new(is, vec![(v2, b2), (seed, b4)]), Type::I32);
+        let phi =
+            builder.insert_inst_with(|| Phi::new(is, smallvec![(v2, b2), (seed, b4)]), Type::I32);
         builder.insert_inst_no_result_with(|| Return::new_single(is, phi));
 
         builder.seal_all();

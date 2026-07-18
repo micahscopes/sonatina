@@ -415,9 +415,26 @@ fn compile_section(
             section = %section_name.0
         )
         .entered();
-        link_section(backend, &prepared, &data, &embeds, section_name, opts).map_err(
-            |e| match e {
-                LinkSectionError::Backend { func, error } => {
+        link_section(
+            backend,
+            &prepared,
+            object_name,
+            &data,
+            &embeds,
+            section_name,
+            opts,
+        )
+        .map_err(|e| match e {
+            LinkSectionError::Backend { func, error } => {
+                vec![ObjectCompileError::BackendError {
+                    object: object_name.clone(),
+                    section: section_name.clone(),
+                    func,
+                    message: error,
+                }]
+            }
+            LinkSectionError::BackendFixup { owner, error } => match owner {
+                CodeUnitOwner::Function(func) => {
                     vec![ObjectCompileError::BackendError {
                         object: object_name.clone(),
                         section: section_name.clone(),
@@ -425,28 +442,18 @@ fn compile_section(
                         message: error,
                     }]
                 }
-                LinkSectionError::BackendFixup { owner, error } => match owner {
-                    CodeUnitOwner::Function(func) => {
-                        vec![ObjectCompileError::BackendError {
-                            object: object_name.clone(),
-                            section: section_name.clone(),
-                            func,
-                            message: error,
-                        }]
-                    }
-                    CodeUnitOwner::SectionUnit(_) => vec![ObjectCompileError::LinkError {
-                        object: object_name.clone(),
-                        section: section_name.clone(),
-                        message: format!("{owner}: {error}"),
-                    }],
-                },
-                LinkSectionError::Link(message) => vec![ObjectCompileError::LinkError {
+                CodeUnitOwner::SectionUnit(_) => vec![ObjectCompileError::LinkError {
                     object: object_name.clone(),
                     section: section_name.clone(),
-                    message,
+                    message: format!("{owner}: {error}"),
                 }],
             },
-        )?
+            LinkSectionError::Link(message) => vec![ObjectCompileError::LinkError {
+                object: object_name.clone(),
+                section: section_name.clone(),
+                message,
+            }],
+        })?
     };
 
     cache.insert(section_id, artifact);
@@ -499,25 +506,13 @@ fn topo_sort_sections(program: &ResolvedProgram<'_>) -> Vec<SectionId> {
 mod tests {
     use super::*;
     use crate::{
-        isa::evm::{EvmBackend, PushWidthPolicy},
-        object::{
-            CompileOptions, FrontendProvenanceMap, OBSERVABILITY_SCHEMA_VERSION, artifact::SymbolId,
-        },
+        isa::evm::{PushWidthPolicy, test_util::osaka_backend},
+        object::{CompileOptions, OBSERVABILITY_SCHEMA_VERSION, PcAttribution, artifact::SymbolId},
     };
-    use sonatina_ir::{
-        InstDowncastMut, Type, inst::arith::Add, ir_writer::ModuleWriter, isa::evm::Evm,
-    };
+    use sonatina_ir::{InstDowncastMut, Type, inst::arith::Add, ir_writer::ModuleWriter};
     use sonatina_parser::parse_module;
-    use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
-    use sonatina_verifier::{VerificationLevel, VerifierConfig};
 
-    fn test_backend() -> EvmBackend {
-        EvmBackend::new(Evm::new(TargetTriple {
-            architecture: Architecture::Evm,
-            vendor: Vendor::Ethereum,
-            operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
-        }))
-    }
+    use sonatina_verifier::{VerificationLevel, VerifierConfig};
 
     fn compile_opts(
         fixup_policy: PushWidthPolicy,
@@ -533,13 +528,33 @@ mod tests {
         }
     }
 
+    /// Compiles object `@O` from `source` at `level`, leaving the outcome for
+    /// the caller to assert on.
+    fn try_compile_o(
+        source: &str,
+        level: VerificationLevel,
+    ) -> Result<crate::object::artifact::ObjectArtifact, Vec<ObjectCompileError>> {
+        let parsed = parse_module(source).unwrap();
+        compile_object(
+            &parsed.module,
+            &osaka_backend(),
+            "O",
+            &compile_opts(
+                PushWidthPolicy::Push4,
+                false,
+                false,
+                VerifierConfig::for_level(level),
+            ),
+        )
+    }
+
     fn compile_fixture(
         source: &str,
         object: &str,
         opts: &CompileOptions,
     ) -> crate::object::artifact::ObjectArtifact {
         let parsed = parse_module(source).unwrap();
-        compile_object(&parsed.module, &test_backend(), object, opts).unwrap()
+        compile_object(&parsed.module, &osaka_backend(), object, opts).unwrap()
     }
 
     fn section<'a>(
@@ -727,7 +742,7 @@ object @Contract {
         });
         let artifact = compile_object(
             &parsed.module,
-            &test_backend(),
+            &osaka_backend(),
             "Contract",
             &compile_opts(
                 PushWidthPolicy::Push4,
@@ -875,21 +890,135 @@ object @Contract {
             runtime_obs.mapped_code_bytes + runtime_obs.unmapped_code_bytes,
             runtime_obs.code_bytes
         );
+    }
 
-        let mut enriched = artifact.observability().expect("object observability");
-        let target = enriched
-            .sections
-            .values()
-            .flat_map(|section| section.pc_map.iter())
-            .find_map(|entry| entry.ir_inst.map(|ir_inst| (entry.func, ir_inst)))
-            .expect("expected ir-backed pc-map entry");
-        let mut map = FrontendProvenanceMap::default();
-        map.insert(target, "mir_stmt:1".to_string());
-        enriched.apply_frontend_provenance(&map);
+    #[test]
+    fn mandatory_evm_preparation_preserves_stamped_provenance() {
+        let parsed = parse_module(
+            r#"
+target = "evm-ethereum-osaka"
+
+global private const [i256; 2] $values = [11, 22];
+
+func public %runtime(v0.i256) -> i256 {
+    block0:
+        v1.constref<[i256; 2]> = const.ref $values;
+        v2.constref<i256> = const.index v1 v0;
+        v3.i256 = const.load v2;
+        return v3;
+}
+
+object @Contract {
+  section runtime {
+    entry %runtime;
+  }
+}
+"#,
+        )
+        .unwrap();
+        let func = parsed.module.funcs()[0];
+        parsed.module.func_store.modify(func, |function| {
+            let const_load = function
+                .layout
+                .iter_all_insts()
+                .find(|&inst| function.dfg.inst(inst).as_text() == "const.load")
+                .expect("fixture should contain const.load");
+            function.set_inst_provenance(const_load, "post-opt:const-load".to_string());
+        });
+
+        let artifact = compile_object(
+            &parsed.module,
+            &osaka_backend(),
+            "Contract",
+            &compile_opts(
+                PushWidthPolicy::Push4,
+                false,
+                true,
+                VerifierConfig::for_level(VerificationLevel::Standard),
+            ),
+        )
+        .unwrap();
+        let runtime = section(&artifact, "runtime");
+        let observability = runtime
+            .observability
+            .as_ref()
+            .expect("runtime observability");
+
+        assert!(observability.pc_map.iter().any(|entry| {
+            matches!(
+                &entry.attribution,
+                PcAttribution::Mapped { post_opt_provenance, .. }
+                    if post_opt_provenance == "post-opt:const-load"
+            )
+        }));
+    }
+
+    #[test]
+    fn observability_json_uses_machine_inst_key() {
+        // Wire-shape guard: the attribution id serializes under "machine_inst",
+        // never the old "ir_inst" name, for both mapped and unmapped entries.
+        // This is the only test that fails if a writer silently renames the field.
+        let parsed = parse_module(
+            r#"
+target = "evm-ethereum-osaka"
+
+global private const [i256; 2] $values = [11, 22];
+
+func public %runtime(v0.i256) -> i256 {
+    block0:
+        v1.constref<[i256; 2]> = const.ref $values;
+        v2.constref<i256> = const.index v1 v0;
+        v3.i256 = const.load v2;
+        return v3;
+}
+
+object @Contract {
+  section runtime {
+    entry %runtime;
+  }
+}
+"#,
+        )
+        .unwrap();
+        let func = parsed.module.funcs()[0];
+        parsed.module.func_store.modify(func, |function| {
+            let const_load = function
+                .layout
+                .iter_all_insts()
+                .find(|&inst| function.dfg.inst(inst).as_text() == "const.load")
+                .expect("fixture should contain const.load");
+            function.set_inst_provenance(const_load, "post-opt:const-load".to_string());
+        });
+
+        let artifact = compile_object(
+            &parsed.module,
+            &osaka_backend(),
+            "Contract",
+            &compile_opts(
+                PushWidthPolicy::Push4,
+                false,
+                true,
+                VerifierConfig::for_level(VerificationLevel::Standard),
+            ),
+        )
+        .unwrap();
+        let json = section(&artifact, "runtime")
+            .observability
+            .as_ref()
+            .expect("runtime observability")
+            .to_json();
+
         assert!(
-            enriched
-                .to_json()
-                .contains("\"frontend_provenance\":\"mir_stmt:1\"")
+            !json.contains("\"ir_inst\""),
+            "attribution must not serialize the renamed ir_inst key: {json}"
+        );
+        assert!(
+            json.contains("\"status\":\"mapped\",\"machine_inst\":"),
+            "mapped entry must serialize machine_inst: {json}"
+        );
+        assert!(
+            json.contains("\"status\":\"unmapped\",\"machine_inst\":"),
+            "unmapped entry must serialize machine_inst: {json}"
         );
     }
 
@@ -964,7 +1093,7 @@ object @Contract {
 
     #[test]
     fn compile_object_reports_verifier_failures_before_codegen() {
-        let parsed = parse_module(
+        let errs = try_compile_o(
             r#"
 target = "evm-ethereum-osaka"
 
@@ -979,18 +1108,7 @@ object @O {
   }
 }
 "#,
-        )
-        .unwrap();
-        let errs = compile_object(
-            &parsed.module,
-            &test_backend(),
-            "O",
-            &compile_opts(
-                PushWidthPolicy::Push4,
-                false,
-                false,
-                VerifierConfig::for_level(VerificationLevel::Standard),
-            ),
+            VerificationLevel::Standard,
         )
         .expect_err("invalid IR should fail verifier preflight");
         assert!(matches!(
@@ -1039,7 +1157,7 @@ object @O {
         verifier_cfg.check_users = true;
         let errs = compile_object(
             &module,
-            &test_backend(),
+            &osaka_backend(),
             "O",
             &compile_opts(PushWidthPolicy::Push4, false, false, verifier_cfg),
         )
@@ -1057,7 +1175,7 @@ object @O {
 
     #[test]
     fn compile_object_fast_rejects_bad_uaddo_result_shape() {
-        let parsed = parse_module(
+        let errs = try_compile_o(
             r#"
 target = "evm-ethereum-osaka"
 
@@ -1073,18 +1191,7 @@ object @O {
   }
 }
 "#,
-        )
-        .unwrap();
-        let errs = compile_object(
-            &parsed.module,
-            &test_backend(),
-            "O",
-            &compile_opts(
-                PushWidthPolicy::Push4,
-                false,
-                false,
-                VerifierConfig::for_level(VerificationLevel::Fast),
-            ),
+            VerificationLevel::Fast,
         )
         .expect_err("bad multi-result IR should fail verifier preflight");
         let [ObjectCompileError::VerifierFailed { report }] = errs.as_slice() else {
@@ -1100,7 +1207,7 @@ object @O {
 
     #[test]
     fn compile_object_fast_rejects_bad_snego_result_shape() {
-        let parsed = parse_module(
+        let errs = try_compile_o(
             r#"
 target = "evm-ethereum-osaka"
 
@@ -1116,18 +1223,7 @@ object @O {
   }
 }
 "#,
-        )
-        .unwrap();
-        let errs = compile_object(
-            &parsed.module,
-            &test_backend(),
-            "O",
-            &compile_opts(
-                PushWidthPolicy::Push4,
-                false,
-                false,
-                VerifierConfig::for_level(VerificationLevel::Fast),
-            ),
+            VerificationLevel::Fast,
         )
         .expect_err("bad checked-overflow IR should fail verifier preflight");
         let [ObjectCompileError::VerifierFailed { report }] = errs.as_slice() else {
@@ -1143,7 +1239,7 @@ object @O {
 
     #[test]
     fn compile_object_rejects_multi_return_section_entry_for_evm() {
-        let parsed = parse_module(
+        let errs = try_compile_o(
             r#"
 target = "evm-ethereum-osaka"
 
@@ -1159,18 +1255,7 @@ object @O {
   }
 }
 "#,
-        )
-        .unwrap();
-        let errs = compile_object(
-            &parsed.module,
-            &test_backend(),
-            "O",
-            &compile_opts(
-                PushWidthPolicy::Push4,
-                false,
-                false,
-                VerifierConfig::for_level(VerificationLevel::Standard),
-            ),
+            VerificationLevel::Standard,
         )
         .expect_err("must reject multi-return");
         assert!(errs.iter().any(|err| matches!(
@@ -1182,7 +1267,7 @@ object @O {
 
     #[test]
     fn compile_object_rejects_declaration_only_section_entry() {
-        let parsed = parse_module(
+        let errs = try_compile_o(
             r#"
 target = "evm-ethereum-osaka"
 
@@ -1194,18 +1279,7 @@ object @O {
   }
 }
 "#,
-        )
-        .unwrap();
-        let errs = compile_object(
-            &parsed.module,
-            &test_backend(),
-            "O",
-            &compile_opts(
-                PushWidthPolicy::Push4,
-                false,
-                false,
-                VerifierConfig::for_level(VerificationLevel::Fast),
-            ),
+            VerificationLevel::Fast,
         )
         .expect_err("declaration-only section entry must fail verifier preflight");
         let [ObjectCompileError::VerifierFailed { report }] = errs.as_slice() else {
@@ -1253,7 +1327,7 @@ object @O {
         .unwrap();
         compile_object(
             &parsed.module,
-            &test_backend(),
+            &osaka_backend(),
             "O",
             &compile_opts(
                 PushWidthPolicy::Push4,
@@ -1267,7 +1341,7 @@ object @O {
 
     #[test]
     fn compile_object_rejects_external_calls_for_evm() {
-        let parsed = parse_module(
+        let errs = try_compile_o(
             r#"
 target = "evm-ethereum-osaka"
 
@@ -1285,18 +1359,7 @@ object @O {
   }
 }
 "#,
-        )
-        .unwrap();
-        let errs = compile_object(
-            &parsed.module,
-            &test_backend(),
-            "O",
-            &compile_opts(
-                PushWidthPolicy::Push4,
-                false,
-                false,
-                VerifierConfig::for_level(VerificationLevel::Standard),
-            ),
+            VerificationLevel::Standard,
         )
         .expect_err("must reject external call");
         assert!(errs.iter().any(|err| matches!(
@@ -1343,7 +1406,7 @@ object @O {
         let original = ModuleWriter::new(&parsed.module).dump_string();
         compile_object(
             &parsed.module,
-            &test_backend(),
+            &osaka_backend(),
             "O",
             &compile_opts(
                 PushWidthPolicy::Push4,
@@ -1409,7 +1472,7 @@ object @O {{
         let parsed = parse_module(&source).unwrap();
         let errs = compile_object(
             &parsed.module,
-            &test_backend(),
+            &osaka_backend(),
             "O",
             &compile_opts(
                 PushWidthPolicy::Push4,

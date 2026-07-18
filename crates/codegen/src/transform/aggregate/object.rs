@@ -4,12 +4,13 @@ use sonatina_ir::{
     Function, I256, Immediate, InstId, Module, Type, Value, ValueId,
     inst::{cast, data, downcast, evm},
     module::{FuncRef, ModuleCtx},
-    types::{CompoundType, CompoundTypeRef, StructData},
-    visitor::VisitorMut,
+    types::{CompoundType, CompoundTypeRef},
 };
 
+use crate::type_rewrite::{TypeRewrite, rewrite_compound_type_default, rewrite_function_type_uses};
+
 use super::{
-    object_locality::{self, LocalObjectArgs, SpecialObjectUse},
+    object_locality::{self, LocalObjectArgMap, LocalObjectArgs, SpecialObjectUse},
     private_abi::{self, PrivateAbiPlan},
 };
 
@@ -41,6 +42,24 @@ pub struct ObjectLowerToMemory;
 impl ObjectLowerToMemory {
     pub fn run(&mut self, module: &Module) -> bool {
         let local_object_args = object_locality::collect_local_object_args(module);
+        self.run_with_local_object_arg_set(module, &local_object_args)
+    }
+
+    pub(super) fn run_with_local_object_args(
+        &mut self,
+        module: &Module,
+        local_object_args: &LocalObjectArgMap,
+    ) -> bool {
+        let local_object_args =
+            object_locality::info_to_local_object_args(module, local_object_args);
+        self.run_with_local_object_arg_set(module, &local_object_args)
+    }
+
+    fn run_with_local_object_arg_set(
+        &mut self,
+        module: &Module,
+        local_object_args: &LocalObjectArgs,
+    ) -> bool {
         let mut type_lowerer = ObjRefTypeLowerer::default();
         let mut plans = self.collect_plans(module, &mut type_lowerer);
         private_abi::retain_higher_order_safe_plans(module, &mut plans);
@@ -51,7 +70,7 @@ impl ObjectLowerToMemory {
 
         for func_ref in module.funcs() {
             changed |= module.func_store.modify(func_ref, |function| {
-                self.rewrite_function(function, &local_object_args, &mut type_lowerer)
+                self.rewrite_function(function, local_object_args, &mut type_lowerer)
             });
             changed |= type_lowerer.changed;
         }
@@ -134,61 +153,7 @@ impl ObjectLowerToMemory {
     }
 
     fn rewrite_types(&self, func: &mut Function, type_lowerer: &mut ObjRefTypeLowerer) -> bool {
-        let mut changed = false;
-        for value in func.dfg.value_ids().collect::<Vec<_>>() {
-            let old_ty = func.dfg.value_ty(value);
-            let new_ty = type_lowerer.rewrite_type(func.ctx(), old_ty);
-            if new_ty == old_ty {
-                continue;
-            }
-
-            let replacement = match func.dfg.value(value).clone() {
-                Value::Immediate { imm, .. } => Value::Immediate { imm, ty: new_ty },
-                Value::Inst {
-                    inst, result_idx, ..
-                } => Value::Inst {
-                    inst,
-                    result_idx,
-                    ty: new_ty,
-                },
-                Value::Arg { idx, .. } => Value::Arg { idx, ty: new_ty },
-                Value::Global { gv, .. } => Value::Global { gv, ty: new_ty },
-                Value::Undef { .. } => Value::Undef { ty: new_ty },
-            };
-            func.dfg.values[value] = replacement;
-            changed = true;
-        }
-
-        struct TypeVisitor<'a> {
-            ctx: ModuleCtx,
-            type_lowerer: &'a mut ObjRefTypeLowerer,
-            changed: bool,
-        }
-
-        impl VisitorMut for TypeVisitor<'_> {
-            fn visit_ty(&mut self, item: &mut Type) {
-                let new_ty = self.type_lowerer.rewrite_type(&self.ctx, *item);
-                self.changed |= new_ty != *item;
-                *item = new_ty;
-            }
-        }
-
-        let mut visitor = TypeVisitor {
-            ctx: func.ctx().clone(),
-            type_lowerer,
-            changed: false,
-        };
-        let blocks: Vec<_> = func.layout.iter_block().collect();
-        for block in blocks {
-            let insts: Vec<_> = func.layout.iter_inst(block).collect();
-            for inst in insts {
-                if func.layout.is_inst_inserted(inst) {
-                    func.dfg.inst_mut(inst).accept_mut(&mut visitor);
-                }
-            }
-        }
-
-        changed || visitor.changed
+        rewrite_function_type_uses(func, type_lowerer, |_, _, _| None)
     }
 
     fn collect_alloc_kinds(
@@ -442,120 +407,35 @@ fn has_object_lowering_work(func: &Function) -> bool {
 #[derive(Default)]
 struct ObjRefTypeLowerer {
     changed: bool,
-    compound_map: FxHashMap<CompoundTypeRef, CompoundTypeRef>,
+    compound_map: FxHashMap<CompoundTypeRef, Type>,
 }
 
-impl ObjRefTypeLowerer {
-    fn rewrite_type(&mut self, ctx: &ModuleCtx, ty: Type) -> Type {
-        match ty {
-            Type::Compound(compound) => Type::Compound(self.rewrite_compound(ctx, compound)),
-            _ => ty,
+impl TypeRewrite for ObjRefTypeLowerer {
+    fn compound_map(&mut self) -> &mut FxHashMap<CompoundTypeRef, Type> {
+        &mut self.compound_map
+    }
+
+    fn rewrite_compound_type(
+        &mut self,
+        ctx: &ModuleCtx,
+        compound: CompoundTypeRef,
+        current: CompoundType,
+    ) -> Type {
+        match current {
+            CompoundType::ObjRef(elem) => {
+                let elem = self.rewrite_type(ctx, elem);
+                ctx.with_ty_store_mut(|store| store.make_ptr(elem))
+            }
+            _ => rewrite_compound_type_default(self, ctx, compound, current),
         }
     }
 
-    fn rewrite_compound(&mut self, ctx: &ModuleCtx, compound: CompoundTypeRef) -> CompoundTypeRef {
-        if let Some(&mapped) = self.compound_map.get(&compound) {
-            return mapped;
-        }
+    fn note_compound_remap(&mut self, _compound: CompoundTypeRef, _mapped: Type) {
+        self.changed = true;
+    }
 
-        let current = ctx.with_ty_store(|store| store.resolve_compound(compound).clone());
-        self.compound_map.insert(compound, compound);
-
-        let mapped = match current {
-            CompoundType::Array { elem, len } => {
-                let elem = self.rewrite_type(ctx, elem);
-                ctx.with_ty_store_mut(|store| {
-                    let Type::Compound(mapped) = store.make_array(elem, len) else {
-                        unreachable!();
-                    };
-                    mapped
-                })
-            }
-            CompoundType::Ptr(elem) => {
-                let elem = self.rewrite_type(ctx, elem);
-                ctx.with_ty_store_mut(|store| {
-                    let Type::Compound(mapped) = store.make_ptr(elem) else {
-                        unreachable!();
-                    };
-                    mapped
-                })
-            }
-            CompoundType::ObjRef(elem) => {
-                let elem = self.rewrite_type(ctx, elem);
-                let mapped = ctx.with_ty_store_mut(|store| {
-                    let Type::Compound(mapped) = store.make_ptr(elem) else {
-                        unreachable!();
-                    };
-                    mapped
-                });
-                self.changed = true;
-                mapped
-            }
-            CompoundType::ConstRef(elem) => {
-                let elem = self.rewrite_type(ctx, elem);
-                ctx.with_ty_store_mut(|store| {
-                    let Type::Compound(mapped) = store.make_const_ref(elem) else {
-                        unreachable!();
-                    };
-                    mapped
-                })
-            }
-            CompoundType::Enum(data) => {
-                let new_variants: Vec<_> = data
-                    .variants
-                    .iter()
-                    .map(|variant| sonatina_ir::types::VariantData {
-                        name: variant.name.clone(),
-                        explicit_discriminant: variant.explicit_discriminant,
-                        fields: variant
-                            .fields
-                            .iter()
-                            .map(|&field| self.rewrite_type(ctx, field))
-                            .collect(),
-                    })
-                    .collect();
-                if new_variants != data.variants {
-                    ctx.with_ty_store_mut(|store| {
-                        store.update_enum_variants(&data.name, &new_variants, data.repr)
-                    });
-                    self.changed = true;
-                }
-                compound
-            }
-            CompoundType::Func { args, ret_tys } => {
-                let args: Vec<_> = args
-                    .iter()
-                    .map(|&arg| self.rewrite_type(ctx, arg))
-                    .collect();
-                let ret_tys: Vec<_> = ret_tys
-                    .iter()
-                    .map(|&ret| self.rewrite_type(ctx, ret))
-                    .collect();
-                ctx.with_ty_store_mut(|store| {
-                    let Type::Compound(mapped) = store.make_func(&args, &ret_tys) else {
-                        unreachable!();
-                    };
-                    mapped
-                })
-            }
-            CompoundType::Struct(StructData { name, fields, .. }) => {
-                let new_fields: Vec<_> = fields
-                    .iter()
-                    .map(|&field| self.rewrite_type(ctx, field))
-                    .collect();
-                if new_fields != fields {
-                    ctx.with_ty_store_mut(|store| store.update_struct_fields(&name, &new_fields));
-                    self.changed = true;
-                }
-                compound
-            }
-        };
-
-        if mapped != compound {
-            self.changed = true;
-        }
-        self.compound_map.insert(compound, mapped);
-        mapped
+    fn note_named_compound_update(&mut self, _compound: CompoundTypeRef) {
+        self.changed = true;
     }
 }
 
@@ -594,6 +474,7 @@ fn zext_before(func: &mut Function, before: InstId, value: ValueId, ty: Type) ->
     let inst = func
         .dfg
         .make_inst(cast::Zext::new_unchecked(func.inst_set(), value, ty));
+    func.propagate_inst_attribution(inst, before);
     func.layout.insert_inst_before(inst, before);
     let result = func.dfg.make_value(Value::Inst {
         inst,
@@ -606,75 +487,22 @@ fn zext_before(func: &mut Function, before: InstId, value: ValueId, ty: Type) ->
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::byval_object_abi::has_nested_objref, *};
     use crate::{
-        isa::evm::{EvmBackend, PushWidthPolicy, test_util::prepare_root},
+        isa::evm::{
+            PushWidthPolicy,
+            test_util::{osaka_backend, prepare_root},
+        },
         object::{CompileOptions, compile_all_objects},
+        test_support::{lookup_func, parse_test_module},
     };
-    use rustc_hash::FxHashSet;
     use sonatina_ir::{
         Module,
         inst::{control_flow, data, evm},
         ir_writer::FuncWriter,
-        isa::evm::Evm,
     };
-    use sonatina_parser::parse_module;
-    use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
+
     use sonatina_verifier::{VerificationLevel, VerifierConfig};
-
-    fn has_nested_objref(ctx: &ModuleCtx, ty: Type) -> bool {
-        let mut visited = FxHashSet::default();
-        let mut worklist = vec![ty];
-
-        while let Some(current) = worklist.pop() {
-            let Type::Compound(compound) = current else {
-                continue;
-            };
-            if !visited.insert(compound) {
-                continue;
-            }
-
-            match ctx.with_ty_store(|store| store.resolve_compound(compound).clone()) {
-                CompoundType::Array { elem, .. }
-                | CompoundType::Ptr(elem)
-                | CompoundType::ConstRef(elem) => worklist.push(elem),
-                CompoundType::ObjRef(_) => return true,
-                CompoundType::Struct(data) => worklist.extend(data.fields),
-                CompoundType::Enum(data) => {
-                    for variant in data.variants {
-                        worklist.extend(variant.fields);
-                    }
-                }
-                CompoundType::Func { args, ret_tys } => {
-                    worklist.extend(args);
-                    worklist.extend(ret_tys);
-                }
-            }
-        }
-
-        false
-    }
-
-    fn parse_test_module(src: &str) -> Module {
-        parse_module(src).expect("parse should succeed").module
-    }
-
-    fn lookup_func(module: &Module, name: &str) -> FuncRef {
-        module
-            .funcs()
-            .into_iter()
-            .find(|&func_ref| module.ctx.func_sig(func_ref, |sig| sig.name() == name))
-            .expect("function should exist")
-    }
-
-    fn test_backend() -> EvmBackend {
-        let triple = TargetTriple::new(
-            Architecture::Evm,
-            Vendor::Ethereum,
-            OperatingSystem::Evm(EvmVersion::Osaka),
-        );
-        EvmBackend::new(Evm::new(triple))
-    }
 
     fn assert_no_object_ir(module: &Module) {
         for func_ref in module.funcs() {
@@ -866,7 +694,7 @@ object @Contract {
 "#,
         );
 
-        let backend = test_backend();
+        let backend = osaka_backend();
         let opts = CompileOptions {
             fixup_policy: PushWidthPolicy::MinimalRelax,
             emit_symtab: false,
@@ -898,8 +726,7 @@ object @Contract {
         prepared_module.func_store.view(make_pair, |func| {
             assert!(
                 func.layout
-                    .iter_block()
-                    .flat_map(|block| func.layout.iter_inst(block))
+                    .iter_all_insts()
                     .all(
                         |inst| downcast::<&evm::EvmMalloc>(func.inst_set(), func.dfg.inst(inst))
                             .is_none()
@@ -910,8 +737,7 @@ object @Contract {
         prepared_module.func_store.view(forward_pair, |func| {
             assert!(
                 func.layout
-                    .iter_block()
-                    .flat_map(|block| func.layout.iter_inst(block))
+                    .iter_all_insts()
                     .all(
                         |inst| downcast::<&evm::EvmMalloc>(func.inst_set(), func.dfg.inst(inst))
                             .is_none()
@@ -922,29 +748,25 @@ object @Contract {
         prepared_module.func_store.view(entry, |func| {
             let mut saw_forward_pair = false;
             assert!(
-                func.layout
-                    .iter_block()
-                    .flat_map(|block| func.layout.iter_inst(block))
-                    .all(|inst| {
+                func.layout.iter_all_insts().all(|inst| {
+                    assert!(
+                        downcast::<&evm::EvmMalloc>(func.inst_set(), func.dfg.inst(inst)).is_none(),
+                        "entry should keep the returned object caller-local"
+                    );
+                    let Some(call) =
+                        downcast::<&control_flow::Call>(func.inst_set(), func.dfg.inst(inst))
+                    else {
+                        return true;
+                    };
+                    if *call.callee() == forward_pair {
+                        saw_forward_pair = true;
                         assert!(
-                            downcast::<&evm::EvmMalloc>(func.inst_set(), func.dfg.inst(inst))
-                                .is_none(),
-                            "entry should keep the returned object caller-local"
+                            func.dfg.inst_results(inst).is_empty(),
+                            "rewritten forward_pair call should return through the out arg"
                         );
-                        let Some(call) =
-                            downcast::<&control_flow::Call>(func.inst_set(), func.dfg.inst(inst))
-                        else {
-                            return true;
-                        };
-                        if *call.callee() == forward_pair {
-                            saw_forward_pair = true;
-                            assert!(
-                                func.dfg.inst_results(inst).is_empty(),
-                                "rewritten forward_pair call should return through the out arg"
-                            );
-                        }
-                        true
-                    }),
+                    }
+                    true
+                }),
                 "entry should still contain lowered calls"
             );
             assert!(saw_forward_pair, "entry should still call forward_pair");
@@ -984,7 +806,7 @@ object @Contract {
 "#,
         );
 
-        let backend = test_backend();
+        let backend = osaka_backend();
         let opts = CompileOptions {
             fixup_policy: PushWidthPolicy::MinimalRelax,
             emit_symtab: false,
@@ -997,15 +819,10 @@ object @Contract {
             .expect("prepare should succeed");
         let entry = lookup_func(prepared.module(), "entry");
         prepared.module().func_store.view(entry, |func| {
+            let dumped = FuncWriter::new(entry, func).dump_string();
             assert!(
-                func.layout
-                    .iter_block()
-                    .flat_map(|block| func.layout.iter_inst(block))
-                    .any(
-                        |inst| downcast::<&evm::EvmMalloc>(func.inst_set(), func.dfg.inst(inst))
-                            .is_some()
-                    ),
-                "escaping stack materialization must force heap allocation"
+                dumped.contains("evm_mload 64.i256") && dumped.contains("evm_mstore 64.i256"),
+                "escaping stack materialization must force heap allocation in machine IR:\n{dumped}"
             );
         });
     }
@@ -1047,7 +864,7 @@ object @Contract {
 "#,
         );
 
-        let backend = test_backend();
+        let backend = osaka_backend();
         let opts = CompileOptions {
             fixup_policy: PushWidthPolicy::MinimalRelax,
             emit_symtab: false,

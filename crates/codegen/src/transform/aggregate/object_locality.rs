@@ -6,7 +6,9 @@ use sonatina_ir::{
 };
 use std::ops::ControlFlow;
 
-use super::{ObjectEffectSummaryMap, ObjectReturnEffect, compute_object_effect_summaries};
+use super::{
+    ObjectEffectSummaryMap, compute_object_effect_summaries, object_abi::OutputBufferContract,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootInit {
@@ -15,9 +17,38 @@ pub(crate) enum RootInit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LocalObjectArgInfo {
-    pub init: RootInit,
-    pub fresh_result_out: bool,
+pub(crate) enum LocalObjectArgInfo {
+    Borrowed,
+    Output(OutputBufferContract),
+}
+
+impl LocalObjectArgInfo {
+    pub(crate) fn output_contract(
+        self,
+        function: &Function,
+        index: usize,
+    ) -> Option<OutputBufferContract> {
+        match self {
+            Self::Output(contract) if contract.matches(function, index) => Some(contract),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_valid_for(self, function: &Function, index: usize) -> bool {
+        match self {
+            Self::Borrowed => function.arg_values.get(index).is_some_and(|&argument| {
+                function.dfg.value_ty(argument).is_obj_ref(function.ctx())
+            }),
+            Self::Output(contract) => contract.matches(function, index),
+        }
+    }
+
+    pub(crate) fn init(self, function: &Function, index: usize) -> Option<RootInit> {
+        self.is_valid_for(function, index).then_some(match self {
+            Self::Borrowed => RootInit::LoadLiveIn,
+            Self::Output(_) => RootInit::UndefFresh,
+        })
+    }
 }
 
 pub(crate) type LocalObjectArgMap = FxHashMap<FuncRef, FxHashMap<usize, LocalObjectArgInfo>>;
@@ -48,55 +79,84 @@ pub(crate) fn collect_local_object_arg_info_with_effects(
     module: &Module,
     object_effects: &ObjectEffectSummaryMap,
 ) -> LocalObjectArgMap {
-    let mut local_object_args = LocalObjectArgMap::default();
-    for func in module.funcs() {
-        let Some(sig) = module.ctx.get_sig(func) else {
-            continue;
-        };
-        let Some(summary) = object_effects.get(&func) else {
-            continue;
-        };
+    module
+        .funcs()
+        .into_iter()
+        .filter_map(|func| {
+            let args = local_object_arg_info(module, func, object_effects);
+            (!args.is_empty()).then_some((func, args))
+        })
+        .collect()
+}
+
+pub(crate) fn local_object_arg_info(
+    module: &Module,
+    func: FuncRef,
+    object_effects: &ObjectEffectSummaryMap,
+) -> FxHashMap<usize, LocalObjectArgInfo> {
+    let mut args = FxHashMap::default();
+    if let Some(sig) = module.ctx.get_sig(func)
+        && let Some(summary) = object_effects.get(&func)
+    {
         for (idx, &root_ty) in sig.args().iter().enumerate() {
-            if !root_ty.is_obj_ref(&module.ctx)
-                || !summary
+            if root_ty.is_obj_ref(&module.ctx)
+                && summary
                     .arg_effects
                     .get(idx)
                     .is_some_and(|effect| effect.local_only)
+                && !summary
+                    .captures
+                    .iter()
+                    .any(|capture| capture.src_arg == idx)
             {
-                continue;
+                args.insert(idx, LocalObjectArgInfo::Borrowed);
             }
-            local_object_args.entry(func).or_default().insert(
-                idx,
-                LocalObjectArgInfo {
-                    init: RootInit::LoadLiveIn,
-                    fresh_result_out: false,
-                },
-            );
         }
     }
-    local_object_args
+    args
 }
 
 pub(crate) fn collect_local_object_args(module: &Module) -> LocalObjectArgs {
-    info_to_local_object_args(&collect_local_object_arg_info(module))
+    info_to_local_object_args(module, &collect_local_object_arg_info(module))
 }
 
-pub(crate) fn info_to_local_object_args(local_object_args: &LocalObjectArgMap) -> LocalObjectArgs {
-    local_object_args
-        .iter()
-        .map(|(&func, args)| (func, args.keys().copied().collect()))
+pub(crate) fn info_to_local_object_args(
+    module: &Module,
+    local_object_args: &LocalObjectArgMap,
+) -> LocalObjectArgs {
+    module
+        .funcs()
+        .into_iter()
+        .filter_map(|func| {
+            let args = local_object_args.get(&func)?;
+            let valid = module.func_store.view(func, |function| {
+                args.iter()
+                    .filter_map(|(&index, info)| {
+                        info.is_valid_for(function, index).then_some(index)
+                    })
+                    .collect()
+            });
+            Some((func, valid))
+        })
         .collect()
 }
 
 pub(crate) fn merge_local_object_arg_info(
+    module: &Module,
     local_object_args: &mut LocalObjectArgMap,
     extra: &LocalObjectArgMap,
 ) {
-    for (&func, args) in extra {
-        local_object_args
-            .entry(func)
-            .or_default()
-            .extend(args.iter().map(|(&idx, &info)| (idx, info)));
+    for func in module.funcs() {
+        if let Some(args) = extra.get(&func) {
+            module.func_store.view(func, |function| {
+                local_object_args
+                    .entry(func)
+                    .or_default()
+                    .extend(args.iter().filter_map(|(&index, &info)| {
+                        info.is_valid_for(function, index).then_some((index, info))
+                    }));
+            });
+        }
     }
 }
 
@@ -159,14 +219,12 @@ fn call_passes_object_to_local_arg_info(
 pub(crate) fn object_root_stays_local(
     function: &Function,
     root: ValueId,
-    root_ty: Type,
     local_object_args: &LocalObjectArgMap,
     allow_return_root: bool,
 ) -> bool {
     object_root_stays_local_with(
         function,
         root,
-        root_ty,
         local_object_args,
         |value| value == root,
         allow_return_root,
@@ -176,7 +234,6 @@ pub(crate) fn object_root_stays_local(
 pub(crate) fn object_root_stays_local_with_effects(
     function: &Function,
     root: ValueId,
-    root_ty: Type,
     object_effects: &ObjectEffectSummaryMap,
     mut is_allowed_root_value: impl FnMut(ValueId) -> bool,
     allow_return_root: bool,
@@ -200,7 +257,6 @@ pub(crate) fn object_root_stays_local_with_effects(
                     inst,
                     call,
                     value,
-                    root_ty,
                     object_effects,
                     &mut is_allowed_root_value,
                 ) =>
@@ -215,7 +271,6 @@ pub(crate) fn object_root_stays_local_with_effects(
 pub(crate) fn object_root_stays_local_with(
     function: &Function,
     root: ValueId,
-    root_ty: Type,
     local_object_args: &LocalObjectArgMap,
     mut is_allowed_root_value: impl FnMut(ValueId) -> bool,
     allow_return_root: bool,
@@ -238,7 +293,7 @@ pub(crate) fn object_root_stays_local_with(
                     function.ctx(),
                     call,
                     value,
-                    root_ty,
+                    function.dfg.value_ty(value),
                     local_object_args,
                 ) =>
         {
@@ -447,6 +502,13 @@ fn walk_object_root_uses_impl<T>(
                 continue;
             }
 
+            if let Some(init) =
+                downcast::<&data::ObjInitConst>(function.inst_set(), function.dfg.inst(user))
+                && *init.object() == value
+            {
+                continue;
+            }
+
             if let Some(enum_get_tag) =
                 downcast::<&data::EnumGetTag>(function.inst_set(), function.dfg.inst(user))
                 && *enum_get_tag.object() == value
@@ -517,7 +579,7 @@ fn walk_object_root_uses_impl<T>(
                     call,
                 });
                 if let Some(result) =
-                    call_same_root_result(function, user, call, value, object_effects)
+                    call_borrowed_root_result(function, user, call, value, object_effects)
                 {
                     worklist.push(result);
                 }
@@ -553,7 +615,6 @@ fn call_root_preserves_locality(
     inst: sonatina_ir::InstId,
     call: &control_flow::Call,
     value: ValueId,
-    value_ty: Type,
     object_effects: &ObjectEffectSummaryMap,
     is_allowed_root_value: &mut impl FnMut(ValueId) -> bool,
 ) -> bool {
@@ -564,6 +625,9 @@ fn call_root_preserves_locality(
         return false;
     };
 
+    // The walker follows projections, so the argument can have a different type
+    // from the allocation whose lifetime is being checked.
+    let value_ty = function.dfg.value_ty(value);
     let mut saw_value = false;
     for (idx, &arg) in call.args().iter().enumerate() {
         if arg != value {
@@ -573,48 +637,47 @@ fn call_root_preserves_locality(
         let Some(effect) = summary.arg_effects.get(idx) else {
             return false;
         };
-        if sig.args().get(idx) != Some(&value_ty) || effect.needs_unknown_object_barrier() {
+        if sig.args().get(idx) != Some(&value_ty)
+            || effect.needs_unknown_object_barrier()
+            || summary
+                .captures
+                .iter()
+                .any(|capture| capture.src_arg == idx)
+        {
             return false;
         }
         if effect.local_only {
             continue;
         }
 
-        let Some(result) = function.dfg.inst_result(inst) else {
+        let &[result] = function.dfg.inst_results(inst) else {
             return false;
         };
-        match summary.ret_effect {
-            ObjectReturnEffect::SameAsArg { index }
-            | ObjectReturnEffect::DerivedFromArg { index }
-                if index == idx && is_allowed_root_value(result) => {}
-            _ => return false,
+        if !summary.ret_effect.borrows_arg(idx) || !is_allowed_root_value(result) {
+            return false;
         }
     }
 
     saw_value
 }
 
-fn call_same_root_result(
+fn call_borrowed_root_result(
     function: &Function,
     inst: sonatina_ir::InstId,
     call: &control_flow::Call,
     value: ValueId,
     object_effects: Option<&ObjectEffectSummaryMap>,
 ) -> Option<ValueId> {
-    let result = function.dfg.inst_result(inst)?;
+    let &[result] = function.dfg.inst_results(inst) else {
+        return None;
+    };
     let summary = object_effects.and_then(|effects| effects.get(call.callee()))?;
     for (idx, &arg) in call.args().iter().enumerate() {
         if arg != value {
             continue;
         }
-        match summary.ret_effect {
-            ObjectReturnEffect::SameAsArg { index }
-            | ObjectReturnEffect::DerivedFromArg { index }
-                if index == idx =>
-            {
-                return Some(result);
-            }
-            _ => {}
+        if summary.ret_effect.borrows_arg(idx) {
+            return Some(result);
         }
     }
     None
@@ -623,19 +686,71 @@ fn call_same_root_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sonatina_ir::module::Module;
-    use sonatina_parser::parse_module;
+    use crate::test_support::{lookup_func, parse_test_module};
 
-    fn parse_test_module(src: &str) -> Module {
-        parse_module(src).expect("parse should succeed").module
-    }
-
-    fn lookup_func(module: &Module, name: &str) -> FuncRef {
-        module
-            .funcs()
-            .into_iter()
-            .find(|&func_ref| module.ctx.func_sig(func_ref, |sig| sig.name() == name))
-            .expect("function should exist")
+    #[test]
+    fn projected_call_arguments_preserve_locality_without_retention() {
+        for (ty, projection) in [
+            ("i64", ""),
+            ("[i64; 2]", "v2.objref<i64> = obj.index v1 1.i64;"),
+            ("@pair", "v2.objref<i64> = obj.proj v1 1.i64;"),
+            (
+                "@nested",
+                "v3.objref<[@pair; 2]> = obj.proj v1 0.i64;\n\
+                 v4.objref<@pair> = obj.index v3 1.i64;\n\
+                 v2.objref<i64> = obj.proj v4 1.i64;",
+            ),
+        ] {
+            let argument = if projection.is_empty() { "v1" } else { "v2" };
+            for retains in [false, true] {
+                let operation = if retains {
+                    "obj.store v1 v0;"
+                } else {
+                    "obj.store v0 42.i64;"
+                };
+                let module = parse_test_module(&format!(
+                    r#"
+target = "aarch64-unknown-native"
+type @pair = {{ i64, i64 }};
+type @nested = {{ [@pair; 2] }};
+func private %helper(v0.objref<i64>, v1.objref<objref<i64>>) {{
+block0:
+    {operation}
+    return;
+}}
+func public %probe(v0.objref<objref<i64>>) {{
+block0:
+    v1.objref<{ty}> = obj.alloc {ty};
+    {projection}
+    call %helper {argument} v0;
+    return;
+}}
+"#
+                ));
+                let effects = compute_object_effect_summaries(&module);
+                let local_args = collect_local_object_arg_info_with_effects(&module, &effects);
+                let probe = lookup_func(&module, "probe");
+                module.func_store.view(probe, |function| {
+                    let root = ValueId::from_u32(1);
+                    assert_eq!(
+                        object_root_stays_local_with_effects(
+                            function,
+                            root,
+                            &effects,
+                            |_| true,
+                            false,
+                        ),
+                        !retains,
+                        "effect-summary locality: {ty}, retains={retains}",
+                    );
+                    assert_eq!(
+                        object_root_stays_local_with(function, root, &local_args, |_| true, false),
+                        !retains,
+                        "local-argument locality: {ty}, retains={retains}",
+                    );
+                });
+            }
+        }
     }
 
     #[test]
@@ -665,10 +780,7 @@ block0:
         let local = collect_local_object_arg_info(&module);
         assert_eq!(
             local.get(&func).and_then(|args| args.get(&0)),
-            Some(&LocalObjectArgInfo {
-                init: RootInit::LoadLiveIn,
-                fresh_result_out: false,
-            })
+            Some(&LocalObjectArgInfo::Borrowed)
         );
     }
 
@@ -695,13 +807,7 @@ block0:
         let func = lookup_func(&module, "f");
         let stays_local = module.func_store.view(func, |function| {
             let root = function.arg_values[0];
-            object_root_stays_local(
-                function,
-                root,
-                function.dfg.value_ty(root),
-                &LocalObjectArgMap::default(),
-                false,
-            )
+            object_root_stays_local(function, root, &LocalObjectArgMap::default(), false)
         });
         assert!(
             !stays_local,

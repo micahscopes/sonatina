@@ -1,4 +1,7 @@
 pub(crate) mod abi;
+#[cfg(test)]
+mod alias_tests;
+mod arg_promotion;
 pub(crate) mod byval_object_abi;
 mod capture_state;
 mod cleanup;
@@ -7,10 +10,16 @@ pub(crate) mod enum_lowering;
 pub(crate) mod legalize;
 pub(crate) mod object;
 pub(crate) mod object_abi;
+mod object_access;
+mod object_alias;
+pub(crate) mod object_arg_invariance;
 pub(crate) mod object_effects;
+mod object_facts;
+mod object_initialization;
 pub(crate) mod object_load_store;
 pub(crate) mod object_locality;
 pub(crate) mod object_memory;
+mod object_reachability;
 mod object_state;
 mod object_tracking;
 pub(crate) mod private_abi;
@@ -21,10 +30,11 @@ pub(crate) mod scalarize;
 pub mod shape;
 
 pub use abi::AggregateExpandAbi;
+pub use arg_promotion::{ObjectArgPromotion, ObjectArgPromotionStats};
 pub use byval_object_abi::{
     ObjectAggregateAbi, ObjectAggregateAbiConfig, ObjectByValueArgAbi, ObjectByValueArgAbiConfig,
 };
-pub use enum_lowering::EnumLowerToProduct;
+pub use enum_lowering::{EnumLowerToProduct, EnumLoweredLayout};
 pub use legalize::{
     AggregateLowerToMemoryLegalize, assert_aggregate_legalized, cleanup_dead_aggregate_alloca_trees,
 };
@@ -33,9 +43,12 @@ pub use object_abi::ObjectReturnOutParam;
 pub(crate) use object_effects::{
     ObjectEffectSummaryMap, ObjectReturnEffect, SliceSet, compute_object_effect_summaries,
 };
+pub(crate) use object_facts::ModuleObjectFacts;
+#[cfg(test)]
+pub(crate) use object_locality::collect_local_object_arg_info;
 pub(crate) use object_locality::{
-    LocalObjectArgInfo, LocalObjectArgMap, RootInit, collect_local_object_arg_info,
-    collect_local_object_arg_info_with_effects, merge_local_object_arg_info,
+    LocalObjectArgInfo, LocalObjectArgMap, RootInit, collect_local_object_arg_info_with_effects,
+    merge_local_object_arg_info,
 };
-pub(crate) use object_memory::{ObjectMemoryAnalysis, ObjectReadGvnKey};
-pub(crate) use provenance::Projection;
+pub(crate) use object_memory::{CarrierSource, ObjectMemoryAnalysis, ObjectReadGvnKey};
+pub(crate) use object_tracking::objref_element_ty;

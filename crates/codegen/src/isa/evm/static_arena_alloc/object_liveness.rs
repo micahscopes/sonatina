@@ -1,4 +1,4 @@
-use cranelift_entity::SecondaryMap;
+use cranelift_entity::{SecondaryMap, entity_impl};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use sonatina_ir::{
@@ -9,9 +9,7 @@ use sonatina_ir::{
 
 use crate::bitset::BitSet;
 
-use super::{
-    super::memory_plan::FuncAnalysis, CallSiteObjects, LocalObjIdx, Provenance, StackObjId,
-};
+use super::{CallSiteObjects, LocalObjIdx, Provenance, StackObjId, StackObjectInput};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BlockLiveSegment {
@@ -20,9 +18,14 @@ pub(crate) struct BlockLiveSegment {
     pub(crate) end_boundary: u32,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PhiEdgePoint(u32);
+entity_impl!(PhiEdgePoint);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LiveRegion {
     pub(crate) segments: SmallVec<[BlockLiveSegment; 4]>,
+    pub(crate) phi_edges: BitSet<PhiEdgePoint>,
     pub(crate) first_rank: u32,
     pub(crate) last_rank: u32,
 }
@@ -31,6 +34,7 @@ impl LiveRegion {
     pub(crate) fn empty() -> Self {
         Self {
             segments: SmallVec::new(),
+            phi_edges: BitSet::default(),
             first_rank: 0,
             last_rank: 0,
         }
@@ -39,6 +43,7 @@ impl LiveRegion {
     pub(crate) fn sort_only(rank: u32) -> Self {
         Self {
             segments: SmallVec::new(),
+            phi_edges: BitSet::default(),
             first_rank: rank,
             last_rank: rank,
         }
@@ -49,6 +54,10 @@ impl LiveRegion {
     }
 
     pub(crate) fn overlaps(&self, other: &Self) -> bool {
+        if !self.phi_edges.is_disjoint(&other.phi_edges) {
+            return true;
+        }
+
         let mut lhs = 0usize;
         let mut rhs = 0usize;
         while lhs < self.segments.len() && rhs < other.segments.len() {
@@ -109,18 +118,6 @@ fn closure_allocas(
     Ok(out)
 }
 
-fn conservative_closure_allocas(
-    roots: impl IntoIterator<Item = InstId>,
-    edges: &FxHashMap<InstId, FxHashSet<InstId>>,
-    unknown: &FxHashSet<InstId>,
-    all_allocas: &FxHashSet<InstId>,
-) -> (FxHashSet<InstId>, bool) {
-    match closure_allocas(roots, edges, unknown) {
-        Ok(allocas) => (allocas, false),
-        Err(UnknownLocalPtr) => (all_allocas.clone(), true),
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct ExpandedAllocaRoots {
     pub(crate) allocas: FxHashSet<InstId>,
@@ -130,16 +127,28 @@ pub(crate) struct ExpandedAllocaRoots {
 pub(crate) struct AllocaClosureCtx<'a> {
     pub(crate) edges: &'a FxHashMap<InstId, FxHashSet<InstId>>,
     pub(crate) unknown: &'a FxHashSet<InstId>,
-    pub(crate) all_allocas: &'a FxHashSet<InstId>,
 }
 
 impl AllocaClosureCtx<'_> {
     pub(crate) fn expand_roots(
         &self,
         roots: impl IntoIterator<Item = InstId>,
+        available: &BitSet<InstId>,
     ) -> ExpandedAllocaRoots {
-        let (allocas, hit_unknown) =
-            conservative_closure_allocas(roots, self.edges, self.unknown, self.all_allocas);
+        // A pointer can name only an allocation that may already have executed,
+        // including one reaching this access around a backedge. Memory facts
+        // are flow-insensitive, so a known closure can include objects from
+        // mutually exclusive or later paths; those cannot exist at this access.
+        let (allocas, hit_unknown) = match closure_allocas(roots, self.edges, self.unknown) {
+            Ok(allocas) => (
+                allocas
+                    .into_iter()
+                    .filter(|&alloca| available.contains(alloca))
+                    .collect(),
+                false,
+            ),
+            Err(UnknownLocalPtr) => (available.iter().collect(), true),
+        };
         ExpandedAllocaRoots {
             allocas,
             hit_unknown,
@@ -148,18 +157,58 @@ impl AllocaClosureCtx<'_> {
 }
 
 #[derive(Default)]
+struct AllocaAvailability {
+    incoming: SecondaryMap<BlockId, BitSet<InstId>>,
+    outgoing: SecondaryMap<BlockId, BitSet<InstId>>,
+}
+
+impl AllocaAvailability {
+    fn compute(
+        function: &Function,
+        cfg: &ControlFlowGraph,
+        block_order: &[BlockId],
+        allocas: &FxHashMap<InstId, StackObjId>,
+    ) -> Self {
+        let mut result = Self::default();
+        for &inst in allocas.keys() {
+            result.outgoing[function.layout.inst_block(inst)].insert(inst);
+        }
+        loop {
+            let mut changed = false;
+            for &block in block_order {
+                let mut incoming = BitSet::default();
+                for &pred in cfg.preds_of(block) {
+                    incoming.union_with(&result.outgoing[pred]);
+                }
+                let outgoing = &mut result.outgoing[block];
+                let old_len = outgoing.len();
+                outgoing.union_with(&incoming);
+                changed |= outgoing.len() != old_len;
+                result.incoming[block] = incoming;
+            }
+            if !changed {
+                return result;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
 struct ObjectEventIndex {
     phi_defs: SecondaryMap<BlockId, BitSet<LocalObjIdx>>,
     edge_phi_uses: FxHashMap<(BlockId, BlockId), BitSet<LocalObjIdx>>,
+    phi_edge_points: FxHashMap<(BlockId, BlockId), PhiEdgePoint>,
+    phi_edge_ranks: SecondaryMap<PhiEdgePoint, u32>,
     local_uses: SecondaryMap<InstId, BitSet<LocalObjIdx>>,
     local_defs: SecondaryMap<InstId, BitSet<LocalObjIdx>>,
     block_inst_count: SecondaryMap<BlockId, u32>,
     block_rank_base: SecondaryMap<BlockId, u32>,
     inst_index_in_block: FxHashMap<InstId, u32>,
+    next_phi_edge_point: u32,
 }
 
 pub(super) struct ComputeCtx<'a, 'b> {
-    pub(super) analysis: &'a FuncAnalysis,
+    pub(super) analysis: &'a StackObjectInput<'a>,
     pub(super) isa: &'a Evm,
     pub(super) prov: &'a SecondaryMap<ValueId, Provenance>,
     pub(super) spill_local_by_value: &'a SecondaryMap<ValueId, Option<LocalObjIdx>>,
@@ -186,6 +235,25 @@ impl ObjectEventIndex {
         self.block_rank_base[block]
             .checked_add(boundary_idx)
             .expect("boundary rank overflow")
+    }
+
+    fn ensure_phi_edge_point(&mut self, pred: BlockId, succ: BlockId) -> PhiEdgePoint {
+        if let Some(&point) = self.phi_edge_points.get(&(pred, succ)) {
+            return point;
+        }
+
+        let point = PhiEdgePoint::from_u32(self.next_phi_edge_point);
+        self.next_phi_edge_point = self
+            .next_phi_edge_point
+            .checked_add(1)
+            .expect("phi edge point overflow");
+        self.phi_edge_points.insert((pred, succ), point);
+        self.phi_edge_ranks[point] = self.boundary_rank(pred, self.block_inst_count[pred]);
+        point
+    }
+
+    fn phi_edge_rank(&self, edge: PhiEdgePoint) -> u32 {
+        self.phi_edge_ranks[edge]
     }
 }
 
@@ -219,25 +287,40 @@ fn seed_object_event_metadata(function: &Function, block_order: &[BlockId]) -> O
     events
 }
 
-fn add_value_alloca_uses(
-    uses: &mut BitSet<LocalObjIdx>,
-    value: ValueId,
-    prov: &SecondaryMap<ValueId, Provenance>,
-    closure: &AllocaClosureCtx<'_>,
-    alloca_local_by_inst: &FxHashMap<InstId, LocalObjIdx>,
-    unknown_barrier_objs: &mut FxHashSet<StackObjId>,
-    obj_id_by_local: &[StackObjId],
-) {
-    let roots: Vec<_> = prov[value].alloca_insts().collect();
-    if roots.is_empty() {
-        return;
+impl ComputeCtx<'_, '_> {
+    fn expand_values(
+        &self,
+        values: impl IntoIterator<Item = ValueId>,
+        available: &BitSet<InstId>,
+    ) -> ExpandedAllocaRoots {
+        let mut roots = FxHashSet::default();
+        for value in values {
+            let provenance = &self.prov[value];
+            if provenance.may_reference_unknown_local() {
+                return ExpandedAllocaRoots {
+                    allocas: available.iter().collect(),
+                    hit_unknown: true,
+                };
+            }
+            roots.extend(provenance.alloca_insts().chain(provenance.malloc_insts()));
+        }
+        self.closure.expand_roots(roots, available)
     }
-    let expanded = closure.expand_roots(roots);
-    for alloca in expanded.allocas {
-        if let Some(&local_idx) = alloca_local_by_inst.get(&alloca) {
-            uses.insert(local_idx);
-            if expanded.hit_unknown {
-                unknown_barrier_objs.insert(obj_id_by_local[local_idx.as_u32() as usize]);
+
+    fn add_value_alloca_uses(
+        &mut self,
+        uses: &mut BitSet<LocalObjIdx>,
+        value: ValueId,
+        available: &BitSet<InstId>,
+    ) {
+        let expanded = self.expand_values([value], available);
+        for alloca in expanded.allocas {
+            if let Some(&local_idx) = self.alloca_local_by_inst.get(&alloca) {
+                uses.insert(local_idx);
+                if expanded.hit_unknown {
+                    self.unknown_barrier_objs
+                        .insert(self.obj_id_by_local[local_idx.as_u32() as usize]);
+                }
             }
         }
     }
@@ -246,12 +329,17 @@ fn add_value_alloca_uses(
 fn build_object_event_index(
     function: &Function,
     block_order: &[BlockId],
+    availability: &AllocaAvailability,
     ctx: &mut ComputeCtx<'_, '_>,
 ) -> ObjectEventIndex {
     let mut events = seed_object_event_metadata(function, block_order);
 
     for &block in block_order {
+        let mut available = availability.incoming[block].clone();
         for inst in function.layout.iter_inst(block) {
+            if ctx.alloca_ids.contains_key(&inst) {
+                available.insert(inst);
+            }
             let resolved = ctx.isa.inst_set().resolve_inst(function.dfg.inst(inst));
             if let EvmInstKind::Phi(phi) = resolved {
                 for &result in function.dfg.inst_results(inst) {
@@ -261,6 +349,7 @@ fn build_object_event_index(
                     }
                 }
                 for (value, pred) in phi.args().iter() {
+                    events.ensure_phi_edge_point(*pred, block);
                     let raw_value = *value;
                     let value = ctx.analysis.canonicalize_value(raw_value);
                     if let Some(local_idx) = ctx.spill_local_by_value[value] {
@@ -272,15 +361,7 @@ fn build_object_event_index(
                     }
 
                     let edge_uses = events.edge_phi_uses.entry((*pred, block)).or_default();
-                    add_value_alloca_uses(
-                        edge_uses,
-                        raw_value,
-                        ctx.prov,
-                        ctx.closure,
-                        ctx.alloca_local_by_inst,
-                        ctx.unknown_barrier_objs,
-                        ctx.obj_id_by_local,
-                    );
+                    ctx.add_value_alloca_uses(edge_uses, raw_value, &availability.outgoing[*pred]);
                 }
                 continue;
             }
@@ -303,15 +384,7 @@ fn build_object_event_index(
                 if let Some(local_idx) = ctx.spill_local_by_value[value] {
                     events.local_uses[inst].insert(local_idx);
                 }
-                add_value_alloca_uses(
-                    &mut events.local_uses[inst],
-                    value,
-                    ctx.prov,
-                    ctx.closure,
-                    ctx.alloca_local_by_inst,
-                    ctx.unknown_barrier_objs,
-                    ctx.obj_id_by_local,
-                );
+                ctx.add_value_alloca_uses(&mut events.local_uses[inst], value, &available);
             });
         }
     }
@@ -428,6 +501,40 @@ fn push_region_segment(
     }
 }
 
+fn push_region_phi_edge(
+    regions: &mut [LiveRegion],
+    events: &ObjectEventIndex,
+    local_idx: LocalObjIdx,
+    edge: PhiEdgePoint,
+) {
+    let region = &mut regions[local_idx.as_u32() as usize];
+    if !region.phi_edges.insert(edge) {
+        return;
+    }
+
+    let rank = events.phi_edge_rank(edge);
+    if region.segments.is_empty() && region.phi_edges.len() == 1 {
+        region.first_rank = rank;
+        region.last_rank = rank;
+    } else {
+        region.first_rank = region.first_rank.min(rank);
+        region.last_rank = region.last_rank.max(rank);
+    }
+}
+
+fn add_phi_edge_points_to_regions(regions: &mut [LiveRegion], events: &ObjectEventIndex) {
+    for (&(pred, succ), &edge) in &events.phi_edge_points {
+        if let Some(uses) = events.edge_phi_uses.get(&(pred, succ)) {
+            for local_idx in uses.iter() {
+                push_region_phi_edge(regions, events, local_idx, edge);
+            }
+        }
+        for local_idx in events.phi_defs[succ].iter() {
+            push_region_phi_edge(regions, events, local_idx, edge);
+        }
+    }
+}
+
 fn coalesce_region_segments(region: &mut LiveRegion) {
     if region.segments.is_empty() {
         return;
@@ -502,6 +609,7 @@ fn emit_regions(
     for region in &mut regions {
         coalesce_region_segments(region);
     }
+    add_phi_edge_points_to_regions(&mut regions, events);
     regions
 }
 
@@ -511,7 +619,8 @@ pub(super) fn compute_regions_and_calls(
     block_order: &[BlockId],
     ctx: &mut ComputeCtx<'_, '_>,
 ) -> (Vec<LiveRegion>, Vec<CallSiteObjects>) {
-    let events = build_object_event_index(function, block_order, ctx);
+    let availability = AllocaAvailability::compute(function, cfg, block_order, ctx.alloca_ids);
+    let events = build_object_event_index(function, block_order, &availability, ctx);
     let block_live = solve_object_block_liveness(function, cfg, block_order, &events);
     let regions = emit_regions(
         function,
@@ -524,7 +633,11 @@ pub(super) fn compute_regions_and_calls(
     let mut call_sites = Vec::new();
     for &block in block_order {
         let boundary_live = build_block_boundary_live_sets(function, block, &block_live, &events);
+        let mut available = availability.incoming[block].clone();
         for inst in function.layout.iter_inst(block) {
+            if ctx.alloca_ids.contains_key(&inst) {
+                available.insert(inst);
+            }
             let Some(call) = function.dfg.cast_call(inst) else {
                 continue;
             };
@@ -539,13 +652,7 @@ pub(super) fn compute_regions_and_calls(
             live_across_objs.sort_unstable_by_key(|id| id.as_u32());
 
             let mut visible_objs: FxHashSet<StackObjId> = FxHashSet::default();
-            let mut roots: FxHashSet<InstId> = FxHashSet::default();
-            for &arg in call.args() {
-                for base in ctx.prov[arg].alloca_insts() {
-                    roots.insert(base);
-                }
-            }
-            let expanded = ctx.closure.expand_roots(roots.iter().copied());
+            let expanded = ctx.expand_values(call.args().iter().copied(), &available);
             for alloca in expanded.allocas {
                 if let Some(&id) = ctx.alloca_ids.get(&alloca) {
                     visible_objs.insert(id);
@@ -562,7 +669,6 @@ pub(super) fn compute_regions_and_calls(
                 callee: *call.callee(),
                 result_count: u8::try_from(function.dfg.inst_results(inst).len())
                     .expect("call result count too large"),
-                arg_count: u8::try_from(call.args().len()).expect("call arg count too large"),
                 live_across_objs,
                 callee_visible_objs,
             });

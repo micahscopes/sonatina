@@ -1,3 +1,5 @@
+use std::any::TypeId;
+
 use macros::define_inst_set_base;
 
 use super::{Inst, arith, cast, cmp, control_flow, data, evm, logic};
@@ -52,6 +54,7 @@ define_inst_set_base! {
         logic::And,
         logic::Or,
         logic::Xor,
+        logic::Bswap,
         cast::Sext,
         cast::Zext,
         cast::Trunc,
@@ -60,6 +63,8 @@ define_inst_set_base! {
         cast::PtrToInt,
         data::Mload,
         data::Mstore,
+        data::Memzero,
+        data::BlackBox,
         data::Gep,
         data::GetFunctionPtr,
         data::SymAddr,
@@ -121,6 +126,7 @@ define_inst_set_base! {
         evm::EvmByte,
         evm::EvmClz,
         evm::EvmKeccak256,
+        evm::EvmKeccak256Words,
         evm::EvmAddress,
         evm::EvmBalance,
         evm::EvmOrigin,
@@ -130,6 +136,7 @@ define_inst_set_base! {
         evm::EvmCalldataCopy,
         evm::EvmCalldataSize,
         evm::EvmCodeSize,
+        evm::EvmCodeLoad,
         evm::EvmCodeCopy,
         evm::EvmGasPrice,
         evm::EvmExtCodeSize,
@@ -148,6 +155,8 @@ define_inst_set_base! {
         evm::EvmBaseFee,
         evm::EvmBlobHash,
         evm::EvmBlobBaseFee,
+        evm::EvmMload,
+        evm::EvmMstore,
         evm::EvmMstore8,
         evm::EvmSload,
         evm::EvmSstore,
@@ -215,6 +224,11 @@ pub trait InstSetExt: InstSetBase {
 
     fn resolve_inst<'i>(&self, inst: &'i dyn Inst) -> Self::InstKind<'i>;
     fn resolve_inst_mut<'i>(&self, inst: &'i mut dyn Inst) -> Self::InstKindMut<'i>;
+    fn contains_inst_type_id(&self, tid: TypeId) -> bool;
+
+    fn contains_inst(&self, inst: &dyn Inst) -> bool {
+        self.contains_inst_type_id(inst.type_id())
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +239,7 @@ mod tests {
     use data::Gep;
     use logic::*;
     use macros::inst_set;
+    use smallvec::smallvec;
 
     use super::*;
     use crate::{
@@ -366,7 +381,7 @@ mod tests {
             InstClassKind::Unary(UnaryInstKind::Snego)
         );
         assert_eq!(
-            Phi::new(inst_set.phi(), vec![(v, b0)]).kind(),
+            Phi::new(inst_set.phi(), smallvec![(v, b0)]).kind(),
             InstClassKind::Phi
         );
         assert_eq!(Jump::new(inst_set.jump(), b0).kind(), InstClassKind::Opaque);

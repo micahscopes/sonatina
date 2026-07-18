@@ -6,9 +6,9 @@ mod operand_prep;
 mod test_utils;
 
 pub(super) use normalize_search::NormalizeSearchScratch;
+pub(crate) use normalize_search::StackifySearchCache;
 
 use crate::{
-    analysis::memory_access::ExactLocalAddr,
     bitset::BitSet,
     stackalloc::{Action, Actions},
 };
@@ -17,10 +17,41 @@ use sonatina_ir::ValueId;
 
 use super::{
     StackifyContext,
+    alloc::SpillStorage,
     slots::{FreeSlotPools, SpillSlotInterference, SpillSlotPools},
     spill::{SpillDiscovery, SpillSet},
     sym_stack::SymStack,
 };
+
+/// Storage-eligibility policy, owned in one place and shared by `MemPlan` and the entry-arg
+/// scratch pre-pass in the builder.
+///
+/// A spilled value must use arena (object) storage rather than a reusable scratch slot when there
+/// are no scratch slots, when it is live across a scratch clobber, or when a previous fixed-point
+/// iteration already forced object storage for it.
+pub(super) fn must_use_object_storage(
+    scratch_spill_slots: u32,
+    scratch_live_values: &BitSet<ValueId>,
+    forced_object_spills: &BitSet<ValueId>,
+    v: ValueId,
+) -> bool {
+    scratch_spill_slots == 0 || scratch_live_values.contains(v) || forced_object_spills.contains(v)
+}
+
+/// Driver-owned memory-planning state, grouped so `MemPlan::new` takes it in one reborrow rather
+/// than six separate arguments. Lives in `FunctionPlanner`; a `MemPlan` borrows its fields for the
+/// span of a single instruction/edge plan.
+pub(super) struct MemState<'a> {
+    pub(super) spill: SpillSet<'a>,
+    /// Provisional per-iteration object-id assignment (`assign_spill_obj_ids`), read by `MemPlan`
+    /// during planning before storage is finalized.
+    pub(super) spill_obj:
+        &'a SecondaryMap<ValueId, Option<crate::isa::evm::static_arena_alloc::StackObjId>>,
+    pub(super) spill_requests: &'a mut BitSet<ValueId>,
+    pub(super) object_spill_requests: &'a mut BitSet<ValueId>,
+    pub(super) forced_object_spills: &'a BitSet<ValueId>,
+    pub(super) slots: &'a mut SpillSlotPools,
+}
 
 #[derive(Clone)]
 pub(super) struct MemPlanSnapshot {
@@ -34,7 +65,7 @@ pub(super) struct MemPlan<'a> {
     scratch_live_values: &'a BitSet<ValueId>,
     scratch_spill_slots: u32,
     spill_obj: &'a SecondaryMap<ValueId, Option<crate::isa::evm::static_arena_alloc::StackObjId>>,
-    exact_local_addr: &'a SecondaryMap<ValueId, Option<ExactLocalAddr>>,
+    remat_actions: &'a SecondaryMap<ValueId, Option<Action>>,
     object_spill_requests: &'a mut BitSet<ValueId>,
     forced_object_spills: &'a BitSet<ValueId>,
     free_slots: &'a mut FreeSlotPools,
@@ -44,32 +75,23 @@ pub(super) struct MemPlan<'a> {
 }
 
 impl<'a> MemPlan<'a> {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        spill: SpillSet<'a>,
-        spill_requests: &'a mut BitSet<ValueId>,
+        mem: &'a mut MemState<'_>,
         ctx: &'a StackifyContext<'_>,
-        spill_obj: &'a SecondaryMap<
-            ValueId,
-            Option<crate::isa::evm::static_arena_alloc::StackObjId>,
-        >,
-        exact_local_addr: &'a SecondaryMap<ValueId, Option<ExactLocalAddr>>,
-        object_spill_requests: &'a mut BitSet<ValueId>,
-        forced_object_spills: &'a BitSet<ValueId>,
+        remat_actions: &'a SecondaryMap<ValueId, Option<Action>>,
         free_slots: &'a mut FreeSlotPools,
-        slots: &'a mut SpillSlotPools,
     ) -> Self {
         Self {
             scratch_live_values: &ctx.scratch_live_values,
             scratch_spill_slots: ctx.scratch_spill_slots,
-            spill_obj,
-            exact_local_addr,
-            object_spill_requests,
-            forced_object_spills,
+            spill_obj: mem.spill_obj,
+            remat_actions,
+            object_spill_requests: &mut *mem.object_spill_requests,
+            forced_object_spills: mem.forced_object_spills,
             free_slots,
-            slots,
+            slots: &mut *mem.slots,
             spill_slot_interference: &ctx.spill_slot_interference,
-            spill: SpillDiscovery::new(spill, spill_requests),
+            spill: SpillDiscovery::new(mem.spill, &mut *mem.spill_requests),
         }
     }
 
@@ -94,9 +116,12 @@ impl<'a> MemPlan<'a> {
     }
 
     fn must_use_object_storage(&self, v: ValueId) -> bool {
-        self.scratch_spill_slots == 0
-            || self.scratch_live_values.contains(v)
-            || self.forced_object_spills.contains(v)
+        must_use_object_storage(
+            self.scratch_spill_slots,
+            self.scratch_live_values,
+            self.forced_object_spills,
+            v,
+        )
     }
 
     fn request_object_storage(&mut self, v: ValueId) {
@@ -107,10 +132,10 @@ impl<'a> MemPlan<'a> {
         let Some(spilled) = self.spill.spilled(v) else {
             return;
         };
-        if self.exact_local_addr[v].is_some() {
+        if self.remat_actions[v].is_some() {
             debug_assert_eq!(
                 self.spill_obj[v], None,
-                "exact local addresses must not have spill objects"
+                "rematerialized values must not have spill objects"
             );
             actions.push(Action::Pop);
             return;
@@ -123,15 +148,22 @@ impl<'a> MemPlan<'a> {
                 &mut self.free_slots.scratch,
                 Some(self.scratch_spill_slots),
             ) {
-                actions.push(Action::MemStoreAbs(slot * 32));
+                actions.push(
+                    SpillStorage::Scratch(slot)
+                        .store_action()
+                        .expect("scratch storage has a store action"),
+                );
                 return;
             }
             self.request_object_storage(v);
         }
 
-        actions.push(Action::MemStoreObj(
-            self.spill_obj[v].expect("spilled value missing stack object id"),
-        ));
+        let obj = self.spill_obj[v].expect("spilled value missing stack object id");
+        actions.push(
+            SpillStorage::Object(obj)
+                .store_action()
+                .expect("object storage has a store action"),
+        );
     }
 
     fn load_frame_slot_or_placeholder(&mut self, v: ValueId) -> Action {
@@ -142,15 +174,12 @@ impl<'a> MemPlan<'a> {
             return Action::MemLoadObj(crate::isa::evm::static_arena_alloc::StackObjId::new(0));
         };
 
-        if let Some(exact) = self.exact_local_addr[v] {
+        if let Some(action) = self.remat_actions[v] {
             debug_assert_eq!(
                 self.spill_obj[v], None,
-                "exact local addresses must not have spill objects"
+                "rematerialized values must not have spill objects"
             );
-            return Action::MaterializeLocalAddr {
-                alloca: exact.root_alloca,
-                offset_bytes: exact.offset_bytes,
-            };
+            return action;
         }
 
         if !self.must_use_object_storage(v) {
@@ -212,52 +241,6 @@ impl<'a, 'ctx: 'a> Planner<'a, 'ctx> {
         debug_assert!(depth < self.ctx.reach.dup_max, "DUP out of range");
         self.mem
             .emit_store_if_spilled_at_depth(v, depth as u8, self.actions);
-    }
-
-    pub(super) fn emit_store_spilled_value_from_source(
-        &mut self,
-        spilled_value: ValueId,
-        source: ValueId,
-    ) {
-        if !self.mem.spill_set().contains(spilled_value) {
-            return;
-        }
-
-        if self.ctx.func.dfg.value_is_imm(source) {
-            let imm = self
-                .ctx
-                .func
-                .dfg
-                .value_imm(source)
-                .expect("imm value missing payload");
-            self.actions.push(Action::Push(imm));
-            self.mem
-                .emit_store_for_spilled_value(spilled_value, self.actions);
-        } else if let Some(pos) = self
-            .stack
-            .find_reachable_value(source, self.ctx.reach.dup_max)
-        {
-            self.actions.push(Action::StackDup(pos as u8));
-            self.mem
-                .emit_store_for_spilled_value(spilled_value, self.actions);
-        } else if let Some(pos) = self
-            .stack
-            .find_reachable_value(source, self.ctx.reach.swap_max)
-        {
-            self.stack.stable_rotate_to_top(pos, self.actions);
-            self.stack.dup(0, self.actions);
-            self.mem
-                .emit_store_for_spilled_value(spilled_value, self.actions);
-            self.stack.pop_operand();
-            for depth in (1..=pos).rev() {
-                self.stack.swap(depth, self.actions);
-            }
-        } else {
-            let act = self.mem.load_frame_slot_or_placeholder(source);
-            self.actions.push(act);
-            self.mem
-                .emit_store_for_spilled_value(spilled_value, self.actions);
-        }
     }
 
     fn push_value_from_spill_slot_or_mark(&mut self, load_from: ValueId, stack_as: ValueId) {

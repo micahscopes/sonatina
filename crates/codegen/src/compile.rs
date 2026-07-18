@@ -1,16 +1,19 @@
 //! High-level compilation entrypoint that bundles the optimization pipeline
 //! and backend codegen into a single API.
 //!
-//! [`Compile`] is the generic entry point: pair any [`Backend`] with a
-//! [`Module`] and an [`OptLevel`], optionally inspect the optimized IR,
-//! then produce artifacts.
-//!
-//! [`EvmCompile`] is a convenience wrapper that constructs an EVM backend
-//! from the module's target triple.
+//! [`Compile`] is the generic entry point. [`EvmCompile`] preserves the
+//! existing EVM-specific convenience API.
 
-use sonatina_ir::Module;
+use sonatina_ir::{InstId, Module, isa::evm::Evm, module::FuncRef};
+use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
 
-use crate::{backend::Backend, optim::Pipeline};
+use crate::{
+    backend::{Backend, BackendOptions},
+    isa::evm::{EvmBackend, ImmediateMaterializationMode, LateCleanupProfile},
+    object::{CompileOptions, ObjectArtifact, ObjectCompileError, compile_all_objects},
+    optim::Pipeline,
+    stackalloc::StackifySearchProfile,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OptLevel {
@@ -21,10 +24,26 @@ pub enum OptLevel {
     O2,
 }
 
-/// Generic compilation pipeline: shared optimization + backend-specific codegen.
+/// An optimized-IR instruction id, the namespace a frontend stamps provenance
+/// against. Distinct from `MachineInstId` so a machine id cannot be handed to
+/// the stamping door by mistake. Use `.raw()` to cross to a bare `InstId`. The
+/// inner field is pub on purpose: crossing namespaces requires writing the wrap
+/// explicitly, which is the reviewable act; the type does not try to prevent
+/// deliberate reconstruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct OptInstId(pub InstId);
+
+impl OptInstId {
+    pub fn raw(self) -> InstId {
+        self.0
+    }
+}
+
+/// Generic shared-optimization and backend-codegen pipeline.
 pub struct Compile<B> {
     module: Module,
-    opt_level: OptLevel,
+    options: BackendOptions,
     backend: B,
     optimized: bool,
 }
@@ -33,14 +52,14 @@ impl<B> Compile<B> {
     pub fn new(module: Module, backend: B) -> Self {
         Self {
             module,
-            opt_level: OptLevel::default(),
+            options: BackendOptions::default(),
             backend,
             optimized: false,
         }
     }
 
     pub fn with_opt_level(mut self, level: OptLevel) -> Self {
-        self.opt_level = level;
+        self.options.opt_level = level;
         self
     }
 
@@ -48,7 +67,7 @@ impl<B> Compile<B> {
     /// the optimized module for inspection or IR dumping.
     pub fn optimize(&mut self) -> &Module {
         if !self.optimized {
-            match self.opt_level {
+            match self.options.opt_level {
                 OptLevel::O0 => {}
                 OptLevel::O1 => Pipeline::speed().run(&mut self.module),
                 OptLevel::Os => Pipeline::size().run(&mut self.module),
@@ -59,8 +78,66 @@ impl<B> Compile<B> {
         &self.module
     }
 
+    /// Stamp codegen-owned provenance after optimization. This is the sanctioned
+    /// door and the easy path, but it does not revoke the module's interior
+    /// mutability: `optimize()` still returns a `&Module` whose `pub func_store`
+    /// can be mutated, so the door disincentivizes reaching around the stamping
+    /// path, it does not close it. A read-only view return type is the real
+    /// close, deferred to the next API window and tracked as the ModuleView
+    /// follow-up so it does not calcify into a permanent excuse.
+    pub fn stamp_post_opt_provenance(
+        &mut self,
+        func: FuncRef,
+        inst: OptInstId,
+        provenance: impl Into<String>,
+    ) -> Result<(), String> {
+        self.optimize();
+        let inst = inst.raw();
+        if !self.module.funcs().contains(&func) {
+            return Err(format!("cannot stamp undefined function {func:?}"));
+        }
+        let valid = self
+            .module
+            .func_store
+            .view(func, |function| function.dfg.has_inst(inst));
+        if !valid {
+            return Err(format!(
+                "cannot stamp missing inst{} in function {func:?}",
+                inst.0
+            ));
+        }
+        self.module.func_store.modify(func, |function| {
+            function.set_inst_provenance(inst, provenance.into());
+        });
+        Ok(())
+    }
+
+    /// Stamp post-optimization provenance across every function in one pass.
+    ///
+    /// The closure returns `Some(provenance)` to stamp a live instruction or
+    /// `None` to leave it unstamped. Stamping many instructions this way runs
+    /// one function-list scan instead of the per-call rescan that
+    /// [`Self::stamp_post_opt_provenance`] pays.
+    pub fn stamp_all_post_opt_provenance(
+        &mut self,
+        mut f: impl FnMut(FuncRef, OptInstId) -> Option<String>,
+    ) {
+        self.optimize();
+        let funcs = self.module.funcs();
+        for func in funcs {
+            self.module.func_store.modify(func, |function| {
+                let insts: Vec<_> = function.dfg.inst_ids().collect();
+                for inst in insts {
+                    if let Some(provenance) = f(func, OptInstId(inst)) {
+                        function.set_inst_provenance(inst, provenance);
+                    }
+                }
+            });
+        }
+    }
+
     pub fn opt_level(&self) -> OptLevel {
-        self.opt_level
+        self.options.opt_level
     }
 
     pub fn module(&self) -> &Module {
@@ -73,84 +150,22 @@ impl<B> Compile<B> {
 }
 
 impl<B: Backend> Compile<B> {
-    /// Optimize (if not already) and compile via the backend.
     pub fn compile(mut self) -> Result<B::Artifact, Vec<B::Error>> {
         self.optimize();
-        self.backend.compile_module(&self.module)
+        self.backend.compile_module(&self.module, &self.options)
     }
 }
 
-// ---------------------------------------------------------------------------
-// EVM convenience wrapper
-// ---------------------------------------------------------------------------
-
-use sonatina_ir::isa::evm::Evm;
-use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
-
-use crate::{
-    isa::evm::{EvmBackend, ImmediateMaterializationMode, LateCleanupProfile},
-    object::{CompileOptions, ObjectArtifact, ObjectCompileError, compile_all_objects},
-    stackalloc::StackifySearchProfile,
-};
-
-/// EVM-specific backend wrapper that implements [`Backend`].
+/// EVM backend adapter for the generic compilation pipeline.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct EvmCompiler {
-    evm_backend: EvmBackend,
-    compile_options: CompileOptions,
-}
-
-impl EvmCompiler {
-    pub fn from_module(module: &Module, opt_level: OptLevel) -> Result<Self, Vec<ObjectCompileError>> {
-        let backend = evm_backend_for_module(module, opt_level)?;
-        Ok(Self {
-            evm_backend: backend,
-            compile_options: CompileOptions::default(),
-        })
-    }
-
-    pub fn with_observability(mut self, on: bool) -> Self {
-        self.compile_options.emit_observability = on;
-        self
-    }
-
-    pub fn evm_backend(&self) -> &EvmBackend {
-        &self.evm_backend
-    }
-}
-
-impl Backend for EvmCompiler {
-    type Artifact = Vec<ObjectArtifact>;
-    type Error = ObjectCompileError;
-
-    fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        compile_all_objects(module, &self.evm_backend, &self.compile_options)
-    }
-}
-
-/// Convenience type for EVM compilation, preserving the existing API.
-pub struct EvmCompile {
-    inner: Compile<EvmCompiler>,
+    emit_symbol_table: bool,
     emit_observability: bool,
 }
 
-impl EvmCompile {
-    pub fn new(module: Module) -> Self {
-        Self {
-            inner: Compile {
-                module,
-                opt_level: OptLevel::default(),
-                backend: EvmCompiler {
-                    evm_backend: EvmBackend::new(Evm::new(evm_osaka_triple())),
-                    compile_options: CompileOptions::default(),
-                },
-                optimized: false,
-            },
-            emit_observability: false,
-        }
-    }
-
-    pub fn with_opt_level(mut self, level: OptLevel) -> Self {
-        self.inner.opt_level = level;
+impl EvmCompiler {
+    pub fn with_symbol_table(mut self, on: bool) -> Self {
+        self.emit_symbol_table = on;
         self
     }
 
@@ -158,27 +173,85 @@ impl EvmCompile {
         self.emit_observability = on;
         self
     }
+}
 
-    /// Run the optimization pipeline (idempotent) and return a reference to
-    /// the optimized module for inspection or IR dumping.
+impl Backend for EvmCompiler {
+    type Artifact = Vec<ObjectArtifact>;
+    type Error = ObjectCompileError;
+
+    fn compile_module(
+        &self,
+        module: &Module,
+        options: &BackendOptions,
+    ) -> Result<Self::Artifact, Vec<Self::Error>> {
+        let backend = evm_backend_for_module(module, options.opt_level)?;
+        let opts = CompileOptions {
+            emit_symtab: self.emit_symbol_table,
+            emit_observability: self.emit_observability,
+            ..CompileOptions::default()
+        };
+        compile_all_objects(module, &backend, &opts)
+    }
+}
+
+/// Convenience wrapper preserving the existing EVM compilation API.
+pub struct EvmCompile {
+    inner: Compile<EvmCompiler>,
+}
+
+impl EvmCompile {
+    pub fn new(module: Module) -> Self {
+        Self {
+            inner: Compile::new(module, EvmCompiler::default()),
+        }
+    }
+
+    pub fn with_opt_level(mut self, level: OptLevel) -> Self {
+        self.inner = self.inner.with_opt_level(level);
+        self
+    }
+
+    pub fn with_observability(mut self, on: bool) -> Self {
+        self.inner.backend = self.inner.backend.with_observability(on);
+        self
+    }
+
+    /// Include linker symbol tables in the compiled object artifacts.
+    ///
+    /// Symbol tables are diagnostic metadata only and do not affect emitted
+    /// section bytes. They are omitted by default.
+    pub fn with_symbol_table(mut self, on: bool) -> Self {
+        self.inner.backend = self.inner.backend.with_symbol_table(on);
+        self
+    }
+
     pub fn optimize(&mut self) -> &Module {
         self.inner.optimize()
     }
 
-    /// Optimize (if not already) and compile every object in the module.
-    pub fn compile(mut self) -> Result<Vec<ObjectArtifact>, Vec<ObjectCompileError>> {
-        self.inner.optimize();
-        let backend = evm_backend_for_module(&self.inner.module, self.inner.opt_level)?;
-        let opts = CompileOptions {
-            emit_observability: self.emit_observability,
-            ..CompileOptions::default()
-        };
-        compile_all_objects(&self.inner.module, &backend, &opts)
+    pub fn stamp_post_opt_provenance(
+        &mut self,
+        func: FuncRef,
+        inst: OptInstId,
+        provenance: impl Into<String>,
+    ) -> Result<(), String> {
+        self.inner.stamp_post_opt_provenance(func, inst, provenance)
+    }
+
+    pub fn stamp_all_post_opt_provenance(
+        &mut self,
+        f: impl FnMut(FuncRef, OptInstId) -> Option<String>,
+    ) {
+        self.inner.stamp_all_post_opt_provenance(f);
+    }
+
+    pub fn compile(self) -> Result<Vec<ObjectArtifact>, Vec<ObjectCompileError>> {
+        self.inner.compile()
     }
 }
 
 impl OptLevel {
-    pub(crate) fn late_cleanup_profile(self) -> LateCleanupProfile {
+    fn late_cleanup_profile(self) -> LateCleanupProfile {
         match self {
             OptLevel::O0 => LateCleanupProfile::Off,
             OptLevel::O1 => LateCleanupProfile::Speed,
@@ -187,7 +260,7 @@ impl OptLevel {
         }
     }
 
-    pub(crate) fn stackify_search_profile(self) -> StackifySearchProfile {
+    fn stackify_search_profile(self) -> StackifySearchProfile {
         match self {
             OptLevel::O0 => StackifySearchProfile::Fast,
             OptLevel::O1 => StackifySearchProfile::GreedyWide,
@@ -195,7 +268,7 @@ impl OptLevel {
         }
     }
 
-    pub(crate) fn immediate_materialization_mode(self) -> ImmediateMaterializationMode {
+    fn immediate_materialization_mode(self) -> ImmediateMaterializationMode {
         match self {
             OptLevel::Os => ImmediateMaterializationMode::Size,
             OptLevel::O2 => ImmediateMaterializationMode::Balanced,
@@ -232,10 +305,32 @@ fn evm_osaka_triple() -> TargetTriple {
 
 #[cfg(test)]
 mod tests {
-    use sonatina_ir::{Module, isa::evm::Evm};
+    use sonatina_ir::{InstId, Module, isa::evm::Evm, module::FuncRef};
+    use sonatina_parser::parse_module;
     use sonatina_triple::{EvmVersion, OperatingSystem, TargetTriple};
 
-    use super::{EvmCompile, ObjectCompileError, evm_osaka_triple};
+    use crate::{
+        backend::{Backend, BackendOptions},
+        compile::{Compile, OptLevel},
+        object::SymbolId,
+    };
+
+    use super::{EvmCompile, ObjectCompileError, OptInstId, evm_osaka_triple};
+
+    struct OptionsBackend;
+
+    impl Backend for OptionsBackend {
+        type Artifact = OptLevel;
+        type Error = ();
+
+        fn compile_module(
+            &self,
+            _module: &Module,
+            options: &BackendOptions,
+        ) -> Result<Self::Artifact, Vec<Self::Error>> {
+            Ok(options.opt_level)
+        }
+    }
 
     fn module_for_evm(version: EvmVersion) -> Module {
         let triple = evm_osaka_triple();
@@ -257,5 +352,91 @@ mod tests {
             target.operating_system,
             OperatingSystem::Evm(EvmVersion::London)
         );
+    }
+
+    #[test]
+    fn post_opt_provenance_stamping_is_metadata_only() {
+        let mut compile = EvmCompile::new(module_for_evm(EvmVersion::Osaka));
+        let error = compile
+            .stamp_post_opt_provenance(FuncRef::from_u32(0), OptInstId(InstId(0)), "post-opt:test")
+            .expect_err("undefined functions must be rejected");
+
+        assert!(error.contains("undefined function"));
+        assert_eq!(compile.optimize().ctx.triple, evm_osaka_triple());
+    }
+
+    #[test]
+    fn symbol_table_option_populates_embed_symbols_without_changing_bytes() {
+        let source = r#"
+target = "evm-ethereum-osaka"
+
+func public %runtime() {
+    block0:
+        evm_return 0.i256 0.i256;
+}
+
+func public %init() {
+    block0:
+        v0.i256 = sym_addr &runtime;
+        v1.i256 = sym_size &runtime;
+        mstore 0.i256 v0 i256;
+        mstore 32.i256 v1 i256;
+        evm_return 0.i256 64.i256;
+}
+
+object @Contract {
+  section init {
+    entry %init;
+    embed .runtime as &runtime;
+  }
+  section runtime {
+    entry %runtime;
+  }
+}
+"#;
+
+        let compile = |emit_symbol_table| {
+            EvmCompile::new(parse_module(source).expect("fixture parses").module)
+                .with_symbol_table(emit_symbol_table)
+                .with_observability(true)
+                .compile()
+                .expect("fixture compiles")
+        };
+        let without_symbols = compile(false);
+        let with_symbols = compile(true);
+        let without = &without_symbols[0];
+        let with = &with_symbols[0];
+
+        assert_eq!(without_symbols.len(), with_symbols.len());
+        assert_eq!(without.sections.len(), with.sections.len());
+        for ((without_name, without_section), (with_name, with_section)) in
+            without.sections.iter().zip(with.sections.iter())
+        {
+            assert_eq!(without_name, with_name);
+            assert_eq!(without_section.bytes, with_section.bytes);
+            assert!(without_section.symtab.is_empty());
+            assert!(with_section.observability.is_some());
+        }
+        let (_, init) = with
+            .sections
+            .iter()
+            .find(|(name, _)| name.0.as_str() == "init")
+            .expect("init section exists");
+        assert!(
+            init.symtab
+                .keys()
+                .any(|symbol| matches!(symbol, SymbolId::Embed(_))),
+            "symbol table must contain the required runtime embed symbol"
+        );
+    }
+
+    #[test]
+    fn generic_compile_passes_optimization_level_to_backend() {
+        let module = module_for_evm(EvmVersion::Osaka);
+        let level = Compile::new(module, OptionsBackend)
+            .with_opt_level(OptLevel::O2)
+            .compile()
+            .unwrap();
+        assert_eq!(level, OptLevel::O2);
     }
 }

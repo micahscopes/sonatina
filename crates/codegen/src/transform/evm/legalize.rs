@@ -1,3 +1,5 @@
+use std::iter;
+
 use cranelift_entity::SecondaryMap;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -14,8 +16,9 @@ use sonatina_ir::{
         data::{Alloca, MemAllocDynamic, Mload, Mstore},
         downcast,
         evm::{
-            EvmMalloc, EvmSaddsat, EvmSdiv, EvmSdivo, EvmSmod, EvmSmodo, EvmSmulsat, EvmSsubsat,
-            EvmUaddsat, EvmUdiv, EvmUdivo, EvmUmod, EvmUmodo, EvmUmulsat, EvmUsubsat,
+            EvmCodeLoad, EvmExp, EvmMalloc, EvmSaddsat, EvmSdiv, EvmSdivo, EvmSmod, EvmSmodo,
+            EvmSmulsat, EvmSsubsat, EvmUaddsat, EvmUdiv, EvmUdivo, EvmUmod, EvmUmodo, EvmUmulsat,
+            EvmUsubsat,
         },
         logic::{self, And, Or, Xor},
     },
@@ -25,7 +28,7 @@ use sonatina_ir::{
 };
 use sonatina_triple::Architecture;
 
-use super::scalar_words::legalize_evm_scalar_immediate;
+use super::{const_data::emit_const_load_from_addr, scalar_words::legalize_evm_scalar_immediate};
 use crate::optim::adce::AdceSolver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,6 +373,28 @@ impl<'a> FunctionLegalizer<'a> {
             self.rewrite_signed_overflow_binary(inst, lhs, rhs, SignedOverflowKind::Mul);
             return;
         }
+        if let Some((base, exponent)) =
+            downcast::<&EvmExp>(is, self.func.dfg.inst(inst)).map(|i| (*i.base(), *i.exponent()))
+            && let Some(width @ ScalarWidth::Narrow(_)) = self.single_result_width(inst)
+        {
+            // EXP wraps at 256 bits; restore the declared width. Boolean
+            // exponentiation already produces a canonical zero or one.
+            let raw = self.insert_before_one(
+                inst,
+                EvmExp::new(is, base, exponent),
+                Type::I256,
+                Some(ScalarWidth::Full256),
+            );
+            let result = self.normalize_and_retag_width(inst, raw, width);
+            self.replace_with_aliases(inst, &[result]);
+            return;
+        }
+        if let Some((lhs, rhs)) =
+            downcast::<&EvmSdiv>(is, self.func.dfg.inst(inst)).map(|i| (*i.lhs(), *i.rhs()))
+        {
+            self.rewrite_evm_sdiv(inst, lhs, rhs);
+            return;
+        }
         if let Some((lhs, rhs)) =
             downcast::<&EvmUdivo>(is, self.func.dfg.inst(inst)).map(|i| (*i.lhs(), *i.rhs()))
         {
@@ -380,6 +405,12 @@ impl<'a> FunctionLegalizer<'a> {
             downcast::<&EvmSdivo>(is, self.func.dfg.inst(inst)).map(|i| (*i.lhs(), *i.rhs()))
         {
             self.rewrite_evm_sdivo(inst, lhs, rhs);
+            return;
+        }
+        if let Some((lhs, rhs)) =
+            downcast::<&EvmSmod>(is, self.func.dfg.inst(inst)).map(|i| (*i.lhs(), *i.rhs()))
+        {
+            self.rewrite_evm_smod(inst, lhs, rhs);
             return;
         }
         if let Some((lhs, rhs)) =
@@ -430,6 +461,13 @@ impl<'a> FunctionLegalizer<'a> {
             downcast::<&cast::IntToPtr>(is, self.func.dfg.inst(inst)).map(|i| (*i.from(), *i.ty()))
         {
             self.rewrite_int_to_ptr(inst, from, ty);
+            return;
+        }
+        if let Some(offset) =
+            downcast::<&EvmCodeLoad>(is, self.func.dfg.inst(inst)).map(|i| *i.code_offset())
+        {
+            let value = emit_const_load_from_addr(self.func, inst, offset, Type::I256, None);
+            self.replace_with_aliases(inst, &[value]);
             return;
         }
         if let Some((addr, ty)) =
@@ -514,6 +552,10 @@ impl<'a> FunctionLegalizer<'a> {
             downcast::<&logic::Not>(is, self.func.dfg.inst(inst)).map(|i| *i.arg())
         {
             self.rewrite_not(inst, arg);
+        } else if let Some(arg) =
+            downcast::<&logic::Bswap>(is, self.func.dfg.inst(inst)).map(|i| *i.arg())
+        {
+            self.rewrite_bswap(inst, arg);
         } else if let Some((lhs, rhs)) =
             downcast::<&cmp::Slt>(is, self.func.dfg.inst(inst)).map(|i| (*i.lhs(), *i.rhs()))
         {
@@ -557,6 +599,7 @@ impl<'a> FunctionLegalizer<'a> {
         widths: &[Option<ScalarWidth>],
     ) -> SmallVec<[ValueId; 2]> {
         let inst = self.func.dfg.make_inst(data);
+        self.func.propagate_inst_attribution(inst, before);
         self.func.layout.insert_inst_before(inst, before);
         let mut results = SmallVec::new();
         for (idx, &ty) in result_tys.iter().enumerate() {
@@ -1764,6 +1807,10 @@ impl<'a> FunctionLegalizer<'a> {
         self.replace_with_aliases(inst, &[result, overflow]);
     }
 
+    fn rewrite_evm_sdiv(&mut self, inst: InstId, lhs: ValueId, rhs: ValueId) {
+        self.rewrite_signed_div_mod(inst, lhs, rhs, true);
+    }
+
     fn rewrite_evm_smodo(&mut self, inst: InstId, lhs: ValueId, rhs: ValueId) {
         let width = self
             .width_of(self.func.dfg.inst_results(inst)[0])
@@ -1795,6 +1842,10 @@ impl<'a> FunctionLegalizer<'a> {
             Some(ScalarWidth::Bool),
         );
         self.replace_with_aliases(inst, &[result, overflow]);
+    }
+
+    fn rewrite_evm_smod(&mut self, inst: InstId, lhs: ValueId, rhs: ValueId) {
+        self.rewrite_signed_div_mod(inst, lhs, rhs, false);
     }
 
     fn rewrite_add(&mut self, inst: InstId, lhs: ValueId, rhs: ValueId) {
@@ -2078,6 +2129,66 @@ impl<'a> FunctionLegalizer<'a> {
                 self.replace_with_aliases(inst, &[result]);
             }
         }
+    }
+
+    /// The EVM has no byte swap. Each round swaps the halves of every lane,
+    /// from the whole value down to byte pairs; a canonical narrow value stays
+    /// within its width throughout.
+    fn rewrite_bswap(&mut self, inst: InstId, arg: ValueId) {
+        let width = self
+            .single_result_width(inst)
+            .expect("missing bswap result width");
+        let bits = match width {
+            ScalarWidth::Bool => panic!("bswap does not support i1"),
+            ScalarWidth::Narrow(8) => {
+                self.replace_with_aliases(inst, &[arg]);
+                return;
+            }
+            ScalarWidth::Narrow(bits) => bits,
+            ScalarWidth::Full256 => 256,
+        };
+        let mut word = arg;
+        for half in iter::successors(Some(bits / 2), |&half| (half > 8).then_some(half / 2)) {
+            let shift = self.shift_value(half);
+            let lane = low_mask(half);
+            let mask = (0..bits)
+                .step_by(usize::from(half) * 2)
+                .fold(U256::zero(), |mask, offset| {
+                    mask | (lane << usize::from(offset))
+                });
+            let mask = self.imm_i256(mask);
+            let high = self.insert_before_one(
+                inst,
+                arith::Shr::new(self.evm_inst_set(), shift, word),
+                Type::I256,
+                Some(width),
+            );
+            let high = self.insert_before_one(
+                inst,
+                And::new(self.evm_inst_set(), high, mask),
+                Type::I256,
+                Some(width),
+            );
+            let low = self.insert_before_one(
+                inst,
+                And::new(self.evm_inst_set(), word, mask),
+                Type::I256,
+                Some(width),
+            );
+            let low = self.insert_before_one(
+                inst,
+                arith::Shl::new(self.evm_inst_set(), shift, low),
+                Type::I256,
+                Some(width),
+            );
+            word = self.insert_before_one(
+                inst,
+                Or::new(self.evm_inst_set(), high, low),
+                Type::I256,
+                Some(width),
+            );
+        }
+        self.replace_with_aliases(inst, &[word]);
     }
 
     fn rewrite_signed_cmp(

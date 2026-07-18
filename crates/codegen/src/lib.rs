@@ -6,8 +6,8 @@ pub mod cfg_scc;
 pub mod compile;
 pub mod structurize;
 
-pub use backend::Backend;
-pub use compile::{Compile, EvmCompile, EvmCompiler, OptLevel};
+pub use backend::{Backend, BackendOptions};
+pub use compile::{Compile, EvmCompile, EvmCompiler, OptInstId, OptLevel};
 pub mod critical_edge;
 pub mod domtree;
 pub mod isa;
@@ -20,5 +20,7 @@ pub mod optim;
 pub mod post_domtree;
 pub mod range_analysis;
 pub mod stackalloc;
-pub mod stackify_edge;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transform;
+pub(crate) mod type_rewrite;

@@ -1,36 +1,51 @@
-use super::*;
+use super::{test_util::osaka_backend, *};
 use crate::{
     analysis::func_behavior,
+    critical_edge::CriticalEdgeSplitter,
     domtree::DomTree,
     liveness::{InstLiveness, Liveness},
     machinst::{
         lower::{LoweredFunction, SectionWorkModule},
         vcode::{Label, VCode, VCodeFixup},
     },
-    object::{CompileOptions, SymbolId, link::link_section},
+    module_analysis::CallGraphSchedule,
+    object::{CompileOptions, PcAttribution, SymbolId, UnmappedReason, link::link_section},
     optim::pipeline::Pipeline,
-    stackalloc::{Action, Actions, Allocator, StackifyBuilder},
-    stackify_edge::StackifyEdgeSplitter,
+    stackalloc::{
+        Action, Actions, Allocator, StackifyAlloc, StackifyBuilder, StackifyEdgeSplitter,
+    },
 };
-use cranelift_entity::SecondaryMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use sonatina_ir::{
-    BlockId, Directive, Immediate, InstId, InstSetBase, InstSetExt, Module, ValueId,
-    cfg::ControlFlowGraph, inst::evm::inst_set::EvmInstKind, ir_writer::FuncWriter, isa::Isa,
-    object::SectionName,
+    BlockId, Function, Immediate, InstId, InstSetBase, InstSetExt, Module, ValueId,
+    cfg::ControlFlowGraph,
+    inst::evm::inst_set::EvmInstKind,
+    ir_writer::FuncWriter,
+    isa::Isa,
+    module::ModuleCtx,
+    object::{ObjectName, SectionName},
 };
 use sonatina_parser::parse_module;
 use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
+use std::sync::Arc;
 
 use self::{
-    dyn_sp::{DynSpInitKind, DynSpPlan, compute_dyn_sp_plan},
+    dyn_sp::DynSpInitKind,
     emit::{
         FinalAlloc, materialize_jumpdests, prune_redundant_opcode_sequences,
         rewrite_evm_local_fallthrough_layout,
     },
+    machine::{
+        final_spills::compute_malloc_spill_bounds,
+        module::FuncMachineMap,
+        placement::{
+            EvmMemoryPlacementPlan, MemoryPlacementSection, compute_semantic_memory_placement,
+        },
+    },
     memory_plan::{
-        ArenaCostModel, ProgramMemoryPlan, compute_abs_clobber_words, compute_program_memory_plan,
+        ArenaCostModel, BackendSpillPlan, BackendSpillReserve, DYN_SP_SLOT, ProgramMemoryPlan,
+        compute_abs_clobber_words_with_extra, compute_semantic_program_memory_plan,
     },
     prepare::compute_return_escape_caller_clamp_words,
 };
@@ -40,13 +55,14 @@ struct PlanTestCtx {
     funcs: Vec<FuncRef>,
     names: FxHashMap<String, FuncRef>,
     plan: ProgramMemoryPlan,
-    analyses: FxHashMap<FuncRef, memory_plan::FuncAnalysis>,
 }
 
-struct DynSpTestCtx {
-    module: sonatina_ir::Module,
-    names: FxHashMap<String, FuncRef>,
-    plan: DynSpPlan,
+#[test]
+fn unknown_contents_keep_branch_exclusive_allocations_disjoint() {
+    let source = include_str!("../../../test_files/evm/branch_exclusive_unknown_storage.sntn");
+    let ctx = plan_test_ctx_from_src(source);
+    let plan = &ctx.plan.funcs[&ctx.names["entry"]];
+    assert_eq!(plan.scratch_words + plan.stable_words, 6);
 }
 
 fn plan_test_ctx_from_src(src: &str) -> PlanTestCtx {
@@ -58,45 +74,21 @@ fn plan_test_ctx_from_src(src: &str) -> PlanTestCtx {
         operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
     });
     let ptr_escape = compute_ptr_escape_summaries(&parsed.module, &funcs, &isa);
+    let backend = EvmBackend::new(isa);
 
-    let mut analyses: FxHashMap<FuncRef, memory_plan::FuncAnalysis> = FxHashMap::default();
+    let mut analyses: FxHashMap<FuncRef, memory_plan::FuncPreAnalysis> = FxHashMap::default();
     for &func in &funcs {
         parsed.module.func_store.modify(func, |function| {
-            let mut cfg = ControlFlowGraph::default();
-            cfg.compute(function);
-
-            StackifyEdgeSplitter::run(function, &mut cfg);
-
-            let mut liveness = Liveness::new();
-            liveness.compute(function, &cfg);
-
-            let mut inst_liveness = InstLiveness::new();
-            inst_liveness.compute(function, &cfg, &liveness);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
             analyses.insert(
                 func,
-                memory_plan::FuncAnalysis {
-                    alloc: StackifyBuilder::new(function, &cfg, &dom, &liveness, 16).compute(),
-                    inst_liveness,
-                    block_order: dom.rpo().to_vec(),
-                    value_aliases: {
-                        let mut value_aliases = SecondaryMap::new();
-                        for value in function.dfg.value_ids() {
-                            value_aliases[value] = Some(value);
-                        }
-                        value_aliases
-                    },
-                },
+                compute_test_pre_analysis(function, &parsed.module.ctx, &backend, &ptr_escape),
             );
         });
     }
 
-    let plan = compute_program_memory_plan(
+    let plan = compute_semantic_program_memory_plan(
         &parsed.module,
-        &funcs,
+        &crate::module_analysis::CallGraphSchedule::compute(&parsed.module, &funcs),
         &analyses,
         &ptr_escape,
         &isa,
@@ -117,47 +109,64 @@ fn plan_test_ctx_from_src(src: &str) -> PlanTestCtx {
         funcs,
         names,
         plan,
-        analyses,
     }
 }
 
-fn dyn_sp_plan_from_src(src: &str) -> DynSpTestCtx {
-    let ctx = plan_test_ctx_from_src(src);
-    let isa = Evm::new(TargetTriple {
-        architecture: Architecture::Evm,
-        vendor: Vendor::Ethereum,
-        operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
-    });
-    let section_entry = ctx
-        .module
-        .objects
-        .values()
-        .find_map(|object| {
-            object.sections.iter().find_map(|section| {
-                section
-                    .directives
-                    .iter()
-                    .find_map(|directive| match directive {
-                        Directive::Entry(func) => Some(*func),
-                        Directive::Include(_) | Directive::Data(_) | Directive::Embed(_) => None,
-                    })
-            })
-        })
-        .unwrap_or(ctx.funcs[0]);
-    let dyn_sp_plan = compute_dyn_sp_plan(
-        &ctx.module,
-        &ctx.funcs,
-        section_entry,
-        &ctx.plan,
-        &ctx.analyses,
-        &isa,
-    );
+fn compute_test_pre_analysis(
+    function: &mut Function,
+    module: &ModuleCtx,
+    backend: &EvmBackend,
+    ptr_escape: &PtrEscapeSummaries,
+) -> memory_plan::FuncPreAnalysis {
+    let mut cfg = ControlFlowGraph::new();
+    cfg.compute(function);
 
-    DynSpTestCtx {
-        module: ctx.module,
-        names: ctx.names,
-        plan: dyn_sp_plan,
+    CriticalEdgeSplitter::new().run(function, &mut cfg);
+
+    let mut dom = DomTree::new();
+    dom.compute(&cfg);
+
+    let mut liveness = Liveness::new();
+    liveness.compute(function, &cfg);
+
+    let mut inst_liveness = InstLiveness::new();
+    inst_liveness.compute(function, &cfg, &liveness);
+
+    let prov = crate::isa::evm::ptr_provenance::compute_provenance(
+        function,
+        module,
+        &backend.isa,
+        ptr_escape,
+    );
+    let prov_conservative_value = crate::isa::evm::ptr_provenance::compute_value_provenance(
+        function,
+        module,
+        &backend.isa,
+        &PtrEscapeSummaries::conservative(),
+    );
+    memory_plan::FuncPreAnalysis {
+        block_order: dom.rpo().to_owned(),
+        value_aliases: backend.compute_high_evm_value_aliases(function, module),
+        cfg,
+        inst_liveness,
+        prov,
+        prov_conservative_value,
     }
+}
+
+fn compute_test_stackify_alloc(function: &mut Function) -> StackifyAlloc {
+    let mut cfg = ControlFlowGraph::new();
+    cfg.compute(function);
+
+    StackifyEdgeSplitter::run(function, &mut cfg);
+
+    let mut liveness = Liveness::new();
+    liveness.compute(function, &cfg);
+
+    let mut dom = DomTree::new();
+    dom.compute(&cfg);
+
+    StackifyBuilder::new(function, &cfg, &dom, &liveness, 16).compute()
 }
 
 fn find_func(module: &Module, name: &str) -> FuncRef {
@@ -180,12 +189,25 @@ fn work_module(module: &Module, funcs: &[FuncRef]) -> SectionWorkModule {
     work_module_with_entry(module, funcs, funcs[0])
 }
 
-fn test_backend() -> EvmBackend {
-    EvmBackend::new(Evm::new(TargetTriple {
-        architecture: Architecture::Evm,
-        vendor: Vendor::Ethereum,
-        operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
-    }))
+#[test]
+fn free_ptr_restore_preserves_heap_published_by_a_callee() {
+    let parsed = parse_module(include_str!(
+        "../../../test_files/evm/callee_heap_escape_free_ptr.sntn"
+    ))
+    .expect("module parses");
+    let backend = osaka_backend();
+    let summaries =
+        compute_ptr_escape_summaries(&parsed.module, &parsed.module.funcs(), &backend.isa);
+    let forward = find_func(&parsed.module, "forward");
+    parsed.module.func_store.modify(forward, |function| {
+        let before = function.layout.iter_all_insts().count();
+        prepare_free_ptr_restore(function, &parsed.module.ctx, &backend, &summaries);
+        let after = function.layout.iter_all_insts().count();
+        assert_eq!(
+            before, after,
+            "callee's published allocation prevents heap restoration"
+        );
+    });
 }
 
 fn first_memory_op(lowered: &LoweredFunction<OpCode>) -> Option<u8> {
@@ -197,20 +219,51 @@ fn first_memory_op(lowered: &LoweredFunction<OpCode>) -> Option<u8> {
         .find(|op| *op == OpCode::MLOAD as u8 || *op == OpCode::MSTORE as u8)
 }
 
+fn lowered_bytes(lowered: &LoweredFunction<OpCode>) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for &block in &lowered.block_order {
+        for inst in lowered.vcode.block_insns(block) {
+            bytes.push(lowered.vcode.insts[inst] as u8);
+            if let Some((_, imm)) = lowered.vcode.inst_imm_bytes.get(inst) {
+                bytes.extend_from_slice(imm);
+            }
+        }
+    }
+    bytes
+}
+
+fn contains_subsequence(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
 fn rewrite_local_fallthrough_order_from_src(
     src: &str,
     func_name: &str,
     block_order: &[u32],
+) -> Vec<u32> {
+    rewrite_local_fallthrough_order_from_src_with_profile(src, func_name, block_order, true)
+}
+
+fn rewrite_local_fallthrough_order_from_src_with_profile(
+    src: &str,
+    func_name: &str,
+    block_order: &[u32],
+    prefer_speed: bool,
 ) -> Vec<u32> {
     let parsed = parse_module(src).expect("module parses");
     let func = find_func(&parsed.module, func_name);
     let block_order: Vec<_> = block_order.iter().copied().map(BlockId).collect();
 
     parsed.module.func_store.view(func, |function| {
-        rewrite_evm_local_fallthrough_layout(function, &FxHashMap::default(), block_order)
-            .into_iter()
-            .map(|block| block.0)
-            .collect()
+        rewrite_evm_local_fallthrough_layout(
+            function,
+            &FxHashMap::default(),
+            block_order,
+            prefer_speed,
+        )
+        .into_iter()
+        .map(|block| block.0)
+        .collect()
     })
 }
 
@@ -253,6 +306,35 @@ block4:
 
 block1:
     return v1;
+}
+"#;
+
+const HOT_LOOP_LT_MULTI_BLOCK_BODY_SRC: &str = r#"
+target = "evm-ethereum-osaka"
+
+func public %main(v0.i1, v1.i256) -> i256 {
+block0:
+    jump block3;
+
+block3:
+    v2.i256 = phi (0.i256 block0) (v5 block7);
+    v3.i1 = lt v2 v1;
+    br v3 block4 block5;
+
+block4:
+    br v0 block6 block7;
+
+block6:
+    v4.i256 = add v2 2.i256;
+    jump block7;
+
+block7:
+    v5.i256 = phi (v2 block4) (v4 block6);
+    v6.i256 = add v5 1.i256;
+    jump block3;
+
+block5:
+    return v2;
 }
 "#;
 
@@ -368,6 +450,27 @@ block2:
 }
 "#;
 
+const NON_LOOP_DIAMOND_SRC: &str = r#"
+target = "evm-ethereum-osaka"
+
+func public %main(v0.i1, v1.i256) -> i256 {
+block0:
+    br v0 block1 block2;
+
+block1:
+    v2.i256 = add v1 1.i256;
+    jump block3;
+
+block2:
+    v3.i256 = add v1 2.i256;
+    jump block3;
+
+block3:
+    v4.i256 = phi (v2 block1) (v3 block2);
+    return v4;
+}
+"#;
+
 #[test]
 fn local_fallthrough_layout_rewrites_hot_loop_header_window() {
     let order =
@@ -381,6 +484,24 @@ fn local_fallthrough_layout_skips_lt_loop_headers() {
     let order = rewrite_local_fallthrough_order_from_src(HOT_LOOP_LT_SRC, "main", &[0, 3, 1, 4]);
 
     assert_eq!(order, vec![0, 3, 1, 4]);
+}
+
+#[test]
+fn local_fallthrough_layout_rewrites_lt_loop_body_fallthrough() {
+    let order = rewrite_local_fallthrough_order_from_src(HOT_LOOP_LT_SRC, "main", &[0, 3, 4, 1]);
+
+    assert_eq!(order, vec![0, 3, 1, 4]);
+}
+
+#[test]
+fn local_fallthrough_layout_rewrites_lt_multi_block_loop_body() {
+    let order = rewrite_local_fallthrough_order_from_src(
+        HOT_LOOP_LT_MULTI_BLOCK_BODY_SRC,
+        "main",
+        &[0, 3, 4, 6, 7, 5],
+    );
+
+    assert_eq!(order, vec![0, 3, 5, 4, 6, 7]);
 }
 
 #[test]
@@ -403,14 +524,14 @@ fn local_fallthrough_layout_skips_non_backedge_body_blocks() {
 }
 
 #[test]
-fn local_fallthrough_layout_skips_nonterminal_exits() {
+fn local_fallthrough_layout_rewrites_nonterminal_loop_exits() {
     let order = rewrite_local_fallthrough_order_from_src(
         HOT_LOOP_NONTERMINAL_EXIT_SRC,
         "main",
         &[0, 3, 1, 4, 2],
     );
 
-    assert_eq!(order, vec![0, 3, 1, 4, 2]);
+    assert_eq!(order, vec![0, 3, 4, 1, 2]);
 }
 
 #[test]
@@ -437,6 +558,26 @@ fn local_fallthrough_layout_skips_non_loop_branches() {
     let order = rewrite_local_fallthrough_order_from_src(NON_LOOP_BRANCH_SRC, "main", &[0, 1, 2]);
 
     assert_eq!(order, vec![0, 1, 2]);
+}
+
+#[test]
+fn local_fallthrough_layout_rewrites_non_loop_diamond() {
+    let order = rewrite_local_fallthrough_order_from_src_with_profile(
+        NON_LOOP_DIAMOND_SRC,
+        "main",
+        &[0, 1, 2, 3],
+        false,
+    );
+
+    assert_eq!(order, vec![0, 2, 1, 3]);
+}
+
+#[test]
+fn local_fallthrough_layout_skips_non_loop_diamond_for_speed() {
+    let order =
+        rewrite_local_fallthrough_order_from_src(NON_LOOP_DIAMOND_SRC, "main", &[0, 1, 2, 3]);
+
+    assert_eq!(order, vec![0, 1, 2, 3]);
 }
 
 #[test]
@@ -556,42 +697,7 @@ fn prune_removes_two_inst_stack_noops() {
 }
 
 #[test]
-fn dyn_sp_entry_init_covers_ready_recursive_entry_scc() {
-    let ctx = dyn_sp_plan_from_src(
-        r#"
-target = "evm-ethereum-osaka"
-
-func public %f(v0.i1, v1.i256) -> i256 {
-block0:
-    br v0 block1 block2;
-
-block1:
-    return 0.i256;
-
-block2:
-    v2.*i256 = alloca i256;
-    mstore v2 v1 i256;
-    v3.i256 = call %f 1.i1 v1;
-    v4.i256 = mload v2 i256;
-    v5.i256 = add v3 v4;
-    return v5;
-}
-"#,
-    );
-
-    let f = ctx.names["f"];
-    assert_eq!(ctx.plan.entry_init, Some(DynSpInitKind::Checked));
-    assert!(
-        ctx.plan
-            .frontier_init_calls
-            .get(&f)
-            .is_none_or(FxHashSet::is_empty)
-    );
-    assert!(ctx.plan.entry_live_frame[&f]);
-}
-
-#[test]
-fn recursive_entry_lowering_checks_dyn_sp_before_reinit() {
+fn recursive_entry_lowering_uses_lazy_frame() {
     let parsed = parse_module(
         r#"
 target = "evm-ethereum-osaka"
@@ -616,7 +722,7 @@ block2:
     .unwrap();
 
     let f = find_func(&parsed.module, "f");
-    let backend = test_backend();
+    let backend = osaka_backend();
     let prepared = backend
         .prepare_section(work_module_with_entry(&parsed.module, &[f], f))
         .expect("prepare should succeed");
@@ -626,6 +732,7 @@ block2:
         Some(DynSpInitKind::Checked)
     );
     assert!(function_plan.dyn_sp_plan.entry_live_frame);
+    assert!(function_plan.frame_summary.lowering.is_some());
 
     let lowered = backend
         .lower_function(&prepared, f)
@@ -635,7 +742,81 @@ block2:
     assert_eq!(
         first_mem_op,
         OpCode::MLOAD as u8,
-        "recursive entry lowering must guard dyn_sp init before writing it"
+        "recursive lazy frame lowering must read dyn_sp before writing it"
+    );
+}
+
+#[test]
+fn lazy_frame_enters_after_values_combined_with_frame_addresses() {
+    // The gas reading only offsets the frame address, so the frame must be
+    // entered after it rather than before the read.
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.i1, v1.i256) -> i256 {
+block0:
+    v2.i256 = evm_gas;
+    br v0 block1 block2;
+
+block1:
+    return v2;
+
+block2:
+    v3.*i256 = alloca i256;
+    v4.i256 = ptr_to_int v3 i256;
+    v5.i256 = add v4 v2;
+    mstore v5 v1 i256;
+    v6.i256 = call %f 1.i1 v1;
+    v7.i256 = mload v5 i256;
+    v8.i256 = add v6 v7;
+    return v8;
+}
+"#,
+    )
+    .unwrap();
+
+    let f = find_func(&parsed.module, "f");
+    let backend = osaka_backend();
+    let prepared = backend
+        .prepare_section(work_module_with_entry(&parsed.module, &[f], f))
+        .expect("prepare should succeed");
+    let function_plan = prepared.function_plan(f).expect("missing function plan");
+    assert!(function_plan.frame_summary.lowering.is_some());
+
+    let lowered = backend
+        .lower_function(&prepared, f)
+        .expect("function lowers");
+    let ops: Vec<(u8, &[u8])> = lowered
+        .block_order
+        .iter()
+        .flat_map(|&block| lowered.vcode.block_insns(block))
+        .map(|inst| {
+            let imm = lowered.vcode.inst_imm_bytes.get(inst);
+            (
+                lowered.vcode.insts[inst] as u8,
+                imm.map_or(&[][..], |(_, bytes)| bytes.as_slice()),
+            )
+        })
+        .collect();
+    let gas = ops
+        .iter()
+        .position(|&(op, _)| op == OpCode::GAS as u8)
+        .expect("gas read");
+    let enter = ops
+        .windows(3)
+        .position(|window| {
+            window
+                == [
+                    (OpCode::PUSH1 as u8, &[DYN_SP_SLOT][..]),
+                    (OpCode::MLOAD as u8, &[][..]),
+                    (OpCode::DUP1 as u8, &[][..]),
+                ]
+        })
+        .expect("frame entry");
+    assert!(
+        gas < enter,
+        "frame entry at op {enter} precedes gas read at op {gas}"
     );
 }
 
@@ -660,7 +841,7 @@ object @Contract {
     .unwrap();
 
     let entry = find_func(&parsed.module, "entry");
-    let backend = test_backend();
+    let backend = osaka_backend();
     let prepared = backend
         .prepare_section(work_module_with_entry(&parsed.module, &[entry], entry))
         .expect("prepare should succeed");
@@ -668,6 +849,7 @@ object @Contract {
         .function_plan(entry)
         .expect("missing function plan");
     assert_eq!(function_plan.dyn_sp_plan.entry_init, None);
+    assert!(function_plan.frame_summary.lowering.is_none());
 
     let lowered = backend
         .lower_function(&prepared, entry)
@@ -719,7 +901,7 @@ object @Contract {
     .unwrap();
 
     let f = find_func(&parsed.module, "f");
-    let backend = test_backend();
+    let backend = osaka_backend();
     let prepared = backend
         .prepare_section(work_module_with_entry(&parsed.module, &[f], f))
         .expect("prepare should succeed");
@@ -729,6 +911,7 @@ object @Contract {
         Some(DynSpInitKind::Always)
     );
     assert!(!function_plan.dyn_sp_plan.entry_live_frame);
+    assert!(function_plan.frame_summary.lowering.is_some());
 
     let lowered = backend
         .lower_function(&prepared, f)
@@ -738,6 +921,902 @@ object @Contract {
         first_mem_op,
         OpCode::MSTORE as u8,
         "entry without live-frame reentry should initialize dyn_sp directly"
+    );
+}
+
+#[test]
+fn fixed_transient_malloc_keccak_lowers_to_machine_zero_buffer() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %entry(v0.i256) -> i256 {
+block0:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.*i256 = bitcast v1 *i256;
+    mstore v2 v0 i256;
+    v3.i256 = evm_keccak256 v1 32.i256;
+    return v3;
+}
+"#,
+    )
+    .unwrap();
+
+    let entry = find_func(&parsed.module, "entry");
+    let backend = osaka_backend();
+    let prepared = backend
+        .prepare_section(work_module_with_entry(&parsed.module, &[entry], entry))
+        .expect("prepare should succeed");
+
+    let dumped = prepared.module().func_store.view(entry, |function| {
+        FuncWriter::new(entry, function).dump_string()
+    });
+    assert!(
+        dumped.contains("evm_mstore 0.i256"),
+        "fixed transient store should use address zero in machine IR:\n{dumped}"
+    );
+    assert!(
+        dumped.contains("evm_keccak256 0.i256 32.i256"),
+        "fixed transient keccak should use address zero in machine IR:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("evm_malloc") && !dumped.contains("bitcast"),
+        "machine IR should not retain malloc/cast operations:\n{dumped}"
+    );
+
+    let lowered = backend
+        .lower_function(&prepared, entry)
+        .expect("entry lowers");
+    let bytes = lowered_bytes(&lowered);
+    assert!(
+        contains_subsequence(
+            &bytes,
+            &[
+                OpCode::PUSH0 as u8,
+                OpCode::MSTORE as u8,
+                OpCode::PUSH1 as u8,
+                0x20,
+                OpCode::PUSH0 as u8,
+                OpCode::KECCAK256 as u8,
+            ],
+        ),
+        "expected PUSH0/MSTORE/PUSH1 0x20/PUSH0/KECCAK256 sequence, got {bytes:?}"
+    );
+    assert!(
+        !contains_subsequence(&bytes, &[OpCode::SWAP1 as u8, OpCode::DUP2 as u8]),
+        "fixed zero buffer should not lower through SWAP1 DUP2: {bytes:?}"
+    );
+}
+
+#[test]
+fn fixed_transient_malloc_return_lowers_to_machine_zero_buffer() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %entry(v0.i256) {
+block0:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.*i256 = bitcast v1 *i256;
+    mstore v2 v0 i256;
+    evm_return v1 32.i256;
+}
+"#,
+    )
+    .unwrap();
+
+    let entry = find_func(&parsed.module, "entry");
+    let backend = osaka_backend();
+    let prepared = backend
+        .prepare_section(work_module_with_entry(&parsed.module, &[entry], entry))
+        .expect("prepare should succeed");
+
+    let dumped = prepared.module().func_store.view(entry, |function| {
+        FuncWriter::new(entry, function).dump_string()
+    });
+    assert!(
+        dumped.contains("evm_mstore 0.i256"),
+        "fixed transient store should use address zero in machine IR:\n{dumped}"
+    );
+    assert!(
+        dumped.contains("evm_return 0.i256 32.i256"),
+        "fixed transient return should use address zero in machine IR:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("evm_malloc") && !dumped.contains("bitcast"),
+        "machine IR should not retain malloc/cast operations:\n{dumped}"
+    );
+
+    let lowered = backend
+        .lower_function(&prepared, entry)
+        .expect("entry lowers");
+    let bytes = lowered_bytes(&lowered);
+    assert!(
+        contains_subsequence(
+            &bytes,
+            &[
+                OpCode::PUSH0 as u8,
+                OpCode::MSTORE as u8,
+                OpCode::PUSH1 as u8,
+                0x20,
+                OpCode::PUSH0 as u8,
+                OpCode::RETURN as u8,
+            ],
+        ),
+        "expected PUSH0/MSTORE/PUSH1 0x20/PUSH0/RETURN sequence, got {bytes:?}"
+    );
+    assert!(
+        !contains_subsequence(&bytes, &[OpCode::SWAP1 as u8, OpCode::DUP2 as u8]),
+        "fixed zero buffer should not lower through SWAP1 DUP2: {bytes:?}"
+    );
+}
+
+fn prepared_func_dump(src: &str, func_name: &str) -> String {
+    let parsed = parse_module(src).expect("module parses");
+    let funcs = parsed.module.funcs();
+    let entry = find_func(&parsed.module, func_name);
+    let backend = osaka_backend();
+    let prepared = backend
+        .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
+        .expect("prepare should succeed");
+
+    prepared.module().func_store.view(entry, |function| {
+        FuncWriter::new(entry, function).dump_string()
+    })
+}
+
+#[test]
+fn non_terminal_private_transient_malloc_lowers_to_static_slot_with_persistent_heap() {
+    let dumped = prepared_func_dump(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %mk(v0.i256) -> *i8 {
+block0:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.i256 = ptr_to_int v1 i256;
+    mstore v2 v0 i256;
+    return v1;
+}
+
+func public %entry(v0.i1, v1.i256) -> i256 {
+block0:
+    br v0 block1 block2;
+
+block1:
+    v2.*i8 = evm_malloc 64.i256;
+    v3.i256 = ptr_to_int v2 i256;
+    mstore v3 v1 i256;
+    v4.i256 = add v3 32.i256;
+    mstore v4 v1 i256;
+    v5.i256 = evm_keccak256 v3 64.i256;
+    return v5;
+
+block2:
+    v6.*i8 = call %mk v1;
+    v7.i256 = ptr_to_int v6 i256;
+    return v7;
+}
+"#,
+        "entry",
+    );
+
+    assert!(
+        dumped.contains("evm_keccak256"),
+        "test should contain the private scratch consumer:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("evm_mload 64.i256"),
+        "private transient malloc should not read the heap free pointer:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("evm_malloc") && !dumped.contains("ptr_to_int"),
+        "machine IR should replace the malloc address with a static slot:\n{dumped}"
+    );
+}
+
+#[test]
+fn disjoint_private_transient_mallocs_pack_into_same_static_slot() {
+    let dumped = prepared_func_dump(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %mk(v0.i256) -> *i8 {
+block0:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.i256 = ptr_to_int v1 i256;
+    mstore v2 v0 i256;
+    return v1;
+}
+
+func public %entry(v0.i256) -> i256 {
+block0:
+    v1.*i8 = evm_malloc 64.i256;
+    v2.i256 = ptr_to_int v1 i256;
+    mstore v2 v0 i256;
+    v3.i256 = evm_keccak256 v2 64.i256;
+    v4.*i8 = evm_malloc 64.i256;
+    v5.i256 = ptr_to_int v4 i256;
+    mstore v5 v0 i256;
+    v6.i256 = evm_keccak256 v5 64.i256;
+    v7.i256 = add v3 v6;
+    return v7;
+}
+"#,
+        "entry",
+    );
+
+    let keccak_bases: Vec<_> = dumped
+        .lines()
+        .filter_map(|line| {
+            line.split("evm_keccak256 ")
+                .nth(1)
+                .and_then(|tail| tail.split_whitespace().next())
+        })
+        .collect();
+    assert_eq!(
+        keccak_bases.len(),
+        2,
+        "test should contain two private scratch consumers:\n{dumped}"
+    );
+    assert_eq!(
+        keccak_bases[0], keccak_bases[1],
+        "disjoint private buffers should share the packed static slot:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("evm_mload 64.i256"),
+        "packed private buffers should not use transient heap bases:\n{dumped}"
+    );
+}
+
+#[test]
+fn precompile_results_keep_private_loop_buffers_transient_until_a_pointer_is_exposed() {
+    for (exposure, expected_transient) in [
+        ("", true),
+        (
+            "v20.*i8 = evm_malloc 32.i256;\n    v21.i256 = ptr_to_int v20 i256;\n    evm_sstore 0.i256 v21;",
+            false,
+        ),
+    ] {
+        // The call keeps unknown words a barrier for every earlier buffer, as in
+        // a contract entry: only exposing a pointer makes the digests unknown.
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func private %noop() {{
+block0:
+    return;
+}}
+func public %entry() {{
+block0:
+    call %noop;
+    {exposure}
+    v0.i256 = evm_calldata_load 0.i256;
+    jump block1;
+block1:
+    v2.i256 = phi (0.i256 block0) (v13 block2);
+    v3.i256 = phi (0.i256 block0) (v12 block2);
+    v4.i1 = lt v2 v0;
+    br v4 block2 block3;
+block2:
+    v9.*i8 = evm_malloc 64.i256;
+    v10.i256 = ptr_to_int v9 i256;
+    mstore v10 v3 i256;
+    v11.i256 = add v10 32.i256;
+    mstore v11 v2 i256;
+    v14.i256 = evm_gas;
+    v15.i256 = evm_static_call v14 2.i256 v10 64.i256 v10 32.i256;
+    v12.i256 = mload v10 i256;
+    v13.i256 = add v2 1.i256;
+    jump block1;
+block3:
+    mstore 0.i256 v3 i256;
+    evm_return 0.i256 32.i256;
+}}
+"#
+        );
+        let parsed = parse_module(&source).expect("loop parses");
+        let entry = find_func(&parsed.module, "entry");
+        let backend = osaka_backend();
+        let digest_buffer = parsed.module.func_store.view(entry, |function| {
+            function
+                .layout
+                .iter_all_insts()
+                .find(|&inst| {
+                    matches!(backend.isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                        EvmInstKind::EvmMalloc(malloc)
+                        if prepare::value_imm_u32(function, *malloc.size()) == Some(64))
+                })
+                .unwrap()
+        });
+        let placement = compute_test_memory_placement(&parsed.module, &backend, entry, &[]);
+        assert_eq!(
+            placement.funcs[&entry]
+                .mem_plan
+                .transient_mallocs
+                .contains(&digest_buffer),
+            expected_transient,
+            "{exposure}"
+        );
+    }
+}
+
+#[test]
+fn unknown_scalar_words_do_not_retain_private_loop_hash_buffers() {
+    for (read, stored, expected_transient) in [
+        ("v8.i256 = add v6 0.i256;", "v8", true),
+        (
+            "v14.i256 = shl 5.i256 v2;\n    v7.i256 = add v1 v14;\n    v8.i256 = mload v7 i256;",
+            "v8",
+            true,
+        ),
+        (
+            "v7.*i256 = int_to_ptr v6 *i256;\n    v8.i256 = mload v7 i256;",
+            "v8",
+            false,
+        ),
+        (
+            "v7.*[i256; 1] = int_to_ptr v1 *[i256; 1];\n    v14.*i256 = gep v7 0.i256 v6;\n    v8.i256 = mload v14 i256;",
+            "v8",
+            false,
+        ),
+        ("v8.i256 = evm_keccak256 v1 v6;", "v8", false),
+        (
+            "v7.i256 = add v2 96.i256;\n    v8.i256 = evm_mload v7;",
+            "v8",
+            false,
+        ),
+        (
+            "v7.i256 = xor v6 1.i256;\n    v8.i256 = evm_mload v7;",
+            "v8",
+            false,
+        ),
+        ("v8.i256 = add v6 0.i256;", "v10", false),
+    ] {
+        // Storing a pointer exposes it to a reentrant frame, so the return
+        // data copied into `v0` may hold pointers: its words are unknown.
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func public %entry() {{
+block0:
+    v18.i256 = evm_return_data_size;
+    v17.i256 = evm_udiv v18 32.i256;
+    v19.i256 = mul v17 32.i256;
+    v0.*i8 = evm_malloc v19;
+    v1.i256 = ptr_to_int v0 i256;
+    evm_sstore 0.i256 v1;
+    evm_return_data_copy v1 0.i256 v19;
+    jump block1;
+block1:
+    v2.i256 = phi (0.i256 block0) (v13 block2);
+    v3.i256 = phi (0.i256 block0) (v12 block2);
+    v4.i1 = lt v2 v17;
+    br v4 block2 block3;
+block2:
+    v6.i256 = mload v1 i256;
+    {read}
+    v9.*i8 = evm_malloc 64.i256;
+    v10.i256 = ptr_to_int v9 i256;
+    mstore v10 {stored} i256;
+    v11.i256 = add v10 32.i256;
+    mstore v11 v3 i256;
+    v12.i256 = evm_keccak256 v10 64.i256;
+    v13.i256 = add v2 1.i256;
+    jump block1;
+block3:
+    mstore 0.i256 v3 i256;
+    evm_return 0.i256 32.i256;
+}}
+"#
+        );
+        let parsed = parse_module(&source).expect("loop parses");
+        let entry = find_func(&parsed.module, "entry");
+        let backend = osaka_backend();
+        let hash_malloc = parsed.module.func_store.view(entry, |function| {
+            function
+                .layout
+                .iter_all_insts()
+                .find(|&inst| {
+                    matches!(backend.isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                        EvmInstKind::EvmMalloc(malloc)
+                        if prepare::value_imm_u32(function, *malloc.size()) == Some(64))
+                })
+                .unwrap()
+        });
+        let placement = compute_test_memory_placement(&parsed.module, &backend, entry, &[]);
+        assert_eq!(
+            placement.funcs[&entry]
+                .mem_plan
+                .transient_mallocs
+                .contains(&hash_malloc),
+            expected_transient,
+            "read={read}, stored={stored}"
+        );
+    }
+}
+
+#[test]
+fn private_memzero_uses_fixed_buffer_only_with_bounded_accesses() {
+    for (offset, len, fixed) in [(0, 64, true), (32, 32, true), (32, 64, false)] {
+        let dumped = prepared_func_dump(
+            &format!(
+                r#"
+target = "evm-ethereum-osaka"
+
+func public %entry() -> i256 {{
+block0:
+    v0.*i8 = evm_malloc 64.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    v2.i256 = add v1 {offset}.i256;
+    memzero v2 {len}.i256;
+    v3.i256 = evm_keccak256 v1 64.i256;
+    return v3;
+}}
+"#
+            ),
+            "entry",
+        );
+        assert_eq!(
+            !dumped.contains("evm_mload 64.i256"),
+            fixed,
+            "offset={offset}, len={len}:\n{dumped}"
+        );
+    }
+}
+
+#[test]
+fn dynamic_private_buffers_require_matching_allocation_extents() {
+    for (offset, len, fixed) in [(0, "v0", true), (1, "v0", false), (0, "v1", false)] {
+        let dumped = prepared_func_dump(
+            &format!(
+                r#"
+target = "evm-ethereum-osaka"
+
+func public %entry(v0.i256, v1.i256) -> i256 {{
+block0:
+    v2.*i8 = evm_malloc v0;
+    v3.i256 = ptr_to_int v2 i256;
+    v4.i256 = add v3 {offset}.i256;
+    evm_calldata_copy v4 0.i256 {len};
+    v5.i256 = evm_keccak256 v4 {len};
+    return v5;
+}}
+"#
+            ),
+            "entry",
+        );
+        assert_eq!(
+            !dumped.contains("evm_mload 64.i256"),
+            fixed,
+            "offset={offset}, len={len}:\n{dumped}"
+        );
+    }
+}
+
+#[test]
+fn dynamic_private_transient_access_len_keeps_heap_base() {
+    let dumped = prepared_func_dump(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %mk(v0.i256) -> *i8 {
+block0:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.i256 = ptr_to_int v1 i256;
+    mstore v2 v0 i256;
+    return v1;
+}
+
+func public %entry(v0.i1, v1.i256, v2.i256) -> i256 {
+block0:
+    br v0 block1 block2;
+
+block1:
+    v3.*i8 = evm_malloc 64.i256;
+    v4.i256 = ptr_to_int v3 i256;
+    mstore v4 v2 i256;
+    v5.i256 = evm_keccak256 v4 v1;
+    return v5;
+
+block2:
+    v6.*i8 = call %mk v2;
+    v7.i256 = ptr_to_int v6 i256;
+    return v7;
+}
+"#,
+        "entry",
+    );
+
+    assert!(
+        dumped.contains("evm_mload 64.i256"),
+        "dynamic private access length must retain the heap-derived base:\n{dumped}"
+    );
+}
+
+#[test]
+fn terminal_private_checked_malloc_lowers_to_fixed_buffer_with_persistent_heap() {
+    let dumped = prepared_func_dump(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %mk(v0.i256) -> *i8 {
+block0:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.i256 = ptr_to_int v1 i256;
+    mstore v2 v0 i256;
+    return v1;
+}
+
+func public %entry(v0.i1, v1.i256) {
+block0:
+    br v0 block1 block4;
+
+block1:
+    v2.*i8 = evm_malloc 64.i256;
+    v3.i256 = ptr_to_int v2 i256;
+    mstore v3 v1 i256;
+    (v4.i256, v5.i1) = uaddo v3 32.i256;
+    br v5 block2 block3;
+
+block2:
+    evm_revert 0.i256 0.i256;
+
+block3:
+    mstore v4 v1 i256;
+    evm_return v3 64.i256;
+
+block4:
+    v6.*i8 = call %mk v1;
+    v7.i256 = ptr_to_int v6 i256;
+    evm_return v7 32.i256;
+}
+"#,
+        "entry",
+    );
+
+    assert!(
+        !dumped.contains("evm_mload 64.i256"),
+        "terminal-private malloc should not lower through the heap free pointer:\n{dumped}"
+    );
+    assert!(
+        !dumped.contains("uaddo") && !dumped.contains(" lt "),
+        "fixed terminal buffer should fold checked address arithmetic:\n{dumped}"
+    );
+}
+
+#[test]
+fn terminal_private_malloc_keeps_heap_base_when_pointer_value_escapes_in_payload() {
+    let dumped = prepared_func_dump(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %entry() {
+block0:
+    v0.*i8 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    mstore v1 v1 i256;
+    evm_return v1 32.i256;
+}
+"#,
+        "entry",
+    );
+
+    assert!(
+        dumped.contains("evm_mload 64.i256"),
+        "malloc address stored into returned bytes must remain heap-based:\n{dumped}"
+    );
+}
+
+#[test]
+fn terminal_private_checked_malloc_keeps_heap_base_when_overflow_flag_escapes() {
+    let dumped = prepared_func_dump(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %mk(v0.i256) -> *i8 {
+block0:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.i256 = ptr_to_int v1 i256;
+    mstore v2 v0 i256;
+    return v1;
+}
+
+func public %entry(v0.i1, v1.i256) {
+block0:
+    br v0 block1 block2;
+
+block1:
+    v2.*i8 = evm_malloc 64.i256;
+    v3.i256 = ptr_to_int v2 i256;
+    (v4.i256, v5.i1) = uaddo v3 32.i256;
+    v6.i256 = zext v5 i256;
+    mstore v3 v6 i256;
+    evm_return v3 32.i256;
+
+block2:
+    v7.*i8 = call %mk v1;
+    v8.i256 = ptr_to_int v7 i256;
+    evm_return v8 32.i256;
+}
+"#,
+        "entry",
+    );
+
+    assert!(
+        dumped.contains("evm_mload 64.i256"),
+        "observable malloc-derived overflow flag must keep heap-based placement:\n{dumped}"
+    );
+}
+
+#[test]
+fn terminal_return_payload_write_does_not_reserve_arena_base() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %callee() -> i256 {
+block0:
+    v0.*i256 = alloca i256;
+    mstore v0 3.i256 i256;
+    v1.i256 = mload v0 i256;
+    return v1;
+}
+
+func public %entry() {
+block0:
+    v0.i256 = call %callee;
+    mstore 0.i32 v0 i256;
+    evm_return 0.i8 32.i8;
+}
+
+object @Contract {
+  section runtime {
+    entry %entry;
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let funcs = parsed.module.funcs();
+    let callee = find_func(&parsed.module, "callee");
+    let entry = find_func(&parsed.module, "entry");
+    let backend = osaka_backend();
+    let prepared = backend
+        .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
+        .expect("prepare should succeed");
+
+    assert_eq!(prepared.section_plan().arena_base, 0);
+    assert_eq!(
+        prepared
+            .function_plan(callee)
+            .expect("missing callee plan")
+            .mem_plan
+            .scratch_words,
+        1
+    );
+}
+
+#[test]
+fn terminal_return_payload_read_across_call_reserves_arena_base() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %callee() -> i256 {
+block0:
+    v0.*i256 = alloca i256;
+    mstore v0 3.i256 i256;
+    v1.i256 = mload v0 i256;
+    return v1;
+}
+
+func public %entry() {
+block0:
+    mstore 0.i32 7.i256 i256;
+    v0.i256 = call %callee;
+    evm_return 0.i8 32.i8;
+}
+
+object @Contract {
+  section runtime {
+    entry %entry;
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let funcs = parsed.module.funcs();
+    let entry = find_func(&parsed.module, "entry");
+    let backend = osaka_backend();
+    let prepared = backend
+        .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
+        .expect("prepare should succeed");
+
+    assert_eq!(prepared.section_plan().arena_base, 0x20);
+}
+
+fn prepare_section_error(src: &str) -> String {
+    let parsed = parse_module(src).expect("module parses");
+    let funcs = parsed.module.funcs();
+    let entry = find_func(&parsed.module, "entry");
+    osaka_backend()
+        .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
+        .err()
+        .expect("prepare should fail")
+}
+
+#[test]
+fn fixed_start_dynamic_length_accesses_are_rejected() {
+    let cases = [
+        // A compiler-owned frame word at 0x200 is live across the copy.
+        (
+            r#"
+target = "evm-ethereum-osaka"
+type @Frame = {i256, i256, i256, i256, i256, i256, i256, i256, i256, i256, i256, i256};
+func public %entry() {
+block0:
+    v0.*@Frame = alloca @Frame;
+    v1.*i256 = gep v0 0.i256 11.i256;
+    mstore v1 7.i256 i256;
+    v2.i256 = evm_calldata_load 0.i32;
+    evm_calldata_copy 512.i256 32.i256 v2;
+    v3.i256 = mload v1 i256;
+    mstore 0.i32 v3 i256;
+    evm_return 0.i8 32.i8;
+}
+object @Contract { section runtime { entry %entry; } }
+"#,
+            "fixed address 0x200 in %entry has a dynamic length: `evm_calldata_copy 512.i256 32.i256 v2;`",
+        ),
+        // Heap memory sits above the arena, so no layout keeps it below the copy.
+        (
+            r#"
+target = "evm-ethereum-osaka"
+func public %entry() {
+block0:
+    v0.*i8 = evm_malloc 32.i256;
+    v1.*i256 = bitcast v0 *i256;
+    mstore v1 7.i256 i256;
+    v2.i256 = evm_calldata_load 0.i32;
+    evm_calldata_copy 160.i256 32.i256 v2;
+    v3.i256 = mload v1 i256;
+    mstore 0.i32 v3 i256;
+    evm_return 0.i8 32.i8;
+}
+object @Contract { section runtime { entry %entry; } }
+"#,
+            "fixed address 0xa0 in %entry has a dynamic length",
+        ),
+        // The buffer outlives its writer, so any function running before the
+        // reader could overwrite it.
+        (
+            r#"
+target = "evm-ethereum-osaka"
+func inline(never) private %writer(v0.i256) {
+block0:
+    evm_calldata_copy 512.i256 32.i256 v0;
+    return;
+}
+func inline(never) private %reader(v0.i256) {
+block0:
+    evm_return 512.i256 v0;
+}
+func public %entry() {
+block0:
+    v0.i256 = evm_calldata_load 0.i32;
+    call %writer v0;
+    call %reader v0;
+    evm_stop;
+}
+object @Contract { section runtime { entry %entry; } }
+"#,
+            "fixed address 0x200 in %",
+        ),
+        // A payload that the preceding write does not produce reads unreserved memory.
+        (
+            r#"
+target = "evm-ethereum-osaka"
+func public %entry() {
+block0:
+    mstore 0.i32 7.i256 i256;
+    v0.i256 = evm_calldata_load 0.i32;
+    evm_return 0.i256 v0;
+}
+object @Contract { section runtime { entry %entry; } }
+"#,
+            "fixed address 0x0 in %entry has a dynamic length: `evm_return 0.i256 v0;`",
+        ),
+    ];
+
+    for (src, expected) in cases {
+        let err = prepare_section_error(src);
+        assert!(err.contains(expected), "expected `{expected}` in: {err}");
+    }
+}
+
+#[test]
+fn dynamic_terminal_payload_write_does_not_reserve_arena_base() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %callee() -> i256 {
+block0:
+    v0.*i256 = alloca i256;
+    mstore v0 3.i256 i256;
+    v1.i256 = mload v0 i256;
+    return v1;
+}
+
+func public %entry() {
+block0:
+    v0.i256 = call %callee;
+    v1.i256 = evm_return_data_size;
+    evm_return_data_copy 0.i256 0.i256 v1;
+    evm_revert 0.i256 v1;
+}
+
+object @Contract {
+  section runtime {
+    entry %entry;
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let funcs = parsed.module.funcs();
+    let callee = find_func(&parsed.module, "callee");
+    let entry = find_func(&parsed.module, "entry");
+    let prepared = osaka_backend()
+        .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
+        .expect("prepare should succeed");
+
+    assert_eq!(prepared.section_plan().arena_base, 0);
+    assert_eq!(
+        prepared
+            .function_plan(callee)
+            .expect("missing callee plan")
+            .mem_plan
+            .scratch_words,
+        1
+    );
+}
+
+#[test]
+fn dynamic_terminal_payload_rejects_clobbered_spilled_length() {
+    // The computed `v0` cannot rematerialize and is used below 20 later values,
+    // so it is spilled, and the terminal
+    // would reload it after the copy overwrote its slot.
+    let loads: String = (0..=20)
+        .map(|i| {
+            let raw = 100 + i;
+            let offset = i * 32;
+            format!("    v{raw}.i256 = evm_calldata_load {offset}.i32;\n    v{i}.i256 = add v{raw} 1.i256;\n")
+        })
+        .collect();
+    let sums: String = (1..20)
+        .rev()
+        .map(|i| format!("    v{}.i256 = add v{} v{i};\n", 41 - i, 40 - i))
+        .collect();
+    let err = prepare_section_error(&format!(
+        r#"
+target = "evm-ethereum-osaka"
+func public %entry() {{
+block0:
+{loads}    v21.i256 = add v0 v20;
+{sums}    evm_code_copy 0.i256 v40 v0;
+    evm_return 0.i256 v0;
+}}
+object @Contract {{ section runtime {{ entry %entry; }} }}
+"#
+    ));
+    assert!(
+        err.contains("EVM terminal payload in %entry reloads its length"),
+        "{err}"
     );
 }
 
@@ -804,465 +1883,635 @@ block0:
 
     let mk = ctx.names["mk"];
     let main = ctx.names["main"];
-    let abs_clobber_words = compute_abs_clobber_words(&ctx.module, &ctx.funcs, &ctx.plan);
-    let clamp_words = compute_return_escape_caller_clamp_words(&ctx.module, &ctx.funcs, &ctx.plan);
-    let main_active_words = ctx.plan.funcs[&main].active_abs_words();
+    let abs_clobber_words = compute_abs_clobber_words_with_extra(
+        &crate::module_analysis::CallGraphSchedule::compute(&ctx.module, &ctx.funcs),
+        &ctx.plan,
+        &FxHashMap::default(),
+    );
+    let clamp_words = compute_return_escape_caller_clamp_words(
+        &crate::module_analysis::CallGraphSchedule::compute(&ctx.module, &ctx.funcs),
+        &ctx.plan,
+        &FxHashMap::default(),
+    );
     let main_clobber_words = abs_clobber_words[&main];
 
-    assert!(
-        main_clobber_words > main_active_words,
-        "test setup requires a caller whose future callee clobber exceeds its own active frame"
-    );
     assert_eq!(clamp_words[&mk], main_clobber_words);
+
+    let extra_reserve = BackendSpillReserve {
+        scratch_words: 3,
+        stable_words: 0,
+    };
+    let extra_main_clobber_words = main_clobber_words
+        .checked_add(extra_reserve.scratch_words)
+        .expect("test clobber overflow");
+    let mut extra_clobber_words = FxHashMap::default();
+    extra_clobber_words.insert(main, extra_reserve);
+    let clamp_words = compute_return_escape_caller_clamp_words(
+        &crate::module_analysis::CallGraphSchedule::compute(&ctx.module, &ctx.funcs),
+        &ctx.plan,
+        &extra_clobber_words,
+    );
+
+    assert_eq!(clamp_words[&mk], extra_main_clobber_words);
 }
 
 #[test]
-fn dyn_sp_frontier_init_marks_call_from_non_ready_entry_into_ready_scc() {
-    let ctx = dyn_sp_plan_from_src(
+fn return_escape_clamp_uses_reserved_static_chain_layout() {
+    let parsed = parse_module(
         r#"
 target = "evm-ethereum-osaka"
 
-func public %dispatch(v0.i1, v1.i256) -> i256 {
+func public %reserve_anchor() {
 block0:
-    br v0 block1 block2;
-
-block1:
-    v2.*i8 = evm_malloc 32.i256;
-    v3.*i256 = bitcast v2 *i256;
-    mstore v3 111.i256 i256;
-    v4.i256 = mload v3 i256;
-    return v4;
-
-block2:
-    v5.i256 = call %ready v1;
-    return v5;
+    return;
 }
 
-func private %ready(v0.i256) -> i256 {
+func public %use(v0.*i256) -> i256 {
 block0:
-    v1.i1 = eq v0 0.i256;
-    br v1 block1 block2;
-
-block1:
-    return 7.i256;
-
-block2:
-    v2.*i256 = alloca i256;
-    mstore v2 v0 i256;
-    v3.i256 = sub v0 1.i256;
-    v4.i256 = call %ready v3;
-    v5.i256 = mload v2 i256;
-    v6.i256 = add v4 v5;
-    return v6;
-}
-"#,
-    );
-
-    let dispatch = ctx.names["dispatch"];
-    let ready = ctx.names["ready"];
-    let frontier_calls = ctx
-        .plan
-        .frontier_init_calls
-        .get(&dispatch)
-        .expect("dispatch should have a frontier init call");
-    let call_inst = ctx.module.func_store.view(dispatch, |function| {
-        function
-            .layout
-            .iter_block()
-            .flat_map(|block| function.layout.iter_inst(block))
-            .find(|&inst| {
-                function
-                    .dfg
-                    .call_info(inst)
-                    .is_some_and(|call| call.callee() == ready)
-            })
-            .expect("call to ready")
-    });
-
-    assert_eq!(ctx.plan.entry_init, None);
-    assert!(frontier_calls.contains(&call_inst));
-    assert!(
-        ctx.plan
-            .checked_frontier_init_calls
-            .get(&dispatch)
-            .is_none_or(|calls| !calls.contains(&call_inst))
-    );
-}
-
-#[test]
-fn dyn_sp_entry_live_frame_propagates_only_from_active_callsites() {
-    let ctx = dyn_sp_plan_from_src(
-        r#"
-target = "evm-ethereum-osaka"
-
-func public %ready(v0.i1, v1.i256) -> i256 {
-block0:
-    br v0 block1 block2;
-
-block1:
-    v2.i256 = call %helper;
-    return v2;
-
-block2:
-    v3.i1 = eq v1 0.i256;
-    br v3 block3 block4;
-
-block3:
-    return 0.i256;
-
-block4:
-    v4.*i256 = alloca i256;
-    mstore v4 v1 i256;
-    v5.i256 = call %helper;
-    v6.i256 = sub v1 1.i256;
-    v7.i256 = call %ready 0.i1 v6;
-    v8.i256 = mload v4 i256;
-    v9.i256 = add v5 v8;
-    return v9;
-}
-
-func private %helper() -> i256 {
-block0:
-    v0.*i8 = evm_malloc 32.i256;
-    v1.*i256 = bitcast v0 *i256;
-    mstore v1 111.i256 i256;
-    v2.i256 = mload v1 i256;
-    return v2;
-}
-"#,
-    );
-
-    let ready = ctx.names["ready"];
-    let helper = ctx.names["helper"];
-    let helper_calls: Vec<InstId> = ctx.module.func_store.view(ready, |function| {
-        function
-            .layout
-            .iter_block()
-            .flat_map(|block| function.layout.iter_inst(block))
-            .filter(|&inst| {
-                function
-                    .dfg
-                    .call_info(inst)
-                    .is_some_and(|call| call.callee() == helper)
-            })
-            .collect()
-    });
-    assert_eq!(
-        helper_calls.len(),
-        2,
-        "expected one cold and one hot helper call"
-    );
-
-    let summary = ctx
-        .plan
-        .frame_summaries
-        .get(&ready)
-        .expect("missing ready summary");
-    let active_count = helper_calls
-        .iter()
-        .copied()
-        .filter(|&inst| summary.local_frame_active_before_inst(inst))
-        .count();
-
-    assert_eq!(
-        active_count, 1,
-        "only the hot helper call should be frame-active"
-    );
-    assert!(ctx.plan.entry_live_frame[&helper]);
-}
-
-#[test]
-fn dyn_sp_helper_before_lazy_enter_stays_not_live() {
-    let ctx = dyn_sp_plan_from_src(
-        r#"
-target = "evm-ethereum-osaka"
-
-func public %helper() -> i256 {
-block0:
-    v0.*i8 = evm_malloc 32.i256;
-    v1.*i256 = bitcast v0 *i256;
-    mstore v1 111.i256 i256;
-    v2.i256 = mload v1 i256;
-    return v2;
-}
-
-func public %ready(v0.i1, v1.i256) -> i256 {
-block0:
-    br v0 block1 block2;
-
-block1:
-    v2.i256 = call %helper;
-    return v2;
-
-block2:
-    v3.*i256 = alloca i256;
-    mstore v3 v1 i256;
-    v4.i256 = mload v3 i256;
-    return v4;
-}
-
-func public %entry(v0.i1, v1.i256) -> i256 {
-block0:
-    v2.i256 = call %ready v0 v1;
-    return v2;
-}
-
-object @Contract {
-  section runtime {
-    entry %entry;
-  }
-}
-"#,
-    );
-
-    let helper = ctx.names["helper"];
-    let ready = ctx.names["ready"];
-    let ready_summary = ctx
-        .plan
-        .frame_summaries
-        .get(&ready)
-        .expect("missing ready summary");
-    let helper_call = ctx.module.func_store.view(ready, |function| {
-        function
-            .layout
-            .iter_block()
-            .flat_map(|block| function.layout.iter_inst(block))
-            .find(|&inst| {
-                function
-                    .dfg
-                    .call_info(inst)
-                    .is_some_and(|call| call.callee() == helper)
-            })
-            .expect("call to helper")
-    });
-
-    assert!(
-        !ready_summary.local_frame_active_before_inst(helper_call),
-        "helper call should stay before lazy frame entry"
-    );
-    assert!(!ctx.plan.entry_live_frame[&helper]);
-}
-
-#[test]
-fn dyn_sp_mixed_entry_helper_uses_checked_frontier_init() {
-    let ctx = dyn_sp_plan_from_src(
-        r#"
-target = "evm-ethereum-osaka"
-
-func public %entry(v0.i1, v1.i256) -> i256 {
-block0:
-    br v0 block1 block2;
-
-block1:
-    v2.i256 = call %helper v1;
-    return v2;
-
-block2:
-    v3.i256 = call %ready_caller v1;
-    return v3;
-}
-
-func private %helper(v0.i256) -> i256 {
-block0:
-    v1.i256 = call %target v0;
+    v1.i256 = mload v0 i256;
     return v1;
 }
 
-func private %ready_caller(v0.i256) -> i256 {
+func public %mk() -> *i256 {
 block0:
-    v1.i1 = eq v0 0.i256;
-    br v1 block1 block2;
-
-block1:
-    return 0.i256;
-
-block2:
-    v2.*i256 = alloca i256;
-    mstore v2 v0 i256;
-    v3.i256 = call %helper 0.i256;
-    v4.i256 = sub v0 1.i256;
-    v5.i256 = call %ready_caller v4;
-    v6.i256 = mload v2 i256;
-    v7.i256 = add v3 v5;
-    v8.i256 = add v7 v6;
-    return v8;
+    v0.*i8 = evm_malloc 32.i256;
+    v1.*i256 = bitcast v0 *i256;
+    mstore v1 111.i256 i256;
+    return v1;
 }
 
-func private %target(v0.i256) -> i256 {
+func public %decode() -> i256 {
 block0:
-    v1.i1 = eq v0 0.i256;
-    br v1 block1 block2;
+    v0.*i256 = alloca i256;
+    mstore v0 7.i256 i256;
+    v1.i256 = call %use v0;
+    return v1;
+}
 
-block1:
-    return 0.i256;
-
-block2:
-    v2.*i256 = alloca i256;
-    mstore v2 v0 i256;
-    v3.i256 = sub v0 1.i256;
-    v4.i256 = call %target v3;
-    v5.i256 = mload v2 i256;
-    v6.i256 = add v4 v5;
-    return v6;
+func public %main() -> i256 {
+block0:
+    v0.*i256 = call %mk;
+    v1.i256 = call %decode;
+    v2.i256 = mload v0 i256;
+    v3.i256 = add v1 v2;
+    return v3;
 }
 "#,
+    )
+    .expect("module parses");
+    let funcs = parsed.module.funcs();
+    let backend = osaka_backend();
+    let ptr_escape = compute_ptr_escape_summaries(&parsed.module, &funcs, &backend.isa);
+
+    let mut analyses = FxHashMap::default();
+    for &func in &funcs {
+        parsed.module.func_store.modify(func, |function| {
+            analyses.insert(
+                func,
+                compute_test_pre_analysis(function, &parsed.module.ctx, &backend, &ptr_escape),
+            );
+        });
+    }
+
+    let mut names = FxHashMap::default();
+    for &func in &funcs {
+        let name = parsed
+            .module
+            .ctx
+            .func_sig(func, |sig| sig.name().to_string());
+        names.insert(name, func);
+    }
+
+    let reserve_words = FxHashMap::from_iter([(
+        names["reserve_anchor"],
+        BackendSpillReserve {
+            scratch_words: 0,
+            stable_words: 8,
+        },
+    )]);
+    let schedule = crate::module_analysis::CallGraphSchedule::compute(&parsed.module, &funcs);
+    let fixed_reservations =
+        prepare::scan_fixed_reservations(&parsed.module, &funcs, &backend, &analyses)
+            .expect("fixed reservations");
+    let placement = machine::placement::compute_semantic_memory_placement(
+        &parsed.module,
+        machine::placement::MemoryPlacementSection {
+            schedule: &schedule,
+            fixed_reservations: &fixed_reservations,
+            funcs: &funcs,
+            entry: names["main"],
+            includes: &[],
+        },
+        &analyses,
+        &ptr_escape,
+        &FxHashSet::default(),
+        &backend,
+        &BackendSpillPlan {
+            reserves: reserve_words,
+            malloc_bounds: FxHashMap::default(),
+        },
     );
 
-    let helper = ctx.names["helper"];
-    let target = ctx.names["target"];
-    let helper_call = ctx.module.func_store.view(helper, |function| {
+    let mk = names["mk"];
+    let decode = names["decode"];
+    let mk_plan = &placement.funcs[&mk].mem_plan;
+    let decode_end_words = placement.funcs[&decode].mem_plan.abs_words_end();
+    assert!(
+        mk_plan.return_escape_caller_abs_words >= decode_end_words,
+        "return-escaping malloc clamp must include the post-reserve sibling callee frame"
+    );
+
+    let malloc = parsed.module.func_store.view(mk, |function| {
         function
             .layout
-            .iter_block()
-            .flat_map(|block| function.layout.iter_inst(block))
+            .iter_all_insts()
             .find(|&inst| {
-                function
-                    .dfg
-                    .call_info(inst)
-                    .is_some_and(|call| call.callee() == target)
+                matches!(
+                    backend.isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                    EvmInstKind::EvmMalloc(_)
+                )
             })
-            .expect("helper call to target")
+            .expect("mk has a malloc")
     });
-
+    let min_base = match placement.funcs[&mk].malloc_placements[&malloc] {
+        machine::placement::MallocPlacement::Heap { min_base, .. } => min_base,
+        machine::placement::MallocPlacement::Fixed { base } => base,
+    };
+    let min_base_words = min_base
+        .checked_sub(mk_plan.arena_base)
+        .expect("malloc min base below arena")
+        / WORD_BYTES;
     assert!(
-        ctx.plan
-            .frontier_init_calls
-            .get(&helper)
-            .is_some_and(|calls| calls.contains(&helper_call))
+        min_base_words >= decode_end_words,
+        "malloc min base must not overlap the sibling callee's reserved static frame"
     );
-    assert!(
-        ctx.plan
-            .checked_frontier_init_calls
-            .get(&helper)
-            .is_some_and(|calls| calls.contains(&helper_call))
+}
+
+fn compute_test_memory_placement(
+    module: &Module,
+    backend: &EvmBackend,
+    entry: FuncRef,
+    includes: &[FuncRef],
+) -> EvmMemoryPlacementPlan {
+    let funcs = module.funcs();
+    let ptr_escape = compute_ptr_escape_summaries(module, &funcs, &backend.isa);
+    let mut analyses = FxHashMap::default();
+    for &func in &funcs {
+        module.func_store.modify(func, |function| {
+            analyses.insert(
+                func,
+                compute_test_pre_analysis(function, &module.ctx, backend, &ptr_escape),
+            );
+        });
+    }
+    let schedule = CallGraphSchedule::compute(module, &funcs);
+    let fixed_reservations = prepare::scan_fixed_reservations(module, &funcs, backend, &analyses)
+        .expect("fixed reservations");
+    compute_semantic_memory_placement(
+        module,
+        MemoryPlacementSection {
+            schedule: &schedule,
+            fixed_reservations: &fixed_reservations,
+            funcs: &funcs,
+            entry,
+            includes,
+        },
+        &analyses,
+        &ptr_escape,
+        &FxHashSet::default(),
+        backend,
+        &BackendSpillPlan::default(),
+    )
+}
+
+#[test]
+fn caller_free_ptr_floor_reaches_callee_malloc() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %clobber_then_read(v0.*i256) -> i256 {
+block0:
+    jump block1;
+block1:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.*i256 = bitcast v1 *i256;
+    mstore v2 v2 i256;
+    v3.i256 = mload v0 i256;
+    return v3;
+}
+
+func public %main() -> i256 {
+block0:
+    v0.*i8 = evm_malloc 32.i256;
+    v1.*i256 = bitcast v0 *i256;
+    mstore v1 111.i256 i256;
+    v2.i256 = call %clobber_then_read v1;
+    return v2;
+}
+
+func public %entry() {
+block0:
+    v0.i256 = call %main;
+    mstore 0.i32 v0 i256;
+    evm_return 0.i8 32.i8;
+}
+"#,
+    )
+    .expect("module parses");
+    let backend = osaka_backend();
+    let clobber = find_func(&parsed.module, "clobber_then_read");
+    let entry = find_func(&parsed.module, "entry");
+    let placement = compute_test_memory_placement(&parsed.module, &backend, entry, &[]);
+    let malloc = parsed.module.func_store.view(clobber, |function| {
+        function
+            .layout
+            .iter_all_insts()
+            .find(|&inst| {
+                matches!(
+                    backend.isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                    EvmInstKind::EvmMalloc(_)
+                )
+            })
+            .expect("clobber_then_read has a malloc")
+    });
+    assert_eq!(
+        placement.funcs[&clobber].free_ptr_floor_before_malloc[&malloc],
+        Some(0xa0)
     );
 }
 
 #[test]
-fn dyn_sp_plan_is_deterministic_across_runs() {
-    let src = r#"
+fn callee_malloc_exit_floor_reaches_later_callee() {
+    let parsed = parse_module(
+        r#"
 target = "evm-ethereum-osaka"
 
-func public %entry(v0.i256) -> i256 {
+func public %alloc() -> i256 {
 block0:
-    v1.i1 = eq v0 0.i256;
-    br v1 block1 block2;
-
+    v0.*i8 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    jump block1;
 block1:
-    v2.i256 = call %helper 4.i256;
+    return v1;
+}
+
+func public %scratch(v0.i256) -> i256 {
+block0:
+    v1.*i8 = evm_malloc 32.i256;
+    v2.i256 = ptr_to_int v1 i256;
+    mstore v2 v2 i256;
+    return v0;
+}
+
+func public %entry() {
+block0:
+    v0.i256 = call %alloc;
+    v1.i256 = call %scratch v0;
+    mstore 0.i32 v1 i256;
+    evm_return 0.i8 32.i8;
+}
+"#,
+    )
+    .expect("module parses");
+    let backend = osaka_backend();
+    let scratch = find_func(&parsed.module, "scratch");
+    let entry = find_func(&parsed.module, "entry");
+    let placement = compute_test_memory_placement(&parsed.module, &backend, entry, &[]);
+    let malloc = parsed.module.func_store.view(scratch, |function| {
+        function
+            .layout
+            .iter_all_insts()
+            .find(|&inst| {
+                matches!(
+                    backend.isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                    EvmInstKind::EvmMalloc(_)
+                )
+            })
+            .expect("scratch has a malloc")
+    });
+    let min_base = match placement.funcs[&scratch].malloc_placements[&malloc] {
+        machine::placement::MallocPlacement::Heap { min_base, .. } => min_base,
+        machine::placement::MallocPlacement::Fixed { base } => base,
+    };
+    assert_eq!(
+        placement.funcs[&scratch].free_ptr_floor_before_malloc[&malloc],
+        Some(min_base)
+    );
+}
+
+#[test]
+fn free_ptr_floor_meets_cfg_edges_and_initial_entry_state() {
+    for (body, expected) in [
+        (
+            "block0:\n    evm_mstore 64.i256 512.i256;\n    jump block1;\nblock1:",
+            Some(512),
+        ),
+        (
+            "block0:\n    br v0 block1 block2;\nblock1:\n    evm_mstore 64.i256 512.i256;\n    jump block3;\nblock2:\n    evm_mstore 64.i256 768.i256;\n    jump block3;\nblock3:",
+            Some(512),
+        ),
+        (
+            "block0:\n    br v0 block1 block2;\nblock1:\n    evm_mstore 64.i256 512.i256;\n    jump block3;\nblock2:\n    evm_mstore 64.i256 v1;\n    jump block3;\nblock3:",
+            None,
+        ),
+        (
+            "block0:\n    evm_mstore 64.i256 512.i256;\n    jump block1;\nblock1:\n    call %clobber v1;",
+            None,
+        ),
+        // A computed address never reaches the free-pointer slot.
+        (
+            "block0:\n    evm_mstore 64.i256 512.i256;\n    mstore v1 7.i256 i256;\n    jump block1;\nblock1:",
+            Some(512),
+        ),
+        // `restore` hands back the free pointer it was called with.
+        (
+            "block0:\n    evm_mstore 64.i256 512.i256;\n    jump block1;\nblock1:\n    call %restore v1;",
+            Some(512),
+        ),
+        // `abort_clobber` writes the slot only on a path that never returns.
+        (
+            "block0:\n    evm_mstore 64.i256 512.i256;\n    jump block1;\nblock1:\n    call %abort_clobber v0 v1;",
+            Some(512),
+        ),
+        ("block0:", None),
+    ] {
+        let exit = if body == "block0:" {
+            "br v0 block0 block1;\nblock1:\n    return v3;"
+        } else {
+            "return v3;"
+        };
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func private %probe(v0.i1, v1.i256) -> i256 {{
+{body}
+    v2.*i8 = evm_malloc 32.i256;
+    v3.i256 = ptr_to_int v2 i256;
+    {exit}
+}}
+func private %clobber(v0.i256) {{
+block0:
+    evm_mstore 64.i256 v0;
+    return;
+}}
+func private %restore(v0.i256) {{
+block0:
+    v1.i256 = mload 64.i256 i256;
+    v2.*i8 = evm_malloc 32.i256;
+    v3.i256 = ptr_to_int v2 i256;
+    mstore v3 v0 i256;
+    mstore 64.i256 v1 i256;
+    return;
+}}
+func private %abort_clobber(v0.i1, v1.i256) {{
+block0:
+    br v0 block1 block2;
+block1:
+    evm_mstore 64.i256 v1;
+    evm_revert 0.i256 0.i256;
+block2:
+    return;
+}}
+func public %entry() {{
+block0:
+    v0.i256 = call %probe 0.i1 0.i256;
+    evm_mstore 0.i256 v0;
+    evm_return 0.i256 32.i256;
+}}
+"#
+        );
+        let module = parse_module(&source).expect("module parses").module;
+        let backend = osaka_backend();
+        let entry = find_func(&module, "entry");
+        let probe = find_func(&module, "probe");
+        let placement = compute_test_memory_placement(&module, &backend, entry, &[]);
+        let floors: Vec<_> = placement.funcs[&probe]
+            .free_ptr_floor_before_malloc
+            .values()
+            .copied()
+            .collect();
+        assert_eq!(floors, [expected], "{body}");
+    }
+}
+
+#[test]
+fn section_entry_initializes_free_ptr_only_when_unobserved_and_entered_once() {
+    for (name, access, caller, included, initialized) in [
+        ("plain", "", "", false, true),
+        (
+            "slot_read",
+            "v1.i256 = mload 64.i256 i256;\n    evm_sstore 0.i256 v1;",
+            "",
+            false,
+            false,
+        ),
+        (
+            "msize",
+            "v1.i256 = evm_msize;\n    evm_sstore 0.i256 v1;",
+            "",
+            false,
+            false,
+        ),
+        // `%alt` calls the entry without forming a cycle, so the section has
+        // no dynamic frame, yet the entry can run after an allocation.
+        (
+            "called",
+            "",
+            "func public %alt() {\nblock0:\n    call %entry;\n    evm_stop;\n}",
+            false,
+            false,
+        ),
+        // As an include root, the entry can be entered with a live heap.
+        ("included", "", "", true, false),
+        // A branch back to the entry block reruns the store after the first
+        // pass has allocated.
+        (
+            "loop_header",
+            "v1.i256 = evm_sload 0.i256;\n    evm_sstore 0.i256 1.i256;\n    v2.i1 = eq v1 0.i256;\n    br v2 block0 block1;\nblock1:",
+            "",
+            false,
+            false,
+        ),
+    ] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func private %probe() -> i256 {{
+block0:
+    v0.*i8 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    return v1;
+}}
+func public %entry() {{
+block0:
+    v0.i256 = call %probe;
+    {access}
+    evm_mstore 0.i256 v0;
+    evm_return 0.i256 32.i256;
+}}
+{caller}
+"#
+        );
+        let module = parse_module(&source).expect("module parses").module;
+        let backend = osaka_backend();
+        let entry = find_func(&module, "entry");
+        let probe = find_func(&module, "probe");
+        let includes = if included { vec![entry] } else { Vec::new() };
+        let placement = compute_test_memory_placement(&module, &backend, entry, &includes);
+        let floors: Vec<_> = placement.funcs[&probe]
+            .free_ptr_floor_before_malloc
+            .values()
+            .copied()
+            .collect();
+        assert_eq!(
+            placement.section_entry_free_ptr.is_some(),
+            initialized,
+            "{name}"
+        );
+        // The probe's malloc needs no clamp exactly when the entry stores the floor.
+        assert_eq!(floors, [placement.section_entry_free_ptr], "{name}");
+    }
+}
+
+#[test]
+fn buffers_beside_exposed_callee_heap_objects_move_into_the_frame() {
+    // `%entry` stores a heap object's address and contents where other frames
+    // can read them. Neither can name `%entry`'s own buffer, which therefore
+    // moves into the frame.
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+func private %allocate() -> i256 {
+block0:
+    v0.*i8 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    return v1;
+}
+func public %entry() {
+block0:
+    v0.*i8 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    mstore v1 7.i256 i256;
+    v2.i256 = call %allocate;
+    v3.i256 = mload v2 i256;
+    v4.i256 = mload v1 i256;
+    mstore 512.i256 v2 i256;
+    mstore 544.i256 v3 i256;
+    mstore 576.i256 v4 i256;
+    evm_return 512.i256 96.i256;
+}
+"#,
+    )
+    .expect("module parses");
+    let funcs = parsed.module.funcs();
+    let entry = find_func(&parsed.module, "entry");
+    for profile in [
+        LateCleanupProfile::Off,
+        LateCleanupProfile::Speed,
+        LateCleanupProfile::Size,
+    ] {
+        let prepared = osaka_backend()
+            .with_late_cleanup_profile(profile)
+            .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
+            .expect("prepare should succeed");
+        let plan = &prepared.function_plan(entry).expect("entry plan").mem_plan;
+        assert_eq!(
+            plan.stable_words, 1,
+            "{profile:?}: buffer stays on the heap"
+        );
+    }
+}
+
+#[test]
+fn heap_addresses_keep_the_arena_floor_only_with_integer_alternatives() {
+    // Each `%entry` stores through `v9`, which names a heap object on some
+    // path. The store may reach low memory the arena would otherwise use
+    // exactly when another path makes `v9` an integer such as 96, whether
+    // through a callee's returns, an SSA join or a memory join.
+    let local_join = |join: &str| {
+        format!(
+            "br v1 block1 block2;\nblock1:\n    v2.*i8 = evm_malloc 32.i256;\n    v3.i256 = ptr_to_int v2 i256;\n    jump block3;\nblock2:\n    jump block3;\nblock3:\n    {join}.i256 = phi (v3 block1) (96.i256 block2);"
+        )
+    };
+    for (name, body, floor) in [
+        ("callee_heap", "v9.i256 = call %heap;".to_string(), false),
+        (
+            "callee_heap_offset",
+            "v8.i256 = call %heap;\n    v9.i256 = add v8 32.i256;".to_string(),
+            false,
+        ),
+        ("callee_split_returns", "v9.i256 = call %split v1;".to_string(), true),
+        ("callee_joined_return", "v9.i256 = call %joined v1;".to_string(), true),
+        ("local_join", local_join("v9"), true),
+        (
+            "local_join_offset",
+            format!("{}\n    v9.i256 = add v8 32.i256;", local_join("v8")),
+            true,
+        ),
+        (
+            "memory_join",
+            "v2.*i256 = alloca i256;\n    br v1 block1 block2;\nblock1:\n    v3.*i8 = evm_malloc 32.i256;\n    v4.i256 = ptr_to_int v3 i256;\n    mstore v2 v4 i256;\n    jump block3;\nblock2:\n    mstore v2 96.i256 i256;\n    jump block3;\nblock3:\n    v9.i256 = mload v2 i256;".to_string(),
+            true,
+        ),
+    ] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func private %heap() -> i256 {{
+block0:
+    v0.*i8 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    return v1;
+}}
+func private %split(v0.i1) -> i256 {{
+block0:
+    br v0 block1 block2;
+block1:
+    v1.i256 = call %heap;
+    return v1;
+block2:
+    return 96.i256;
+}}
+func private %joined(v0.i1) -> i256 {{
+block0:
+    br v0 block1 block2;
+block1:
+    v1.i256 = call %heap;
+    jump block3;
+block2:
+    jump block3;
+block3:
+    v2.i256 = phi (v1 block1) (96.i256 block2);
     return v2;
-
-block2:
-    v3.i256 = call %ready_caller v0;
-    return v3;
-}
-
-func private %helper(v0.i256) -> i256 {
+}}
+func public %entry() {{
 block0:
-    v1.i1 = eq v0 0.i256;
-    br v1 block1 block2;
-
-block1:
-    return 0.i256;
-
-block2:
-    v2.*i256 = alloca i256;
-    mstore v2 v0 i256;
-    v3.i256 = call %ready_caller v0;
-    v4.i256 = sub v0 1.i256;
-    v5.i256 = call %target v4;
-    v6.i256 = mload v2 i256;
-    v7.i256 = add v3 v5;
-    v8.i256 = add v7 v6;
-    return v8;
-}
-
-func private %ready_caller(v0.i256) -> i256 {
-block0:
-    v1.i1 = eq v0 0.i256;
-    br v1 block1 block2;
-
-block1:
-    return 0.i256;
-
-block2:
-    v2.*i256 = alloca i256;
-    mstore v2 v0 i256;
-    v3.i256 = call %target v0;
-    v4.i256 = mload v2 i256;
-    v5.i256 = add v3 v4;
-    return v5;
-}
-
-func private %target(v0.i256) -> i256 {
-block0:
-    v1.i1 = eq v0 0.i256;
-    br v1 block1 block2;
-
-block1:
-    return 0.i256;
-
-block2:
-    v2.*i256 = alloca i256;
-    mstore v2 v0 i256;
-    v3.i256 = sub v0 1.i256;
-    v4.i256 = call %target v3;
-    v5.i256 = mload v2 i256;
-    v6.i256 = add v4 v5;
-    return v6;
-}
-
-object @Contract {
-  section runtime {
-    entry %entry;
-  }
-}
-"#;
-
-    let mut expected_frontier_init_calls = None;
-    let mut expected_checked_frontier_init_calls = None;
-    let mut expected_entry_init = None;
-    let mut expected_entry_live_frame = None;
-    let mut expected_frame_summaries = None;
-
-    for _ in 0..8 {
-        let plan = dyn_sp_plan_from_src(src).plan;
-        if let Some(expected) = &expected_frontier_init_calls {
+    v0.i256 = evm_calldata_load 0.i256;
+    v1.i1 = trunc v0 i1;
+    {body}
+    mstore v9 99.i256 i256;
+    evm_return 0.i256 32.i256;
+}}
+"#
+        );
+        let module = parse_module(&source).expect("module parses").module;
+        let funcs = module.funcs();
+        let entry = find_func(&module, "entry");
+        for profile in [
+            LateCleanupProfile::Off,
+            LateCleanupProfile::Speed,
+            LateCleanupProfile::Size,
+        ] {
+            let prepared = osaka_backend()
+                .with_late_cleanup_profile(profile)
+                .prepare_section(work_module_with_entry(&module, &funcs, entry))
+                .expect("prepare should succeed");
             assert_eq!(
-                &plan.frontier_init_calls, expected,
-                "frontier init calls changed across runs"
+                prepared.section_plan().arena_base >= STATIC_BASE,
+                floor,
+                "{name}, {profile:?}"
             );
-        } else {
-            expected_frontier_init_calls = Some(plan.frontier_init_calls.clone());
-        }
-        if let Some(expected) = &expected_checked_frontier_init_calls {
-            assert_eq!(
-                &plan.checked_frontier_init_calls, expected,
-                "checked frontier init calls changed across runs"
-            );
-        } else {
-            expected_checked_frontier_init_calls = Some(plan.checked_frontier_init_calls.clone());
-        }
-        if let Some(expected) = expected_entry_init {
-            assert_eq!(plan.entry_init, expected, "entry init changed across runs");
-        } else {
-            expected_entry_init = Some(plan.entry_init);
-        }
-        if let Some(expected) = &expected_entry_live_frame {
-            assert_eq!(
-                &plan.entry_live_frame, expected,
-                "entry live frame changed across runs"
-            );
-        } else {
-            expected_entry_live_frame = Some(plan.entry_live_frame.clone());
-        }
-        if let Some(expected) = &expected_frame_summaries {
-            assert_eq!(
-                &plan.frame_summaries, expected,
-                "frame summaries changed across runs"
-            );
-        } else {
-            expected_frame_summaries = Some(plan.frame_summaries.clone());
         }
     }
 }
@@ -1307,60 +2556,31 @@ block0:
     }
     let caller = names["caller"];
 
-    let mut analyses: FxHashMap<FuncRef, memory_plan::FuncAnalysis> = FxHashMap::default();
+    let backend = EvmBackend::new(isa);
+    let mut pre_analyses: FxHashMap<FuncRef, memory_plan::FuncPreAnalysis> = FxHashMap::default();
+    let mut stack_allocs: FxHashMap<FuncRef, StackifyAlloc> = FxHashMap::default();
     for &func in &funcs {
         parsed.module.func_store.modify(func, |function| {
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(function);
-
-            StackifyEdgeSplitter::run(function, &mut cfg);
-
-            let mut liveness = Liveness::new();
-            liveness.compute(function, &cfg);
-
-            let mut inst_liveness = InstLiveness::new();
-            inst_liveness.compute(function, &cfg, &liveness);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            analyses.insert(
+            pre_analyses.insert(
                 func,
-                memory_plan::FuncAnalysis {
-                    alloc: StackifyBuilder::new(function, &cfg, &dom, &liveness, 16).compute(),
-                    inst_liveness,
-                    block_order: dom.rpo().to_vec(),
-                    value_aliases: {
-                        let mut value_aliases = SecondaryMap::new();
-                        for value in function.dfg.value_ids() {
-                            value_aliases[value] = Some(value);
-                        }
-                        value_aliases
-                    },
-                },
+                compute_test_pre_analysis(function, &parsed.module.ctx, &backend, &ptr_escape),
             );
+            stack_allocs.insert(func, compute_test_stackify_alloc(function));
         });
     }
 
-    let (call_inst, call_args) = parsed.module.func_store.view(caller, |function| {
+    let call_inst = parsed.module.func_store.view(caller, |function| {
         function
             .layout
-            .iter_block()
-            .flat_map(|block| function.layout.iter_inst(block))
-            .find_map(|inst| {
-                function
-                    .dfg
-                    .cast_call(inst)
-                    .map(|call| (inst, call.args().clone()))
-            })
+            .iter_all_insts()
+            .find_map(|inst| function.dfg.cast_call(inst).map(|_| inst))
             .expect("missing call inst")
     });
 
-    let actions = analyses
+    let actions = stack_allocs
         .get(&caller)
         .expect("missing caller analysis")
-        .alloc
-        .read(call_inst, &call_args);
+        .pre_inst(call_inst);
     assert!(
         !actions
             .iter()
@@ -1368,10 +2588,10 @@ block0:
         "noreturn call should not materialize a local continuation: {actions:?}"
     );
 
-    let plan = compute_program_memory_plan(
+    let plan = compute_semantic_program_memory_plan(
         &parsed.module,
-        &funcs,
-        &analyses,
+        &crate::module_analysis::CallGraphSchedule::compute(&parsed.module, &funcs),
+        &pre_analyses,
         &ptr_escape,
         &isa,
         &ArenaCostModel::default(),
@@ -1622,7 +2842,8 @@ target = "evm-ethereum-osaka"
 
 func private %helper(v0.i256, v1.i256) -> i256 {
 block0:
-    return v1;
+    v2.i256 = add v1 1.i256;
+    return v2;
 }
 
 func public %entry(v0.i256) -> i256 {
@@ -1697,6 +2918,81 @@ object @Contract {
 }
 
 #[test]
+fn prepare_section_binds_uniform_const_arg_before_late_dead_arg_elim() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %helper(v0.i256, v1.i256) -> i256 {
+block0:
+    v2.i256 = add v0 v1;
+    return v2;
+}
+
+func public %entry(v0.i256) -> i256 {
+block0:
+    v1.i256 = add 1.i256 2.i256;
+    v2.i256 = call %helper v1 v0;
+    v3.i256 = call %helper 3.i256 v2;
+    return v3;
+}
+
+object @Contract {
+  section runtime {
+    entry %entry;
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let funcs = parsed.module.funcs();
+    let mut names: FxHashMap<String, FuncRef> = FxHashMap::default();
+    for &func in &funcs {
+        let name = parsed
+            .module
+            .ctx
+            .func_sig(func, |sig| sig.name().to_string());
+        names.insert(name, func);
+    }
+
+    let backend = EvmBackend::new(Evm::new(TargetTriple {
+        architecture: Architecture::Evm,
+        vendor: Vendor::Ethereum,
+        operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
+    }))
+    .with_late_cleanup_profile(LateCleanupProfile::Speed);
+    let prepared = backend
+        .prepare_section(work_module_with_entry(
+            &parsed.module,
+            &funcs,
+            names["entry"],
+        ))
+        .expect("prepare should succeed");
+
+    let helper_sig = prepared
+        .module()
+        .ctx
+        .get_sig(names["helper"])
+        .expect("helper signature should exist");
+    assert_eq!(
+        helper_sig.args().len(),
+        1,
+        "uniform const arg binding should expose removable helper arg"
+    );
+    prepared
+        .module()
+        .func_store
+        .view(names["entry"], |function| {
+            let dumped = FuncWriter::new(names["entry"], function).dump_string();
+            assert!(
+                !dumped.contains("call %helper 3.i256"),
+                "entry callsites should drop the bound constant:\n{dumped}"
+            );
+        });
+}
+
+#[test]
 fn prepare_section_prunes_dead_constref_specialization_original() {
     let parsed = parse_module(
         r#"
@@ -1741,7 +3037,7 @@ object @Contract {
     let funcs = parsed.module.funcs();
     let verify = find_func(&parsed.module, "verify");
     let entry = find_func(&parsed.module, "entry");
-    let backend = test_backend().with_late_cleanup_profile(LateCleanupProfile::Speed);
+    let backend = osaka_backend().with_late_cleanup_profile(LateCleanupProfile::Speed);
     let prepared = backend
         .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
         .expect("prepare should succeed");
@@ -1794,7 +3090,7 @@ object @Contract {
     let funcs = parsed.module.funcs();
     let verify = find_func(&parsed.module, "verify");
     let entry = find_func(&parsed.module, "entry");
-    let backend = test_backend().with_late_cleanup_profile(LateCleanupProfile::Speed);
+    let backend = osaka_backend().with_late_cleanup_profile(LateCleanupProfile::Speed);
     let prepared = backend
         .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
         .expect("prepare should succeed");
@@ -1865,6 +3161,7 @@ fn prepare_section_runs_raw_memory_cleanup_after_memory_legalize() {
         .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
         .expect("prepare with optional cleanup should succeed");
     let before_dump = dump_entry(&before);
+    let after_dump = dump_entry(&after);
     let before = count_insts(&before);
     let after = count_insts(&after);
 
@@ -1873,8 +3170,12 @@ fn prepare_section_runs_raw_memory_cleanup_after_memory_legalize() {
         "mandatory lowering must still remove object IR when optional cleanup is off:\n{before_dump}"
     );
     assert!(
-        after < before,
-        "late raw-memory cleanup should reduce prepared IR after memory legalization (before={before}, after={after})"
+        !after_dump.contains("obj."),
+        "mandatory lowering must still remove object IR when optional cleanup is on:\n{after_dump}"
+    );
+    assert!(
+        after <= before,
+        "late raw-memory cleanup should not expand prepared machine IR (before={before}, after={after})"
     );
 }
 
@@ -1903,7 +3204,7 @@ block0:
     .unwrap();
     let funcs = parsed.module.funcs();
     let entry = find_func(&parsed.module, "entry");
-    let prepared = test_backend()
+    let prepared = osaka_backend()
         .with_late_cleanup_profile(LateCleanupProfile::Off)
         .prepare_section(work_module_with_entry(&parsed.module, &funcs, entry))
         .expect("zero-sized callee-visible alloca should lower without optional cleanup");
@@ -1911,13 +3212,7 @@ block0:
 
     assert_eq!(plan.mem_plan.scratch_words, 0);
     assert_eq!(plan.mem_plan.stable_words, 0);
-    assert_eq!(plan.mem_plan.alloca_loc.len(), 1);
-    assert!(
-        plan.mem_plan
-            .alloca_loc
-            .values()
-            .all(|loc| matches!(loc, ObjLoc::ScratchAbs(0)))
-    );
+    assert!(plan.mem_plan.alloca_loc.is_empty());
 }
 
 #[test]
@@ -2287,6 +3582,70 @@ object @Contract {
 }
 
 #[test]
+fn machine_pipeline_compiles_multiway_entry_self_loops() {
+    // Regression for the `StackifyEdgeSplitter` pipeline gap: a multiway self-loop on the entry
+    // block (`br v0 block0 block1`) is an in-cycle multiway edge that is *not* critical (block0's
+    // only predecessor is itself), so plain critical-edge splitting leaves it intact. Stackify
+    // then plans a branch edge back to the already-planned entry block, which trips the guard in
+    // `on_branch_edge` (previously a debug assert / silent miscompile). The machine pipeline runs
+    // `StackifyEdgeSplitter`, which splits the edge and makes the shape compile. The
+    // all-duplicate form is canonicalized to a jump before edge classification.
+    let sources = [
+        (
+            "mixed targets",
+            r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.i1, v1.i256) {
+block0:
+    mstore v1 v1 i256;
+    br v0 block0 block1;
+
+block1:
+    evm_return 0.i256 0.i256;
+}
+
+object @Contract {
+  section runtime {
+    entry %f;
+  }
+}
+"#,
+        ),
+        (
+            "duplicate targets",
+            r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.i1, v1.i256) {
+block0:
+    mstore v1 v1 i256;
+    br v0 block0 block0;
+}
+
+object @Contract {
+  section runtime {
+    entry %f;
+  }
+}
+"#,
+        ),
+    ];
+    let backend = osaka_backend();
+    for (label, source) in sources {
+        let parsed = parse_module(source).unwrap();
+        let func = parsed.module.funcs()[0];
+        let prepared = backend
+            .prepare_section(work_module(&parsed.module, &[func]))
+            .unwrap_or_else(|err| panic!("prepare should succeed for {label}: {err}"));
+
+        backend
+            .lower_function(&prepared, func)
+            .unwrap_or_else(|err| panic!("lowering should succeed for {label}: {err}"));
+    }
+}
+
+#[test]
 fn prepared_section_is_reusable_across_lower_calls() {
     let parsed = parse_module(
         r#"
@@ -2435,41 +3794,16 @@ block0:
     });
     let ptr_escape = compute_ptr_escape_summaries(&parsed.module, &funcs, &isa);
 
-    let mut analyses: FxHashMap<FuncRef, memory_plan::FuncAnalysis> = FxHashMap::default();
+    let backend = EvmBackend::new(isa);
+    let mut pre_analyses: FxHashMap<FuncRef, memory_plan::FuncPreAnalysis> = FxHashMap::default();
+    let mut stack_allocs: FxHashMap<FuncRef, StackifyAlloc> = FxHashMap::default();
     for &func in &funcs {
         parsed.module.func_store.modify(func, |function| {
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(function);
-
-            StackifyEdgeSplitter::run(function, &mut cfg);
-
-            let mut liveness = Liveness::new();
-            liveness.compute(function, &cfg);
-
-            let mut inst_liveness = InstLiveness::new();
-            inst_liveness.compute(function, &cfg, &liveness);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let block_order = dom.rpo().to_owned();
-            let alloc = StackifyBuilder::new(function, &cfg, &dom, &liveness, 16).compute();
-
-            analyses.insert(
+            pre_analyses.insert(
                 func,
-                memory_plan::FuncAnalysis {
-                    alloc,
-                    inst_liveness,
-                    block_order,
-                    value_aliases: {
-                        let mut value_aliases = SecondaryMap::new();
-                        for value in function.dfg.value_ids() {
-                            value_aliases[value] = Some(value);
-                        }
-                        value_aliases
-                    },
-                },
+                compute_test_pre_analysis(function, &parsed.module.ctx, &backend, &ptr_escape),
             );
+            stack_allocs.insert(func, compute_test_stackify_alloc(function));
         });
     }
 
@@ -2478,10 +3812,10 @@ block0:
         w_code: 0,
         ..ArenaCostModel::default()
     };
-    let plan = compute_program_memory_plan(
+    let plan = compute_semantic_program_memory_plan(
         &parsed.module,
-        &funcs,
-        &analyses,
+        &crate::module_analysis::CallGraphSchedule::compute(&parsed.module, &funcs),
+        &pre_analyses,
         &ptr_escape,
         &isa,
         &cost_model,
@@ -2509,25 +3843,34 @@ block0:
 
     assert_eq!(call_args.len(), 2, "test expects a 2-arg call");
 
-    let analysis = analyses.remove(&caller).expect("missing caller analysis");
-    let mem_plan = plan
-        .funcs
-        .get(&caller)
-        .expect("missing caller plan")
-        .clone();
-    let alloc = FinalAlloc::new(analysis.alloc, mem_plan);
+    let stack_alloc = stack_allocs
+        .remove(&caller)
+        .expect("missing caller analysis");
+    let semantic_plan = plan.funcs.get(&caller).expect("missing caller plan");
+    // These tests run on source IR with an identity inst mapping, so the
+    // semantic call_preserve keys are already the "machine" keys.
+    let mem_plan = memory_plan::MachineFuncPlan {
+        arena_base: semantic_plan.arena_base,
+        scratch_words: semantic_plan.scratch_words,
+        stable_words: semantic_plan.stable_words,
+        stable_mode: semantic_plan.stable_mode,
+        entry_abs_words: semantic_plan.entry_abs_words,
+        obj_loc: semantic_plan.obj_loc.clone(),
+        alloca_loc: semantic_plan.alloca_loc.clone(),
+        spill_obj: Default::default(),
+        call_preserve: semantic_plan.call_preserve.clone(),
+    };
+    let alloc = FinalAlloc::new(stack_alloc, mem_plan);
 
     let save_plan = alloc
         .mem_plan
         .call_preserve
         .get(&call_inst)
         .expect("expected non-empty call preserve entry for call");
-    let PreserveMode::ShadowRuns { shadow_obj, runs } = &save_plan.mode else {
-        panic!("expected shadow preserve plan for caller");
-    };
+    let (shadow_obj, runs) = (&save_plan.shadow_obj, &save_plan.runs);
     assert!(!runs.is_empty(), "expected at least one saved run");
 
-    let actions = alloc.read(call_inst, &call_args);
+    let actions = alloc.pre_inst(call_inst);
     let cont_pos = actions
         .iter()
         .position(|a| matches!(a, Action::PushContinuationOffset))
@@ -2600,41 +3943,16 @@ block2:
     });
     let ptr_escape = compute_ptr_escape_summaries(&parsed.module, &funcs, &isa);
 
-    let mut analyses: FxHashMap<FuncRef, memory_plan::FuncAnalysis> = FxHashMap::default();
+    let backend = EvmBackend::new(isa);
+    let mut pre_analyses: FxHashMap<FuncRef, memory_plan::FuncPreAnalysis> = FxHashMap::default();
+    let mut stack_allocs: FxHashMap<FuncRef, StackifyAlloc> = FxHashMap::default();
     for &func in &funcs {
         parsed.module.func_store.modify(func, |function| {
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(function);
-
-            StackifyEdgeSplitter::run(function, &mut cfg);
-
-            let mut liveness = Liveness::new();
-            liveness.compute(function, &cfg);
-
-            let mut inst_liveness = InstLiveness::new();
-            inst_liveness.compute(function, &cfg, &liveness);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let block_order = dom.rpo().to_owned();
-            let alloc = StackifyBuilder::new(function, &cfg, &dom, &liveness, 16).compute();
-
-            analyses.insert(
+            pre_analyses.insert(
                 func,
-                memory_plan::FuncAnalysis {
-                    alloc,
-                    inst_liveness,
-                    block_order,
-                    value_aliases: {
-                        let mut value_aliases = SecondaryMap::new();
-                        for value in function.dfg.value_ids() {
-                            value_aliases[value] = Some(value);
-                        }
-                        value_aliases
-                    },
-                },
+                compute_test_pre_analysis(function, &parsed.module.ctx, &backend, &ptr_escape),
             );
+            stack_allocs.insert(func, compute_test_stackify_alloc(function));
         });
     }
 
@@ -2643,10 +3961,10 @@ block2:
         w_code: 0,
         ..ArenaCostModel::default()
     };
-    let plan = compute_program_memory_plan(
+    let plan = compute_semantic_program_memory_plan(
         &parsed.module,
-        &funcs,
-        &analyses,
+        &crate::module_analysis::CallGraphSchedule::compute(&parsed.module, &funcs),
+        &pre_analyses,
         &ptr_escape,
         &isa,
         &cost_model,
@@ -2659,29 +3977,36 @@ block2:
     }
     let caller = names["caller"];
 
-    let (call_inst, call_results): (InstId, SmallVec<[ValueId; 8]>) =
-        parsed.module.func_store.view(caller, |function| {
-            for block in function.layout.iter_block() {
-                for inst in function.layout.iter_inst(block) {
-                    if function.dfg.call_info(inst).is_none() {
-                        continue;
-                    }
-                    return (
-                        inst,
-                        function.dfg.inst_results(inst).iter().copied().collect(),
-                    );
+    let call_inst: InstId = parsed.module.func_store.view(caller, |function| {
+        for block in function.layout.iter_block() {
+            for inst in function.layout.iter_inst(block) {
+                if function.dfg.call_info(inst).is_none() {
+                    continue;
                 }
+                return inst;
             }
-            panic!("missing call inst");
-        });
+        }
+        panic!("missing call inst");
+    });
 
-    let analysis = analyses.remove(&caller).expect("missing caller analysis");
-    let mem_plan = plan
-        .funcs
-        .get(&caller)
-        .expect("missing caller plan")
-        .clone();
-    let alloc = FinalAlloc::new(analysis.alloc, mem_plan);
+    let stack_alloc = stack_allocs
+        .remove(&caller)
+        .expect("missing caller analysis");
+    let semantic_plan = plan.funcs.get(&caller).expect("missing caller plan");
+    // These tests run on source IR with an identity inst mapping, so the
+    // semantic call_preserve keys are already the "machine" keys.
+    let mem_plan = memory_plan::MachineFuncPlan {
+        arena_base: semantic_plan.arena_base,
+        scratch_words: semantic_plan.scratch_words,
+        stable_words: semantic_plan.stable_words,
+        stable_mode: semantic_plan.stable_mode,
+        entry_abs_words: semantic_plan.entry_abs_words,
+        obj_loc: semantic_plan.obj_loc.clone(),
+        alloca_loc: semantic_plan.alloca_loc.clone(),
+        spill_obj: Default::default(),
+        call_preserve: semantic_plan.call_preserve.clone(),
+    };
+    let alloc = FinalAlloc::new(stack_alloc, mem_plan);
 
     let save_plan = alloc
         .mem_plan
@@ -2689,12 +4014,10 @@ block2:
         .get(&call_inst)
         .expect("expected non-empty call preserve entry for call");
     assert_eq!(save_plan.result_count, 2);
-    let PreserveMode::ShadowRuns { shadow_obj, runs } = &save_plan.mode else {
-        panic!("expected shadow preserve plan for caller");
-    };
+    let (shadow_obj, runs) = (&save_plan.shadow_obj, &save_plan.runs);
     assert!(!runs.is_empty(), "expected at least one saved run");
 
-    let actions = alloc.write(call_inst, &call_results);
+    let actions = alloc.post_inst(call_inst);
     let mut expected = Actions::new();
     let shadow_loc = alloc.obj_loc_for_id(*shadow_obj);
     for run in runs.iter().rev() {
@@ -2716,6 +4039,61 @@ block2:
         expected.as_slice(),
         "multi-result call preserve restore must copy saved scratch words back after post-actions"
     );
+}
+
+#[test]
+fn prune_clears_ir_mapping_when_combining_different_attributions() {
+    let mut vcode = VCode::<OpCode>::default();
+    let block = BlockId(0);
+
+    let push = vcode.add_inst_to_block(OpCode::PUSH1, Some(InstId(1)), block);
+    vcode.inst_imm_bytes.insert((push, smallvec![0u8]));
+    let eq = vcode.add_inst_to_block(OpCode::EQ, Some(InstId(2)), block);
+
+    prune_redundant_opcode_sequences(&mut vcode, &[block]);
+
+    assert_eq!(vcode.block_insns(block).collect::<Vec<_>>(), vec![eq]);
+    assert_eq!(vcode.insts[eq] as u8, OpCode::ISZERO as u8);
+    assert_eq!(vcode.inst_ir[eq].expand(), None);
+}
+
+#[test]
+fn prune_preserves_ir_mapping_when_combining_the_same_attribution() {
+    let mut vcode = VCode::<OpCode>::default();
+    let block = BlockId(0);
+    let owner = InstId(7);
+    let push = vcode.add_inst_to_block(OpCode::PUSH1, Some(owner), block);
+    vcode.inst_imm_bytes.insert((push, smallvec![0u8]));
+    let eq = vcode.add_inst_to_block(OpCode::EQ, Some(owner), block);
+
+    prune_redundant_opcode_sequences(&mut vcode, &[block]);
+
+    assert_eq!(vcode.block_insns(block).collect::<Vec<_>>(), vec![eq]);
+    assert_eq!(vcode.insts[eq] as u8, OpCode::ISZERO as u8);
+    assert_eq!(vcode.inst_ir[eq].expand(), Some(owner));
+}
+
+#[test]
+fn prune_preserves_surviving_owners_when_reordering_stack_operations() {
+    let mut vcode = VCode::<OpCode>::default();
+    let block = BlockId(0);
+    let addr = vcode.add_inst_to_block(OpCode::PUSH1, Some(InstId(1)), block);
+    vcode.inst_imm_bytes.insert((addr, smallvec![32u8]));
+    let load = vcode.add_inst_to_block(OpCode::MLOAD, Some(InstId(2)), block);
+    let imm = vcode.add_inst_to_block(OpCode::PUSH1, Some(InstId(3)), block);
+    vcode.inst_imm_bytes.insert((imm, smallvec![5u8]));
+    vcode.add_inst_to_block(OpCode::SWAP1, Some(InstId(4)), block);
+    let sub = vcode.add_inst_to_block(OpCode::SUB, Some(InstId(5)), block);
+
+    prune_redundant_opcode_sequences(&mut vcode, &[block]);
+
+    assert_eq!(
+        vcode.block_insns(block).collect::<Vec<_>>(),
+        vec![imm, addr, load, sub]
+    );
+    for (inst, owner) in [(addr, 1), (load, 2), (imm, 3), (sub, 5)] {
+        assert_eq!(vcode.inst_ir[inst].expand(), Some(InstId(owner)));
+    }
 }
 
 #[test]
@@ -2832,6 +4210,190 @@ fn prune_keeps_iszero_iszero_before_non_labeled_jumpi() {
 }
 
 #[test]
+fn exact_and_glue_lowering_have_distinct_pc_attribution() {
+    let mut parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %runtime(v0.i256, v1.i256) {
+block0:
+    v2.i256 = add v0 v1;
+    v3.i1 = le v2 v1;
+    v4.i256 = zext v3 i256;
+    v5.i256 = add v2 v4;
+    mstore 0.i256 v5 i256;
+    evm_return 0.i256 32.i256;
+}
+
+object @Contract {
+  section runtime {
+    entry %runtime;
+  }
+}
+"#,
+    )
+    .expect("module parses");
+    let runtime = find_func(&parsed.module, "runtime");
+
+    parsed.module.func_store.modify(runtime, |function| {
+        let insts: Vec<_> = function.layout.iter_all_insts().collect();
+        let mut add_count = 0;
+        let mut le_count = 0;
+        for inst in insts {
+            match function.dfg.inst(inst).as_text() {
+                "add" if add_count == 0 => {
+                    function.set_inst_frontend_origin(inst, Arc::from("frontend:add"));
+                    add_count += 1;
+                }
+                "le" => {
+                    function.set_inst_frontend_origin(inst, Arc::from("frontend:le"));
+                    le_count += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(add_count, 1, "fixture should contain the exact add");
+        assert_eq!(le_count, 1, "fixture should contain the glue comparison");
+    });
+
+    Pipeline::speed().run(&mut parsed.module);
+    parsed.module.func_store.modify(runtime, |function| {
+        let insts: Vec<_> = function.layout.iter_all_insts().collect();
+        let mut stamped_add = false;
+        let mut stamped_le = false;
+        for inst in insts {
+            match function.inst_frontend_origin(inst) {
+                Some("frontend:add") => {
+                    function.set_inst_provenance(inst, "post-opt:add".to_string());
+                    stamped_add = true;
+                }
+                Some("frontend:le") => {
+                    function.set_inst_provenance(inst, "post-opt:le".to_string());
+                    stamped_le = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(stamped_add);
+        assert!(stamped_le);
+    });
+
+    let backend = osaka_backend().with_late_cleanup_profile(LateCleanupProfile::Off);
+    let prepared = backend
+        .prepare_section(work_module_with_entry(&parsed.module, &[runtime], runtime))
+        .expect("prepare should succeed");
+
+    let (exact_machine_insts, glue_machine_insts) =
+        prepared.module().func_store.view(runtime, |function| {
+            let mut exact = FxHashSet::default();
+            let mut glue = FxHashSet::default();
+            for inst in function.layout.iter_all_insts() {
+                match function.inst_frontend_origin(inst) {
+                    Some("frontend:add") => {
+                        assert_eq!(function.inst_provenance(inst), Some("post-opt:add"));
+                        exact.insert(inst);
+                    }
+                    Some("frontend:le") => {
+                        assert_eq!(
+                            function.inst_provenance(inst),
+                            None,
+                            "one-to-many lowering glue must not inherit exact provenance"
+                        );
+                        glue.insert(inst);
+                    }
+                    _ => {}
+                }
+            }
+            (exact, glue)
+        });
+    assert!(
+        !exact_machine_insts.is_empty(),
+        "exact add lowering should retain origin and provenance"
+    );
+    assert!(
+        !glue_machine_insts.is_empty(),
+        "comparison glue should retain only frontend origin"
+    );
+
+    let artifact = link_section(
+        &backend,
+        &prepared,
+        &ObjectName("Contract".into()),
+        &[],
+        &[],
+        &SectionName("runtime".into()),
+        &CompileOptions {
+            fixup_policy: PushWidthPolicy::Push4,
+            emit_symtab: true,
+            emit_observability: true,
+            ..CompileOptions::default()
+        },
+    )
+    .expect("linking should succeed");
+    let observability = artifact
+        .observability
+        .as_ref()
+        .expect("runtime observability");
+
+    let exact_ranges: Vec<_> = observability
+        .pc_map
+        .iter()
+        .filter(|entry| {
+            entry
+                .attribution
+                .machine_inst()
+                .is_some_and(|inst| exact_machine_insts.contains(&inst.raw()))
+        })
+        .collect();
+    assert!(!exact_ranges.is_empty());
+    assert!(exact_ranges.iter().all(|entry| matches!(
+        &entry.attribution,
+        PcAttribution::Mapped {
+            post_opt_provenance,
+            ..
+        } if post_opt_provenance == "post-opt:add"
+    )));
+
+    let glue_ranges: Vec<_> = observability
+        .pc_map
+        .iter()
+        .filter(|entry| {
+            entry
+                .attribution
+                .machine_inst()
+                .is_some_and(|inst| glue_machine_insts.contains(&inst.raw()))
+        })
+        .collect();
+    assert!(!glue_ranges.is_empty());
+    assert!(glue_ranges.iter().all(|entry| matches!(
+        &entry.attribution,
+        PcAttribution::Unmapped {
+            reason: UnmappedReason::MissingProvenance,
+            ..
+        }
+    )));
+
+    let exact_bytes: u32 = exact_ranges
+        .iter()
+        .map(|entry| entry.pc_end - entry.pc_start)
+        .sum();
+    let glue_bytes: u32 = glue_ranges
+        .iter()
+        .map(|entry| entry.pc_end - entry.pc_start)
+        .sum();
+    assert_eq!(observability.mapped_code_bytes, exact_bytes);
+    assert!(glue_bytes > 0);
+    assert!(
+        observability.unmapped_reason_coverage.missing_provenance >= glue_bytes,
+        "glue bytes must be counted under missing_provenance"
+    );
+    assert_eq!(
+        observability.mapped_code_bytes + observability.unmapped_code_bytes,
+        observability.code_bytes
+    );
+}
+
+#[test]
 fn link_section_resolves_sym_fixups_in_late_outlined_helper() {
     let parsed = parse_module(
         r#"
@@ -2888,7 +4450,7 @@ block2:
 "#,
     )
     .expect("module parses");
-    let backend = test_backend().with_late_cleanup_profile(LateCleanupProfile::Speed);
+    let backend = osaka_backend().with_late_cleanup_profile(LateCleanupProfile::Speed);
     let entry = find_func(&parsed.module, "main");
     let prepared = backend
         .prepare_section(work_module_with_entry(&parsed.module, &[entry], entry))
@@ -2937,6 +4499,7 @@ block2:
     let artifact = link_section(
         &backend,
         &prepared,
+        &sonatina_ir::object::ObjectName("test".into()),
         &[],
         &[],
         &SectionName("runtime".into()),
@@ -2967,4 +4530,153 @@ block2:
             .any(|window| window == size),
         "linked section must contain the resolved current-section size"
     );
+}
+
+#[test]
+fn caller_spills_survive_transitive_scratch_arena_clobbers() {
+    let fixture = include_str!("../../../test_files/evm/caller_spill_callee_scratch.sntn");
+    for indirect in [false, true] {
+        let source = if indirect {
+            fixture.replace("call %clobber;", "call %bridge;").replace(
+                "object @Contract",
+                "func private %bridge() -> i256 {\nblock0:\n    v0.i256 = call %clobber;\n    return v0;\n}\n\nobject @Contract",
+            )
+        } else {
+            fixture.to_owned()
+        };
+        let parsed = parse_module(&source).expect("module parses");
+        let entry = find_func(&parsed.module, "entry");
+        let clobber = find_func(&parsed.module, "clobber");
+        let backend = osaka_backend().with_stackify_reach_depth(4);
+        let prepared = backend
+            .prepare_section(work_module_with_entry(
+                &parsed.module,
+                &parsed.module.funcs(),
+                entry,
+            ))
+            .expect("prepare succeeds");
+        let callee_plan = &prepared.function_plan(clobber).unwrap().mem_plan;
+        let caller_plan = prepared.function_plan(entry).unwrap();
+        assert_eq!(callee_plan.scratch_words, 8);
+        assert!(callee_plan.arena_base >= 64);
+        assert!(
+            !prepared
+                .function_plan(clobber)
+                .unwrap()
+                .alloc
+                .uses_scratch_spills()
+        );
+        if indirect {
+            let bridge = find_func(&parsed.module, "bridge");
+            assert_eq!(
+                prepared
+                    .function_plan(bridge)
+                    .unwrap()
+                    .mem_plan
+                    .scratch_words,
+                0
+            );
+        }
+        assert_eq!(caller_plan.mem_plan.stable_words, 4);
+        for (_, object) in caller_plan.alloc.object_spills() {
+            assert!(matches!(
+                caller_plan.mem_plan.obj_loc[&object],
+                memory_plan::ObjLoc::StableAbs(_)
+            ));
+        }
+    }
+}
+
+#[test]
+fn branch_exclusive_final_spills_do_not_raise_getter_heap_floor() {
+    let parsed = parse_module(include_str!(
+        "../../../test_files/evm/branch_exclusive_final_spills.sntn"
+    ))
+    .expect("module parses");
+    let entry = find_func(&parsed.module, "entry");
+    let backend = osaka_backend().with_stackify_reach_depth(4);
+    let prepared = backend
+        .prepare_section(work_module_with_entry(
+            &parsed.module,
+            &parsed.module.funcs(),
+            entry,
+        ))
+        .expect("prepare succeeds");
+    let plan = &prepared.function_plan(entry).unwrap().mem_plan;
+    assert!(plan.spill_obj.values().any(Option::is_some));
+    let spill_words: FxHashSet<_> = plan.spill_obj.values().flatten().collect();
+    assert_eq!(
+        usize::try_from(plan.stable_words).unwrap(),
+        spill_words.len(),
+        "terminal writes in the getter must not add padding to unrelated spills"
+    );
+    let getter_floor = plan.abs_addr_for_word(plan.entry_abs_words);
+    prepared.module().func_store.view(entry, |function| {
+        let return_buffers: Vec<_> = function
+            .layout
+            .iter_all_insts()
+            .filter(|&inst| {
+                matches!(
+                    backend.isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                    EvmInstKind::EvmReturn(_)
+                )
+            })
+            .filter_map(|inst| {
+                let pointer = function.dfg.inst(inst).collect_values()[0];
+                prepare::value_imm_u32(function, pointer)
+            })
+            .filter(|&address| address != 0)
+            .collect();
+        assert_eq!(
+            return_buffers,
+            [getter_floor],
+            "the getter cannot reach the other branch's spill accesses"
+        );
+    });
+}
+
+#[test]
+fn removed_malloc_boundary_keeps_spills_separate_from_dead_objects() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+func public %entry() {
+block0:
+    v0.*[i256; 8] = alloca [i256; 8];
+    memzero v0 256.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    v2.i256 = evm_keccak256 v1 256.i256;
+    v3.*i8 = evm_malloc 32.i256;
+    mstore v3 v2 i256;
+    evm_return v3 32.i256;
+}
+"#,
+    )
+    .expect("module parses");
+    let entry = find_func(&parsed.module, "entry");
+    let backend = osaka_backend();
+    let prepared = backend
+        .prepare_section(work_module_with_entry(
+            &parsed.module,
+            &parsed.module.funcs(),
+            entry,
+        ))
+        .expect("prepare succeeds");
+    let plan = prepared.function_plan(entry).unwrap();
+    assert!(plan.mem_plan.abs_words_end() > 0);
+    assert!(plan.mem_plan.spill_obj.values().all(Option::is_none));
+    assert!(!plan.alloc.uses_scratch_spills());
+    parsed.module.func_store.view(entry, |source| {
+        prepared.module().func_store.view(entry, |machine| {
+            let bounds = compute_malloc_spill_bounds(
+                source,
+                machine,
+                &FuncMachineMap::new(),
+                &FinalAlloc::new(plan.alloc.clone(), plan.mem_plan.clone()),
+                &backend.isa,
+            );
+            assert_eq!(bounds.len(), 1);
+            assert_eq!(bounds.values().next(), Some(&0));
+        });
+    });
 }

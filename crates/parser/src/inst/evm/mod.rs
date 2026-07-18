@@ -1,4 +1,7 @@
-use ir::inst::evm::*;
+use ir::{HasInst, builder::FunctionBuilder, inst::evm::*};
+use smallvec::SmallVec;
+
+use crate::{BuildCtx, Error, ast};
 
 super::impl_inst_build! {EvmUdiv, (lhs: ValueId, rhs:ValueId)}
 super::impl_inst_build! {EvmUdivo, (lhs: ValueId, rhs:ValueId)}
@@ -23,6 +26,7 @@ super::impl_inst_build! {EvmSignExtend, (byte: ValueId, value: ValueId)}
 super::impl_inst_build! {EvmByte, (pos: ValueId, value: ValueId)}
 super::impl_inst_build! {EvmClz, (word: ValueId)}
 super::impl_inst_build! {EvmKeccak256, (addr: ValueId, len: ValueId)}
+super::impl_inst_build_common! {EvmKeccak256Words, build_evm_keccak256_words}
 super::impl_inst_build! {EvmAddress, ()}
 super::impl_inst_build! {EvmBalance, (contract_addr: ValueId)}
 super::impl_inst_build! {EvmOrigin, ()}
@@ -32,6 +36,7 @@ super::impl_inst_build! {EvmCalldataLoad, (data_offset: ValueId)}
 super::impl_inst_build! {EvmCalldataCopy, (dst_addr: ValueId, data_offset: ValueId, len: ValueId)}
 super::impl_inst_build! {EvmCalldataSize, ()}
 super::impl_inst_build! {EvmCodeSize, ()}
+super::impl_inst_build! {EvmCodeLoad, (code_offset: ValueId)}
 super::impl_inst_build! {EvmCodeCopy, (dst_addr: ValueId, code_offset: ValueId, len: ValueId)}
 super::impl_inst_build! {EvmGasPrice, ()}
 super::impl_inst_build! {EvmExtCodeSize, (ext_addr: ValueId)}
@@ -50,6 +55,8 @@ super::impl_inst_build! {EvmSelfBalance, ()}
 super::impl_inst_build! {EvmBaseFee, ()}
 super::impl_inst_build! {EvmBlobHash, (idx: ValueId)}
 super::impl_inst_build! {EvmBlobBaseFee, ()}
+super::impl_inst_build! {EvmMload, (addr: ValueId)}
+super::impl_inst_build! {EvmMstore, (addr: ValueId, value: ValueId)}
 super::impl_inst_build! {EvmMstore8, (addr: ValueId, val: ValueId)}
 super::impl_inst_build! {EvmSload, (key: ValueId)}
 super::impl_inst_build! {EvmSstore, (key: ValueId, val: ValueId)}
@@ -64,8 +71,8 @@ super::impl_inst_build! {EvmLog2, (addr: ValueId, len: ValueId, topic0: ValueId,
 super::impl_inst_build! {EvmLog3, (addr: ValueId, len: ValueId, topic0: ValueId, topic1: ValueId, topic2: ValueId)}
 super::impl_inst_build! {EvmLog4, (addr: ValueId, len: ValueId, topic0: ValueId, topic1: ValueId, topic2: ValueId, topic3: ValueId)}
 super::impl_inst_build! {EvmCreate, (val: ValueId, addr: ValueId, len: ValueId)}
-super::impl_inst_build! {EvmCall, (gas: ValueId, addr: ValueId, val: ValueId, arg_addr: ValueId, arg_len: ValueId, ret_addr: ValueId, ret_offset: ValueId)}
-super::impl_inst_build! {EvmCallCode, (gas: ValueId, addr: ValueId, val: ValueId, arg_addr: ValueId, arg_len: ValueId, ret_addr: ValueId, ret_offset: ValueId)}
+super::impl_inst_build! {EvmCall, (gas: ValueId, addr: ValueId, val: ValueId, arg_addr: ValueId, arg_len: ValueId, ret_addr: ValueId, ret_len: ValueId)}
+super::impl_inst_build! {EvmCallCode, (gas: ValueId, addr: ValueId, val: ValueId, arg_addr: ValueId, arg_len: ValueId, ret_addr: ValueId, ret_len: ValueId)}
 super::impl_inst_build! {EvmReturn, (addr: ValueId, len: ValueId)}
 super::impl_inst_build! {EvmDelegateCall, (gas: ValueId, ext_addr: ValueId, arg_addr: ValueId, arg_len: ValueId, ret_addr: ValueId, ret_len: ValueId)}
 super::impl_inst_build! {EvmCreate2, (val: ValueId, addr: ValueId, len: ValueId, salt: ValueId)}
@@ -73,3 +80,17 @@ super::impl_inst_build! {EvmStaticCall, (gas: ValueId, ext_addr: ValueId, arg_ad
 super::impl_inst_build! {EvmRevert, (addr: ValueId, len: ValueId)}
 super::impl_inst_build! {EvmSelfDestruct, (addr: ValueId)}
 super::impl_inst_build! {EvmMalloc, (size: ValueId)}
+
+fn build_evm_keccak256_words(
+    ctx: &mut BuildCtx,
+    fb: &mut FunctionBuilder<ir::func_cursor::InstInserter>,
+    args: &[ast::InstArg],
+    has_inst: &dyn HasInst<EvmKeccak256Words>,
+) -> Result<EvmKeccak256Words, Box<Error>> {
+    let mut words = SmallVec::new();
+    let mut ast_args = args.iter().peekable();
+    while ast_args.peek().is_some() {
+        words.push(super::process_arg!(ctx, fb, ast_args, ValueId));
+    }
+    Ok(EvmKeccak256Words::new(has_inst, words))
+}

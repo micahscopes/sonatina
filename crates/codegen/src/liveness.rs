@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 
 use crate::bitset::BitSet;
 use cranelift_entity::SecondaryMap;
+use smallvec::SmallVec;
 use sonatina_ir::{BlockId, Function, InstId, ValueId, cfg::ControlFlowGraph};
 
 #[derive(Default)]
@@ -171,6 +172,15 @@ impl InstLiveness {
 
         for block in cfg.post_order() {
             let mut live = liveness.block_live_outs(block).clone();
+            // Phi inputs are uses at the block's tail, which its live-outs
+            // omit when the input is defined in the block.
+            for &succ in cfg.succs_of(block) {
+                for value in phi_args_for_edge(func, block, succ) {
+                    if !func.dfg.value_is_imm(value) {
+                        live.insert(value);
+                    }
+                }
+            }
 
             let insts: Vec<_> = func.layout.iter_inst(block).collect();
             for inst in insts.into_iter().rev() {
@@ -232,6 +242,26 @@ pub fn value_uses_in_block_matching_predicate(
         }
     });
     counts
+}
+
+/// Phi inputs consumed on `pred -> succ`, in successor phi order.
+/// These predecessor-tail uses may be absent from `block_live_outs` when the
+/// input is defined in `pred`, so reverse instruction scans must add them.
+pub(crate) fn phi_args_for_edge(
+    func: &Function,
+    pred: BlockId,
+    succ: BlockId,
+) -> SmallVec<[ValueId; 4]> {
+    func.layout
+        .iter_inst(succ)
+        .map_while(|inst| {
+            func.dfg.cast_phi(inst).and_then(|phi| {
+                phi.args()
+                    .iter()
+                    .find_map(|(val, block)| (*block == pred).then_some(*val))
+            })
+        })
+        .collect()
 }
 
 fn for_each_use(func: &Function, block: BlockId, mut f: impl FnMut(ValueId, Option<BlockId>)) {
@@ -387,8 +417,7 @@ block0:
 
             let call_inst = function
                 .layout
-                .iter_block()
-                .flat_map(|b| function.layout.iter_inst(b))
+                .iter_all_insts()
                 .find(|&inst| function.dfg.call_info(inst).is_some())
                 .expect("missing call inst");
 
@@ -407,5 +436,56 @@ block0:
             .view(caller, |function| inst_live.call_live_values(function));
         assert!(call_live.contains(v1));
         assert!(!call_live.contains(v2));
+    }
+
+    #[test]
+    fn phi_inputs_defined_in_the_predecessor_stay_live_to_its_tail() {
+        const SRC: &str = r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.i256) -> i256 {
+block0:
+    v1.i256 = add v0 1.i256;
+    v2.i256 = add v0 2.i256;
+    jump block1;
+
+block1:
+    v3.i256 = phi (v1 block0) (v4 block1);
+    v4.i256 = add v3 v2;
+    v5.i1 = lt v4 100.i256;
+    br v5 block1 block2;
+
+block2:
+    return v4;
+}
+"#;
+
+        let parsed = parse_module(SRC).unwrap();
+        let f = *parsed.module.funcs().first().unwrap();
+        let v = |n: usize| parsed.debug.value(f, &format!("v{n}")).unwrap();
+
+        let (inst_live, v2_def, loop_add) = parsed.module.func_store.view(f, |function| {
+            let mut cfg = ControlFlowGraph::new();
+            cfg.compute(function);
+
+            let mut live = Liveness::default();
+            live.compute(function, &cfg);
+
+            let mut inst_live = InstLiveness::default();
+            inst_live.compute(function, &cfg, &live);
+
+            let def_of = |value| {
+                function
+                    .layout
+                    .iter_all_insts()
+                    .find(|&inst| function.dfg.inst_results(inst).contains(&value))
+                    .unwrap()
+            };
+            (inst_live, def_of(v(2)), def_of(v(4)))
+        });
+
+        // `v1` feeds `block1`'s phi from `block0`, and `v4` its own backedge.
+        assert!(inst_live.live_out(v2_def).contains(v(1)));
+        assert!(inst_live.live_out(loop_add).contains(v(4)));
     }
 }

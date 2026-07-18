@@ -1,10 +1,48 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use sonatina_ir::{
     DataFlowGraph, Type, U256, ValueId,
     module::ModuleCtx,
     types::{CompoundType, EnumData, EnumVariantRef, TypeStore},
 };
+
+// References embedded in SSA aggregates have no object slice/capture identity.
+// Classify by type so arguments, phi results and call returns share the boundary.
+pub(crate) fn is_reference_aggregate(module: &ModuleCtx, ty: Type) -> bool {
+    module.with_ty_store(|types| {
+        if !matches!(
+            compound_ty(types, ty),
+            Some(CompoundType::Array { .. } | CompoundType::Struct(_) | CompoundType::Enum(_))
+        ) {
+            return false;
+        }
+        let mut pending = vec![ty];
+        let mut seen = FxHashSet::default();
+        while let Some(ty) = pending.pop() {
+            if !seen.insert(ty) {
+                continue;
+            }
+            match compound_ty(types, ty) {
+                Some(
+                    CompoundType::ObjRef(_) | CompoundType::Ptr(_) | CompoundType::ConstRef(_),
+                ) => {
+                    return true;
+                }
+                Some(CompoundType::Array { elem, len }) if *len != 0 => pending.push(*elem),
+                Some(CompoundType::Struct(data)) => pending.extend(data.fields.iter().copied()),
+                Some(CompoundType::Enum(data)) => {
+                    pending.extend(
+                        data.variants
+                            .iter()
+                            .flat_map(|variant| variant.fields.iter().copied()),
+                    );
+                }
+                _ => {}
+            }
+        }
+        false
+    })
+}
 
 pub type FieldPath = SmallVec<[u32; 4]>;
 pub type RuntimeLeaves = SmallVec<[AggregateLeaf; 4]>;
@@ -85,6 +123,54 @@ impl AggregateLayoutCache {
 
     pub fn shape(&mut self, module: &ModuleCtx, ty: Type) -> Option<AggregateShape> {
         self.with_layout(module, |layout| layout.shape(ty))
+    }
+
+    /// Count coordinates without constructing paths or layouts for every leaf.
+    pub fn shape_leaf_count(&mut self, module: &ModuleCtx, ty: Type) -> Option<usize> {
+        self.with_layout(module, |layout| {
+            if !layout.is_supported_scalar_shape_ty(ty) {
+                return None;
+            }
+            layout.flattened_leaf_count(ty)
+        })
+    }
+
+    pub(crate) fn child_containing_slice(
+        &mut self,
+        module: &ModuleCtx,
+        ty: Type,
+        slice: AggregateSlice,
+    ) -> Option<(u32, AggregateSlice)> {
+        self.with_layout(module, |layout| {
+            if let Some(CompoundType::Array { elem, len }) = compound_ty(layout.types, ty) {
+                let (elem, len) = (*elem, *len);
+                let count = layout.flattened_leaf_count(elem)?;
+                let index = slice.first_leaf.checked_div(count)?;
+                if index >= len
+                    || slice.first_leaf.checked_add(slice.leaf_count)?
+                        > (index + 1).checked_mul(count)?
+                {
+                    return None;
+                }
+                return Some((
+                    u32::try_from(index).ok()?,
+                    AggregateSlice {
+                        ty: elem,
+                        first_leaf: index * count,
+                        leaf_count: count,
+                    },
+                ));
+            }
+            let count = layout.aggregate_child_count(ty)?;
+            (0..count).find_map(|index| {
+                let index = u32::try_from(index).ok()?;
+                let child = layout.aggregate_slice_for_index(ty, index)?;
+                (child.first_leaf <= slice.first_leaf
+                    && slice.first_leaf.checked_add(slice.leaf_count)?
+                        <= child.first_leaf.checked_add(child.leaf_count)?)
+                .then_some((index, child))
+            })
+        })
     }
 
     pub fn runtime_leaves(&mut self, module: &ModuleCtx, ty: Type) -> Option<RuntimeLeaves> {
@@ -1439,15 +1525,83 @@ pub fn enum_variant_field_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::parse_test_module;
     use sonatina_ir::{
-        DataFlowGraph, Type,
-        module::Module,
+        DataFlowGraph, Type, ValueId,
         types::{EnumReprHint, VariantData},
     };
-    use sonatina_parser::parse_module;
 
-    fn parse_test_module(src: &str) -> Module {
-        parse_module(src).expect("parse should succeed").module
+    use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_module};
+
+    use crate::transform::aggregate::{
+        compute_object_effect_summaries, object_tracking::AggregateFacts,
+        provenance::ProvenanceSnapshot,
+    };
+
+    #[test]
+    fn large_object_access_facts_do_not_materialize_leaf_layouts() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+func private %f(v0.objref<[i256; 1000000]>) -> i256 {
+block0:
+    v1.objref<i256> = obj.index v0 999999.i256;
+    obj.store v1 42.i256;
+    v2.i256 = obj.load v1;
+    return v2;
+}
+"#,
+        );
+        let report = verify_module(&module, &VerifierConfig::for_level(VerificationLevel::Full));
+        assert!(report.is_ok(), "{report}");
+        let effects = compute_object_effect_summaries(&module);
+        let func_ref = module.funcs()[0];
+        module.func_store.view(func_ref, |func| {
+            let mut cache = AggregateLayoutCache::default();
+            let mut snapshot = ProvenanceSnapshot::new(func, Some(&effects));
+            let facts = AggregateFacts::for_call_planner(func, &mut cache, &mut snapshot);
+            assert_eq!(
+                facts.root_slices()[&func.arg_values[0]].leaf_count,
+                1_000_000
+            );
+            let field = facts
+                .complete()
+                .exact_projection(ValueId::from_u32(1))
+                .unwrap();
+            assert_eq!(
+                (field.slice.first_leaf, field.slice.leaf_count),
+                (999_999, 1)
+            );
+            assert!(cache.shape_cache.is_empty());
+            assert!(cache.runtime_leaf_cache.is_empty());
+            assert!(cache.flattened_leaf_count_cache.len() <= 2);
+        });
+    }
+
+    #[test]
+    fn sparse_leaf_counts_match_nested_shape_coordinates() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+type @Empty = {};
+type @Bytes = { [i8; 3] };
+type @Choice = enum { #None, #Pair(i256,@Bytes) };
+type @Nested = { @Empty, [@Choice; 2], objref<i256>, [i256; 0] };
+func private %f() {
+block0:
+    return;
+}
+"#,
+        );
+        let mut cache = AggregateLayoutCache::default();
+        for name in ["Empty", "Nested"] {
+            let ty = module
+                .ctx
+                .with_ty_store(|types| Type::Compound(types.lookup_struct(name).unwrap()));
+            let count = cache.shape_leaf_count(&module.ctx, ty).unwrap();
+            let shape = cache.shape(&module.ctx, ty).unwrap();
+            assert_eq!(count, shape.leaves.len(), "{name}");
+        }
     }
 
     #[test]

@@ -8,6 +8,9 @@ on:
     branches:
       - "**"
 
+# Only main saves Rust caches. A pull request's caches are visible to that pull
+# request alone, and saving them on every push evicts main's caches under the
+# repository's 10 GB limit.
 jobs:
   doc:
     name: Doc
@@ -19,7 +22,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo doc --workspace --all-features --no-deps
 
   fmt:
     name: Rustfmt
@@ -31,8 +36,9 @@ jobs:
         with:
           toolchain: nightly
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      - run: rustfmt --edition 2024 crates/sp1/runtime/src/lib.rs --check
+      - run: cargo fmt --manifest-path tests/sp1/Cargo.toml -- --check
 
   clippy:
     name: Clippy
@@ -44,23 +50,101 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-features --all-targets -- -D clippy::all
 
-  unused_deps:
-    name: Unused dependencies
+  cranelift_feature_off:
+    name: Cranelift feature off
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          toolchain: nightly
-      - name: Install cargo-udeps
-        uses: baptiste0928/cargo-install@v3
-        with:
-          crate: cargo-udeps
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check -p sonatina-codegen --no-default-features
+      - name: Check that Cranelift dependencies do not leak
+        shell: bash
+        run: |
+          if cargo tree -p sonatina-codegen --no-default-features -e normal | grep -q 'cranelift-\(codegen\|frontend\|module\|native\|object\|jit\)'; then
+            echo 'Cranelift dependencies are active without the cranelift feature'
+            exit 1
+          fi
 
-      - run: cargo +nightly udeps
+  cranelift_native:
+    name: Cranelift native (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64-linux
+          - os: macos-15
+            arch: aarch64-macos
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test object-only feature and linked C executables
+        run: cargo test -p sonatina-codegen --features cranelift --test cranelift_object
+      - name: Test host-native JIT and object backends
+        run: cargo test -p sonatina-codegen --features cranelift-jit --test cranelift_object --test cranelift_jit
+
+  cranelift_windows_check:
+    name: Cranelift Windows compile check
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check -p sonatina-codegen --features cranelift-jit --all-targets
+
+  sp1_lockfile:
+    name: SP1 lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # This excluded workspace shares local crates with the root workspace.
+      # Resolve its dependencies on PRs without building the SDK or guests.
+      - name: Check SDK harness lockfile
+        run: cargo metadata --locked --manifest-path tests/sp1/Cargo.toml --format-version 1 > /dev/null
+
+  sp1:
+    name: SP1 RV64IM
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      # The runner context is only available to steps, not job-level env.
+      - name: Locate the Succinct toolchain directory
+        run: echo "SONATINA_SP1_TOOLCHAIN=$RUNNER_TEMP/sonatina-sp1-toolchain" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            . -> target
+            tests/sp1 -> target
+      - name: Test SP1 objects without the Succinct toolchain
+        run: cargo test --locked -p sonatina-codegen --features sp1,cranelift-jit --test cranelift_sp1
+      - name: Install checksum-pinned Succinct toolchain
+        run: bash crates/sp1/install-toolchain.sh "$SONATINA_SP1_TOOLCHAIN"
+      # The SDK's prover types are generated from protobuf definitions.
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # The CPU core proof and the harness lint run in the SP1 proof workflow.
+      - name: Execute guests
+        run: cargo test --locked --release --manifest-path tests/sp1/Cargo.toml
 
   test:
     name: Test
@@ -74,17 +158,14 @@ jobs:
           - ubuntu-latest
           - macos-latest
           - windows-latest
-        rust:
-          - stable
-          - nightly
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: ${{ matrix.rust }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Test
         run: cargo test --workspace --all-targets --no-fail-fast

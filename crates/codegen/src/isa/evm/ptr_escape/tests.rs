@@ -1,0 +1,1580 @@
+use super::*;
+use sonatina_ir::{InstSetExt, inst::evm::inst_set::EvmInstKind, isa::Isa};
+use sonatina_parser::parse_module;
+use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
+
+fn arg_may_escape(summary: &PtrEscapeSummary) -> Vec<bool> {
+    (0..summary.arg_count())
+        .map(|idx| summary.arg_may_escape(idx))
+        .collect()
+}
+
+fn arg_may_be_returned(summary: &PtrEscapeSummary) -> Vec<bool> {
+    (0..summary.arg_count())
+        .map(|idx| summary.arg_may_be_returned(idx))
+        .collect()
+}
+
+fn ret_args(summary: &PtrEscapeSummary, ret_idx: usize) -> Vec<u32> {
+    summary.returned_arg_indices(ret_idx).to_vec()
+}
+
+fn arg_store_targets(summary: &PtrEscapeSummary, idx: usize) -> Vec<u32> {
+    summary.arg_store_targets(idx).to_vec()
+}
+
+fn compute(
+    src: &str,
+) -> (
+    FxHashMap<String, PtrEscapeSummary>,
+    FxHashMap<String, FuncRef>,
+) {
+    let parsed = parse_module(src).unwrap();
+    let funcs: Vec<FuncRef> = parsed.module.funcs();
+    let mut names: FxHashMap<String, FuncRef> = FxHashMap::default();
+    for f in funcs.iter().copied() {
+        let name = parsed.module.ctx.func_sig(f, |sig| sig.name().to_string());
+        names.insert(name, f);
+    }
+
+    let isa = Evm::new(TargetTriple {
+        architecture: Architecture::Evm,
+        vendor: Vendor::Ethereum,
+        operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
+    });
+
+    let summaries = compute_ptr_escape_summaries(&parsed.module, &funcs, &isa);
+
+    let mut out: FxHashMap<String, PtrEscapeSummary> = FxHashMap::default();
+    for (name, f) in &names {
+        if let Some(sum) = summaries.get(*f) {
+            out.insert(name.clone(), sum.clone());
+        }
+    }
+
+    (out, names)
+}
+
+fn call_arg_may_escape_from_src(src: &str, func_name: &str, arg_index: usize) -> bool {
+    let parsed = parse_module(src).expect("module parses");
+    let funcs: Vec<FuncRef> = parsed.module.funcs();
+    let isa = Evm::new(TargetTriple {
+        architecture: Architecture::Evm,
+        vendor: Vendor::Ethereum,
+        operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
+    });
+    let summaries = compute_ptr_escape_summaries(&parsed.module, &funcs, &isa);
+    let func_ref = parsed
+        .module
+        .funcs()
+        .into_iter()
+        .find(|&func| {
+            parsed
+                .module
+                .ctx
+                .func_sig(func, |sig| sig.name() == func_name)
+        })
+        .expect("function exists");
+
+    parsed.module.func_store.view(func_ref, |function| {
+        let prov = compute_provenance(function, &parsed.module.ctx, &isa, &summaries).value;
+        let call_inst = function
+            .layout
+            .iter_all_insts()
+            .find(|&inst| function.dfg.call_info(inst).is_some())
+            .expect("call exists");
+        let EvmInstKind::Call(call) = isa.inst_set().resolve_inst(function.dfg.inst(call_inst))
+        else {
+            panic!("expected internal call");
+        };
+        let callee_sum = summaries.get_or_conservative(&parsed.module.ctx, *call.callee());
+
+        callee_sum.call_arg_may_escape_nonlocal(arg_index, call.args(), &prov)
+    })
+}
+
+fn ret_provenance_from_src(src: &str, func_name: &str) -> Provenance {
+    let parsed = parse_module(src).expect("module parses");
+    let funcs: Vec<FuncRef> = parsed.module.funcs();
+    let isa = Evm::new(TargetTriple {
+        architecture: Architecture::Evm,
+        vendor: Vendor::Ethereum,
+        operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
+    });
+    let summaries = compute_ptr_escape_summaries(&parsed.module, &funcs, &isa);
+    let func_ref = parsed
+        .module
+        .funcs()
+        .into_iter()
+        .find(|&func| {
+            parsed
+                .module
+                .ctx
+                .func_sig(func, |sig| sig.name() == func_name)
+        })
+        .expect("function exists");
+
+    parsed.module.func_store.view(func_ref, |function| {
+        let prov = compute_provenance(function, &parsed.module.ctx, &isa, &summaries).value;
+
+        for block in function.layout.iter_block() {
+            for inst in function.layout.iter_inst(block) {
+                let data = isa.inst_set().resolve_inst(function.dfg.inst(inst));
+                if let EvmInstKind::Return(_) = data
+                    && let Some(ret_val) = function
+                        .dfg
+                        .return_args(inst)
+                        .and_then(|args| args.first().copied())
+                {
+                    return prov[ret_val].clone();
+                }
+            }
+        }
+
+        panic!("no return value in function");
+    })
+}
+
+#[test]
+fn ptr_escape_direct_return() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %g(v0.*i8) -> *i8 {
+block0:
+return v0;
+}
+"#,
+    );
+
+    let g = &summaries["g"];
+    assert_eq!(ret_args(g, 0), vec![0]);
+    assert!(!g.return_may_be_non_arg_pointer(0));
+    assert_eq!(arg_may_be_returned(g), vec![true]);
+    assert_eq!(arg_may_escape(g), vec![false]);
+}
+
+#[test]
+fn heap_publication_propagates_through_recursive_calls() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func private %publish(v0.**i8) {
+block0:
+v1.*i8 = evm_malloc 32.i256;
+mstore v0 v1 *i8;
+return;
+}
+
+func private %first(v0.**i8, v1.i1) {
+block0:
+br v1 block1 block2;
+block1:
+call %second v0 0.i1;
+return;
+block2:
+call %publish v0;
+return;
+}
+
+func private %second(v0.**i8, v1.i1) {
+block0:
+call %first v0 v1;
+return;
+}
+
+func private %private_scratch() -> i256 {
+block0:
+v0.*i8 = evm_malloc 32.i256;
+mstore v0 7.i256 i256;
+return 7.i256;
+}
+
+func private %return_only() -> *i8 {
+block0:
+v0.*i8 = evm_malloc 32.i256;
+return v0;
+}
+
+func private %discard_return() {
+block0:
+v0.*i8 = call %return_only;
+return;
+}
+"#,
+    );
+
+    for name in ["publish", "first", "second"] {
+        assert!(summaries[name].may_publish_heap, "{name}");
+    }
+    for name in ["private_scratch", "return_only", "discard_return"] {
+        assert!(!summaries[name].may_publish_heap, "{name}");
+    }
+    assert!(summaries["return_only"].return_may_be_non_arg_pointer(0));
+}
+
+#[test]
+fn ptr_escape_propagates_through_calls() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %sink(v0.*i8) {
+block0:
+mstore 0.i32 v0 *i8;
+return;
+}
+
+func public %f(v0.*i8) {
+block0:
+call %sink v0;
+return;
+}
+"#,
+    );
+
+    let sink = &summaries["sink"];
+    assert_eq!(arg_may_escape(sink), vec![true]);
+
+    let f = &summaries["f"];
+    assert_eq!(arg_may_escape(f), vec![true]);
+}
+
+#[test]
+fn ptr_escape_call_return_flow() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %id(v0.*i8) -> *i8 {
+block0:
+return v0;
+}
+
+func public %f(v0.*i8) -> *i8 {
+block0:
+v1.*i8 = call %id v0;
+return v1;
+}
+"#,
+    );
+
+    let f = &summaries["f"];
+    assert_eq!(ret_args(f, 0), vec![0]);
+    assert!(!f.return_may_be_non_arg_pointer(0));
+    assert_eq!(arg_may_be_returned(f), vec![true]);
+    assert_eq!(arg_may_escape(f), vec![false]);
+}
+
+#[test]
+fn ptr_escape_tracks_i256_arg_returned_in_aggregate() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+type @Box = {i256};
+
+func public %box(v0.i256) -> @Box {
+block0:
+v1.@Box = insert_value undef.@Box 0.i256 v0;
+return v1;
+}
+"#,
+    );
+
+    let boxed = &summaries["box"];
+    assert_eq!(ret_args(boxed, 0), vec![0]);
+    assert_eq!(arg_may_be_returned(boxed), vec![true]);
+    assert_eq!(arg_may_escape(boxed), vec![false]);
+}
+
+#[test]
+fn ptr_escape_tracks_i256_store_into_i256_out_param_conditionally() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.i256, v1.i256) {
+block0:
+mstore v1 v0 i256;
+return;
+}
+"#,
+    );
+
+    let capture = &summaries["capture"];
+    assert_eq!(arg_may_escape(capture), vec![false, false]);
+    assert_eq!(arg_store_targets(capture, 0), vec![1]);
+    assert!(capture.arg_store_lattice(0).may_store_to_arg());
+    assert!(!capture.arg_store_lattice(0).may_store_nonlocal());
+}
+
+#[test]
+fn ptr_escape_tracks_i256_malloc_return_as_non_arg_pointer() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %mk() -> i256 {
+block0:
+v0.*i8 = evm_malloc 32.i256;
+v1.i256 = ptr_to_int v0 i256;
+return v1;
+}
+"#,
+    );
+
+    let mk = &summaries["mk"];
+    assert!(mk.return_may_be_non_arg_pointer(0));
+    assert!(ret_args(mk, 0).is_empty());
+    assert_eq!(arg_may_be_returned(mk), Vec::<bool>::new());
+}
+
+#[test]
+fn ptr_escape_keeps_i256_arg_store_into_local_malloc_local() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %scratch(v0.i256) {
+block0:
+v1.*i8 = evm_malloc 32.i256;
+v2.i256 = ptr_to_int v1 i256;
+mstore v2 v0 i256;
+return;
+}
+"#,
+    );
+
+    let scratch = &summaries["scratch"];
+    assert_eq!(arg_may_escape(scratch), vec![false]);
+    assert!(scratch.arg_store_lattice(0).may_store_local());
+    assert!(!scratch.arg_store_lattice(0).may_store_nonlocal());
+}
+
+#[test]
+fn ptr_escape_marks_i256_arg_stored_into_returned_malloc_as_escaping() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %box(v0.i256) -> i256 {
+block0:
+v1.*i8 = evm_malloc 32.i256;
+v2.i256 = ptr_to_int v1 i256;
+mstore v2 v0 i256;
+return v2;
+}
+"#,
+    );
+
+    let boxed = &summaries["box"];
+    assert!(boxed.return_may_be_non_arg_pointer(0));
+    assert_eq!(arg_may_escape(boxed), vec![true]);
+    assert_eq!(arg_may_be_returned(boxed), vec![false]);
+}
+
+#[test]
+fn ptr_escape_closes_escaping_malloc_contents() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %box(v0.i256) -> i256 {
+block0:
+v1.*i8 = evm_malloc 32.i256;
+v2.i256 = ptr_to_int v1 i256;
+mstore v2 v0 i256;
+v3.*i8 = evm_malloc 32.i256;
+v4.i256 = ptr_to_int v3 i256;
+mstore v4 v2 i256;
+return v4;
+}
+"#,
+    );
+
+    let boxed = &summaries["box"];
+    assert!(boxed.return_may_be_non_arg_pointer(0));
+    assert_eq!(arg_may_escape(boxed), vec![true]);
+    assert_eq!(arg_may_be_returned(boxed), vec![false]);
+}
+
+#[test]
+fn conservative_unknown_i256_return_is_not_pointer_provenance() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.i256) -> i256 {
+block0:
+return 0.i256;
+}
+"#,
+    )
+    .expect("module parses");
+    let f = parsed
+        .module
+        .funcs()
+        .into_iter()
+        .find(|&func| parsed.module.ctx.func_sig(func, |sig| sig.name() == "f"))
+        .expect("function exists");
+
+    let summary = PtrEscapeSummary::conservative_unknown_ctx(&parsed.module.ctx, f);
+    assert!(summary.may_publish_heap);
+    assert!(!summary.return_may_be_non_arg_pointer(0));
+    assert_eq!(ret_args(&summary, 0), Vec::<u32>::new());
+}
+
+#[test]
+fn conservative_unknown_i256_args_do_not_create_pointer_store_effects() {
+    let parsed = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %scalar(v0.i256, v1.i256) {
+block0:
+return;
+}
+
+func public %ptr(v0.*i8, v1.*i8) {
+block0:
+return;
+}
+"#,
+    )
+    .expect("module parses");
+    let scalar = parsed
+        .module
+        .funcs()
+        .into_iter()
+        .find(|&func| {
+            parsed
+                .module
+                .ctx
+                .func_sig(func, |sig| sig.name() == "scalar")
+        })
+        .expect("function exists");
+    let ptr = parsed
+        .module
+        .funcs()
+        .into_iter()
+        .find(|&func| parsed.module.ctx.func_sig(func, |sig| sig.name() == "ptr"))
+        .expect("function exists");
+
+    let scalar = PtrEscapeSummary::conservative_unknown_ctx(&parsed.module.ctx, scalar);
+    assert_eq!(arg_may_escape(&scalar), vec![false, false]);
+    assert_eq!(arg_store_targets(&scalar, 0), Vec::<u32>::new());
+    assert_eq!(arg_store_targets(&scalar, 1), Vec::<u32>::new());
+
+    let ptr = PtrEscapeSummary::conservative_unknown_ctx(&parsed.module.ctx, ptr);
+    assert_eq!(arg_may_escape(&ptr), vec![true, true]);
+    assert_eq!(arg_store_targets(&ptr, 0), vec![0, 1]);
+    assert_eq!(arg_store_targets(&ptr, 1), vec![0, 1]);
+}
+
+#[test]
+fn ptr_escape_does_not_forward_i256_arg_after_narrowing_to_noncarrier() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.i256, v1.i256) {
+block0:
+v2.i8 = trunc v0 i8;
+mstore v1 v2 i8;
+return;
+}
+"#,
+    );
+
+    let capture = &summaries["capture"];
+    assert_eq!(arg_may_escape(capture), vec![false, false]);
+    assert_eq!(arg_store_targets(capture, 0), Vec::<u32>::new());
+}
+
+#[test]
+fn ptr_escape_non_arg_unknown_return_does_not_mark_all_args_returned() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.*i8, v1.*i8) -> *i8 {
+block0:
+v2.*i8 = int_to_ptr 0.i32 *i8;
+return v2;
+}
+"#,
+    );
+
+    let f = &summaries["f"];
+    assert!(f.return_may_be_non_arg_pointer(0));
+    assert_eq!(arg_may_be_returned(f), vec![false, false]);
+    assert_eq!(arg_may_escape(f), vec![false, false]);
+}
+
+#[test]
+fn ptr_escape_non_arg_unknown_store_does_not_mark_all_args_escape() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.*i8, v1.*i8) {
+block0:
+v2.*i8 = int_to_ptr 0.i32 *i8;
+mstore 0.i32 v2 *i8;
+return;
+}
+"#,
+    );
+
+    let f = &summaries["f"];
+    assert_eq!(arg_may_be_returned(f), vec![false, false]);
+    assert_eq!(arg_may_escape(f), vec![false, false]);
+}
+
+#[test]
+fn ptr_escape_tracks_pointer_store_into_out_param_arg_conditionally() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.*i8, v1.**i8) {
+block0:
+mstore v1 v0 *i8;
+return;
+}
+"#,
+    );
+
+    let capture = &summaries["capture"];
+    assert_eq!(arg_may_escape(capture), vec![false, false]);
+    assert_eq!(arg_may_be_returned(capture), vec![false, false]);
+    assert_eq!(
+        arg_store_targets(capture, 0),
+        vec![1],
+        "arg 0 should only escape through arg 1"
+    );
+    assert!(
+        capture.arg_store_targets(1).is_empty(),
+        "out-param itself should not be marked as forwarded"
+    );
+    assert!(capture.arg_store_lattice(0).may_store_to_arg());
+    assert!(!capture.arg_store_lattice(0).may_store_nonlocal());
+}
+
+#[test]
+fn ptr_escape_preserves_self_target_arg_stores() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.**i8) {
+block0:
+mstore v0 v0 **i8;
+return;
+}
+"#,
+    );
+
+    let capture = &summaries["capture"];
+    assert_eq!(arg_may_escape(capture), vec![false]);
+    assert_eq!(arg_may_be_returned(capture), vec![false]);
+    assert_eq!(
+        arg_store_targets(capture, 0),
+        vec![0],
+        "self-target out-param stores must stay modeled"
+    );
+    assert!(capture.arg_store_lattice(0).may_store_to_arg());
+    assert!(!capture.arg_store_lattice(0).may_store_nonlocal());
+}
+
+#[test]
+fn ptr_escape_self_target_call_preserves_local_roundtrip_provenance() {
+    let ret_prov = ret_provenance_from_src(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.**i8) {
+block0:
+mstore v0 v0 **i8;
+return;
+}
+
+func public %wrapper() -> **i8 {
+block0:
+v0.**i8 = alloca *i8;
+call %capture v0;
+v1.**i8 = mload v0 **i8;
+return v1;
+}
+"#,
+        "wrapper",
+    );
+
+    assert!(ret_prov.is_local_addr(), "{ret_prov:?}");
+    assert_eq!(ret_prov.alloca_insts().count(), 1);
+}
+
+#[test]
+fn ptr_escape_keeps_nonlocal_outparam_destinations_context_sensitive() {
+    let src = r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.*i8, v1.**i8) {
+block0:
+mstore v1 v0 *i8;
+mstore 0.i32 v1 **i8;
+return;
+}
+
+func public %top_arg(v0.*i8, v1.**i8) {
+block0:
+call %capture v0 v1;
+return;
+}
+
+func public %top_local(v0.*i8) {
+block0:
+v1.**i8 = alloca *i8;
+call %capture v0 v1;
+return;
+}
+"#;
+    let (summaries, _) = compute(src);
+
+    let capture = &summaries["capture"];
+    assert_eq!(arg_may_escape(capture), vec![false, true]);
+    assert_eq!(
+        arg_store_targets(capture, 0),
+        vec![1],
+        "source arg should keep only the forwarded out-param target"
+    );
+    assert!(!capture.arg_store_lattice(0).may_store_nonlocal());
+    assert!(capture.arg_store_lattice(0).may_store_to_arg());
+    assert!(capture.arg_store_lattice(1).may_store_nonlocal());
+
+    assert!(
+        call_arg_may_escape_from_src(src, "top_arg", 0),
+        "arg-backed out-param should still make the source escape"
+    );
+    assert!(
+        !call_arg_may_escape_from_src(src, "top_local", 0),
+        "caller-local out-param should remain non-escaping"
+    );
+}
+
+#[test]
+fn ptr_escape_local_out_param_capture_does_not_mark_caller_arg_escape() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+type @Take = {i256, *[i256; 8]};
+
+func public %take(v7.*@Take, v0.i256, v1.*[i256; 8]) {
+block0:
+v3.*i256 = bitcast v7 *i256;
+mstore v3 v0 i256;
+v4.**[i256; 8] = gep v7 0.i256 1.i256;
+mstore v4 v1 *[i256; 8];
+return;
+}
+
+func public %take_get(v0.*@Take, v1.i256) -> i256 {
+block0:
+v3.**[i256; 8] = gep v0 0.i256 1.i256;
+v4.*[i256; 8] = mload v3 *[i256; 8];
+v5.*i256 = gep v4 0.i256 v1;
+v6.i256 = mload v5 i256;
+return v6;
+}
+
+func public %sum_last4(v0.*[i256; 8]) -> i256 {
+block0:
+v1.*@Take = alloca @Take;
+call %take v1 4.i256 v0;
+v2.i256 = call %take_get v1 0.i256;
+return v2;
+}
+"#,
+    );
+
+    let take = &summaries["take"];
+    assert_eq!(arg_may_escape(take), vec![false, false, false]);
+    assert_eq!(
+        arg_store_targets(take, 2),
+        vec![0],
+        "take should forward arg 2 only into the synthetic out-param"
+    );
+
+    let sum_last4 = &summaries["sum_last4"];
+    assert_eq!(
+        arg_may_escape(sum_last4),
+        vec![false],
+        "caller-local synthetic out-param must not count as an escape"
+    );
+}
+
+#[test]
+fn ptr_escape_resolves_outparam_arg_escapes_through_callers() {
+    let src = r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.*i8, v1.**i8) {
+block0:
+mstore v1 v0 *i8;
+return;
+}
+
+func public %wrapper(v0.*i8, v1.**i8) {
+block0:
+call %capture v0 v1;
+return;
+}
+
+func public %through_arg(v0.*i8, v1.**i8) {
+block0:
+call %wrapper v0 v1;
+return;
+}
+
+func public %top_arg(v0.*i8, v1.**i8) {
+block0:
+call %through_arg v0 v1;
+return;
+}
+
+func public %top_local(v0.*i8) {
+block0:
+v1.**i8 = alloca *i8;
+call %through_arg v0 v1;
+return;
+}
+"#;
+    let (summaries, _) = compute(src);
+
+    let wrapper = &summaries["wrapper"];
+    assert_eq!(arg_may_escape(wrapper), vec![false, false]);
+    assert_eq!(
+        arg_store_targets(wrapper, 0),
+        vec![1],
+        "wrapper should still record that arg 0 flows into arg 1"
+    );
+
+    let through_arg = &summaries["through_arg"];
+    assert_eq!(
+        arg_may_escape(through_arg),
+        vec![false, false],
+        "intermediate wrappers should keep arg-backed stores contextual"
+    );
+
+    assert!(
+        call_arg_may_escape_from_src(src, "top_arg", 0),
+        "argument-backed out-param should mark the source arg as escaping at the caller boundary"
+    );
+
+    assert!(
+        !call_arg_may_escape_from_src(src, "top_local", 0),
+        "caller-local synthetic out-param must stay non-escaping"
+    );
+}
+
+#[test]
+fn ptr_escape_store_lattice_covers_direct_and_mixed_destinations() {
+    type PtrEscapeCase = (&'static str, &'static str, fn(&PtrEscapeSummary));
+
+    let cases: [PtrEscapeCase; 4] = [
+        (
+            "direct_nonlocal",
+            r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.*i8) {
+block0:
+mstore 0.i32 v0 *i8;
+return;
+}
+"#,
+            |summary: &PtrEscapeSummary| {
+                assert_eq!(arg_may_escape(summary), vec![true]);
+                assert!(summary.arg_store_lattice(0).may_store_nonlocal());
+                assert!(!summary.arg_store_lattice(0).may_store_local());
+                assert!(!summary.arg_store_lattice(0).may_store_to_arg());
+            },
+        ),
+        (
+            "wrapper_arg",
+            r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.*i8, v1.**i8) {
+block0:
+mstore v1 v0 *i8;
+return;
+}
+
+func public %f(v0.*i8, v1.**i8) {
+block0:
+call %capture v0 v1;
+return;
+}
+"#,
+            |summary: &PtrEscapeSummary| {
+                assert_eq!(arg_may_escape(summary), vec![false, false]);
+                assert!(!summary.arg_store_lattice(0).may_store_local());
+                assert!(summary.arg_store_lattice(0).may_store_to_arg());
+                assert!(!summary.arg_store_lattice(0).may_store_nonlocal());
+                assert_eq!(arg_store_targets(summary, 0), vec![1]);
+            },
+        ),
+        (
+            "wrapper_local",
+            r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.*i8, v1.**i8) {
+block0:
+mstore v1 v0 *i8;
+return;
+}
+
+func public %f(v0.*i8) {
+block0:
+v1.**i8 = alloca *i8;
+call %capture v0 v1;
+return;
+}
+"#,
+            |summary: &PtrEscapeSummary| {
+                assert_eq!(arg_may_escape(summary), vec![false]);
+                assert!(summary.arg_store_lattice(0).may_store_local());
+                assert!(!summary.arg_store_lattice(0).may_store_nonlocal());
+                assert!(!summary.arg_store_lattice(0).may_store_to_arg());
+            },
+        ),
+        (
+            "mixed_destinations",
+            r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.*i8, v1.**i8, v2.i1) {
+block0:
+br v2 block1 block2;
+
+block1:
+mstore v1 v0 *i8;
+return;
+
+block2:
+v3.**i8 = alloca *i8;
+mstore v3 v0 *i8;
+return;
+}
+"#,
+            |summary: &PtrEscapeSummary| {
+                assert_eq!(arg_may_escape(summary), vec![false, false, false]);
+                assert!(summary.arg_store_lattice(0).may_store_local());
+                assert!(summary.arg_store_lattice(0).may_store_to_arg());
+                assert!(!summary.arg_store_lattice(0).may_store_nonlocal());
+                assert_eq!(arg_store_targets(summary, 0), vec![1]);
+            },
+        ),
+    ];
+
+    for (name, src, check) in cases {
+        let (summaries, _) = compute(src);
+        check(
+            summaries
+                .get("f")
+                .unwrap_or_else(|| panic!("missing summary for case {name}")),
+        );
+    }
+}
+
+#[test]
+fn ptr_escape_no_transitive_closure_over_arg_store_targets() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %capture(v0.*i8, v1.**i8) {
+block0:
+mstore v1 v0 *i8;
+return;
+}
+
+func public %forward(v0.*i8, v1.**i8, v2.***i8) {
+block0:
+call %capture v0 v1;
+call %capture v1 v2;
+return;
+}
+"#,
+    );
+
+    let forward = &summaries["forward"];
+    assert_eq!(
+        arg_store_targets(forward, 0),
+        vec![1],
+        "arg 0 stores to arg 1 only; no transitive closure to arg 2"
+    );
+    assert_eq!(
+        arg_store_targets(forward, 1),
+        vec![2],
+        "arg 1 stores to arg 2 only"
+    );
+    assert_eq!(
+        arg_may_escape(forward),
+        vec![false, false, false],
+        "no arg should be unconditionally nonlocal"
+    );
+}
+
+#[test]
+fn ptr_escape_mcopy_from_arg_attributes_stored_content_not_source_address() {
+    let src = r#"
+target = "evm-ethereum-osaka"
+
+func public %relay(v0.*i8, v1.**i8, v2.**i8) {
+block0:
+mstore v1 v0 *i8;
+evm_mcopy v2 v1 32.i256;
+return;
+}
+
+func public %top_local(v0.*i8) {
+block0:
+v1.**i8 = alloca *i8;
+v2.**i8 = alloca *i8;
+call %relay v0 v1 v2;
+return;
+}
+
+func public %top_nonlocal_dest(v0.*i8, v1.**i8) {
+block0:
+v2.**i8 = alloca *i8;
+call %relay v0 v2 v1;
+return;
+}
+"#;
+    let (summaries, _) = compute(src);
+
+    let relay = &summaries["relay"];
+    // arg 0's value was stored at *arg1, then mcopy'd to *arg2.
+    // The summary should attribute the escape to arg 0 (the content),
+    // NOT to arg 1 (the source address).
+    assert_eq!(
+        arg_store_targets(relay, 0),
+        vec![1, 2],
+        "arg 0 should flow to both arg 1 (via mstore) and arg 2 (via mcopy of *arg1)"
+    );
+    assert!(
+        !relay.arg_store_targets(1).contains(&2),
+        "arg 1 (source address) should NOT be recorded as storing to arg 2"
+    );
+    assert_eq!(
+        arg_may_escape(relay),
+        vec![false, false, false],
+        "no arg should be unconditionally nonlocal"
+    );
+
+    // When both the mstore dest and mcopy dest are caller-local,
+    // no escape should be reported.
+    assert!(
+        !call_arg_may_escape_from_src(src, "top_local", 0),
+        "arg 0 should not escape when all destinations are caller-local"
+    );
+
+    // When the mcopy destination is nonlocal, arg 0 should escape.
+    assert!(
+        call_arg_may_escape_from_src(src, "top_nonlocal_dest", 0),
+        "arg 0 should escape when mcopy destination is nonlocal"
+    );
+}
+
+#[test]
+fn ptr_escape_mcopy_from_local_to_arg_tracks_content() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %copy_out(v0.*i8, v1.**i8) {
+block0:
+v2.**i8 = alloca *i8;
+mstore v2 v0 *i8;
+evm_mcopy v1 v2 32.i256;
+return;
+}
+"#,
+    );
+
+    let f = &summaries["copy_out"];
+    // arg 0 was stored to local memory, then mcopy'd to *arg 1.
+    // The local branch of mcopy should attribute this to arg 0.
+    assert_eq!(
+        arg_store_targets(f, 0),
+        vec![1],
+        "arg 0 should escape through arg 1 via local-to-arg mcopy"
+    );
+    assert_eq!(
+        arg_may_escape(f),
+        vec![false, false],
+        "no arg should be unconditionally nonlocal"
+    );
+}
+
+#[test]
+fn ptr_escape_mcopy_from_arg_to_local_keeps_escape_local() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %copy_local(v0.*i8, v1.**i8) {
+block0:
+mstore v1 v0 *i8;
+v2.**i8 = alloca *i8;
+evm_mcopy v2 v1 32.i256;
+return;
+}
+"#,
+    );
+
+    let f = &summaries["copy_local"];
+    assert_eq!(arg_store_targets(f, 0), vec![1]);
+    assert!(f.arg_store_lattice(0).may_store_local());
+    assert!(f.arg_store_lattice(0).may_store_to_arg());
+    assert!(!f.arg_store_lattice(0).may_store_nonlocal());
+    assert_eq!(arg_may_escape(f), vec![false, false]);
+}
+
+#[test]
+fn ptr_escape_mstore8_uses_destination_provenance_like_mstore() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %f(v0.*i8, v1.*i8, v2.i1) {
+block0:
+v3.i256 = ptr_to_int v0 i256;
+br v2 block1 block2;
+
+block1:
+evm_mstore8 v1 v3;
+return;
+
+block2:
+v4.*i8 = alloca i8;
+evm_mstore8 v4 v3;
+return;
+}
+"#,
+    );
+
+    let f = &summaries["f"];
+    assert_eq!(arg_store_targets(f, 0), vec![1]);
+    assert!(f.arg_store_lattice(0).may_store_local());
+    assert!(f.arg_store_lattice(0).may_store_to_arg());
+    assert!(!f.arg_store_lattice(0).may_store_nonlocal());
+    assert_eq!(arg_may_escape(f), vec![false, false, false]);
+}
+
+#[test]
+fn loaded_return_depths_and_recursive_widening() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+type @Pair = { i256, i256 };
+func private %load(v0.*i256) -> i256 {
+block0:
+    v1.i256 = mload v0 i256;
+    return v1;
+}
+func private %nested(v0.*i256) -> i256 {
+block0:
+    v1.i256 = call %load v0;
+    v2.i256 = mload v1 i256;
+    return v2;
+}
+func private %offset(v0.*i256) -> i256 {
+block0:
+    v1.i256 = ptr_to_int v0 i256;
+    v2.i256 = add v1 32.i256;
+    v3.i256 = mload v2 i256;
+    return v3;
+}
+func private %wrapped_offset(v0.*i256) -> i256 {
+block0:
+    v1.i256 = call %offset v0;
+    return v1;
+}
+func private %wide(v0.*@Pair) -> i256 {
+block0:
+    v1.@Pair = mload v0 @Pair;
+    v2.i256 = extract_value v1 1.i8;
+    return v2;
+}
+
+func private %recursive(v0.i256, v1.i1) -> i256 {
+block0:
+    v2.i256 = mload v0 i256;
+    br v1 block1 block2;
+block1:
+    return v2;
+block2:
+    v3.i256 = call %recursive v2 v1;
+    return v3;
+}
+"#,
+    );
+    for name in ["offset", "wrapped_offset", "wide"] {
+        let origin = summaries[name].returns[0].origins[0];
+        assert_eq!(
+            (origin.index, origin.depth, origin.exact),
+            (0, 1, false),
+            "{name}: {origin:?}"
+        );
+    }
+    for (name, depth, transitive) in [
+        ("load", 1, false),
+        ("nested", 2, false),
+        ("recursive", 1, true),
+    ] {
+        let summary = &summaries[name];
+        let ret = &summary.returns[0];
+        assert_eq!(ret.origins.len(), 1, "{name}: {ret:?}");
+        let origin = ret.origins[0];
+        assert_eq!(
+            (origin.index, origin.depth, origin.transitive),
+            (0, depth, transitive),
+            "{name}: {ret:?}"
+        );
+        assert!(!ret.heap_pointer && !ret.unknown_pointer, "{name}: {ret:?}");
+    }
+}
+
+#[test]
+fn loaded_argument_stores_and_publication_keep_their_source() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+func private %copy(v0.*i256, v1.*i256) {
+block0:
+    v2.i256 = mload v0 i256;
+    mstore v1 v2 i256;
+    return;
+}
+func private %nested_copy(v0.*i256, v1.*i256) {
+block0:
+    v2.i256 = mload v0 i256;
+    v3.i256 = mload v1 i256;
+    mstore v3 v2 i256;
+    return;
+}
+func private %publish(v0.*i256) {
+block0:
+    v1.i256 = mload v0 i256;
+    mstore 4096.i256 v1 i256;
+    return;
+}
+func private %relay(v0.*i256) {
+block0:
+    call %publish v0;
+    return;
+}
+"#,
+    );
+    for (name, target_depth) in [("copy", 0), ("nested_copy", 1)] {
+        let summary = &summaries[name];
+        assert!(!summary.arg_may_escape(0));
+        let (source, effect) = summary
+            .argument_effects()
+            .find(|(origin, _)| origin.depth == 1 && origin.index == 0)
+            .unwrap();
+        assert!(source.exact);
+        assert_eq!(effect.arg_store_targets.len(), 1, "{name}: {effect:?}");
+        let target = effect.arg_store_targets[0];
+        assert_eq!((target.index, target.depth), (1, target_depth));
+        assert!(!effect.stores.may_store_nonlocal());
+    }
+    for name in ["publish", "relay"] {
+        let summary = &summaries[name];
+        assert!(
+            !summary.arg_may_escape(0),
+            "the descriptor address itself is not published"
+        );
+        assert!(
+            summary
+                .argument_effects()
+                .any(|(origin, effect)| origin.index == 0
+                    && origin.depth == 1
+                    && effect.stores.may_store_nonlocal()),
+            "{name}: {summary:?}"
+        );
+    }
+}
+
+#[test]
+fn callee_output_writes_preserve_heap_and_clobber_origins() {
+    let src = r#"
+target = "evm-ethereum-osaka"
+func private %heap_out(v0.*i256) {
+block0:
+    v1.*i256 = evm_malloc 32.i256;
+    v2.i256 = ptr_to_int v1 i256;
+    mstore v0 v2 i256;
+    return;
+}
+func private %heap_relay(v0.*i256) {
+block0:
+    call %heap_out v0;
+    return;
+}
+func private %clobber(v0.*i256) {
+block0:
+    evm_mstore8 v0 1.i8;
+    return;
+}
+func private %clobber_relay(v0.*i256) {
+block0:
+    call %clobber v0;
+    return;
+}
+func public %heap_caller() -> i256 {
+block0:
+    v0.*i256 = alloca i256;
+    call %heap_relay v0;
+    v1.i256 = mload v0 i256;
+    return v1;
+}
+func public %clobber_caller() -> i256 {
+block0:
+    v0.*i256 = alloca i256;
+    call %clobber_relay v0;
+    v1.i256 = mload v0 i256;
+    return v1;
+}
+"#;
+    let (summaries, _) = compute(src);
+    for name in ["heap_out", "heap_relay"] {
+        assert!(summaries[name].args[0].stored_heap_pointer, "{name}");
+        assert!(!summaries[name].args[0].stored_unknown_pointer, "{name}");
+    }
+    for name in ["clobber", "clobber_relay"] {
+        assert!(summaries[name].args[0].stored_unknown_pointer, "{name}");
+    }
+    let heap = ret_provenance_from_src(src, "heap_caller");
+    assert!(heap.may_reference_heap());
+    assert!(!heap.may_reference_unknown_local());
+    let clobber = ret_provenance_from_src(src, "clobber_caller");
+    assert!(clobber.may_reference_unknown_local());
+}
+
+#[test]
+fn summaries_report_integers_that_may_stand_in_for_pointers() {
+    // `%overwrite` replaces the caller's stored heap pointer with an integer,
+    // so the caller's reloaded word names the heap object or no allocation.
+    let src = r#"
+target = "evm-ethereum-osaka"
+func private %heap() -> i256 {
+block0:
+    v0.*i8 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    return v1;
+}
+func private %joined(v0.i1) -> i256 {
+block0:
+    br v0 block1 block2;
+block1:
+    v1.i256 = call %heap;
+    jump block3;
+block2:
+    jump block3;
+block3:
+    v2.i256 = phi (v1 block1) (96.i256 block2);
+    return v2;
+}
+func private %overwrite(v0.*i256) {
+block0:
+    mstore v0 96.i256 i256;
+    return;
+}
+func public %caller() -> i256 {
+block0:
+    v0.*i256 = alloca i256;
+    v1.i256 = call %heap;
+    mstore v0 v1 i256;
+    call %overwrite v0;
+    v2.i256 = mload v0 i256;
+    return v2;
+}
+"#;
+    let (summaries, _) = compute(src);
+    assert!(!summaries["heap"].returns[0].raw);
+    assert!(summaries["joined"].returns[0].raw);
+    assert!(summaries["overwrite"].args[0].stored_raw);
+    let reloaded = ret_provenance_from_src(src, "caller");
+    assert!(
+        reloaded.may_reference_heap() && reloaded.may_be_raw(),
+        "{reloaded:?}"
+    );
+}
+
+#[test]
+fn private_hash_buffers_do_not_publish_unknown_heap_contents() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+func private %hash() -> i256 {
+block0:
+    v0.*i256 = evm_malloc 32.i256;
+    evm_mstore8 v0 1.i8;
+    v1.i256 = mload v0 i256;
+    v2.*i256 = evm_malloc 32.i256;
+    mstore v2 v1 i256;
+    v3.i256 = evm_keccak256 v2 32.i256;
+    return v3;
+}
+func public %relay() -> i256 {
+block0:
+    v0.i256 = call %hash;
+    return v0;
+}
+"#,
+    );
+    for name in ["hash", "relay"] {
+        assert!(!summaries[name].may_publish_heap, "{name}");
+    }
+}
+
+#[test]
+fn unknown_escaped_container_keeps_stored_arguments_nonlocal() {
+    let (summaries, _) = compute(
+        r#"
+target = "evm-ethereum-osaka"
+func public %box(v0.i256) -> i256 {
+block0:
+    v1.*i256 = evm_malloc 32.i256;
+    mstore v1 v0 i256;
+    v2.*i256 = evm_malloc 32.i256;
+    evm_mstore8 v2 1.i8;
+    v3.i256 = mload v2 i256;
+    return v3;
+}
+"#,
+    );
+    assert!(summaries["box"].args[0].stores.may_store_nonlocal());
+}
+
+#[test]
+fn nested_exact_loads_exclude_unrelated_cycle_fields() {
+    for (inner_address, shifted) in [("v3", false), ("v4", true)] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func private %read(v0.*i256) -> i256 {{
+block0:
+    v1.i256 = mload v0 i256;
+    v2.i256 = mload v1 i256;
+    return v2;
+}}
+func public %f() -> i256 {{
+block0:
+    v0.*i256 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    v2.*[i256; 2] = alloca [i256; 2];
+    v3.*i256 = bitcast v2 *i256;
+    mstore v3 v1 i256;
+    v4.*i256 = gep v2 0.i256 1.i256;
+    v5.i256 = ptr_to_int v3 i256;
+    mstore v4 v5 i256;
+    v6.*i256 = alloca i256;
+    v7.i256 = ptr_to_int {inner_address} i256;
+    mstore v6 v7 i256;
+    v8.i256 = call %read v6;
+    return v8;
+}}
+"#
+        );
+        let provenance = ret_provenance_from_src(&source, "f");
+        assert_eq!(provenance.malloc_insts().count(), 1, "{provenance:?}");
+        assert_eq!(
+            provenance.alloca_insts().count(),
+            usize::from(shifted),
+            "{provenance:?}"
+        );
+        assert!(!provenance.is_unknown_ptr(), "{provenance:?}");
+    }
+}
+
+fn untracked_memory(src: &str) -> UntrackedMemory {
+    let parsed = parse_module(src).unwrap();
+    let isa = Evm::new(TargetTriple {
+        architecture: Architecture::Evm,
+        vendor: Vendor::Ethereum,
+        operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
+    });
+    compute_ptr_escape_summaries(&parsed.module, &parsed.module.funcs(), &isa).untracked_memory
+}
+
+#[test]
+fn pointers_reaching_untracked_memory_are_exposed() {
+    for (body, ret, exposed) in [
+        ("evm_sstore 0.i256 v1;", "0.i256", true),
+        ("evm_tstore 0.i256 v1;", "0.i256", true),
+        ("mstore 64.i256 v1 i256;", "0.i256", true),
+        (
+            "v2.i256 = evm_call 0.i256 4.i256 v1 0.i256 0.i256 0.i256 0.i256;",
+            "0.i256",
+            true,
+        ),
+        (
+            "v2.*i256 = evm_malloc 32.i256;\n    mstore v2 v1 i256;\n    v3.i256 = evm_static_call 0.i256 4.i256 v2 32.i256 0.i256 0.i256;",
+            "0.i256",
+            true,
+        ),
+        (
+            "v2.*i256 = evm_malloc 32.i256;\n    mstore v2 v1 i256;\n    evm_mcopy 64.i256 v2 32.i256;",
+            "0.i256",
+            true,
+        ),
+        (
+            "v2.*i256 = evm_malloc 32.i256;\n    mstore v2 v1 i256;\n    v3.i256 = ptr_to_int v2 i256;",
+            "v3",
+            true,
+        ),
+        (
+            "v2.*i256 = evm_malloc 32.i256;\n    mstore v2 v1 i256;\n    v3.i256 = evm_keccak256 v2 32.i256;",
+            "v3",
+            false,
+        ),
+        (
+            "v2.*i256 = evm_malloc 32.i256;\n    mstore v2 7.i256 i256;\n    v3.i256 = evm_static_call 0.i256 4.i256 v2 32.i256 v2 32.i256;\n    v4.i256 = ptr_to_int v2 i256;",
+            "v4",
+            false,
+        ),
+        (
+            "v2.i256 = evm_calldata_load 0.i256;\n    evm_sstore 0.i256 v2;",
+            "0.i256",
+            false,
+        ),
+    ] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func public %f() -> i256 {{
+block0:
+    v0.*i256 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    {body}
+    return {ret};
+}}
+"#
+        );
+        assert_eq!(
+            untracked_memory(&source),
+            if exposed {
+                UntrackedMemory::MayHoldPointers
+            } else {
+                UntrackedMemory::PointerFree
+            },
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn exposed_callee_heap_objects_hold_only_heap_pointers() {
+    // `%f` exposes a heap object `%make` allocated, which belongs to no running
+    // frame, so a word loaded from such an object is at most a heap pointer.
+    // Exposing `%f`'s own allocation lets untracked memory hold any pointer.
+    for (expose, untracked) in [
+        (
+            "evm_sstore 0.i256 v0;",
+            UntrackedMemory::MayHoldHeapPointers,
+        ),
+        (
+            "mstore 512.i256 v0 i256;",
+            UntrackedMemory::MayHoldHeapPointers,
+        ),
+        (
+            "v1.*i256 = evm_malloc 32.i256;\n    v2.i256 = ptr_to_int v1 i256;\n    evm_sstore 0.i256 v2;",
+            UntrackedMemory::MayHoldPointers,
+        ),
+    ] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func private %make() -> i256 {{
+block0:
+    v0.*i256 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    return v1;
+}}
+func public %f() -> i256 {{
+block0:
+    v0.i256 = call %make;
+    {expose}
+    v3.i256 = mload v0 i256;
+    return v3;
+}}
+"#
+        );
+        assert_eq!(untracked_memory(&source), untracked, "{expose}");
+        let loaded = ret_provenance_from_src(&source, "f");
+        assert!(loaded.is_unknown_ptr(), "{expose}: {loaded:?}");
+        assert_eq!(
+            loaded.may_reference_unknown_local(),
+            untracked == UntrackedMemory::MayHoldPointers,
+            "{expose}: {loaded:?}"
+        );
+    }
+}
+
+#[test]
+fn callers_resolve_values_their_callees_expose() {
+    for (value, exposed) in [
+        ("v0.i256 = evm_calldata_load 0.i256;", false),
+        (
+            "v1.*i256 = evm_malloc 32.i256;\n    v0.i256 = ptr_to_int v1 i256;",
+            true,
+        ),
+    ] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+func private %send(v0.i256) {{
+block0:
+    v1.*i256 = evm_malloc 32.i256;
+    mstore v1 v0 i256;
+    v2.i256 = evm_call 0.i256 4.i256 0.i256 v1 32.i256 0.i256 0.i256;
+    return;
+}}
+func public %f() {{
+block0:
+    {value}
+    call %send v0;
+    return;
+}}
+"#
+        );
+        let (summaries, _) = compute(&source);
+        assert_eq!(summaries["send"].exposure.origins.len(), 1, "{value}");
+        assert_eq!(
+            summaries["send"].exposure.pointers,
+            UntrackedMemory::PointerFree,
+            "{value}"
+        );
+        assert_eq!(
+            summaries["f"].exposure.pointers == UntrackedMemory::MayHoldPointers,
+            exposed,
+            "{value}"
+        );
+        assert_eq!(
+            untracked_memory(&source) == UntrackedMemory::MayHoldPointers,
+            exposed,
+            "{value}"
+        );
+    }
+}

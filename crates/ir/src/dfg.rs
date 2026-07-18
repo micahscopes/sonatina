@@ -15,6 +15,8 @@ use crate::{
     inst::{
         InstId,
         control_flow::{self, BranchInfo, CallInfo, Jump, Phi},
+        data::EnumExtract,
+        downcast,
     },
     ir_writer::{FuncWriteCtx, IrWrite},
     module::ModuleCtx,
@@ -50,10 +52,6 @@ impl ValueUsers {
 
     fn remove(&mut self, inst: &InstId) {
         self.0.remove(inst);
-    }
-
-    fn union_with(&mut self, other: &Self) {
-        self.0 |= &other.0;
     }
 }
 
@@ -269,6 +267,38 @@ impl DataFlowGraph {
         self.attach_results(inst_id, &[value_id]);
     }
 
+    /// Retains selected results of an instruction and compacts their result indices.
+    ///
+    /// Removed results must have no users. The instruction itself is preserved, so
+    /// this is suitable for signature rewrites that remove dead call result lanes
+    /// without discarding the instruction's effects.
+    pub fn retain_inst_results(&mut self, inst_id: InstId, keep: &[bool]) {
+        assert_eq!(
+            self.inst_results(inst_id).len(),
+            keep.len(),
+            "result retention mask must match the instruction result count"
+        );
+
+        let old_results = std::mem::take(&mut self.inst_results[inst_id]);
+        let mut retained = SmallVec::<[ValueId; 1]>::new();
+        for (value_id, keep_result) in old_results.into_iter().zip(keep.iter().copied()) {
+            if keep_result {
+                let result_idx = u16::try_from(retained.len())
+                    .expect("instruction result count must fit in u16");
+                let ty = self.value_ty(value_id);
+                self.values[value_id] = Value::Inst {
+                    inst: inst_id,
+                    result_idx,
+                    ty,
+                };
+                retained.push(value_id);
+            } else {
+                self.delete_value(value_id);
+            }
+        }
+        self.inst_results[inst_id] = retained;
+    }
+
     pub fn make_arg_value(&mut self, ty: Type, idx: usize) -> Value {
         Value::Arg { ty, idx }
     }
@@ -358,6 +388,24 @@ impl DataFlowGraph {
             | Value::Immediate { ty, .. }
             | Value::Global { ty, .. }
             | Value::Undef { ty } => *ty,
+        }
+    }
+
+    pub fn retype_value(&mut self, value_id: ValueId, new_ty: Type) {
+        match &mut self.values[value_id] {
+            Value::Immediate { imm, ty } => {
+                assert_eq!(
+                    imm.ty(),
+                    new_ty,
+                    "cannot retype immediate from {:?} to {new_ty:?}",
+                    imm.ty()
+                );
+                *ty = new_ty;
+            }
+            Value::Inst { ty, .. }
+            | Value::Arg { ty, .. }
+            | Value::Global { ty, .. }
+            | Value::Undef { ty } => *ty = new_ty,
         }
     }
 
@@ -463,7 +511,21 @@ impl DataFlowGraph {
             return;
         };
         phi.append_phi_arg(value, block);
+        self.users[value].insert(inst_id);
+    }
+
+    pub fn edit_phi<R>(
+        &mut self,
+        inst_id: InstId,
+        f: impl FnOnce(&mut control_flow::Phi) -> R,
+    ) -> R {
+        self.untrack_inst(inst_id);
+        let phi = self
+            .cast_phi_mut(inst_id)
+            .unwrap_or_else(|| panic!("{inst_id:?} is not a phi"));
+        let result = f(phi);
         self.attach_user(inst_id);
+        result
     }
 
     pub fn inst_set(&self) -> &'static dyn InstSetBase {
@@ -476,7 +538,7 @@ impl DataFlowGraph {
         InstDowncast::downcast(is, inst)
     }
 
-    pub fn cast_phi_mut(&mut self, inst_id: InstId) -> Option<&mut control_flow::Phi> {
+    fn cast_phi_mut(&mut self, inst_id: InstId) -> Option<&mut control_flow::Phi> {
         let is = self.inst_set();
         let inst = self.inst_mut(inst_id);
         InstDowncastMut::downcast_mut(is, inst)
@@ -511,24 +573,36 @@ impl DataFlowGraph {
         InstDowncast::downcast(is, inst)
     }
 
-    pub fn make_phi(&self, args: Vec<(ValueId, BlockId)>) -> Phi {
-        Phi::new(self.inst_set(), args)
+    pub fn make_phi(&self, args: control_flow::PhiArgs) -> Phi {
+        Phi::new(self.inst_set().phi(), args)
     }
 
     pub fn make_jump(&self, to: BlockId) -> Jump {
         Jump::new(self.inst_set(), to)
     }
 
-    pub fn change_to_alias(&mut self, value: ValueId, alias: ValueId) {
+    /// Rewrites every use of `value` to `alias` and returns the rewritten instructions.
+    pub fn change_to_alias(&mut self, value: ValueId, alias: ValueId) -> SmallVec<[InstId; 4]> {
         let users = std::mem::take(&mut self.users[value]);
-        for inst in users.iter() {
-            self.insts[*inst].for_each_value_mut(&mut |user_value| {
+        let mut modified = SmallVec::new();
+        for &inst in users.iter() {
+            if !self.has_inst(inst) {
+                continue;
+            }
+
+            let mut uses_value = false;
+            self.insts[inst].for_each_value_mut(&mut |user_value| {
                 if *user_value == value {
                     *user_value = alias;
+                    uses_value = true;
                 }
             });
+            if uses_value {
+                self.users[alias].insert(inst);
+                modified.push(inst);
+            }
         }
-        self.users[alias].union_with(&users);
+        modified
     }
 
     pub fn delete_inst(&mut self, inst_id: InstId) {
@@ -658,8 +732,14 @@ impl DataFlowGraph {
             && !self.effect_summary(inst_id).has_effect()
     }
 
+    /// Whether `inst_id` may also run on paths that did not run it, such as
+    /// when hoisted above a branch. Moving it only to positions its old one
+    /// dominates needs [`Self::has_value_semantics`] alone.
     pub fn can_speculate(&self, inst_id: InstId) -> bool {
+        // Payload extraction is pure, but requires an active-variant proof at
+        // its use site, which hoisting above a branch or assumption can lose.
         self.has_value_semantics(inst_id)
+            && downcast::<&EnumExtract>(self.inst_set(), self.inst(inst_id)).is_none()
     }
 
     pub fn effect_cost_class(&self, inst_id: InstId) -> EffectCostClass {
@@ -807,13 +887,50 @@ impl Block {
 
 #[cfg(test)]
 mod tests {
+    use smallvec::smallvec;
+
     use super::*;
     use crate::{
         Type,
         builder::test_util::test_isa,
-        inst::arith::{Add, Uaddo},
+        inst::{
+            arith::{Add, Uaddo},
+            control_flow::Phi,
+        },
         module::ModuleCtx,
     };
+
+    #[test]
+    fn retype_value_updates_non_immediate_type() {
+        let isa = test_isa();
+        let mut dfg = DataFlowGraph::new(ModuleCtx::new(&isa));
+        let value = dfg.make_undef_value(Type::I8);
+
+        dfg.retype_value(value, Type::I16);
+
+        assert_eq!(dfg.value_ty(value), Type::I16);
+    }
+
+    #[test]
+    fn retype_value_preserves_immediate_interning() {
+        let isa = test_isa();
+        let mut dfg = DataFlowGraph::new(ModuleCtx::new(&isa));
+        let value = dfg.make_imm_value(Immediate::I32(1));
+
+        dfg.retype_value(value, Type::I32);
+
+        assert_eq!(dfg.make_imm_value(Immediate::I32(1)), value);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot retype immediate")]
+    fn retype_value_rejects_immediate_type_changes() {
+        let isa = test_isa();
+        let mut dfg = DataFlowGraph::new(ModuleCtx::new(&isa));
+        let value = dfg.make_imm_value(Immediate::I32(1));
+
+        dfg.retype_value(value, Type::I64);
+    }
 
     #[test]
     fn inst_results_track_order_and_result_slots() {
@@ -919,6 +1036,33 @@ mod tests {
     }
 
     #[test]
+    fn edit_phi_retracks_replaced_args() {
+        let isa = test_isa();
+        let mut dfg = DataFlowGraph::new(ModuleCtx::new(&isa));
+        let block0 = dfg.make_block();
+        let block1 = dfg.make_block();
+        let block2 = dfg.make_block();
+        let kept = dfg.make_imm_value(Immediate::I32(1));
+        let removed = dfg.make_imm_value(Immediate::I32(2));
+        let added = dfg.make_imm_value(Immediate::I32(3));
+        let phi = dfg.make_inst(Phi::new(
+            dfg.inst_set().has_phi().unwrap(),
+            smallvec![(kept, block0), (removed, block1)],
+        ));
+
+        let removed_value = dfg.edit_phi(phi, |phi| {
+            let removed_value = phi.remove_phi_arg(block1);
+            phi.append_phi_arg(added, block2);
+            removed_value
+        });
+
+        assert_eq!(removed_value, Some(removed));
+        assert!(dfg.users(kept).any(|&user| user == phi));
+        assert!(dfg.users(added).any(|&user| user == phi));
+        assert!(!dfg.users(removed).any(|&user| user == phi));
+    }
+
+    #[test]
     #[should_panic(expected = "cannot delete inst")]
     fn delete_inst_rejects_live_result_users() {
         let isa = test_isa();
@@ -943,5 +1087,31 @@ mod tests {
         dfg.attach_result(consumer, consumer_result);
 
         dfg.delete_inst(producer);
+    }
+
+    #[test]
+    fn retain_inst_results_compacts_indices_and_removes_dead_values() {
+        let isa = test_isa();
+        let mut dfg = DataFlowGraph::new(ModuleCtx::new(&isa));
+        let lhs = dfg.make_imm_value(Immediate::I32(1));
+        let rhs = dfg.make_imm_value(Immediate::I32(2));
+        let inst = dfg.make_inst(Uaddo::new_unchecked(dfg.inst_set(), lhs, rhs));
+        let sum = dfg.make_value(Value::Inst {
+            inst,
+            result_idx: 0,
+            ty: Type::I32,
+        });
+        let overflow = dfg.make_value(Value::Inst {
+            inst,
+            result_idx: 1,
+            ty: Type::I1,
+        });
+        dfg.attach_results(inst, &[sum, overflow]);
+
+        dfg.retain_inst_results(inst, &[false, true]);
+
+        assert!(!dfg.has_value(sum));
+        assert_eq!(dfg.inst_results(inst), &[overflow]);
+        assert_eq!(dfg.value_inst_result(overflow), Some((inst, 0)));
     }
 }

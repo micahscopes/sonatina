@@ -2,6 +2,7 @@ use macros::inst_set;
 
 use crate::inst::*;
 
+/// Target-neutral instructions accepted by the host-native ISA.
 #[inst_set(InstKind = "NativeInstKind")]
 pub struct NativeInstSet(
     arith::Neg,
@@ -54,6 +55,7 @@ pub struct NativeInstSet(
     control_flow::Unreachable,
     data::Mload,
     data::Mstore,
+    data::Memzero,
     data::Gep,
     data::GetFunctionPtr,
     data::SymAddr,
@@ -93,4 +95,5 @@ pub struct NativeInstSet(
     // by the CraneliftBackend rather than single opcodes.
     evm::EvmAddMod,
     evm::EvmMulMod,
+    logic::Bswap,
 );

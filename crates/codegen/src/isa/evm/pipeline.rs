@@ -1,4 +1,5 @@
-use rustc_hash::FxHashMap;
+use std::iter;
+
 use tracing::{debug_span, info_span, trace_span};
 
 use crate::{
@@ -6,29 +7,33 @@ use crate::{
     optim::{
         constref_specialize::specialize_private_constrefs,
         dead_arg::{DeadArgElimConfig, run_dead_arg_elim},
-        pipeline::{FuncPassOverrides, Pass, run_function_pass_round},
+        dead_ret::{DeadRetElimConfig, run_dead_ret_elim},
+        forwarded_ret::{ForwardedRetElimConfig, run_forwarded_ret_elim},
+        pipeline::{Pass, run_function_pass_round},
+        uniform_const_arg::run_uniform_const_arg_binding,
     },
     transform::{
         aggregate::{
-            AggregateExpandAbi, AggregateLowerToMemoryLegalize, LocalObjectArgMap,
-            ObjectAggregateAbi, ObjectEffectSummaryMap, ObjectLowerToMemory,
+            AggregateExpandAbi, AggregateLowerToMemoryLegalize, ObjectAggregateAbi,
             assert_aggregate_legalized, cleanup_dead_aggregate_alloca_trees,
-            collect_local_object_arg_info_with_effects, compute_object_effect_summaries,
-            merge_local_object_arg_info,
         },
-        evm::{ConstDataLower, legalize_evm_section},
+        evm::{
+            ConstDataLower, legalize_evm_section, lower_keccak256_words,
+            reuse_terminal_word_buffers,
+        },
     },
 };
 use sonatina_ir::{Module, module::FuncRef};
 
 use super::{
-    EvmBackend, LateCleanupProfile, PtrEscapeSummary, collect_unsupported_evm_calls,
-    compute_ptr_escape_summaries, prepare_free_ptr_restore, validate_supported_lowering_ir,
+    EvmBackend, LateCleanupProfile, PtrEscapeSummaries, collect_unsupported_evm_calls,
+    compute_ptr_escape_summaries, prepare_free_ptr_restore, promote_local_mallocs,
+    validate_supported_lowering_ir,
 };
 
 pub(crate) struct EvmPipelineArtifacts {
     pub(crate) funcs: Vec<FuncRef>,
-    pub(crate) ptr_escape: FxHashMap<FuncRef, PtrEscapeSummary>,
+    pub(crate) ptr_escape: PtrEscapeSummaries,
 }
 
 pub(crate) struct EvmPipeline<'a> {
@@ -39,11 +44,9 @@ struct EvmPipelineContext<'a> {
     backend: &'a EvmBackend,
     work: &'a SectionWorkModule,
     funcs: Vec<FuncRef>,
+    roots: Vec<FuncRef>,
     func_behavior_dirty: bool,
-    synthetic_out_args: LocalObjectArgMap,
-    local_object_args: Option<LocalObjectArgMap>,
-    object_effects: Option<ObjectEffectSummaryMap>,
-    ptr_escape: Option<FxHashMap<FuncRef, PtrEscapeSummary>>,
+    ptr_escape: Option<PtrEscapeSummaries>,
 }
 
 impl<'a> EvmPipeline<'a> {
@@ -56,17 +59,17 @@ impl<'a> EvmPipeline<'a> {
             backend: self.backend,
             work,
             funcs: work.module().funcs(),
+            roots: iter::once(work.entry())
+                .chain(work.includes().iter().copied())
+                .collect(),
             func_behavior_dirty: true,
-            synthetic_out_args: LocalObjectArgMap::default(),
-            local_object_args: None,
-            object_effects: None,
             ptr_escape: None,
         };
         let optional_cleanup = self.backend.late_cleanup_profile != LateCleanupProfile::Off;
         let _span = info_span!(
             "sonatina.codegen.evm.pipeline.run",
             funcs = ctx.funcs.len(),
-            phases = if optional_cleanup { 9 } else { 5 }
+            phases = if optional_cleanup { 8 } else { 5 }
         )
         .entered();
 
@@ -80,18 +83,6 @@ impl<'a> EvmPipeline<'a> {
                 "object_combine",
                 "optional",
                 EvmPipelineContext::run_object_combine,
-            )?;
-        }
-        ctx.run_phase(
-            "object_aggregate_abi_lowering",
-            "mandatory",
-            EvmPipelineContext::run_object_aggregate_abi_lowering,
-        )?;
-        if optional_cleanup {
-            ctx.run_phase(
-                "object_cleanup",
-                "optional",
-                EvmPipelineContext::run_object_cleanup,
             )?;
         }
         ctx.run_phase(
@@ -123,6 +114,11 @@ impl<'a> EvmPipeline<'a> {
                 EvmPipelineContext::run_raw_memory_cleanup,
             )?;
         }
+        ctx.run_phase(
+            "keccak_words_lowering",
+            "mandatory",
+            EvmPipelineContext::run_keccak_words_lowering,
+        )?;
 
         Ok(EvmPipelineArtifacts {
             funcs: ctx.funcs,
@@ -156,42 +152,19 @@ impl EvmPipelineContext<'_> {
         phase(self)
     }
 
-    fn run_pass_round(
-        &mut self,
-        mode: &'static str,
-        passes: &[Pass],
-        local_object_args: bool,
-        object_effects: bool,
-    ) {
+    fn run_pass_round(&mut self, mode: &'static str, passes: &[Pass]) {
         let _span = debug_span!(
             "sonatina.codegen.evm.pipeline.optimize",
             mode = mode,
             pass_count = passes.len()
         )
         .entered();
-        let local_object_args = if local_object_args {
-            self.local_object_args.as_ref()
-        } else {
-            None
-        };
-        let object_effects = if object_effects {
-            self.object_effects.as_ref()
-        } else {
-            None
-        };
         run_function_pass_round(
             self.work.module(),
             passes,
             &mut self.func_behavior_dirty,
-            FuncPassOverrides {
-                funcs: Some(self.funcs.as_slice()),
-                local_object_args,
-                object_effects,
-            },
+            Some(self.funcs.as_slice()),
         );
-        if object_effects.is_some() {
-            self.object_effects = None;
-        }
     }
 
     fn refresh_section_funcs(&mut self) {
@@ -220,15 +193,10 @@ impl EvmPipelineContext<'_> {
         crate::transform::aggregate::EnumLowerToProduct.run(self.module());
         let stats = specialize_private_constrefs(self.module(), &self.funcs);
         if stats.changed {
-            run_dead_arg_elim(self.module(), DeadArgElimConfig::default());
+            run_dead_arg_elim(self.module(), &self.roots, DeadArgElimConfig::default());
             self.refresh_section_funcs();
             self.func_behavior_dirty = true;
-            self.run_pass_round(
-                "constref_specialize",
-                &[Pass::Sccp, Pass::CfgCleanup],
-                false,
-                false,
-            );
+            self.run_pass_round("constref_specialize", &[Pass::Sccp, Pass::CfgCleanup]);
             self.refresh_section_funcs();
         }
         ConstDataLower::default().run(self.module());
@@ -237,54 +205,71 @@ impl EvmPipelineContext<'_> {
     }
 
     fn run_object_combine(&mut self) -> Result<(), String> {
-        self.run_pass_round("default", &[Pass::AggregateCombine], false, false);
-        Ok(())
-    }
-
-    fn run_object_aggregate_abi_lowering(&mut self) -> Result<(), String> {
-        self.synthetic_out_args =
-            ObjectAggregateAbi::default().run_with_synthetic_out_args(self.module())?;
-        self.func_behavior_dirty = true;
-        Ok(())
-    }
-
-    fn run_object_cleanup(&mut self) -> Result<(), String> {
-        let object_effects = compute_object_effect_summaries(self.module());
-        let mut local_object_args =
-            collect_local_object_arg_info_with_effects(self.module(), &object_effects);
-        merge_local_object_arg_info(&mut local_object_args, &self.synthetic_out_args);
-        self.object_effects = Some(object_effects);
-        self.local_object_args = Some(local_object_args);
-
-        self.run_pass_round("object_facts", &[Pass::ObjectLoadStore], true, true);
+        self.run_pass_round("default", &[Pass::AggregateCombine]);
         Ok(())
     }
 
     fn run_object_abi_and_type_lowering(&mut self) -> Result<(), String> {
-        ObjectLowerToMemory.run(self.module());
+        ObjectAggregateAbi::default().lower_to_memory(
+            self.module(),
+            self.backend.late_cleanup_profile != LateCleanupProfile::Off,
+        )?;
         AggregateExpandAbi::default().run(self.module());
         self.refresh_section_funcs();
         self.ensure_only_section_funcs_remain()?;
         legalize_evm_section(self.module(), &self.funcs);
         self.func_behavior_dirty = true;
         if self.backend.late_cleanup_profile == LateCleanupProfile::Off {
-            self.run_pass_round("post_evm_legalize", &[Pass::CfgCleanup], false, false);
+            self.run_pass_round("post_evm_legalize", &[Pass::CfgCleanup]);
         }
         Ok(())
     }
 
     fn run_aggregate_cleanup(&mut self) -> Result<(), String> {
         self.run_pass_round(
-            "local_object_args",
+            "aggregate_cleanup",
             &[
                 Pass::CfgCleanup,
                 Pass::AggregateCombine,
                 Pass::AggregateScalarize,
             ],
-            true,
-            false,
         );
-        run_dead_arg_elim(self.work.module(), DeadArgElimConfig::default());
+        self.run_pass_round(
+            "uniform_const_arg_canonicalize",
+            &[
+                Pass::CfgCleanup,
+                Pass::ScalarCanonicalize,
+                Pass::KnownBitsSimplify,
+                Pass::Sccp,
+                Pass::CfgCleanup,
+            ],
+        );
+        run_uniform_const_arg_binding(self.work.module(), &self.funcs);
+        run_dead_arg_elim(
+            self.work.module(),
+            &self.roots,
+            DeadArgElimConfig::default(),
+        );
+        // Return lanes that only echo an argument, or that no caller reads, are
+        // the result-side twin of dead arguments. Dropping them can leave
+        // arguments dead again, so dead-argument elimination runs once more.
+        let forwarded = run_forwarded_ret_elim(
+            self.work.module(),
+            &self.roots,
+            ForwardedRetElimConfig::default(),
+        );
+        let dead = run_dead_ret_elim(
+            self.work.module(),
+            &self.roots,
+            DeadRetElimConfig::default(),
+        );
+        if forwarded.removed_rets + dead.removed_rets > 0 {
+            run_dead_arg_elim(
+                self.work.module(),
+                &self.roots,
+                DeadArgElimConfig::default(),
+            );
+        }
         self.func_behavior_dirty = true;
         self.run_pass_round(
             "default",
@@ -298,8 +283,6 @@ impl EvmPipelineContext<'_> {
                 Pass::BranchCanonicalize,
                 Pass::CfgCleanup,
             ],
-            false,
-            false,
         );
         Ok(())
     }
@@ -385,8 +368,6 @@ impl EvmPipelineContext<'_> {
                 Pass::Licm,
                 Pass::CfgCleanup,
             ],
-            false,
-            false,
         );
         self.run_pass_round(
             "default",
@@ -403,9 +384,8 @@ impl EvmPipelineContext<'_> {
                 Pass::BranchCanonicalize,
                 Pass::CfgCleanup,
             ],
-            false,
-            false,
         );
+        let mut terminal_payloads_changed = false;
         {
             let module = self.module();
             let module_ctx = &module.ctx;
@@ -415,12 +395,49 @@ impl EvmPipelineContext<'_> {
                     func_ref = func.as_u32()
                 )
                 .entered();
-                module.func_store.modify(func, |function| {
+                terminal_payloads_changed |= module.func_store.modify(func, |function| {
                     cleanup_dead_aggregate_alloca_trees(function, module_ctx);
                     assert_aggregate_legalized(function, module_ctx);
+                    reuse_terminal_word_buffers(function)
                 });
             }
         }
+        if terminal_payloads_changed {
+            self.func_behavior_dirty = true;
+            self.run_pass_round("terminal_payload", &[Pass::Sccp, Pass::LoadStore]);
+            self.ptr_escape = Some(compute_ptr_escape_summaries(
+                self.module(),
+                &self.funcs,
+                &self.backend.isa,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Word hashes stay pure values through every optimization round above;
+    /// only now do they become the memory hash the EVM executes, before
+    /// memory planning places the preimages.
+    fn run_keccak_words_lowering(&mut self) -> Result<(), String> {
+        let mut changed = false;
+        {
+            let module = self.module();
+            for &func in &self.funcs {
+                changed |= module.func_store.modify(func, lower_keccak256_words);
+            }
+        }
+        let summaries = match self.ptr_escape.take() {
+            Some(summaries) if !changed => summaries,
+            _ => compute_ptr_escape_summaries(self.module(), &self.funcs, &self.backend.isa),
+        };
+        let promoted = promote_local_mallocs(self.module(), &self.funcs, self.backend, &summaries);
+        if changed || promoted {
+            self.func_behavior_dirty = true;
+        }
+        self.ptr_escape = Some(if promoted {
+            compute_ptr_escape_summaries(self.module(), &self.funcs, &self.backend.isa)
+        } else {
+            summaries
+        });
         Ok(())
     }
 }

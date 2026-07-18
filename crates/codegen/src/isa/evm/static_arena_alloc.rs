@@ -22,10 +22,11 @@ use sonatina_ir::{
 
 use super::{
     escape_scan::{EscapeScanCtx, EscapeSink, EscapeSource, for_each_escape_event_at_inst},
-    memory_plan::{FuncAnalysis, WORD_BYTES},
-    provenance::{Provenance, compute_provenance},
-    ptr_escape::PtrEscapeSummary,
+    memory_plan::{FuncPreAnalysis, WORD_BYTES},
+    ptr_escape::PtrEscapeSummaries,
+    ptr_provenance::{Provenance, ProvenanceInfo, compute_provenance, memory_load, memory_store},
 };
+use crate::stackalloc::StackifyAlloc;
 
 mod exact_pack;
 mod object_liveness;
@@ -34,12 +35,24 @@ pub(crate) use exact_pack::{
     ExactPackItem, ExactPackWorkspace, PackedObject, pack_exact_peak_by,
     pack_exact_with_offsets_by, pack_objects_presorted,
 };
-#[cfg(test)]
-pub(crate) use object_liveness::BlockLiveSegment;
-pub(crate) use object_liveness::LiveRegion;
 use object_liveness::{
     AllocaClosureCtx, ComputeCtx as ObjectLivenessCtx, compute_regions_and_calls,
 };
+pub(crate) use object_liveness::{BlockLiveSegment, LiveRegion};
+
+#[cfg(test)]
+pub(crate) struct StackifiedFuncAnalysis {
+    pub(crate) alloc: StackifyAlloc,
+    pub(crate) block_order: Vec<BlockId>,
+    pub(crate) value_aliases: SecondaryMap<ValueId, Option<ValueId>>,
+}
+
+#[cfg(test)]
+impl StackifiedFuncAnalysis {
+    pub(crate) fn canonicalize_value(&self, value: ValueId) -> ValueId {
+        super::canonicalize_alias_value(&self.value_aliases, value)
+    }
+}
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct StackObjId(u32);
@@ -105,9 +118,10 @@ pub(crate) struct CallSiteObjects {
     pub(crate) call_rank: u32,
     pub(crate) callee: FuncRef,
     pub(crate) result_count: u8,
-    #[allow(dead_code)]
-    pub(crate) arg_count: u8,
+    /// The objects live across the call that have storage: a zero-sized
+    /// object has no location to keep.
     pub(crate) live_across_objs: Vec<StackObjId>,
+    /// The objects with storage the callee can reach through its arguments.
     pub(crate) callee_visible_objs: Vec<StackObjId>,
 }
 
@@ -116,22 +130,53 @@ pub(crate) struct FuncStackObjects {
     pub(crate) obj_facts: FxHashMap<StackObjId, ObjFacts>,
     pub(crate) obj_size_words: FxHashMap<StackObjId, u32>,
     pub(crate) alloca_ids: FxHashMap<InstId, StackObjId>,
-    pub(crate) spill_obj: SecondaryMap<ValueId, Option<StackObjId>>,
     pub(crate) call_sites: Vec<CallSiteObjects>,
     pub(crate) next_obj_id: u32,
+}
+
+pub(super) struct StackObjectInput<'a> {
+    stackify_alloc: Option<&'a StackifyAlloc>,
+    block_order: &'a [BlockId],
+    value_aliases: &'a SecondaryMap<ValueId, Option<ValueId>>,
+    prov_info: Option<&'a ProvenanceInfo>,
+}
+
+impl<'a> StackObjectInput<'a> {
+    #[cfg(test)]
+    fn stackified(analysis: &'a StackifiedFuncAnalysis) -> Self {
+        Self {
+            stackify_alloc: Some(&analysis.alloc),
+            block_order: &analysis.block_order,
+            value_aliases: &analysis.value_aliases,
+            prov_info: None,
+        }
+    }
+
+    fn semantic(analysis: &'a FuncPreAnalysis) -> Self {
+        Self {
+            stackify_alloc: None,
+            block_order: &analysis.block_order,
+            value_aliases: &analysis.value_aliases,
+            prov_info: Some(&analysis.prov),
+        }
+    }
+
+    pub(super) fn canonicalize_value(&self, value: ValueId) -> ValueId {
+        super::canonicalize_alias_value(self.value_aliases, value)
+    }
 }
 
 pub(crate) struct StaticArenaAllocCtx<'a> {
     module: &'a ModuleCtx,
     isa: &'a Evm,
-    ptr_escape: &'a FxHashMap<FuncRef, PtrEscapeSummary>,
+    ptr_escape: &'a PtrEscapeSummaries,
 }
 
 impl<'a> StaticArenaAllocCtx<'a> {
     pub(crate) fn new(
         module: &'a ModuleCtx,
         isa: &'a Evm,
-        ptr_escape: &'a FxHashMap<FuncRef, PtrEscapeSummary>,
+        ptr_escape: &'a PtrEscapeSummaries,
     ) -> Self {
         Self {
             module,
@@ -140,13 +185,23 @@ impl<'a> StaticArenaAllocCtx<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn compute_func_stack_objects(
         &self,
         func_ref: FuncRef,
         function: &Function,
-        analysis: &FuncAnalysis,
+        analysis: &StackifiedFuncAnalysis,
     ) -> FuncStackObjects {
         compute_func_stack_objects(func_ref, function, self, analysis)
+    }
+
+    pub(crate) fn compute_func_semantic_stack_objects(
+        &self,
+        func_ref: FuncRef,
+        function: &Function,
+        analysis: &FuncPreAnalysis,
+    ) -> FuncStackObjects {
+        compute_func_semantic_stack_objects(func_ref, function, self, analysis)
     }
 }
 
@@ -183,7 +238,7 @@ pub(crate) fn compute_inst_order(
     (order, pos)
 }
 
-fn compute_block_order(function: &Function, block_order: &[BlockId]) -> Vec<BlockId> {
+pub(crate) fn compute_block_order(function: &Function, block_order: &[BlockId]) -> Vec<BlockId> {
     let mut blocks = Vec::new();
     let mut seen: FxHashSet<BlockId> = FxHashSet::default();
     for &block in block_order {
@@ -199,43 +254,65 @@ fn compute_block_order(function: &Function, block_order: &[BlockId]) -> Vec<Bloc
     blocks
 }
 
+#[cfg(test)]
 pub(crate) fn compute_func_stack_objects(
     func_ref: FuncRef,
     function: &Function,
     ctx: &StaticArenaAllocCtx<'_>,
-    analysis: &FuncAnalysis,
+    analysis: &StackifiedFuncAnalysis,
 ) -> FuncStackObjects {
-    let block_order = compute_block_order(function, &analysis.block_order);
-    let (inst_order, _inst_pos) = compute_inst_order(function, &analysis.block_order);
+    let input = StackObjectInput::stackified(analysis);
+    compute_func_stack_objects_from_input(func_ref, function, ctx, &input)
+}
+
+pub(crate) fn compute_func_semantic_stack_objects(
+    func_ref: FuncRef,
+    function: &Function,
+    ctx: &StaticArenaAllocCtx<'_>,
+    analysis: &FuncPreAnalysis,
+) -> FuncStackObjects {
+    let input = StackObjectInput::semantic(analysis);
+    compute_func_stack_objects_from_input(func_ref, function, ctx, &input)
+}
+
+fn compute_func_stack_objects_from_input(
+    func_ref: FuncRef,
+    function: &Function,
+    ctx: &StaticArenaAllocCtx<'_>,
+    analysis: &StackObjectInput<'_>,
+) -> FuncStackObjects {
+    let block_order = compute_block_order(function, analysis.block_order);
+    let (inst_order, _inst_pos) = compute_inst_order(function, analysis.block_order);
     let mut cfg = ControlFlowGraph::new();
     cfg.compute(function);
 
-    let prov_info = compute_provenance(function, ctx.module, ctx.isa, |callee| {
-        PtrEscapeSummary::get_or_conservative(ctx.ptr_escape, ctx.module, callee)
-    });
+    let computed_prov_info;
+    let prov_info = match analysis.prov_info {
+        Some(prov_info) => prov_info,
+        None => {
+            computed_prov_info = compute_provenance(function, ctx.module, ctx.isa, ctx.ptr_escape);
+            &computed_prov_info
+        }
+    };
     let prov = &prov_info.value;
 
     let mut local_edges: FxHashMap<InstId, FxHashSet<InstId>> = FxHashMap::default();
     let mut local_unknown: FxHashSet<InstId> = FxHashSet::default();
-    for (&base, stored) in &prov_info.local_mem {
-        if stored.is_unknown_ptr() {
+    // Heap containers can retain local objects, including through mixed
+    // local/heap cycles. Heap nodes participate in the closure but do not
+    // become stack objects themselves.
+    for (&base, stored) in prov_info.local_mem.iter().chain(&prov_info.malloc_mem) {
+        if stored.may_reference_unknown_local() {
             local_unknown.insert(base);
             continue;
         }
-        for child in stored.alloca_insts() {
+        for child in stored.alloca_insts().chain(stored.malloc_insts()) {
             local_edges.entry(base).or_default().insert(child);
         }
     }
 
-    let escaping_sites = compute_escaping_allocas(
-        function,
-        ctx.module,
-        ctx.isa,
-        ctx.ptr_escape,
-        prov,
-        &prov_info.local_mem,
-        &prov_info.arg_mem,
-    );
+    let escaping_sites =
+        compute_escaping_allocas(function, ctx.module, ctx.isa, ctx.ptr_escape, prov_info);
     if !escaping_sites.is_empty() {
         panic!(
             "{}",
@@ -249,10 +326,10 @@ pub(crate) fn compute_func_stack_objects(
     }
 
     let mut spilled_values: BitSet<ValueId> = BitSet::default();
-    for (v, obj) in analysis.alloc.spill_obj.iter() {
-        if obj.is_some() {
+    if let Some(alloc) = analysis.stackify_alloc {
+        for (v, obj) in alloc.object_spills() {
             spilled_values.insert(v);
-            spill_obj[v] = *obj;
+            spill_obj[v] = Some(obj);
         }
     }
 
@@ -270,14 +347,13 @@ pub(crate) fn compute_func_stack_objects(
         });
     }
 
-    let mut next_id: u32 = analysis
-        .alloc
-        .spill_obj
-        .values()
-        .filter_map(|o| *o)
-        .map(|id| id.as_u32())
-        .max()
-        .map_or(0, |n| n.checked_add(1).expect("stack object id overflow"));
+    let mut next_id: u32 = analysis.stackify_alloc.map_or(0, |alloc| {
+        alloc
+            .object_spills()
+            .map(|(_, id)| id.as_u32())
+            .max()
+            .map_or(0, |n| n.checked_add(1).expect("stack object id overflow"))
+    });
 
     let mut alloca_ids: FxHashMap<InstId, StackObjId> = FxHashMap::default();
     for &inst in &inst_order {
@@ -307,8 +383,6 @@ pub(crate) fn compute_func_stack_objects(
             store_count: 0,
         });
     }
-    let all_allocas: FxHashSet<InstId> = alloca_ids.keys().copied().collect();
-
     let mut obj_index: FxHashMap<StackObjId, usize> = FxHashMap::default();
     for (idx, obj) in objects.iter().enumerate() {
         obj_index.insert(obj.id, idx);
@@ -331,28 +405,23 @@ pub(crate) fn compute_func_stack_objects(
     for block in function.layout.iter_block() {
         for inst in function.layout.iter_inst(block) {
             let data = ctx.isa.inst_set().resolve_inst(function.dfg.inst(inst));
-            match data {
-                EvmInstKind::Mload(mload) => {
-                    for base in prov[*mload.addr()].alloca_insts() {
-                        if let Some(&id) = alloca_ids.get(&base)
-                            && let Some(obj) =
-                                obj_index.get(&id).and_then(|idx| objects.get_mut(*idx))
-                        {
-                            obj.load_count = obj.load_count.saturating_add(1);
-                        }
+            if let Some((addr, _)) = memory_load(&data, ctx.module) {
+                for base in prov[addr].alloca_insts() {
+                    if let Some(&id) = alloca_ids.get(&base)
+                        && let Some(obj) = obj_index.get(&id).and_then(|idx| objects.get_mut(*idx))
+                    {
+                        obj.load_count = obj.load_count.saturating_add(1);
                     }
                 }
-                EvmInstKind::Mstore(mstore) => {
-                    for base in prov[*mstore.addr()].alloca_insts() {
-                        if let Some(&id) = alloca_ids.get(&base)
-                            && let Some(obj) =
-                                obj_index.get(&id).and_then(|idx| objects.get_mut(*idx))
-                        {
-                            obj.store_count = obj.store_count.saturating_add(1);
-                        }
+            }
+            if let Some((addr, _, _)) = memory_store(&data, ctx.module) {
+                for base in prov[addr].alloca_insts() {
+                    if let Some(&id) = alloca_ids.get(&base)
+                        && let Some(obj) = obj_index.get(&id).and_then(|idx| objects.get_mut(*idx))
+                    {
+                        obj.store_count = obj.store_count.saturating_add(1);
                     }
                 }
-                _ => {}
             }
 
             function.dfg.inst(inst).for_each_value(&mut |v| {
@@ -400,7 +469,6 @@ pub(crate) fn compute_func_stack_objects(
     let closure = AllocaClosureCtx {
         edges: &local_edges,
         unknown: &local_unknown,
-        all_allocas: &all_allocas,
     };
     let mut liveness_ctx = ObjectLivenessCtx {
         analysis,
@@ -423,11 +491,19 @@ pub(crate) fn compute_func_stack_objects(
     for obj in &objects {
         obj_size_words.insert(obj.id, obj.size_words);
     }
+    // A zero-sized object has no storage for a call to keep or expose.
+    let has_storage = |obj: &StackObjId| {
+        obj_size_words
+            .get(obj)
+            .copied()
+            .unwrap_or_else(|| panic!("missing object size for obj {}", obj.as_u32()))
+            != 0
+    };
     for call in &mut call_sites {
-        call.live_across_objs.retain(|obj| obj_size_words[obj] != 0);
-        call.callee_visible_objs
-            .retain(|obj| obj_size_words[obj] != 0);
+        call.live_across_objs.retain(|obj| has_storage(obj));
+        call.callee_visible_objs.retain(|obj| has_storage(obj));
     }
+    unknown_barrier_objs.retain(|obj| has_storage(obj));
 
     let mut obj_facts: FxHashMap<StackObjId, ObjFacts> = FxHashMap::default();
     for obj in &objects {
@@ -477,9 +553,6 @@ pub(crate) fn compute_func_stack_objects(
         let facts = obj_facts
             .get_mut(&obj)
             .unwrap_or_else(|| panic!("missing object facts for obj {}", obj.as_u32()));
-        if facts.size_words == 0 {
-            continue;
-        }
         facts.must_stable = true;
         if matches!(facts.stable_reason, StableReason::None) {
             facts.stable_reason = StableReason::UnknownLocalPointerClosure;
@@ -491,7 +564,6 @@ pub(crate) fn compute_func_stack_objects(
         obj_facts,
         obj_size_words,
         alloca_ids,
-        spill_obj,
         call_sites,
         next_obj_id: next_id,
     }
@@ -501,24 +573,15 @@ fn compute_escaping_allocas(
     function: &Function,
     module: &ModuleCtx,
     isa: &Evm,
-    ptr_escape: &FxHashMap<FuncRef, PtrEscapeSummary>,
-    prov: &SecondaryMap<ValueId, Provenance>,
-    local_mem: &FxHashMap<InstId, Provenance>,
-    arg_mem: &[Provenance],
+    ptr_escape: &PtrEscapeSummaries,
+    prov_info: &ProvenanceInfo,
 ) -> FxHashMap<InstId, Vec<AllocaEscapeSite>> {
     let mut escaping: FxHashMap<InstId, Vec<AllocaEscapeSite>> = FxHashMap::default();
-    let scan_ctx = EscapeScanCtx {
-        module,
-        isa,
-        ptr_escape,
-        prov,
-        local_mem,
-        arg_mem,
-    };
+    let scan_ctx = EscapeScanCtx::new(function, module, isa, ptr_escape, prov_info);
 
     for block in function.layout.iter_block() {
         for inst in function.layout.iter_inst(block) {
-            for_each_escape_event_at_inst(function, inst, scan_ctx, |event| match event.source {
+            for_each_escape_event_at_inst(function, inst, &scan_ctx, |event| match event.source {
                 EscapeSource::Value(value) => {
                     let site = match event.sink {
                         EscapeSink::Return => AllocaEscapeSite::Return { inst, value },
@@ -526,6 +589,7 @@ fn compute_escaping_allocas(
                             inst,
                             addr: match isa.inst_set().resolve_inst(function.dfg.inst(inst)) {
                                 EvmInstKind::Mstore(mstore) => *mstore.addr(),
+                                EvmInstKind::EvmMstore(mstore) => *mstore.addr(),
                                 EvmInstKind::EvmMstore8(mstore8) => *mstore8.addr(),
                                 _ => unreachable!("only stores emit direct-value store escapes"),
                             },
@@ -542,11 +606,11 @@ fn compute_escaping_allocas(
                         }
                     };
 
-                    for base in prov[value].alloca_insts() {
+                    for base in prov_info.value[value].alloca_insts() {
                         escaping.entry(base).or_default().push(site.clone());
                     }
                 }
-                EscapeSource::LocalMem { addr, stored } => {
+                EscapeSource::Memory { addr, stored } => {
                     for base in stored.alloca_insts() {
                         escaping
                             .entry(base)
@@ -554,7 +618,22 @@ fn compute_escaping_allocas(
                             .push(AllocaEscapeSite::NonLocalCopy { inst, addr });
                     }
                 }
-                EscapeSource::UnknownCopy => {}
+                EscapeSource::CallArgument { value, stored } => {
+                    let EscapeSink::CallArg { callee, arg_index } = event.sink else {
+                        unreachable!("resolved argument escape must come from a call");
+                    };
+                    for base in stored.alloca_insts() {
+                        escaping
+                            .entry(base)
+                            .or_default()
+                            .push(AllocaEscapeSite::CallArg {
+                                inst,
+                                callee,
+                                arg_index,
+                                value,
+                            });
+                    }
+                }
             });
         }
     }
@@ -662,11 +741,10 @@ fn render_alloca_escapes(
 mod tests {
     use super::*;
     use crate::{
-        critical_edge::CriticalEdgeSplitter,
         domtree::DomTree,
         isa::evm::{EvmBackend, canonicalize_alias_value},
-        liveness::{InstLiveness, Liveness},
-        stackalloc::StackifyBuilder,
+        liveness::Liveness,
+        stackalloc::{StackifyBuilder, StackifyEdgeSplitter},
     };
     use sonatina_parser::{ParsedModule, parse_module};
     use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
@@ -687,6 +765,7 @@ mod tests {
                 start_boundary,
                 end_boundary,
             }]),
+            phi_edges: BitSet::default(),
             first_rank: start_boundary,
             last_rank: end_boundary,
         }
@@ -696,7 +775,12 @@ mod tests {
         input: &str,
         func_name: &str,
         stack_reach: u8,
-    ) -> (ParsedModule, FuncRef, FuncAnalysis, FuncStackObjects) {
+    ) -> (
+        ParsedModule,
+        FuncRef,
+        StackifiedFuncAnalysis,
+        FuncStackObjects,
+    ) {
         let parsed = parse_module(input).expect("module parses");
         let isa = test_isa();
         let backend = EvmBackend::new(test_isa());
@@ -720,19 +804,16 @@ mod tests {
         parsed.module.func_store.modify(func_ref, |function| {
             let mut cfg = sonatina_ir::cfg::ControlFlowGraph::new();
             cfg.compute(function);
-            CriticalEdgeSplitter::new().run(function, &mut cfg);
+            StackifyEdgeSplitter::run(function, &mut cfg);
 
             let mut liveness = Liveness::new();
             liveness.compute(function, &cfg);
-
-            let mut inst_liveness = InstLiveness::new();
-            inst_liveness.compute(function, &cfg, &liveness);
 
             let mut dom = DomTree::new();
             dom.compute(&cfg);
 
             let value_aliases =
-                backend.compute_stackify_value_aliases(function, &parsed.module.ctx);
+                backend.compute_high_evm_value_aliases(function, &parsed.module.ctx);
 
             let mut stack_liveness = Liveness::new();
             stack_liveness.compute_with_value_normalizer(function, &cfg, |value| {
@@ -743,9 +824,8 @@ mod tests {
                 .with_value_aliases(&value_aliases)
                 .compute();
 
-            analysis = Some(FuncAnalysis {
+            analysis = Some(StackifiedFuncAnalysis {
                 alloc,
-                inst_liveness,
                 block_order: dom.rpo().to_vec(),
                 value_aliases,
             });
@@ -757,6 +837,48 @@ mod tests {
             alloc_ctx.compute_func_stack_objects(func_ref, function, &analysis)
         });
         (parsed, func_ref, analysis, stack)
+    }
+
+    #[test]
+    fn codecopy_source_casts_do_not_extend_previous_local_lifetimes() {
+        let (parsed, func_ref, _, stack) = analyze_function(
+            r#"
+target = "evm-ethereum-osaka"
+global private const [i256; 1] $data = [7];
+func private %entry() -> i256 {
+block0:
+    v0.*i256 = alloca i256;
+    v1.i256 = sym_addr $data;
+    v2.*[i256; 1] = int_to_ptr v1 *[i256; 1];
+    v3.*i256 = gep v2 0.i256 0.i256;
+    v4.i256 = ptr_to_int v3 i256;
+    evm_code_copy v0 v4 32.i256;
+    v5.i256 = mload v0 i256;
+    v6.*i256 = alloca i256;
+    v7.i256 = sym_addr $data;
+    v8.*[i256; 1] = int_to_ptr v7 *[i256; 1];
+    v9.*i256 = gep v8 0.i256 0.i256;
+    v10.i256 = ptr_to_int v9 i256;
+    evm_code_copy v6 v10 32.i256;
+    v11.i256 = mload v6 i256;
+    v12.i256 = add v5 v11;
+    return v12;
+}
+"#,
+            "entry",
+            16,
+        );
+        parsed.module.func_store.view(func_ref, |function| {
+            let regions = ["v0", "v6"].map(|name| {
+                let value = parsed.debug.value(func_ref, name).unwrap();
+                let inst = function.dfg.value_inst(value).unwrap();
+                &stack.obj_facts[&stack.alloca_ids[&inst]].region
+            });
+            assert!(
+                !regions[0].overlaps(regions[1]),
+                "code offsets must not retain unrelated local memory: {regions:?}"
+            );
+        });
     }
 
     #[test]
@@ -773,7 +895,10 @@ mod tests {
                 .value(func_ref, "v5")
                 .expect("aliased pointer value exists"),
         );
-        let spill_obj = analysis.alloc.spill_obj[spill_value].expect("spill object exists");
+        let spill_obj = analysis
+            .alloc
+            .spill_obj(spill_value)
+            .expect("spill object exists");
 
         let call = stack
             .call_sites
@@ -803,10 +928,9 @@ mod tests {
         let closure = AllocaClosureCtx {
             edges: &edges,
             unknown: &unknown,
-            all_allocas: &all_allocas,
         };
 
-        let expanded = closure.expand_roots([root]);
+        let expanded = closure.expand_roots([root], &BitSet::from([root, child, unrelated]));
         assert!(expanded.hit_unknown);
         assert_eq!(expanded.allocas, all_allocas);
     }
@@ -859,8 +983,10 @@ block3:
         let (parsed, func_ref, analysis, stack) = analyze_function(&src, "loop_spill", 16);
         let spilled =
             analysis.canonicalize_value(parsed.debug.value(func_ref, "v18").expect("v18 exists"));
-        let spill_obj =
-            analysis.alloc.spill_obj[spilled].expect("loop-carried phi spill object exists");
+        let spill_obj = analysis
+            .alloc
+            .spill_obj(spilled)
+            .expect("loop-carried phi spill object exists");
         let region = &stack.obj_facts[&spill_obj].region;
         assert!(
             region
@@ -937,6 +1063,69 @@ func private %loop_alloca_phi() -> i256 {
     }
 
     #[test]
+    fn contents_keep_backedge_allocations_but_exclude_future_ones() {
+        // Unknown contents name every allocation that may exist; known contents
+        // name the stored child, which a flow-insensitive closure includes even
+        // before it is allocated.
+        for clobber in ["evm_mstore8 v1 1.i8;", ""] {
+            let (parsed, func_ref, _, stack) = analyze_function(
+                &format!(
+                    r#"
+target = "evm-ethereum-osaka"
+
+func private %touch(v0.*i256) {{
+block0:
+    v1.i256 = mload v0 i256;
+    return;
+}}
+
+func private %entry(v0.i1) {{
+block0:
+    v1.*i256 = alloca i256;
+    {clobber}
+    call %touch v1;
+    jump block1;
+block1:
+    call %touch v1;
+    br v0 block2 block3;
+block2:
+    v2.*i256 = alloca i256;
+    mstore v2 42.i256 i256;
+    mstore v1 v2 *i256;
+    jump block1;
+block3:
+    return;
+}}
+"#
+                ),
+                "entry",
+                16,
+            );
+            parsed.module.func_store.view(func_ref, |function| {
+                let child = parsed.debug.value(func_ref, "v2").unwrap();
+                let child_inst = function.dfg.value_inst(child).unwrap();
+                let child_obj = stack.alloca_ids[&child_inst];
+                for call in &stack.call_sites {
+                    let block = function.layout.inst_block(call.inst);
+                    assert_eq!(
+                        call.callee_visible_objs.contains(&child_obj),
+                        block == BlockId::from_u32(1),
+                        "{clobber}: the child exists at the loop header through the backedge, but not at entry"
+                    );
+                }
+                assert!(
+                    stack.obj_facts[&child_obj]
+                        .region
+                        .segments
+                        .iter()
+                        .any(|segment| segment.block == BlockId::from_u32(1)),
+                    "{clobber}"
+                );
+            });
+        }
+    }
+
+    #[test]
     fn phi_operand_allocas_live_on_predecessor_tails_not_successor_entry() {
         let mut src = String::from(
             r#"
@@ -995,7 +1184,7 @@ block3:
                         .value(func_ref, &name)
                         .expect("branch value exists"),
                 );
-                let obj = analysis.alloc.spill_obj[value]?;
+                let obj = analysis.alloc.spill_obj(value)?;
                 Some(&stack.obj_facts[&obj].region)
             })
             .expect("left branch should produce a spilled phi operand value");
@@ -1008,7 +1197,7 @@ block3:
                         .value(func_ref, &name)
                         .expect("branch value exists"),
                 );
-                let obj = analysis.alloc.spill_obj[value]?;
+                let obj = analysis.alloc.spill_obj(value)?;
                 Some(&stack.obj_facts[&obj].region)
             })
             .expect("right branch should produce a spilled phi operand value");
@@ -1145,40 +1334,6 @@ block0:
     }
 
     #[test]
-    #[should_panic(expected = "alloca escapes in mixed_call_result_escape")]
-    fn alloca_escape_via_derived_mixed_unknown_call_result_panics() {
-        let _ = analyze_function(
-            r#"
-target = "evm-ethereum-osaka"
-
-func private %maybe_arg(v0.*i8, v1.i1) -> *i8 {
-block0:
-    br v1 block1 block2;
-
-block1:
-    return v0;
-
-block2:
-    v2.*i8 = int_to_ptr 0.i32 *i8;
-    return v2;
-}
-
-func private %mixed_call_result_escape(v0.i1) -> *i8 {
-block0:
-    v1.*i8 = alloca i8;
-    v2.*i8 = call %maybe_arg v1 v0;
-    v3.i256 = ptr_to_int v2 i256;
-    v4.i256 = add v3 0.i256;
-    v5.*i8 = int_to_ptr v4 *i8;
-    return v5;
-}
-"#,
-            "mixed_call_result_escape",
-            16,
-        );
-    }
-
-    #[test]
     fn exact_pack_reuses_storage_for_branch_exclusive_regions() {
         let mut objects = vec![
             PackedObject {
@@ -1231,12 +1386,64 @@ block0:
         let mut workspace = ExactPackWorkspace::default();
         let packed = pack_exact_with_offsets_by(
             &items,
-            |lhs, rhs| conflicts[lhs.index()].contains(rhs),
+            |lhs, rhs| conflicts[lhs.as_u32() as usize].contains(rhs),
             &mut workspace,
         );
         assert_eq!(packed.offsets[&StackObjId::new(1)], 0);
         assert_eq!(packed.offsets[&StackObjId::new(2)], 3);
         assert_eq!(packed.offsets[&StackObjId::new(3)], 5);
         assert_eq!(packed.max_used, 6);
+    }
+
+    #[test]
+    fn callee_heap_return_does_not_extend_dead_local_objects() {
+        let (parsed, func_ref, _, stack) = analyze_function(
+            r#"
+target = "evm-ethereum-osaka"
+
+func private %allocate() -> i256 {
+block0:
+    v0.*i256 = evm_malloc 32.i256;
+    v1.i256 = ptr_to_int v0 i256;
+    return v1;
+}
+
+func private %read(v0.*i256) -> i256 {
+block0:
+    v1.i256 = mload v0 i256;
+    return v1;
+}
+
+func private %caller() -> i256 {
+block0:
+    v0.*[i256; 4] = alloca [i256; 4];
+    v1.*i256 = bitcast v0 *i256;
+    mstore v1 7.i256 i256;
+    v2.i256 = call %read v1;
+    v3.*i256 = alloca i256;
+    v4.i256 = call %allocate;
+    mstore v3 v4 i256;
+    v5.i256 = call %read v3;
+    v6.i256 = add v2 v5;
+    return v6;
+}
+"#,
+            "caller",
+            16,
+        );
+        let regions: Vec<_> = ["v0", "v3"]
+            .into_iter()
+            .map(|name| {
+                let value = parsed.debug.value(func_ref, name).expect("alloca exists");
+                let inst = parsed.module.func_store.view(func_ref, |function| {
+                    function
+                        .dfg
+                        .value_inst(value)
+                        .expect("alloca has a definition")
+                });
+                &stack.obj_facts[&stack.alloca_ids[&inst]].region
+            })
+            .collect();
+        assert!(!regions[0].overlaps(regions[1]), "{regions:?}");
     }
 }

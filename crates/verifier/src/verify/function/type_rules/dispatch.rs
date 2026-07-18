@@ -43,7 +43,22 @@ macro_rules! impl_unary_integral_same_rule {
 impl_unary_integral_same_rule!(
     arith::Neg => "neg",
     logic::Not => "not",
+    data::BlackBox => "black_box",
 );
+
+impl VerifyInst for logic::Bswap {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verifier.verify_unary_integral_same(inst_id, *self.arg(), "bswap");
+        if verifier.value_ty(*self.arg()) == Some(Type::I1) {
+            let location = verifier.inst_location(inst_id);
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                "bswap does not support i1 operands",
+                location,
+            ));
+        }
+    }
+}
 
 macro_rules! impl_binary_integral_same_rule {
     ($($ty:ty => $opname:literal),+ $(,)?) => {
@@ -612,285 +627,6 @@ fn variant_payload_tys(
     })
 }
 
-fn same_block_dominating_enum_assert(
-    verifier: &FunctionVerifier<'_>,
-    use_inst: InstId,
-    value: ValueId,
-    variant: EnumVariantRef,
-) -> bool {
-    let Some(block) = verifier.inst_to_block.get(&use_inst).copied() else {
-        return false;
-    };
-    let Some(insts) = verifier.block_to_insts.get(&block) else {
-        return false;
-    };
-
-    for &inst in insts {
-        if inst == use_inst {
-            break;
-        }
-        if let Some(assert_variant) = sonatina_ir::inst::downcast::<&data::EnumAssertVariant>(
-            verifier.ctx.inst_set,
-            verifier.func.dfg.inst(inst),
-        ) && *assert_variant.value() == value
-            && *assert_variant.variant() == variant
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct EnumFieldLoadProof {
-    active_variant: bool,
-    field_initialized: bool,
-}
-
-fn predecessor_edge_proves_enum_assert_ref(
-    verifier: &FunctionVerifier<'_>,
-    use_inst: InstId,
-    object: ValueId,
-    variant: EnumVariantRef,
-) -> bool {
-    let Some(block) = verifier.inst_to_block.get(&use_inst).copied() else {
-        return false;
-    };
-    let Some(preds) = verifier.preds.get(&block) else {
-        return false;
-    };
-
-    let mut saw_reachable_pred = false;
-    for &pred in preds {
-        if !verifier.reachable.contains(&pred) {
-            continue;
-        }
-        saw_reachable_pred = true;
-        if !br_table_edge_proves_enum_variant(verifier, pred, block, object, variant) {
-            return false;
-        }
-    }
-
-    saw_reachable_pred
-}
-
-fn same_block_enum_field_load_proof(
-    verifier: &FunctionVerifier<'_>,
-    use_inst: InstId,
-    root_object: ValueId,
-    field_object: ValueId,
-    variant: EnumVariantRef,
-) -> EnumFieldLoadProof {
-    let pred_proof =
-        predecessor_edge_proves_enum_assert_ref(verifier, use_inst, root_object, variant);
-    let mut proof = EnumFieldLoadProof {
-        active_variant: pred_proof,
-        field_initialized: false,
-    };
-    let Some(block) = verifier.inst_to_block.get(&use_inst).copied() else {
-        return proof;
-    };
-    let Some(insts) = verifier.block_to_insts.get(&block) else {
-        return proof;
-    };
-
-    for &inst in insts {
-        if inst == use_inst {
-            break;
-        }
-        let inst_data = verifier.func.dfg.inst(inst);
-        if let Some(assert_variant_ref) = sonatina_ir::inst::downcast::<&data::EnumAssertVariantRef>(
-            verifier.ctx.inst_set,
-            inst_data,
-        ) && *assert_variant_ref.object() == root_object
-        {
-            if *assert_variant_ref.variant() == variant {
-                proof.active_variant = true;
-                proof.field_initialized = true;
-            } else {
-                proof = EnumFieldLoadProof::default();
-            }
-            continue;
-        }
-        if let Some(set_tag) =
-            sonatina_ir::inst::downcast::<&data::EnumSetTag>(verifier.ctx.inst_set, inst_data)
-            && *set_tag.object() == root_object
-        {
-            if *set_tag.variant() == variant {
-                proof.active_variant = true;
-            } else {
-                proof = EnumFieldLoadProof::default();
-            }
-            continue;
-        }
-        if let Some(write_variant) =
-            sonatina_ir::inst::downcast::<&data::EnumWriteVariant>(verifier.ctx.inst_set, inst_data)
-            && *write_variant.object() == root_object
-        {
-            if *write_variant.variant() == variant {
-                proof.active_variant = true;
-                proof.field_initialized = true;
-            } else {
-                proof = EnumFieldLoadProof::default();
-            }
-            continue;
-        }
-        if let Some(store) =
-            sonatina_ir::inst::downcast::<&data::ObjStore>(verifier.ctx.inst_set, inst_data)
-        {
-            if *store.object() == root_object {
-                proof = EnumFieldLoadProof::default();
-                continue;
-            }
-            if *store.object() == field_object {
-                proof.field_initialized = true;
-            }
-        }
-        if sonatina_ir::inst::downcast::<&control_flow::Call>(verifier.ctx.inst_set, inst_data)
-            .is_some()
-        {
-            proof = EnumFieldLoadProof::default();
-        }
-    }
-
-    proof
-}
-
-fn enum_assert_variant_ref_of_value(
-    verifier: &FunctionVerifier<'_>,
-    value: ValueId,
-) -> Option<data::EnumAssertVariantRef> {
-    let inst = verifier.func.dfg.value_inst(value)?;
-    sonatina_ir::inst::downcast::<&data::EnumAssertVariantRef>(
-        verifier.ctx.inst_set,
-        verifier.func.dfg.inst(inst),
-    )
-    .cloned()
-}
-
-fn br_table_edge_proves_enum_variant(
-    verifier: &FunctionVerifier<'_>,
-    pred: sonatina_ir::BlockId,
-    succ: sonatina_ir::BlockId,
-    object: ValueId,
-    variant: EnumVariantRef,
-) -> bool {
-    let Some(term) = verifier.func.layout.last_inst_of(pred) else {
-        return false;
-    };
-    let Some(br_table) = sonatina_ir::inst::downcast::<&control_flow::BrTable>(
-        verifier.ctx.inst_set,
-        verifier.func.dfg.inst(term),
-    ) else {
-        return false;
-    };
-    br_table_edge_variant(verifier, br_table, succ).is_some_and(
-        |(proved_object, proved_variant)| proved_object == object && proved_variant == variant,
-    )
-}
-
-fn br_table_edge_variant(
-    verifier: &FunctionVerifier<'_>,
-    br_table: &control_flow::BrTable,
-    succ: sonatina_ir::BlockId,
-) -> Option<(ValueId, EnumVariantRef)> {
-    let enum_get_tag = enum_get_tag_of_value(verifier, *br_table.scrutinee())?;
-    let object = *enum_get_tag.object();
-    let Type::EnumTag(enum_ty) = verifier.value_ty(*br_table.scrutinee())? else {
-        return None;
-    };
-
-    let mut matched_variant = None;
-    for &(case_value, dest) in br_table.table() {
-        if dest != succ {
-            continue;
-        }
-        let case_variant = enum_variant_for_tag_value(verifier, enum_ty, case_value)?;
-        if matched_variant.is_some_and(|matched| matched != case_variant) {
-            return None;
-        }
-        matched_variant = Some(case_variant);
-    }
-    if let Some(matched_variant) = matched_variant {
-        return Some((object, matched_variant));
-    }
-
-    if *br_table.default() != Some(succ) {
-        return None;
-    }
-
-    let remaining_variant = remaining_br_table_variant(verifier, enum_ty, br_table)?;
-    Some((object, remaining_variant))
-}
-
-fn remaining_br_table_variant(
-    verifier: &FunctionVerifier<'_>,
-    enum_ty: CompoundTypeRef,
-    br_table: &control_flow::BrTable,
-) -> Option<EnumVariantRef> {
-    let variant_count = verifier.ctx.with_ty_store(|store| {
-        let CompoundType::Enum(enum_data) = store.get_compound(enum_ty)? else {
-            return None;
-        };
-        Some(enum_data.variants.len())
-    })?;
-
-    let mut uncovered_variant = None;
-    for idx in 0..variant_count {
-        let variant = EnumVariantRef::new(
-            enum_ty,
-            u32::try_from(idx).expect("enum variant index overflow"),
-        );
-        let mut covered = false;
-        for &(case_value, _) in br_table.table() {
-            if enum_variant_for_tag_value(verifier, enum_ty, case_value) == Some(variant) {
-                covered = true;
-                break;
-            }
-        }
-        if covered {
-            continue;
-        }
-        if uncovered_variant.is_some() {
-            return None;
-        }
-        uncovered_variant = Some(variant);
-    }
-
-    uncovered_variant
-}
-
-fn enum_variant_for_tag_value(
-    verifier: &FunctionVerifier<'_>,
-    enum_ty: CompoundTypeRef,
-    value: ValueId,
-) -> Option<EnumVariantRef> {
-    let idx = verifier.value_imm(value)?.to_nonnegative_usize()?;
-    let variant_count = verifier.ctx.with_ty_store(|store| {
-        let CompoundType::Enum(enum_data) = store.get_compound(enum_ty)? else {
-            return None;
-        };
-        Some(enum_data.variants.len())
-    })?;
-    (idx < variant_count).then_some(EnumVariantRef::new(
-        enum_ty,
-        u32::try_from(idx).expect("enum variant index overflow"),
-    ))
-}
-
-fn enum_get_tag_of_value(
-    verifier: &FunctionVerifier<'_>,
-    value: ValueId,
-) -> Option<data::EnumGetTag> {
-    let inst = verifier.func.dfg.value_inst(value)?;
-    sonatina_ir::inst::downcast::<&data::EnumGetTag>(
-        verifier.ctx.inst_set,
-        verifier.func.dfg.inst(inst),
-    )
-    .cloned()
-}
-
 fn expect_objref_result(
     verifier: &mut FunctionVerifier<'_>,
     inst_id: InstId,
@@ -1079,7 +815,38 @@ impl VerifyInst for cast::Bitcast {
                 location.clone(),
             ));
         }
-        if verifier.objref_ty(from_ty).is_some() || verifier.objref_ty(to_ty).is_some() {
+        // Object references have no implicit raw representation. Applying this
+        // only at the top level lets an aggregate wrapper bypass the rule.
+        let contains_object_reference = |ty| {
+            let mut pending = vec![ty];
+            let mut seen = FxHashSet::default();
+            while let Some(ty) = pending.pop() {
+                let Type::Compound(id) = ty else { continue };
+                if !seen.insert(id) {
+                    continue;
+                }
+                let Some(compound) = verifier
+                    .ctx
+                    .with_ty_store(|store| store.get_compound(id).cloned())
+                else {
+                    continue;
+                };
+                match compound {
+                    CompoundType::ObjRef(_) => return true,
+                    CompoundType::Array { elem, .. } => pending.push(elem),
+                    CompoundType::Struct(record) => pending.extend(record.fields),
+                    CompoundType::Enum(enumeration) => pending.extend(
+                        enumeration
+                            .variants
+                            .into_iter()
+                            .flat_map(|variant| variant.fields),
+                    ),
+                    _ => {}
+                }
+            }
+            false
+        };
+        if contains_object_reference(from_ty) || contains_object_reference(to_ty) {
             verifier.emit(Diagnostic::error(
                 DiagnosticCode::InstOperandTypeMismatch,
                 "bitcast does not allow object-reference types",
@@ -1569,33 +1336,6 @@ impl VerifyInst for data::ObjLoad {
                 location.clone(),
             ));
         }
-        if let Some(proj_inst) = verifier.func.dfg.value_inst(*self.object())
-            && let Some(enum_proj) = sonatina_ir::inst::downcast::<&data::EnumProj>(
-                verifier.ctx.inst_set,
-                verifier.func.dfg.inst(proj_inst),
-            )
-        {
-            let proj_object = *enum_proj.object();
-            let root_object = enum_assert_variant_ref_of_value(verifier, proj_object)
-                .filter(|assert_variant_ref| *assert_variant_ref.variant() == *enum_proj.variant())
-                .map_or(proj_object, |assert_variant_ref| {
-                    *assert_variant_ref.object()
-                });
-            let proof = same_block_enum_field_load_proof(
-                verifier,
-                inst_id,
-                root_object,
-                *self.object(),
-                *enum_proj.variant(),
-            );
-            if !proof.active_variant || !proof.field_initialized {
-                verifier.emit(Diagnostic::error(
-                    DiagnosticCode::InstOperandTypeMismatch,
-                    "obj.load from enum.proj requires a proven initialized active variant field",
-                    location.clone(),
-                ));
-            }
-        }
         verifier.expect_result_ty(inst_id, value_ty, location);
     }
 }
@@ -1813,28 +1553,6 @@ impl VerifyInst for data::EnumExtract {
         ) else {
             return;
         };
-
-        let proven = verifier
-            .func
-            .dfg
-            .value_inst(*self.value())
-            .and_then(|def_inst| {
-                sonatina_ir::inst::downcast::<&data::EnumMake>(
-                    verifier.ctx.inst_set,
-                    verifier.func.dfg.inst(def_inst),
-                )
-                .map(|make| *make.variant() == *self.variant())
-            })
-            .unwrap_or(false)
-            || same_block_dominating_enum_assert(verifier, inst_id, *self.value(), *self.variant());
-
-        if !proven {
-            verifier.emit(Diagnostic::error(
-                DiagnosticCode::InstOperandTypeMismatch,
-                "enum.extract requires a proven active variant at the use site",
-                location.clone(),
-            ));
-        }
 
         verifier.expect_result_ty(inst_id, field_ty, location);
     }
@@ -2449,6 +2167,31 @@ impl VerifyInst for control_flow::Return {
     }
 }
 
+impl VerifyInst for data::Memzero {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        let location = verifier.inst_location(inst_id);
+        if let Some(dest_ty) = verifier.value_ty(*self.dest())
+            && !is_integral_or_pointer(verifier.ctx, dest_ty)
+        {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                "memzero destination must be integral or pointer",
+                location.clone(),
+            ));
+        }
+        if let Some(len_ty) = verifier.value_ty(*self.len())
+            && !len_ty.is_integral()
+        {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                "memzero length must be integral",
+                location.clone(),
+            ));
+        }
+        verifier.expect_no_result(inst_id, location);
+    }
+}
+
 impl VerifyInst for control_flow::Unreachable {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
         verifier.expect_no_result(inst_id, verifier.inst_location(inst_id));
@@ -2474,6 +2217,7 @@ impl_evm_no_result_rule!(
     evm::EvmCodeCopy,
     evm::EvmExtCodeCopy,
     evm::EvmReturnDataCopy,
+    evm::EvmMstore,
     evm::EvmMstore8,
     evm::EvmSstore,
     evm::EvmTstore,
@@ -2514,6 +2258,35 @@ impl_evm_arithmetic_rule!(
     evm::EvmClz,
     evm::EvmSignExtend,
 );
+
+impl VerifyInst for evm::EvmKeccak256Words {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        let location = verifier.inst_location(inst_id);
+        verifier.verify_evm_rule_common(inst_id, self.words(), false);
+        for &word in self.words() {
+            if let Some(ty) = verifier.value_ty(word)
+                && ty != Type::I256
+            {
+                verifier.emit(
+                    Diagnostic::error(
+                        DiagnosticCode::InstOperandTypeMismatch,
+                        "evm_keccak256_words operands must be i256 words",
+                        location.clone(),
+                    )
+                    .with_note(format!("operand v{} has type {ty:?}", word.as_u32())),
+                );
+            }
+        }
+        verifier.expect_result_ty(inst_id, Type::I256, location);
+    }
+}
+
+impl VerifyInst for evm::EvmCodeLoad {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verifier.verify_evm_rule_common(inst_id, &self.collect_values(), false);
+        verifier.expect_result_ty(inst_id, Type::I256, verifier.inst_location(inst_id));
+    }
+}
 
 impl VerifyInst for evm::EvmMalloc {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
@@ -2560,6 +2333,7 @@ impl_evm_general_result_rule!(
     evm::EvmBaseFee,
     evm::EvmBlobHash,
     evm::EvmBlobBaseFee,
+    evm::EvmMload,
     evm::EvmSload,
     evm::EvmMsize,
     evm::EvmGas,

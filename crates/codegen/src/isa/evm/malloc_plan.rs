@@ -1,24 +1,32 @@
 use cranelift_entity::SecondaryMap;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::{FxHashMap, FxHashSet};
 use sonatina_ir::{
-    BlockId, Function, InstId, InstSetExt, Type, ValueId,
+    AccessKind, AccessLoc, BlockId, Function, InstId, InstSetExt, Module, Type, Value, ValueId,
     cfg::ControlFlowGraph,
     func_cursor::{CursorLocation, FuncCursor, InstInserter},
     inst::{
         data::{Mload, Mstore},
         evm::inst_set::EvmInstKind,
     },
-    isa::{Isa, evm::Evm},
+    isa::{
+        Isa,
+        evm::{Evm, space::MEMORY},
+    },
     module::{FuncRef, ModuleCtx},
 };
 
-use crate::{bitset::BitSet, liveness::InstLiveness};
+use crate::{bitset::BitSet, liveness::InstLiveness, module_analysis::CallGraphSchedule};
 
 use super::{
-    escape_scan::{EscapeScanCtx, EscapeSink, EscapeSource, for_each_escape_event_at_inst},
-    mem_effects::FuncMemEffects,
-    provenance::{Provenance, compute_provenance},
-    ptr_escape::PtrEscapeSummary,
+    escape_scan::{
+        EscapeScanCtx, EscapeSink, EscapeSource, escape_source_may_be_heap_derived,
+        for_each_escape_event_at_inst,
+    },
+    memory_plan::SemanticFuncPlan,
+    private_malloc::PrivateMallocUseAnalysis,
+    ptr_escape::PtrEscapeSummaries,
+    ptr_provenance::{Provenance, ProvenanceInfo},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -29,12 +37,12 @@ impl MallocEscapeKind {
     pub(crate) const STORED_NON_LOCAL: Self = Self(1 << 1);
     pub(crate) const UNKNOWN: Self = Self(1 << 2);
 
-    pub(crate) fn has_global_or_unknown(self) -> bool {
-        self.contains(Self::STORED_NON_LOCAL) || self.contains(Self::UNKNOWN)
+    pub(crate) fn escapes(self) -> bool {
+        self.0 != 0
     }
 
-    pub(crate) fn is_return_only(self) -> bool {
-        self.contains(Self::RETURNS_TO_CALLER) && !self.has_global_or_unknown()
+    pub(crate) fn has_global_or_unknown(self) -> bool {
+        self.contains(Self::STORED_NON_LOCAL) || self.contains(Self::UNKNOWN)
     }
 
     fn contains(self, other: Self) -> bool {
@@ -46,11 +54,44 @@ impl MallocEscapeKind {
     }
 }
 
+pub(crate) type TransientMallocCallBarriers = FxHashMap<FuncRef, bool>;
+
+/// Computes whether calls to each function can invalidate transient mallocs.
+pub(crate) fn compute_transient_malloc_call_barriers(
+    module: &Module,
+    schedule: &CallGraphSchedule,
+    semantic_plans: &FxHashMap<FuncRef, SemanticFuncPlan>,
+    isa: &Evm,
+) -> TransientMallocCallBarriers {
+    let mut local_results: Vec<_> = schedule
+        .funcs()
+        .par_iter()
+        .copied()
+        .map(|func| {
+            let uses_dynamic_frame = semantic_plans
+                .get(&func)
+                .is_some_and(|plan| plan.dynamic_frame_layout().is_some());
+            let uses_malloc = module
+                .func_store
+                .view(func, |function| func_uses_malloc(function, isa));
+            (func, uses_dynamic_frame || uses_malloc)
+        })
+        .collect();
+    local_results.sort_unstable_by_key(|(func, _)| func.as_u32());
+    let local_barriers: TransientMallocCallBarriers = local_results.into_iter().collect();
+
+    schedule.join_over_callees(
+        |func| local_barriers[&func],
+        |barrier, callee_barrier| *barrier |= *callee_barrier,
+    )
+}
+
 pub(crate) fn should_restore_free_ptr_on_internal_returns(
     function: &Function,
     module: &ModuleCtx,
     isa: &Evm,
-    ptr_escape: &FxHashMap<FuncRef, PtrEscapeSummary>,
+    ptr_escape: &PtrEscapeSummaries,
+    prov_info: &ProvenanceInfo,
     transient_mallocs: &FxHashSet<InstId>,
 ) -> bool {
     let mut has_internal_return = false;
@@ -59,6 +100,15 @@ pub(crate) fn should_restore_free_ptr_on_internal_returns(
     for block in function.layout.iter_block() {
         for inst in function.layout.iter_inst(block) {
             let data = isa.inst_set().resolve_inst(function.dfg.inst(inst));
+            if let EvmInstKind::Call(call) = data
+                && ptr_escape
+                    .get_or_conservative(module, *call.callee())
+                    .may_publish_heap
+            {
+                // Restoring the entry cursor also frees allocations published
+                // by callees, even when no caller-owned pointer escapes.
+                return false;
+            }
             if matches!(data, EvmInstKind::Return(_)) {
                 has_internal_return = true;
             }
@@ -72,33 +122,14 @@ pub(crate) fn should_restore_free_ptr_on_internal_returns(
         return false;
     }
 
-    let prov_info = compute_provenance(function, module, isa, |callee| {
-        PtrEscapeSummary::get_or_conservative(ptr_escape, module, callee)
-    });
-    let prov = &prov_info.value;
-    let local_mem = &prov_info.local_mem;
-    let arg_mem = &prov_info.arg_mem;
-    let scan_ctx = EscapeScanCtx {
-        module,
-        isa,
-        ptr_escape,
-        prov,
-        local_mem,
-        arg_mem,
-    };
+    let scan_ctx = EscapeScanCtx::new(function, module, isa, ptr_escape, prov_info);
 
     for block in function.layout.iter_block() {
         for inst in function.layout.iter_inst(block) {
             let mut escapes_heap = false;
-            for_each_escape_event_at_inst(function, inst, scan_ctx, |event| match event.source {
-                EscapeSource::Value(value) => {
-                    escapes_heap |= value_may_be_heap_derived(function, module, value, prov);
-                }
-                EscapeSource::LocalMem { stored, .. } => {
-                    escapes_heap |=
-                        stored.is_unknown_ptr() || stored.malloc_insts().next().is_some();
-                }
-                EscapeSource::UnknownCopy => escapes_heap = true,
+            for_each_escape_event_at_inst(function, inst, &scan_ctx, |event| {
+                escapes_heap |=
+                    escape_source_may_be_heap_derived(function, &scan_ctx, &event.source);
             });
             if escapes_heap {
                 return false;
@@ -157,8 +188,9 @@ pub(crate) fn compute_transient_mallocs(
     function: &Function,
     module: &ModuleCtx,
     isa: &Evm,
-    ptr_escape: &FxHashMap<FuncRef, PtrEscapeSummary>,
-    mem_effects: Option<&FxHashMap<FuncRef, FuncMemEffects>>,
+    ptr_escape: &PtrEscapeSummaries,
+    prov_info: &ProvenanceInfo,
+    call_barriers: Option<&TransientMallocCallBarriers>,
     inst_liveness: &InstLiveness,
 ) -> FxHashSet<InstId> {
     let mut mallocs: FxHashSet<InstId> = FxHashSet::default();
@@ -177,27 +209,31 @@ pub(crate) fn compute_transient_mallocs(
         return FxHashSet::default();
     }
 
-    let prov_info = compute_provenance(function, module, isa, |callee| {
-        PtrEscapeSummary::get_or_conservative(ptr_escape, module, callee)
-    });
-    let prov = &prov_info.value;
-    let local_mem = &prov_info.local_mem;
-    let arg_mem = &prov_info.arg_mem;
-    let scan_ctx = EscapeScanCtx {
-        module,
-        isa,
-        ptr_escape,
-        prov,
-        local_mem,
-        arg_mem,
-    };
+    let scan_ctx = EscapeScanCtx::new(function, module, isa, ptr_escape, prov_info);
 
     let block_malloc_in = compute_block_malloc_in(function, isa);
-    let escape_kinds = compute_malloc_escape_kinds(function, scan_ctx, &block_malloc_in);
+    let escape_kinds = compute_malloc_escape_kinds(function, &scan_ctx, &block_malloc_in);
 
     for malloc in escape_kinds.keys() {
         mallocs.remove(malloc);
     }
+
+    let address_barriers = unknown_data_address_barriers(function, isa, prov_info);
+    let private_mallocs: FxHashSet<_> = mallocs
+        .iter()
+        .copied()
+        .filter(|&inst| {
+            let EvmInstKind::EvmMalloc(malloc) =
+                isa.inst_set().resolve_inst(function.dfg.inst(inst))
+            else {
+                return false;
+            };
+            address_barriers.is_some()
+                && PrivateMallocUseAnalysis::new(function, module, isa, inst)
+                    .analyze_bounded_private_address_uses(*malloc.size(), false)
+                    .is_some()
+        })
+        .collect();
 
     for block in function.layout.iter_block() {
         let mut seen_mallocs = block_malloc_in[block].clone();
@@ -210,7 +246,16 @@ pub(crate) fn compute_transient_mallocs(
                     live.remove(*def);
                 }
 
-                remove_live_mallocs(&mut mallocs, &live, prov, local_mem, &seen_mallocs);
+                remove_live_mallocs(
+                    &mut mallocs,
+                    &live,
+                    prov_info,
+                    &seen_mallocs,
+                    &private_mallocs,
+                    address_barriers
+                        .as_ref()
+                        .is_none_or(|barriers| barriers.contains(inst)),
+                );
                 seen_mallocs.insert(inst);
                 continue;
             }
@@ -220,14 +265,13 @@ pub(crate) fn compute_transient_mallocs(
             };
 
             let callee = call_info.callee();
-            let is_barrier = mem_effects.is_none_or(|effects| {
-                let eff = effects.get(&callee).copied().unwrap_or_else(|| {
+            let is_barrier = call_barriers.is_none_or(|barriers| {
+                *barriers.get(&callee).unwrap_or_else(|| {
                     panic!(
-                        "missing mem effects for callee {} in transient malloc analysis",
+                        "missing transient malloc call barrier for callee {}",
                         callee.as_u32()
                     )
-                });
-                eff.touches_heap_meta || eff.touches_dyn_frame
+                })
             });
             if !is_barrier {
                 continue;
@@ -245,74 +289,253 @@ pub(crate) fn compute_transient_mallocs(
             for &arg in call.args() {
                 live.insert(arg);
             }
-            remove_live_mallocs(&mut mallocs, &live, prov, local_mem, &seen_mallocs);
+            remove_live_mallocs(
+                &mut mallocs,
+                &live,
+                prov_info,
+                &seen_mallocs,
+                &private_mallocs,
+                address_barriers
+                    .as_ref()
+                    .is_none_or(|barriers| barriers.contains(inst)),
+            );
         }
     }
 
     mallocs
 }
 
+fn func_uses_malloc(function: &Function, isa: &Evm) -> bool {
+    function.layout.iter_block().any(|block| {
+        function.layout.iter_inst(block).any(|inst| {
+            matches!(
+                isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                EvmInstKind::EvmMalloc(_)
+            )
+        })
+    })
+}
+
 pub(crate) fn compute_malloc_escape_kinds_for_function(
     function: &Function,
     module: &ModuleCtx,
     isa: &Evm,
-    ptr_escape: &FxHashMap<FuncRef, PtrEscapeSummary>,
+    ptr_escape: &PtrEscapeSummaries,
+    prov_info: &ProvenanceInfo,
 ) -> FxHashMap<InstId, MallocEscapeKind> {
-    let prov_info = compute_provenance(function, module, isa, |callee| {
-        PtrEscapeSummary::get_or_conservative(ptr_escape, module, callee)
-    });
-    let prov = &prov_info.value;
-    let local_mem = &prov_info.local_mem;
-    let arg_mem = &prov_info.arg_mem;
-    let scan_ctx = EscapeScanCtx {
-        module,
-        isa,
-        ptr_escape,
-        prov,
-        local_mem,
-        arg_mem,
-    };
+    let scan_ctx = EscapeScanCtx::new(function, module, isa, ptr_escape, prov_info);
     let block_malloc_in = compute_block_malloc_in(function, isa);
-    compute_malloc_escape_kinds(function, scan_ctx, &block_malloc_in)
+    compute_malloc_escape_kinds(function, &scan_ctx, &block_malloc_in)
 }
 
 fn remove_live_mallocs(
     mallocs: &mut FxHashSet<InstId>,
     live: &BitSet<ValueId>,
-    prov: &SecondaryMap<ValueId, Provenance>,
-    local_mem: &FxHashMap<InstId, Provenance>,
+    prov_info: &ProvenanceInfo,
     seen_mallocs: &BitSet<InstId>,
+    private_mallocs: &FxHashSet<InstId>,
+    unknown_address_is_reachable: bool,
 ) {
-    let mut has_unknown_ptr = false;
-    for v in live.iter() {
-        let v_prov = &prov[v];
-        if v_prov.is_unknown_ptr() {
-            has_unknown_ptr = true;
-        }
-        for base in v_prov.malloc_insts() {
-            mallocs.remove(&base);
-        }
+    let mut roots = Provenance::default();
+    for value in live.iter() {
+        let provenance = &prov_info.value[value];
+        roots.union_with(provenance);
+    }
+    // Pointers saved in nested local or private heap containers remain live
+    // even after their original SSA values die. Follow both kinds of storage.
+    let reachable = prov_info.reachable_memory(&roots);
+    for base in reachable.malloc_insts() {
+        mallocs.remove(&base);
+    }
+    if reachable.may_reference_unknown_local() {
+        mallocs.retain(|malloc| {
+            !seen_mallocs.contains(*malloc)
+                || (!unknown_address_is_reachable && private_mallocs.contains(malloc))
+        });
+    }
+}
 
-        // A malloc-derived pointer can be saved into local memory and reloaded later, without
-        // remaining live as an SSA value. If the *address* of such local memory is live here,
-        // conservatively treat any malloc pointers that may be stored there as live too.
-        if v_prov.is_local_addr() {
-            for alloca_base in v_prov.alloca_insts() {
-                let Some(stored) = local_mem.get(&alloca_base) else {
-                    continue;
-                };
-                if stored.is_unknown_ptr() {
-                    has_unknown_ptr = true;
-                }
-                for base in stored.malloc_insts() {
-                    mallocs.remove(&base);
-                }
+/// Unknown scalar data does not retain an unobservable private buffer unless
+/// it can be used as an address. Known roots are still closed over memory by
+/// `remove_live_mallocs`; this only proves when additional unknown roots do not
+/// apply. If memory contents can feed an address, preserve the original whole-
+/// container barrier, including aliases and stores not represented in SSA.
+fn unknown_data_address_barriers(
+    function: &Function,
+    isa: &Evm,
+    prov_info: &ProvenanceInfo,
+) -> Option<BitSet<InstId>> {
+    let mut uses = BitSet::default();
+    let mut direct_uses: SecondaryMap<InstId, BitSet<ValueId>> = SecondaryMap::new();
+    for inst in function.layout.iter_all_insts() {
+        if function.dfg.call_info(inst).is_some() {
+            // A callee can interpret stored words as pointers without a local
+            // SSA load. Retain the barrier until a read-demand summary proves it.
+            return None;
+        }
+        if matches!(
+            isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+            EvmInstKind::EvmMalloc(_)
+        ) {
+            continue;
+        }
+        if let Some(values) = function.dfg.return_args(inst) {
+            for &value in values {
+                uses.insert(value);
+                direct_uses[inst].insert(value);
             }
+        }
+        for access in function.dfg.effects(inst).accesses {
+            if access.space != MEMORY {
+                continue;
+            }
+            let addr = match access.loc {
+                AccessLoc::LinearExact { addr, bytes, .. } if bytes != 0 => addr,
+                AccessLoc::LinearRange { addr, len }
+                    if !function.dfg.value_imm(len).is_some_and(|len| len.is_zero()) =>
+                {
+                    // Extending a range can observe unrelated allocations just
+                    // as changing its starting address can.
+                    uses.insert(len);
+                    direct_uses[inst].insert(len);
+                    addr
+                }
+                AccessLoc::LinearExact { .. }
+                | AccessLoc::LinearRange { .. }
+                | AccessLoc::LinearExactImm { .. } => continue,
+                _ => return None,
+            };
+            if prov_info.value[addr].has_no_known_bases() && function.dfg.value_imm(addr).is_none()
+            {
+                // Raw numeric addresses can alias a private buffer even when
+                // computed from constants. Only fixed immediate ranges have
+                // separate reservation evidence.
+                return None;
+            }
+            // A known base does not make its address calculation private:
+            // GEP indices and other offsets can still come from unknown data.
+            uses.insert(addr);
+            direct_uses[inst].insert(addr);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for inst in function.layout.iter_all_insts() {
+            if !function
+                .dfg
+                .inst_results(inst)
+                .iter()
+                .any(|&value| uses.contains(value))
+            {
+                continue;
+            }
+            if matches!(
+                isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                EvmInstKind::Alloca(_) | EvmInstKind::EvmMalloc(_)
+            ) {
+                // Fresh allocation addresses do not expose their size operands
+                // as pointers. Their known roots remain lifetime barriers.
+                continue;
+            }
+            if function
+                .dfg
+                .effects(inst)
+                .accesses
+                .iter()
+                .any(|access| access.space == MEMORY && access.kind == AccessKind::Read)
+            {
+                return None;
+            }
+            function.dfg.inst(inst).for_each_value(&mut |value| {
+                changed |= uses.insert(value);
+            });
+        }
+        if !changed {
+            break;
         }
     }
 
-    if has_unknown_ptr {
-        mallocs.retain(|m| !seen_mallocs.contains(*m));
+    // A counter computed from literals can contribute to an address without
+    // carrying unknown pointer bits. Seed opaque inputs, then propagate only
+    // along demanded computations; loop phis converge without tainting such
+    // counters. Known allocation roots are handled separately by liveness.
+    let mut unknown = BitSet::default();
+    for value in uses.iter() {
+        match function.dfg.get_value(value)? {
+            Value::Immediate { .. } => {}
+            Value::Inst { inst, .. } => {
+                if matches!(
+                    isa.inst_set().resolve_inst(function.dfg.inst(*inst)),
+                    EvmInstKind::Alloca(_) | EvmInstKind::EvmMalloc(_)
+                ) {
+                    continue;
+                }
+                if function.dfg.effects(*inst).summary().has_effect()
+                    || function.dfg.inst(*inst).collect_values().is_empty()
+                {
+                    unknown.insert(value);
+                }
+            }
+            _ => {
+                unknown.insert(value);
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for inst in function.layout.iter_all_insts() {
+            if matches!(
+                isa.inst_set().resolve_inst(function.dfg.inst(inst)),
+                EvmInstKind::Alloca(_) | EvmInstKind::EvmMalloc(_)
+            ) || !function
+                .dfg
+                .inst(inst)
+                .collect_values()
+                .iter()
+                .any(|value| unknown.contains(*value))
+            {
+                continue;
+            }
+            for &result in function.dfg.inst_results(inst) {
+                if uses.contains(result) {
+                    changed |= unknown.insert(result);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Values can remain live as scalar data after their last address use. Only
+    // memory observations reachable after the allocation can keep earlier
+    // private buffers alive. Include backedges, but not initialization on an
+    // entry path that cannot execute again.
+    let mut cfg = ControlFlowGraph::new();
+    cfg.compute(function);
+    let mut block_in: SecondaryMap<BlockId, bool> = SecondaryMap::new();
+    let mut barriers = BitSet::default();
+    loop {
+        let mut changed = false;
+        for block in cfg.post_order() {
+            let mut future = cfg.succs_of(block).any(|succ| block_in[*succ]);
+            let insts: Vec<_> = function.layout.iter_inst(block).collect();
+            for inst in insts.into_iter().rev() {
+                if future {
+                    barriers.insert(inst);
+                }
+                future |= direct_uses[inst]
+                    .iter()
+                    .any(|value| unknown.contains(value));
+            }
+            if future && !block_in[block] {
+                block_in[block] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return Some(barriers);
+        }
     }
 }
 
@@ -364,29 +587,20 @@ fn compute_block_malloc_in(
     block_in
 }
 
-fn record_escaping_mallocs(
-    escape_kinds: &mut FxHashMap<InstId, MallocEscapeKind>,
-    value: ValueId,
-    prov: &SecondaryMap<ValueId, Provenance>,
-    seen_mallocs: &BitSet<InstId>,
-    direct_kind: MallocEscapeKind,
-) {
-    let p = &prov[value];
-    record_escaping_provenance(escape_kinds, p, seen_mallocs, direct_kind);
-}
-
 fn record_escaping_provenance(
     escape_kinds: &mut FxHashMap<InstId, MallocEscapeKind>,
-    p: &Provenance,
+    provenance: &Provenance,
+    prov_info: &ProvenanceInfo,
     seen_mallocs: &BitSet<InstId>,
     direct_kind: MallocEscapeKind,
 ) {
-    if p.is_unknown_ptr() {
+    let reachable = prov_info.reachable_memory(provenance);
+    if reachable.may_reference_unknown_local() {
         for malloc in seen_mallocs.iter() {
             record_escape_kind(escape_kinds, malloc, MallocEscapeKind::UNKNOWN);
         }
     }
-    for malloc in p.malloc_insts() {
+    for malloc in reachable.malloc_insts() {
         record_escape_kind(escape_kinds, malloc, direct_kind);
     }
 }
@@ -402,22 +616,13 @@ fn record_escape_kind(
         .or_insert(kind);
 }
 
-fn record_unknown_seen_mallocs(
-    escape_kinds: &mut FxHashMap<InstId, MallocEscapeKind>,
-    seen_mallocs: &BitSet<InstId>,
-) {
-    for malloc in seen_mallocs.iter() {
-        record_escape_kind(escape_kinds, malloc, MallocEscapeKind::UNKNOWN);
-    }
-}
-
 fn compute_malloc_escape_kinds(
     function: &Function,
-    scan_ctx: EscapeScanCtx<'_>,
+    scan_ctx: &EscapeScanCtx<'_>,
     block_malloc_in: &SecondaryMap<BlockId, BitSet<InstId>>,
 ) -> FxHashMap<InstId, MallocEscapeKind> {
     let mut escape_kinds: FxHashMap<InstId, MallocEscapeKind> = FxHashMap::default();
-    let prov = scan_ctx.prov;
+    let prov = &scan_ctx.prov_info.value;
 
     for block in function.layout.iter_block() {
         let mut seen_mallocs = block_malloc_in[block].clone();
@@ -430,24 +635,18 @@ fn compute_malloc_escape_kinds(
                     | EscapeSink::CallArg { .. } => MallocEscapeKind::STORED_NON_LOCAL,
                 };
 
-                match event.source {
-                    EscapeSource::Value(value) => record_escaping_mallocs(
-                        &mut escape_kinds,
-                        value,
-                        prov,
-                        &seen_mallocs,
-                        direct_kind,
-                    ),
-                    EscapeSource::LocalMem { stored, .. } => record_escaping_provenance(
-                        &mut escape_kinds,
-                        stored,
-                        &seen_mallocs,
-                        direct_kind,
-                    ),
-                    EscapeSource::UnknownCopy => {
-                        record_unknown_seen_mallocs(&mut escape_kinds, &seen_mallocs)
-                    }
-                }
+                let source = match &event.source {
+                    EscapeSource::Value(value) => &prov[*value],
+                    EscapeSource::Memory { stored, .. }
+                    | EscapeSource::CallArgument { stored, .. } => stored,
+                };
+                record_escaping_provenance(
+                    &mut escape_kinds,
+                    source,
+                    scan_ctx.prov_info,
+                    &seen_mallocs,
+                    direct_kind,
+                );
             });
 
             if matches!(
@@ -463,15 +662,4 @@ fn compute_malloc_escape_kinds(
     }
 
     escape_kinds
-}
-
-fn value_may_be_heap_derived(
-    function: &Function,
-    module: &ModuleCtx,
-    value: ValueId,
-    prov: &SecondaryMap<ValueId, Provenance>,
-) -> bool {
-    prov[value].malloc_insts().next().is_some()
-        || prov[value].is_unknown_ptr()
-        || (function.dfg.value_ty(value).is_pointer(module) && prov[value].has_no_known_bases())
 }

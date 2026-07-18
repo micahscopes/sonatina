@@ -2,20 +2,27 @@ use cranelift_entity::SecondaryMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{SmallVec, smallvec};
 use sonatina_ir::{
-    BlockId, Function, I256, Immediate, InstId, Type, Value, ValueId,
+    BlockId, ControlFlowGraph, Function, I256, Immediate, InstId, Type, Value, ValueId,
     func_cursor::{CursorLocation, FuncCursor, InstInserter},
+    global_variable::GvInitializer,
     inst::{cast, cmp, control_flow, data, downcast},
     module::FuncRef,
     types::CompoundType,
 };
 
-use crate::cfg_edit::{CfgEditor, CleanupMode};
+use crate::{
+    cfg_edit::{CfgEditor, CleanupMode},
+    optim::const_eval::{
+        ConstPathAnalysis, analyze_const_paths, collect_constref_value_tys, eval_const_path_subtree,
+    },
+};
 
 use super::{
-    LocalObjectArgInfo, LocalObjectArgMap, RootInit,
+    LocalObjectArgInfo, LocalObjectArgMap, ObjectEffectSummaryMap, ObjectMemoryAnalysis, RootInit,
     cleanup::DeadPureInstCleanup,
-    object_tracking::AggregateFacts,
-    promotion::SsaBuilder,
+    object_arg_invariance::FunctionArgInvariance,
+    object_tracking::{AggregateFacts, ObjectSlice, objref_element_ty},
+    promotion::{ReadPrefixRequirement, SsaBuilder, unconditional_read_prefix},
     provenance::{CompleteProvenance, ExactProjectionMap, ProvenanceSnapshot, RootValue},
     reconstruct::{
         AggregateValueReconstructor, bitcast_before_inst, rebuild_scalar_shape_from_leaf_values,
@@ -38,6 +45,18 @@ enum RootKind {
     SyntheticOutArg { index: usize },
 }
 
+enum RootUseKind {
+    ProjectionPreserving { result: ValueId },
+    SameProjection { result: ValueId, allow_dead: bool },
+    LoadView { ty: Type },
+    StoreView { ty: Type },
+    ConstInit { value: ValueId },
+    EnumTagRead { ty: Type },
+    EnumMutation,
+    DeadUse,
+    EscapingOrUnsupported,
+}
+
 #[derive(Clone)]
 struct PromotableRoot {
     root_value: ValueId,
@@ -46,6 +65,100 @@ struct PromotableRoot {
     shape: shape::AggregateShape,
     leaf_vars: SmallVec<[sonatina_ir::builder::Variable; 4]>,
     init: RootInit,
+    incoming: Option<IncomingPromotionPlan>,
+}
+
+/// Constructed from the original function before any loads or CFG edits.
+/// Each read has an entry-content proof; each demanded leaf separately has an
+/// unconditional prefix witness or a caller-derived entry-validity proof.
+#[derive(Clone)]
+struct IncomingPromotionPlan {
+    reads: FxHashMap<InstId, ObjectSlice>,
+    entry_leaf_reads: SmallVec<[Option<InstId>; 4]>,
+}
+
+impl IncomingPromotionPlan {
+    fn build(
+        func: &Function,
+        root: ValueId,
+        shape: &shape::AggregateShape,
+        provenance: CompleteProvenance<'_>,
+        memory: &ObjectMemoryAnalysis,
+        callers: Option<&FunctionArgInvariance>,
+    ) -> Option<Self> {
+        let mut reads = FxHashMap::default();
+        let mut demanded: SmallVec<[bool; 4]> = smallvec![false; shape.leaves.len()];
+        for block in func.layout.iter_block() {
+            for inst in func.layout.iter_inst(block) {
+                let object = downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst))
+                    .map(|load| *load.object())
+                    .or_else(|| {
+                        downcast::<&data::Mload>(func.inst_set(), func.dfg.inst(inst))
+                            .map(|load| *load.addr())
+                    });
+                let Some(projection) =
+                    object.and_then(|object| provenance.exact_projection(object))
+                else {
+                    continue;
+                };
+                if projection.root_value.value() != root {
+                    continue;
+                }
+                let slice = ObjectSlice {
+                    root,
+                    ty: projection.slice.ty,
+                    first_leaf: projection.slice.first_leaf,
+                    leaf_count: projection.slice.leaf_count,
+                    total_leaves: shape.leaves.len(),
+                };
+                if !memory.read_observes_entry_contents(inst, slice)
+                    && !callers.is_some_and(|proof| proof.proves_unchanged(func, slice))
+                {
+                    return None;
+                }
+                demanded
+                    .get_mut(slice.first_leaf..slice.first_leaf + slice.leaf_count)?
+                    .fill(true);
+                reads.insert(inst, slice);
+            }
+        }
+
+        let mut entry_leaf_reads: SmallVec<[Option<InstId>; 4]> =
+            smallvec![None; shape.leaves.len()];
+        // Caller-proven allocated and initialized storage is independently safe
+        // to read at entry. Certificates of unchanged contents alone never seed
+        // this placement proof. The witness still identifies an original read.
+        for (&inst, &slice) in &reads {
+            if callers.is_some_and(|proof| proof.permits_entry_read(func, slice)) {
+                entry_leaf_reads[slice.first_leaf..slice.first_leaf + slice.leaf_count]
+                    .fill(Some(inst));
+            }
+        }
+        func.layout.entry_block()?;
+        for inst in unconditional_read_prefix(func, ReadPrefixRequirement::Unconditional, |inst| {
+            reads.contains_key(&inst)
+        }) {
+            let slice = reads[&inst];
+            entry_leaf_reads[slice.first_leaf..slice.first_leaf + slice.leaf_count]
+                .fill(Some(inst));
+        }
+        // Sufficient placement proof for non-enum scalar/product roots: every
+        // demanded leaf has either caller-proven entry validity or an
+        // unconditional read before calls, conditional control, other memory
+        // accesses, allocations, or guards. Unconditional edges preserve
+        // guaranteed execution for the latter proof.
+        // Generated projections use only the argument and static in-bounds paths.
+        // No reference-validity or safe-speculation promise is inferred from
+        // local_only or the objref type itself.
+        demanded
+            .iter()
+            .zip(&entry_leaf_reads)
+            .all(|(&needed, witness)| !needed || witness.is_some())
+            .then_some(Self {
+                reads,
+                entry_leaf_reads,
+            })
+    }
 }
 
 #[derive(Default)]
@@ -57,7 +170,7 @@ pub struct AggregateScalarize {
 
 impl AggregateScalarize {
     pub fn run(&mut self, func: &mut Function) -> bool {
-        self.run_with_local_object_args(func, None)
+        self.run_with_local_object_args(func, None, None, None)
     }
 
     // `local_object_args` must be computed before entering `func_store.modify(...)`.
@@ -66,25 +179,43 @@ impl AggregateScalarize {
         func_ref: FuncRef,
         func: &mut Function,
         local_object_args: &LocalObjectArgMap,
+        object_effects: &ObjectEffectSummaryMap,
+        callers: Option<&FunctionArgInvariance>,
     ) -> bool {
-        self.run_with_local_object_args(func, local_object_args.get(&func_ref))
+        self.run_with_local_object_args(
+            func,
+            local_object_args.get(&func_ref),
+            Some(object_effects),
+            callers.filter(|proof| proof.is_for_function(func_ref)),
+        )
     }
 
     fn run_with_local_object_args(
         &mut self,
         func: &mut Function,
         local_object_args: Option<&FxHashMap<usize, LocalObjectArgInfo>>,
+        object_effects: Option<&ObjectEffectSummaryMap>,
+        callers: Option<&FunctionArgInvariance>,
     ) -> bool {
         self.changed = false;
         self.layout_cache.clear();
         let module = func.ctx().clone();
         func.rebuild_users();
         self.assert_cfg_cleaned_up(func);
+        let constref_value_tys = collect_constref_value_tys(func);
+        let const_paths = analyze_const_paths(func, &constref_value_tys);
 
-        let (mut promoted_roots, mut projection_of) =
-            self.find_promotable_roots(func, &module, local_object_args);
+        let (mut promoted_roots, mut projection_of) = self.find_promotable_roots(
+            func,
+            &module,
+            local_object_args,
+            object_effects,
+            callers,
+            &const_paths,
+        );
         let scalarizable = loop {
-            let scalarizable = self.compute_scalarizable_aggregates(func, &module, &projection_of);
+            let scalarizable =
+                self.compute_scalarizable_aggregates(func, &module, &projection_of, &[], &[]);
             let changed = self.filter_promotable_roots(
                 func,
                 &module,
@@ -113,6 +244,15 @@ impl AggregateScalarize {
 
         self.canonicalize_promotable_roots(func, &mut promoted_roots);
 
+        // Visit source instructions in dominance order. Live-in loads inserted below
+        // define promoted variables and must not be rewritten as uses of themselves.
+        let mut cfg = ControlFlowGraph::new();
+        cfg.compute(func);
+        let blocks: Vec<_> = cfg
+            .post_order()
+            .map(|block| (block, func.layout.iter_inst(block).collect::<Vec<_>>()))
+            .collect();
+
         let mut ssa = SsaBuilder::new();
         self.append_block_preds(func, &mut ssa);
         self.setup_promoted_leaf_vars(func, &module, &mut ssa, &mut promoted_roots);
@@ -135,9 +275,8 @@ impl AggregateScalarize {
             .map(|root| (root.root_value, root))
             .collect();
 
-        let blocks: Vec<_> = func.layout.iter_block().collect();
-        for block in blocks {
-            let insts: Vec<_> = func.layout.iter_inst(block).collect();
+        // Phi placeholders handle loop edges; other definitions precede their uses.
+        for (block, insts) in blocks.into_iter().rev() {
             for inst in insts {
                 if !func.layout.is_inst_inserted(inst) {
                     continue;
@@ -150,6 +289,7 @@ impl AggregateScalarize {
                     &projection_of,
                     &promoted_by_root,
                     &scalarizable,
+                    &const_paths,
                     &mut scalarized_agg,
                     &mut ssa,
                     &mut modified_leaves,
@@ -203,6 +343,13 @@ impl AggregateScalarize {
             &modified_leaves,
             &mut ssa,
         );
+        // Removing a trivial phi, the SSA builder also removes the scalar phis
+        // that become trivial through it, recording each as an alias.
+        for leaf_phis in scalar_phi_results.values_mut().flatten() {
+            for leaf_phi in leaf_phis {
+                *leaf_phi = ssa.resolve_alias(*leaf_phi);
+            }
+        }
         self.simplify_scalar_phi_results(func, &mut scalar_phi_results);
         self.changed |= self.cleanup_scalarized_artifacts(func, &projection_of, &promoted_by_root);
         #[cfg(debug_assertions)]
@@ -285,7 +432,19 @@ impl AggregateScalarize {
                 let init = match promoted.init {
                     RootInit::UndefFresh => func.dfg.make_undef_value(leaf.ty),
                     RootInit::LoadLiveIn => {
-                        self.insert_live_in_leaf_load(func, module, promoted, leaf_idx)
+                        if promoted
+                            .incoming
+                            .as_ref()
+                            .expect("incoming root needs a promotion plan")
+                            .entry_leaf_reads[leaf_idx]
+                            .is_some()
+                        {
+                            self.insert_live_in_leaf_load(func, module, promoted, leaf_idx)
+                        } else {
+                            // No rewritten read demands this leaf. Keeping a variable
+                            // slot avoids changing private-root reconstruction paths.
+                            func.dfg.make_undef_value(leaf.ty)
+                        }
                     }
                 };
                 ssa.def_var(var, init, promoted.seed_block);
@@ -303,12 +462,7 @@ impl AggregateScalarize {
         }
 
         let mut inst_order = FxHashMap::default();
-        for (idx, inst) in func
-            .layout
-            .iter_block()
-            .flat_map(|block| func.layout.iter_inst(block))
-            .enumerate()
-        {
+        for (idx, inst) in func.layout.iter_all_insts().enumerate() {
             inst_order.insert(inst, idx);
         }
         promoted_roots.sort_by_key(|promoted| {
@@ -364,6 +518,9 @@ impl AggregateScalarize {
         func: &Function,
         module: &sonatina_ir::module::ModuleCtx,
         local_object_args: Option<&FxHashMap<usize, LocalObjectArgInfo>>,
+        object_effects: Option<&ObjectEffectSummaryMap>,
+        callers: Option<&FunctionArgInvariance>,
+        const_paths: &ConstPathAnalysis,
     ) -> (Vec<PromotableRoot>, ExactProjectionMap) {
         let mut promoted = Vec::new();
 
@@ -396,7 +553,7 @@ impl AggregateScalarize {
                 let Some(ptr_value) = ptr_value else {
                     continue;
                 };
-                let Some(shape) = self.aggregate_shape(module, ty) else {
+                let Some(shape) = self.promotable_root_shape(module, ty) else {
                     continue;
                 };
                 if shape.leaves.len() > 4 {
@@ -408,19 +565,22 @@ impl AggregateScalarize {
 
         if let Some(local_object_args) = local_object_args {
             for (&idx, &info) in local_object_args {
+                if !info.is_valid_for(func, idx) {
+                    continue;
+                }
                 let Some(&root_value) = func.arg_values.get(idx) else {
                     continue;
                 };
                 let Some(root_ty) = objref_element_ty(module, func.dfg.value_ty(root_value)) else {
                     continue;
                 };
-                let Some(shape) = self.aggregate_shape(module, root_ty) else {
+                let Some(shape) = self.promotable_root_shape(module, root_ty) else {
                     continue;
                 };
                 if shape.leaves.len() > 4 {
                     continue;
                 }
-                let kind = if info.fresh_result_out {
+                let kind = if info.output_contract(func, idx).is_some() {
                     RootKind::SyntheticOutArg { index: idx }
                 } else {
                     RootKind::Arg { index: idx }
@@ -435,10 +595,8 @@ impl AggregateScalarize {
             if root_kind.is_arg_like() && shape_contains_enum(&shape_data) {
                 continue;
             }
-            // Mutated live-in args are semantically scalarizable, but the current
-            // writeback strategy inflates EVM gas by adding entry loads, phis, and
-            // return-path stores. Keep the profitability guard here until writeback
-            // becomes path-sensitive or these locals can stay expanded in SSA.
+            // Deferred writeback is not generally correct for borrowed storage:
+            // aliases may observe or modify it between the original writes.
             if matches!(root_kind, RootKind::Arg { .. })
                 && self.live_in_arg_root_is_mutated(func, root_value)
             {
@@ -453,7 +611,14 @@ impl AggregateScalarize {
             candidate_roots.push((root_value, root_kind, shape_data));
         }
 
-        let mut snapshot = ProvenanceSnapshot::new(func, None);
+        let mut object_memory = ObjectMemoryAnalysis::default();
+        if candidate_roots
+            .iter()
+            .any(|(_, kind, _)| matches!(kind, RootKind::Arg { .. }))
+        {
+            object_memory.compute(func, local_object_args, object_effects);
+        }
+        let mut snapshot = ProvenanceSnapshot::new(func, object_effects);
         let facts = AggregateFacts::from_root_slices(
             func,
             module,
@@ -462,9 +627,30 @@ impl AggregateScalarize {
             &mut snapshot,
         );
         for (root_value, root_kind, shape_data) in candidate_roots {
-            if !self.root_use_chain_is_promotable(func, module, root_value, facts.complete()) {
+            if !self.root_use_chain_is_promotable(
+                func,
+                module,
+                root_value,
+                facts.complete(),
+                const_paths,
+            ) {
                 continue;
             }
+            let incoming = if matches!(root_kind, RootKind::Arg { .. }) {
+                let Some(plan) = IncomingPromotionPlan::build(
+                    func,
+                    root_value,
+                    &shape_data,
+                    facts.complete(),
+                    &object_memory,
+                    callers,
+                ) else {
+                    continue;
+                };
+                Some(plan)
+            } else {
+                None
+            };
             promoted.push(PromotableRoot {
                 root_value,
                 root_kind,
@@ -479,6 +665,7 @@ impl AggregateScalarize {
                 shape: shape_data,
                 leaf_vars: SmallVec::new(),
                 init: root_kind.default_init(),
+                incoming,
             });
         }
 
@@ -494,14 +681,16 @@ impl AggregateScalarize {
         module: &sonatina_ir::module::ModuleCtx,
         root_value: ValueId,
         provenance: CompleteProvenance<'_>,
+        const_paths: &ConstPathAnalysis,
     ) -> bool {
         let mut dead_use_cache = FxHashMap::default();
+        let root = RootValue::new(root_value);
 
         for ptr in func.dfg.value_ids() {
             let Some(projection) = provenance.exact_projection(ptr) else {
                 continue;
             };
-            if projection.root_value != RootValue::new(root_value) {
+            if projection.root_value != root {
                 continue;
             }
 
@@ -510,217 +699,74 @@ impl AggregateScalarize {
                     continue;
                 }
 
-                if let Some(gep) = downcast::<&data::Gep>(func.inst_set(), func.dfg.inst(user))
-                    && gep.values().first() == Some(&ptr)
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    if provenance
-                        .exact_projection(result)
-                        .is_some_and(|next| next.root_value == RootValue::new(root_value))
-                    {
-                        continue;
+                match classify_root_use(func, user, ptr, &mut dead_use_cache) {
+                    RootUseKind::ProjectionPreserving { result } => {
+                        if !provenance
+                            .exact_projection(result)
+                            .is_some_and(|next| next.root_value == root)
+                            && !is_dead_inst_tree(
+                                func,
+                                user,
+                                &mut dead_use_cache,
+                                &mut FxHashSet::default(),
+                            )
+                        {
+                            return false;
+                        }
                     }
-                }
-
-                if let Some(bitcast) =
-                    downcast::<&cast::Bitcast>(func.inst_set(), func.dfg.inst(user))
-                    && *bitcast.from() == ptr
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    if provenance
-                        .exact_projection(result)
-                        .is_some_and(|next| next.root_value == RootValue::new(root_value))
-                    {
-                        continue;
+                    RootUseKind::SameProjection { result, allow_dead } => {
+                        if provenance.exact_projection(result) != Some(projection)
+                            && (!allow_dead
+                                || !is_dead_inst_tree(
+                                    func,
+                                    user,
+                                    &mut dead_use_cache,
+                                    &mut FxHashSet::default(),
+                                ))
+                        {
+                            return false;
+                        }
                     }
-                }
-
-                if let Some(obj_proj) =
-                    downcast::<&data::ObjProj>(func.inst_set(), func.dfg.inst(user))
-                    && obj_proj.values().first() == Some(&ptr)
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    if provenance
-                        .exact_projection(result)
-                        .is_some_and(|next| next.root_value == RootValue::new(root_value))
-                    {
-                        continue;
-                    }
-                }
-
-                if let Some(obj_index) =
-                    downcast::<&data::ObjIndex>(func.inst_set(), func.dfg.inst(user))
-                    && *obj_index.object() == ptr
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    if provenance
-                        .exact_projection(result)
-                        .is_some_and(|next| next.root_value == RootValue::new(root_value))
-                    {
-                        continue;
-                    }
-                }
-
-                if let Some(enum_proj) =
-                    downcast::<&data::EnumProj>(func.inst_set(), func.dfg.inst(user))
-                    && *enum_proj.object() == ptr
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    if provenance
-                        .exact_projection(result)
-                        .is_some_and(|next| next.root_value == RootValue::new(root_value))
-                    {
-                        continue;
-                    }
-                }
-
-                if let Some(phi) =
-                    downcast::<&control_flow::Phi>(func.inst_set(), func.dfg.inst(user))
-                    && phi.args().iter().any(|(arg, _)| *arg == ptr)
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    if provenance.exact_projection(result) == Some(projection) {
-                        continue;
-                    }
-                }
-
-                if let Some(mload) = downcast::<&data::Mload>(func.inst_set(), func.dfg.inst(user))
-                    && *mload.addr() == ptr
-                {
-                    let load_ty = *mload.ty();
-                    if (!shape::is_supported_scalar_shape_ty(module, load_ty)
-                        && self.projection_slice_can_view_as(module, projection.slice, load_ty))
-                        || (shape::is_supported_scalar_shape_ty(module, load_ty)
-                            && self.projection_load_has_full_rewrite_plan(
+                    RootUseKind::LoadView { ty } => {
+                        if (shape::is_supported_scalar_shape_ty(module, ty)
+                            && !self.projection_load_has_full_rewrite_plan(
                                 module,
                                 projection.slice,
-                                load_ty,
+                                ty,
                             ))
-                    {
-                        continue;
+                            || (!shape::is_supported_scalar_shape_ty(module, ty)
+                                && !self.projection_slice_can_view_as(module, projection.slice, ty))
+                        {
+                            return false;
+                        }
                     }
-                    return false;
-                }
-
-                if let Some(obj_load) =
-                    downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(user))
-                    && *obj_load.object() == ptr
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    let load_ty = func.dfg.value_ty(result);
-                    if (!shape::is_supported_scalar_shape_ty(module, load_ty)
-                        && self.projection_slice_can_view_as(module, projection.slice, load_ty))
-                        || (shape::is_supported_scalar_shape_ty(module, load_ty)
-                            && self.projection_load_has_full_rewrite_plan(
-                                module,
-                                projection.slice,
-                                load_ty,
-                            ))
-                    {
-                        continue;
+                    RootUseKind::StoreView { ty } | RootUseKind::EnumTagRead { ty } => {
+                        if !self.projection_slice_can_view_as(module, projection.slice, ty) {
+                            return false;
+                        }
                     }
-                    return false;
-                }
-
-                if let Some(enum_get_tag) =
-                    downcast::<&data::EnumGetTag>(func.inst_set(), func.dfg.inst(user))
-                    && *enum_get_tag.object() == ptr
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    if self.projection_slice_can_view_as(
-                        module,
-                        projection.slice,
-                        func.dfg.value_ty(result),
-                    ) {
-                        continue;
+                    RootUseKind::ConstInit { value } => {
+                        if !self.obj_init_const_has_full_rewrite_plan(
+                            func,
+                            module,
+                            projection.slice,
+                            value,
+                            const_paths,
+                        ) {
+                            return false;
+                        }
                     }
-                    return false;
-                }
-
-                if let Some(mstore) =
-                    downcast::<&data::Mstore>(func.inst_set(), func.dfg.inst(user))
-                    && *mstore.addr() == ptr
-                {
-                    if self.projection_slice_can_view_as(module, projection.slice, *mstore.ty()) {
-                        continue;
+                    RootUseKind::EnumMutation => {
+                        if !matches!(
+                            projection.slice.ty.resolve_compound(module),
+                            Some(sonatina_ir::types::CompoundType::Enum(_))
+                        ) {
+                            return false;
+                        }
                     }
-                    return false;
+                    RootUseKind::DeadUse => {}
+                    RootUseKind::EscapingOrUnsupported => return false,
                 }
-
-                if let Some(obj_store) =
-                    downcast::<&data::ObjStore>(func.inst_set(), func.dfg.inst(user))
-                    && *obj_store.object() == ptr
-                {
-                    if self.projection_slice_can_view_as(
-                        module,
-                        projection.slice,
-                        func.dfg.value_ty(*obj_store.value()),
-                    ) {
-                        continue;
-                    }
-                    return false;
-                }
-
-                if let Some(enum_assert_ref) =
-                    downcast::<&data::EnumAssertVariantRef>(func.inst_set(), func.dfg.inst(user))
-                    && *enum_assert_ref.object() == ptr
-                {
-                    let Some(result) = func.dfg.inst_result(user) else {
-                        return false;
-                    };
-                    if provenance.exact_projection(result) == Some(projection) {
-                        continue;
-                    }
-                    return false;
-                }
-
-                if let Some(enum_set_tag) =
-                    downcast::<&data::EnumSetTag>(func.inst_set(), func.dfg.inst(user))
-                    && *enum_set_tag.object() == ptr
-                {
-                    if matches!(
-                        projection.slice.ty.resolve_compound(module),
-                        Some(sonatina_ir::types::CompoundType::Enum(_))
-                    ) {
-                        continue;
-                    }
-                    return false;
-                }
-
-                if let Some(enum_write_variant) =
-                    downcast::<&data::EnumWriteVariant>(func.inst_set(), func.dfg.inst(user))
-                    && *enum_write_variant.object() == ptr
-                {
-                    if matches!(
-                        projection.slice.ty.resolve_compound(module),
-                        Some(sonatina_ir::types::CompoundType::Enum(_))
-                    ) {
-                        continue;
-                    }
-                    return false;
-                }
-
-                if is_dead_inst_tree(func, user, &mut dead_use_cache, &mut FxHashSet::default()) {
-                    continue;
-                }
-
-                return false;
             }
         }
 
@@ -784,6 +830,8 @@ impl AggregateScalarize {
                     .is_some_and(|obj_store| *obj_store.object() == value)
                     || downcast::<&data::Mstore>(func.inst_set(), func.dfg.inst(user))
                         .is_some_and(|mstore| *mstore.addr() == value)
+                    || downcast::<&data::ObjInitConst>(func.inst_set(), func.dfg.inst(user))
+                        .is_some_and(|init| *init.object() == value)
                     || downcast::<&data::EnumSetTag>(func.inst_set(), func.dfg.inst(user))
                         .is_some_and(|enum_set_tag| *enum_set_tag.object() == value)
                     || downcast::<&data::EnumWriteVariant>(func.inst_set(), func.dfg.inst(user))
@@ -955,26 +1003,77 @@ impl AggregateScalarize {
         true
     }
 
+    /// Prove the caller's uses assuming the call results are replaced by
+    /// scalarizable definitions. Other producers still require their own proof.
+    pub(crate) fn scalarizable_call_results(
+        &mut self,
+        func: &Function,
+        call: InstId,
+        candidate_results: &[bool],
+    ) -> Vec<bool> {
+        let results = func.dfg.inst_results(call);
+        if !results
+            .iter()
+            .any(|&value| shape::is_supported_scalar_shape_ty(func.ctx(), func.dfg.value_ty(value)))
+        {
+            return vec![false; results.len()];
+        }
+        let substituted: Vec<_> = results
+            .iter()
+            .zip(candidate_results)
+            .filter_map(|(&value, &candidate)| candidate.then_some(value))
+            .collect();
+        let scalarizable = self.compute_scalarizable_aggregates(
+            func,
+            func.ctx(),
+            &ExactProjectionMap::default(),
+            &substituted,
+            &[],
+        );
+        results
+            .iter()
+            .zip(candidate_results)
+            .map(|(&value, &candidate)| candidate && scalarizable[value])
+            .collect()
+    }
+
+    /// Prove callee definitions and uses, allowing only return lanes whose
+    /// corresponding callsite uses were separately proved scalarizable.
+    pub(crate) fn scalarizable_values_for_inlining(
+        &mut self,
+        func: &Function,
+        scalarizable_returns: &[bool],
+    ) -> SecondaryMap<ValueId, bool> {
+        self.compute_scalarizable_aggregates(
+            func,
+            func.ctx(),
+            &ExactProjectionMap::default(),
+            &[],
+            scalarizable_returns,
+        )
+    }
+
     fn compute_scalarizable_aggregates(
         &mut self,
         func: &Function,
         module: &sonatina_ir::module::ModuleCtx,
         projection_of: &ExactProjectionMap,
+        substituted_values: &[ValueId],
+        scalarizable_returns: &[bool],
     ) -> SecondaryMap<ValueId, bool> {
         let mut scalarizable: SecondaryMap<ValueId, bool> = SecondaryMap::default();
 
         for value in func.dfg.value_ids() {
             let ty = func.dfg.value_ty(value);
-            if !shape::is_supported_scalar_shape_ty(module, ty) {
-                continue;
-            }
-            if self
-                .aggregate_shape(module, ty)
-                .is_some_and(|shape| shape.leaves.len() > MAX_SCALARIZABLE_VALUE_LEAVES)
+            if !self
+                .layout_cache
+                .shape_leaf_count(module, ty)
+                .is_some_and(|count| count <= MAX_SCALARIZABLE_VALUE_LEAVES)
             {
                 continue;
             }
             let ok = match func.dfg.value(value) {
+                _ if substituted_values.contains(&value) => true,
                 Value::Undef { .. } => true,
                 Value::Arg { .. } => false,
                 Value::Immediate { .. } | Value::Global { .. } => false,
@@ -1037,19 +1136,23 @@ impl AggregateScalarize {
                 if !scalarizable[value] {
                     continue;
                 }
-                if !self.scalarizable_definition_is_closed(
-                    func,
-                    module,
-                    projection_of,
-                    &scalarizable,
-                    value,
-                ) || !self.scalarizable_uses_are_closed(
-                    func,
-                    module,
-                    projection_of,
-                    &scalarizable,
-                    value,
-                ) {
+                if !substituted_values.contains(&value)
+                    && !self.scalarizable_definition_is_closed(
+                        func,
+                        module,
+                        projection_of,
+                        &scalarizable,
+                        value,
+                    )
+                    || !self.scalarizable_uses_are_closed(
+                        func,
+                        module,
+                        projection_of,
+                        &scalarizable,
+                        value,
+                        scalarizable_returns,
+                    )
+                {
                     scalarizable[value] = false;
                     changed = true;
                 }
@@ -1233,6 +1336,7 @@ impl AggregateScalarize {
         projection_of: &ExactProjectionMap,
         scalarizable: &SecondaryMap<ValueId, bool>,
         value: ValueId,
+        scalarizable_returns: &[bool],
     ) -> bool {
         for &user in func.dfg.users(value) {
             if !func.layout.is_inst_inserted(user) {
@@ -1354,6 +1458,14 @@ impl AggregateScalarize {
                 continue;
             }
 
+            if let Some(ret) =
+                downcast::<&control_flow::Return>(func.inst_set(), func.dfg.inst(user))
+                && ret.args().iter().enumerate().all(|(index, &arg)| {
+                    arg != value || scalarizable_returns.get(index).copied().unwrap_or(false)
+                })
+            {
+                continue;
+            }
             return false;
         }
         true
@@ -1389,7 +1501,7 @@ impl AggregateScalarize {
                 let mut leaf_phis: LeafValues = SmallVec::new();
                 for leaf in shape.leaves {
                     let mut cursor = InstInserter::at_location(CursorLocation::BlockTop(block));
-                    let phi = control_flow::Phi::new_unchecked(func.inst_set(), Vec::new());
+                    let phi = control_flow::Phi::new_unchecked(func.inst_set(), SmallVec::new());
                     let phi_inst = cursor.prepend_inst_data(func, phi);
                     let phi_res = func.dfg.make_value(Value::Inst {
                         inst: phi_inst,
@@ -1417,6 +1529,7 @@ impl AggregateScalarize {
         projection_of: &ExactProjectionMap,
         promoted_by_root: &FxHashMap<ValueId, PromotableRoot>,
         scalarizable: &SecondaryMap<ValueId, bool>,
+        const_paths: &ConstPathAnalysis,
         scalarized_agg: &mut SecondaryMap<ValueId, Option<LeafValues>>,
         ssa: &mut SsaBuilder,
         modified_leaves: &mut FxHashMap<ValueId, FxHashSet<usize>>,
@@ -1445,6 +1558,15 @@ impl AggregateScalarize {
             let Some(result) = result else {
                 return;
             };
+            if let Some(plan) = &promoted.incoming {
+                let read = plan
+                    .reads
+                    .get(&inst)
+                    .expect("rewritten incoming load must be planned");
+                assert_eq!(read.root, promoted.root_value);
+                assert_eq!(read.first_leaf, projection.slice.first_leaf);
+                assert_eq!(read.leaf_count, projection.slice.leaf_count);
+            }
             if shape::is_supported_scalar_shape_ty(module, ty) {
                 if !self.projection_load_has_full_rewrite_plan(module, projection.slice, ty) {
                     return;
@@ -1625,6 +1747,48 @@ impl AggregateScalarize {
                 projection.root_value.value(),
                 tag_leaf_idx..tag_leaf_idx + tag_slice.leaf_count,
             );
+            InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
+            return;
+        }
+
+        if let Some(init) =
+            downcast::<&data::ObjInitConst>(func.inst_set(), func.dfg.inst(inst)).cloned()
+        {
+            let Some(projection) = projection_of.get(*init.object()) else {
+                return;
+            };
+            let Some(promoted) = promoted_by_root.get(&projection.root_value.value()) else {
+                return;
+            };
+            let ty = projection.slice.ty;
+            let Some(payload_imms) =
+                self.const_init_leaf_imms(func, module, *init.value(), ty, const_paths)
+            else {
+                return;
+            };
+            let Some(view_leaf_tys) = self.projection_view_leaf_tys(module, ty) else {
+                return;
+            };
+            let leaf_range = projection.slice.first_leaf
+                ..projection.slice.first_leaf + projection.slice.leaf_count;
+            let underlying_leaves = &promoted.shape.leaves[leaf_range.clone()];
+            if payload_imms.len() != projection.slice.leaf_count
+                || view_leaf_tys.len() != underlying_leaves.len()
+            {
+                return;
+            }
+            for (i, ((imm, view_ty), underlying_leaf)) in payload_imms
+                .into_iter()
+                .zip(view_leaf_tys)
+                .zip(underlying_leaves.iter())
+                .enumerate()
+            {
+                let var = promoted.leaf_vars[projection.slice.first_leaf + i];
+                let value = func.dfg.make_imm_value(imm);
+                let stored = bitcast_before_inst(func, inst, value, view_ty, underlying_leaf.ty);
+                ssa.def_var(var, stored, block);
+            }
+            record_modified_leaves(modified_leaves, projection.root_value.value(), leaf_range);
             InstInserter::at_location(CursorLocation::At(inst)).remove_inst(func);
             return;
         }
@@ -2300,6 +2464,29 @@ impl AggregateScalarize {
         true
     }
 
+    fn promotable_root_shape(
+        &mut self,
+        module: &sonatina_ir::module::ModuleCtx,
+        ty: Type,
+    ) -> Option<shape::AggregateShape> {
+        if ty.is_integral() || ty.is_enum_tag() || ty.is_pointer(module) {
+            // Scalar slots use the same SSA and escape checks as aggregate leaves.
+            // Keep this separate from classifying aggregate SSA values.
+            let size_bytes = self.layout_cache.runtime_size_bytes(module, ty)?;
+            Some(shape::AggregateShape {
+                root_ty: ty,
+                leaves: smallvec![shape::AggregateLeaf {
+                    path: smallvec![],
+                    ty,
+                    offset_bytes: 0,
+                    size_bytes,
+                }],
+            })
+        } else {
+            self.aggregate_shape(module, ty)
+        }
+    }
+
     fn aggregate_shape(
         &mut self,
         module: &sonatina_ir::module::ModuleCtx,
@@ -2351,6 +2538,53 @@ impl AggregateScalarize {
     ) -> bool {
         self.projection_slice_can_view_as(module, slice, view_ty)
             && shape::is_leaf_reifiable_ty(module, view_ty)
+    }
+
+    fn obj_init_const_has_full_rewrite_plan(
+        &mut self,
+        func: &Function,
+        module: &sonatina_ir::module::ModuleCtx,
+        slice: shape::AggregateSlice,
+        value: ValueId,
+        const_paths: &ConstPathAnalysis,
+    ) -> bool {
+        self.projection_slice_can_view_as(module, slice, slice.ty)
+            && self
+                .const_init_leaf_imms(func, module, value, slice.ty, const_paths)
+                .is_some()
+    }
+
+    fn const_init_leaf_imms(
+        &mut self,
+        func: &Function,
+        module: &sonatina_ir::module::ModuleCtx,
+        value: ValueId,
+        ty: Type,
+        const_paths: &ConstPathAnalysis,
+    ) -> Option<SmallVec<[Immediate; 4]>> {
+        let path = const_paths.path(value)?;
+        let (subtree_ty, init) =
+            eval_const_path_subtree(module, path, |value| func.dfg.value_imm(value))?;
+        if subtree_ty != ty {
+            return None;
+        }
+
+        if !shape::is_supported_scalar_shape_ty(module, ty) {
+            return match init {
+                GvInitializer::Immediate(imm) if imm.ty() == ty => Some(smallvec![imm]),
+                _ => None,
+            };
+        }
+
+        let mut imms = SmallVec::new();
+        for leaf in self.aggregate_shape(module, ty)?.leaves {
+            let imm = initializer_leaf_immediate(module, ty, &init, &leaf.path)?;
+            if imm.ty() != leaf.ty {
+                return None;
+            }
+            imms.push(imm);
+        }
+        Some(imms)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2708,13 +2942,26 @@ impl AggregateScalarize {
                         func.dfg.value_ty(*obj_store.value()),
                     ));
                 }
+                if let Some(init) =
+                    downcast::<&data::ObjInitConst>(func.inst_set(), func.dfg.inst(inst))
+                    && let Some(projection) = projection_of.get(*init.object())
+                    && promoted_by_root.contains_key(&projection.root_value.value())
+                {
+                    return Some(format!(
+                        "obj.init.const at block {} inst {} on promoted root {} to object {}",
+                        block.as_u32(),
+                        inst.as_u32(),
+                        projection.root_value.value().as_u32(),
+                        init.object().as_u32(),
+                    ));
+                }
             }
         }
         None
     }
 }
 
-fn insert_object_child_ref(
+pub(crate) fn insert_object_child_ref(
     func: &mut Function,
     cursor: &mut InstInserter,
     module: &sonatina_ir::module::ModuleCtx,
@@ -2770,17 +3017,42 @@ impl RootKind {
     }
 }
 
+fn initializer_leaf_immediate(
+    module: &sonatina_ir::module::ModuleCtx,
+    ty: Type,
+    init: &GvInitializer,
+    path: &[u32],
+) -> Option<Immediate> {
+    if path.is_empty() {
+        return match init {
+            GvInitializer::Immediate(imm) if imm.ty() == ty => Some(*imm),
+            _ => None,
+        };
+    }
+
+    let (&idx, rest) = path.split_first()?;
+
+    match (ty.resolve_compound(module)?, init) {
+        (CompoundType::Array { elem, len }, GvInitializer::Array(items)) => {
+            let idx = usize::try_from(idx).ok()?;
+            (idx < len).then_some(())?;
+            initializer_leaf_immediate(module, elem, items.get(idx)?, rest)
+        }
+        (CompoundType::Struct(s), GvInitializer::Struct(fields)) => {
+            if s.packed {
+                return None;
+            }
+            let idx = usize::try_from(idx).ok()?;
+            initializer_leaf_immediate(module, *s.fields.get(idx)?, fields.get(idx)?, rest)
+        }
+        _ => None,
+    }
+}
+
 impl PromotableRoot {
     fn root_inst(&self) -> Option<InstId> {
         self.root_kind.inst()
     }
-}
-
-fn objref_element_ty(ctx: &sonatina_ir::module::ModuleCtx, ty: Type) -> Option<Type> {
-    let sonatina_ir::types::CompoundType::ObjRef(elem) = ty.resolve_compound(ctx)? else {
-        return None;
-    };
-    Some(elem)
 }
 
 fn record_modified_leaves(
@@ -2883,6 +3155,110 @@ fn replace_scalar_phi_value(
     }
 }
 
+fn classify_root_use(
+    func: &Function,
+    user: InstId,
+    ptr: ValueId,
+    dead_use_cache: &mut FxHashMap<InstId, bool>,
+) -> RootUseKind {
+    let inst = func.dfg.inst(user);
+    let is = func.inst_set();
+    let result = || func.dfg.inst_result(user);
+    let projection_preserving = || {
+        result().map_or(RootUseKind::EscapingOrUnsupported, |result| {
+            RootUseKind::ProjectionPreserving { result }
+        })
+    };
+    let same_projection = |allow_dead| {
+        result().map_or(RootUseKind::EscapingOrUnsupported, |result| {
+            RootUseKind::SameProjection { result, allow_dead }
+        })
+    };
+
+    if downcast::<&data::Gep>(is, inst).is_some_and(|gep| gep.values().first() == Some(&ptr))
+        || downcast::<&cast::Bitcast>(is, inst).is_some_and(|bitcast| *bitcast.from() == ptr)
+        || downcast::<&data::ObjProj>(is, inst)
+            .is_some_and(|obj_proj| obj_proj.values().first() == Some(&ptr))
+        || downcast::<&data::ObjIndex>(is, inst).is_some_and(|obj_index| *obj_index.object() == ptr)
+        || downcast::<&data::EnumProj>(is, inst).is_some_and(|enum_proj| *enum_proj.object() == ptr)
+    {
+        return projection_preserving();
+    }
+
+    if downcast::<&control_flow::Phi>(is, inst)
+        .is_some_and(|phi| phi.args().iter().any(|(arg, _)| *arg == ptr))
+    {
+        return same_projection(true);
+    }
+
+    if downcast::<&data::EnumAssertVariantRef>(is, inst)
+        .is_some_and(|enum_assert_ref| *enum_assert_ref.object() == ptr)
+    {
+        return same_projection(false);
+    }
+
+    if let Some(mload) = downcast::<&data::Mload>(is, inst)
+        && *mload.addr() == ptr
+    {
+        return RootUseKind::LoadView { ty: *mload.ty() };
+    }
+
+    if let Some(obj_load) = downcast::<&data::ObjLoad>(is, inst)
+        && *obj_load.object() == ptr
+    {
+        return result().map_or(RootUseKind::EscapingOrUnsupported, |result| {
+            RootUseKind::LoadView {
+                ty: func.dfg.value_ty(result),
+            }
+        });
+    }
+
+    if let Some(enum_get_tag) = downcast::<&data::EnumGetTag>(is, inst)
+        && *enum_get_tag.object() == ptr
+    {
+        return result().map_or(RootUseKind::EscapingOrUnsupported, |result| {
+            RootUseKind::EnumTagRead {
+                ty: func.dfg.value_ty(result),
+            }
+        });
+    }
+
+    if let Some(mstore) = downcast::<&data::Mstore>(is, inst)
+        && *mstore.addr() == ptr
+    {
+        return RootUseKind::StoreView { ty: *mstore.ty() };
+    }
+
+    if let Some(obj_store) = downcast::<&data::ObjStore>(is, inst)
+        && *obj_store.object() == ptr
+    {
+        return RootUseKind::StoreView {
+            ty: func.dfg.value_ty(*obj_store.value()),
+        };
+    }
+
+    if let Some(init) = downcast::<&data::ObjInitConst>(is, inst)
+        && *init.object() == ptr
+    {
+        return RootUseKind::ConstInit {
+            value: *init.value(),
+        };
+    }
+
+    if downcast::<&data::EnumSetTag>(is, inst).is_some_and(|set_tag| *set_tag.object() == ptr)
+        || downcast::<&data::EnumWriteVariant>(is, inst)
+            .is_some_and(|write_variant| *write_variant.object() == ptr)
+    {
+        return RootUseKind::EnumMutation;
+    }
+
+    if is_dead_inst_tree(func, user, dead_use_cache, &mut FxHashSet::default()) {
+        return RootUseKind::DeadUse;
+    }
+
+    RootUseKind::EscapingOrUnsupported
+}
+
 fn is_dead_inst_tree(
     func: &Function,
     inst: InstId,
@@ -2933,26 +3309,59 @@ fn is_promoted_path_inst(func: &Function, inst: InstId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        test_support::{lookup_func, parse_test_module},
+        transform::aggregate::{ObjectReturnOutParam, compute_object_effect_summaries},
+    };
     use sonatina_ir::{InstDowncast, Module, inst::cast, ir_writer::FuncWriter, module::FuncRef};
-    use sonatina_parser::parse_module;
 
-    fn parse_test_module(src: &str) -> Module {
-        parse_module(src).expect("parse should succeed").module
-    }
-
-    fn lookup_func(module: &Module, name: &str) -> FuncRef {
-        module
-            .funcs()
-            .into_iter()
-            .find(|&func_ref| module.ctx.func_sig(func_ref, |sig| sig.name() == name))
-            .expect("function should exist")
-    }
+    use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_module};
 
     fn run_scalarize_with_local_args(module: &Module, func_ref: FuncRef) {
         let local_object_args = crate::transform::aggregate::collect_local_object_arg_info(module);
+        let object_effects = compute_object_effect_summaries(module);
         module.func_store.modify(func_ref, |func| {
-            AggregateScalarize::default().run_for_func(func_ref, func, &local_object_args);
+            AggregateScalarize::default().run_for_func(
+                func_ref,
+                func,
+                &local_object_args,
+                &object_effects,
+                None,
+            );
         });
+    }
+
+    fn scalarize_verified(src: &str) -> String {
+        let module = parse_test_module(src);
+        let config = VerifierConfig::for_level(VerificationLevel::Standard);
+        let report = verify_module(&module, &config);
+        assert!(!report.has_errors(), "input should be valid: {report}");
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.modify(func_ref, |func| {
+            AggregateScalarize::default().run(func);
+        });
+        let report = verify_module(&module, &config);
+        assert!(
+            !report.has_errors(),
+            "promoted IR should be valid: {report}"
+        );
+        module.func_store.view(func_ref, |func| {
+            FuncWriter::new(func_ref, func).dump_string()
+        })
+    }
+
+    fn scalarize_incoming_verified(src: &str) -> String {
+        let module = parse_test_module(src);
+        let config = VerifierConfig::for_level(VerificationLevel::Full);
+        let report = verify_module(&module, &config);
+        assert!(report.is_ok(), "{report}");
+        let func_ref = lookup_func(&module, "f");
+        run_scalarize_with_local_args(&module, func_ref);
+        let report = verify_module(&module, &config);
+        assert!(report.is_ok(), "{report}");
+        module.func_store.view(func_ref, |func| {
+            FuncWriter::new(func_ref, func).dump_string()
+        })
     }
 
     fn assert_no_promoted_aggregate_artifacts(
@@ -3016,6 +3425,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn scalarize_aggregate_phi_with_definitions_later_in_layout() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+type @pair = { i256, i256 };
+func private %f(v0.i1, v1.i1, v2.i256, v3.i256) -> i256 {
+    block0:
+        br v0 block2 block4;
+    block1:
+        v5.@pair = insert_value v4 1.i8 v3;
+        jump block3;
+    block2:
+        v4.@pair = insert_value undef.@pair 0.i8 v2;
+        br v1 block1 block4;
+    block3:
+        v8.@pair = phi (v5 block1) (v7 block4);
+        v9.i256 = extract_value v8 0.i8;
+        return v9;
+    block4:
+        v6.@pair = insert_value undef.@pair 0.i8 v3;
+        v7.@pair = insert_value v6 1.i8 v2;
+        jump block3;
+}
+"#,
+        );
+        let config = VerifierConfig::for_level(VerificationLevel::Standard);
+        let report = verify_module(&module, &config);
+        assert!(!report.has_errors(), "input should be valid: {report}");
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.modify(func_ref, |func| {
+            AggregateScalarize::default().run(func);
+            assert_no_promoted_aggregate_artifacts(func, &module.ctx);
+            for block in func.layout.iter_block() {
+                for inst in func.layout.iter_inst(block) {
+                    if downcast::<&control_flow::Phi>(func.inst_set(), func.dfg.inst(inst))
+                        .is_some()
+                        && let Some(result) = func.dfg.inst_result(inst)
+                    {
+                        assert_eq!(func.dfg.value_ty(result), Type::I256);
+                    }
+                }
+            }
+        });
+        let report = verify_module(&module, &config);
+        assert!(
+            !report.has_errors(),
+            "scalarized IR should be valid: {report}"
+        );
     }
 
     #[test]
@@ -3245,6 +3705,207 @@ func private %f(v0.i1, v1.i256, v2.i256) -> i256 {
     }
 
     #[test]
+    fn scalarize_promotes_scalar_loop_accumulator() {
+        let dumped = scalarize_verified(
+            r#"
+target = "evm-ethereum-osaka"
+func private %f(v0.i256) -> i256 {
+    block0:
+        v1.objref<i256> = obj.alloc i256;
+        obj.store v1 0.i256;
+        jump block1;
+    block1:
+        v2.i256 = phi (0.i256 block0) (v7 block2);
+        v3.i1 = lt v2 v0;
+        br v3 block2 block3;
+    block2:
+        v4.i256 = obj.load v1;
+        v5.i256 = add v4 v2;
+        obj.store v1 v5;
+        v7.i256 = add v2 1.i256;
+        jump block1;
+    block3:
+        v8.i256 = obj.load v1;
+        return v8;
+}
+"#,
+        );
+        assert!(!dumped.contains("obj."), "{dumped}");
+        assert_eq!(dumped.matches(" = phi ").count(), 2, "{dumped}");
+    }
+
+    #[test]
+    fn scalarize_promotes_scalar_slots_across_branches() {
+        for ty in [
+            "i1",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "i128",
+            "i256",
+            "*i256",
+            "enumtag(@Choice)",
+        ] {
+            for (root_ty, alloc, store, load, suffix) in [
+                (
+                    format!("objref<{ty}>"),
+                    "obj.alloc",
+                    "obj.store",
+                    "obj.load",
+                    String::new(),
+                ),
+                (
+                    format!("*{ty}"),
+                    "alloca",
+                    "mstore",
+                    "mload",
+                    format!(" {ty}"),
+                ),
+            ] {
+                // Enum tags may live in typed objects, but not in raw memory.
+                if ty == "enumtag(@Choice)" && alloc == "alloca" {
+                    continue;
+                }
+                let dumped = scalarize_verified(&format!(
+                    r#"
+target = "evm-ethereum-osaka"
+type @Choice = enum {{ #A, #B }};
+func private %f(v0.i1, v1.{ty}, v2.{ty}) -> {ty} {{
+    block0:
+        v3.{root_ty} = {alloc} {ty};
+        br v0 block1 block2;
+    block1:
+        {store} v3 v1{suffix};
+        jump block3;
+    block2:
+        {store} v3 v2{suffix};
+        jump block3;
+    block3:
+        v4.{ty} = {load} v3{suffix};
+        return v4;
+}}
+"#
+                ));
+                assert!(!dumped.contains(alloc), "{dumped}");
+                assert!(!dumped.contains(store), "{dumped}");
+                assert!(!dumped.contains(load), "{dumped}");
+                assert!(dumped.contains("phi (v1 block1) (v2 block2)"), "{dumped}");
+            }
+        }
+    }
+
+    #[test]
+    fn scalarize_scalar_loop_local_reseeds_undef() {
+        let dumped = scalarize_verified(
+            r#"
+target = "evm-ethereum-osaka"
+func private %f() -> i256 {
+    block0:
+        jump block1;
+    block1:
+        v0.i1 = phi (1.i1 block0) (0.i1 block4);
+        v1.i256 = add 5.i256 6.i256;
+        v2.objref<i256> = obj.alloc i256;
+        br v0 block2 block3;
+    block2:
+        obj.store v2 9.i256;
+        jump block3;
+    block3:
+        v3.i256 = obj.load v2;
+        br v0 block4 block5;
+    block4:
+        jump block1;
+    block5:
+        return v3;
+}
+"#,
+        );
+        assert!(!dumped.contains("obj."), "{dumped}");
+        assert!(dumped.contains("undef.i256"), "{dumped}");
+        assert!(dumped.contains("9.i256 block2"), "{dumped}");
+    }
+
+    #[test]
+    fn scalarize_keeps_scalar_roots_with_mixed_root_phi() {
+        let dumped = scalarize_verified(
+            r#"
+target = "evm-ethereum-osaka"
+func private %f(v0.i1) -> i256 {
+    block0:
+        v1.objref<i256> = obj.alloc i256;
+        v2.objref<i256> = obj.alloc i256;
+        obj.store v1 11.i256;
+        obj.store v2 22.i256;
+        br v0 block1 block2;
+    block1:
+        jump block3;
+    block2:
+        jump block3;
+    block3:
+        v3.objref<i256> = phi (v1 block1) (v2 block2);
+        obj.store v3 33.i256;
+        v4.i256 = obj.load v1;
+        return v4;
+}
+"#,
+        );
+        assert_eq!(dumped.matches("obj.alloc").count(), 2, "{dumped}");
+        assert!(dumped.contains("obj.store v3 33.i256"), "{dumped}");
+        assert!(dumped.contains("obj.load v1"), "{dumped}");
+    }
+
+    #[test]
+    fn scalarize_keeps_scalar_roots_passed_to_calls() {
+        let dumped = scalarize_verified(
+            r#"
+target = "evm-ethereum-osaka"
+func private %overwrite(v0.objref<i256>) {
+    block0:
+        obj.store v0 22.i256;
+        return;
+}
+func private %f() -> i256 {
+    block0:
+        v0.objref<i256> = obj.alloc i256;
+        obj.store v0 11.i256;
+        call %overwrite v0;
+        v1.i256 = obj.load v0;
+        return v1;
+}
+"#,
+        );
+        assert!(dumped.contains("obj.alloc i256"), "{dumped}");
+        assert!(dumped.contains("obj.load v0"), "{dumped}");
+    }
+
+    #[test]
+    fn scalarize_keeps_observable_scalar_addresses() {
+        for (root_ty, allocation, address) in [
+            ("*i256", "alloca i256", "v1.i256 = ptr_to_int v0 i256;"),
+            (
+                "objref<i256>",
+                "obj.alloc i256",
+                "v2.*i256 = obj.materialize.stack v0;\n        v1.i256 = ptr_to_int v2 i256;",
+            ),
+        ] {
+            let dumped = scalarize_verified(&format!(
+                r#"
+target = "evm-ethereum-osaka"
+func private %f() -> i256 {{
+    block0:
+        v0.{root_ty} = {allocation};
+        {address}
+        return v1;
+}}
+"#
+            ));
+            assert!(dumped.contains(allocation), "{dumped}");
+            assert!(dumped.contains("ptr_to_int"), "{dumped}");
+        }
+    }
+
+    #[test]
     fn scalarize_promotes_obj_alloc_root() {
         let module = parse_test_module(
             r#"
@@ -3272,6 +3933,148 @@ func private %f(v0.i256, v1.i256) -> i256 {
 
         module.func_store.view(func_ref, |func| {
             assert_no_promoted_aggregate_artifacts(func, &ctx);
+        });
+    }
+
+    #[test]
+    fn scalarize_promotes_obj_init_const_root() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+
+type @pair = { i256, i256 };
+
+global private const @pair $pair = {11, 22};
+
+func private %f() -> i256 {
+    block0:
+        v0.objref<@pair> = obj.alloc @pair;
+        v1.constref<@pair> = const.ref $pair;
+        obj.init.const v0 v1;
+        v2.@pair = obj.load v0;
+        v3.i256 = extract_value v2 1.i8;
+        return v3;
+}
+"#,
+        );
+        let ctx = module.ctx.clone();
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.modify(func_ref, |func| {
+            AggregateScalarize::default().run(func);
+        });
+
+        module.func_store.view(func_ref, |func| {
+            let dumped = FuncWriter::new(func_ref, func).dump_string();
+            assert_no_promoted_aggregate_artifacts(func, &ctx);
+            assert!(!dumped.contains("obj.init.const"), "{dumped}");
+            assert!(dumped.contains("return 22.i256;"), "{dumped}");
+        });
+    }
+
+    #[test]
+    fn scalarize_promotes_projected_scalar_obj_init_const() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+
+type @pair = { i256, i256 };
+
+global private const i256 $field = 22;
+
+func private %f() -> i256 {
+    block0:
+        v0.objref<@pair> = obj.alloc @pair;
+        v1.objref<i256> = obj.proj v0 1.i8;
+        v2.constref<i256> = const.ref $field;
+        obj.init.const v1 v2;
+        v3.@pair = obj.load v0;
+        v4.i256 = extract_value v3 1.i8;
+        return v4;
+}
+"#,
+        );
+        let ctx = module.ctx.clone();
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.modify(func_ref, |func| {
+            AggregateScalarize::default().run(func);
+        });
+
+        module.func_store.view(func_ref, |func| {
+            let dumped = FuncWriter::new(func_ref, func).dump_string();
+            assert_no_promoted_aggregate_artifacts(func, &ctx);
+            assert!(!dumped.contains("obj.init.const"), "{dumped}");
+            assert!(dumped.contains("return 22.i256;"), "{dumped}");
+        });
+    }
+
+    #[test]
+    fn scalarize_promotes_nested_obj_init_const_root() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+
+type @inner = { i8, i256 };
+type @outer = { @inner, [i256; 2] };
+
+global private const @outer $outer = {{7, 11}, [22, 33]};
+
+func private %f() -> i256 {
+    block0:
+        v0.objref<@outer> = obj.alloc @outer;
+        v1.constref<@outer> = const.ref $outer;
+        obj.init.const v0 v1;
+        v2.@outer = obj.load v0;
+        v3.[i256; 2] = extract_value v2 1.i8;
+        v4.i256 = extract_value v3 0.i8;
+        return v4;
+}
+"#,
+        );
+        let ctx = module.ctx.clone();
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.modify(func_ref, |func| {
+            AggregateScalarize::default().run(func);
+        });
+
+        module.func_store.view(func_ref, |func| {
+            let dumped = FuncWriter::new(func_ref, func).dump_string();
+            assert_no_promoted_aggregate_artifacts(func, &ctx);
+            assert!(!dumped.contains("obj.init.const"), "{dumped}");
+            assert!(dumped.contains("return 22.i256;"), "{dumped}");
+        });
+    }
+
+    #[test]
+    fn scalarize_skips_dynamic_obj_init_const_source() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+
+type @pair = { i256, i256 };
+
+global private const [@pair; 2] $pairs = [{11, 22}, {33, 44}];
+
+func private %f(v0.i256) -> i256 {
+    block0:
+        v1.constref<[@pair; 2]> = const.ref $pairs;
+        v2.constref<@pair> = const.index v1 v0;
+        v3.objref<@pair> = obj.alloc @pair;
+        obj.init.const v3 v2;
+        v4.@pair = obj.load v3;
+        v5.i256 = extract_value v4 1.i8;
+        return v5;
+}
+"#,
+        );
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.modify(func_ref, |func| {
+            AggregateScalarize::default().run(func);
+        });
+
+        module.func_store.view(func_ref, |func| {
+            let dumped = FuncWriter::new(func_ref, func).dump_string();
+            assert!(dumped.contains("obj.init.const"), "{dumped}");
+            assert!(dumped.contains("obj.load"), "{dumped}");
         });
     }
 
@@ -3323,6 +4126,213 @@ func private %f(v0.i256, v1.i256) -> i256 {
     }
 
     #[test]
+    fn incoming_promotion_checks_each_read_across_alias_effects() {
+        for aggregate in [false, true] {
+            for (effect, preserves_entry) in [
+                ("", true),
+                ("call %readonly v1;", true),
+                ("obj.store v1 22.i256;", false),
+                ("call %write v1;", false),
+                ("call %opaque;", false),
+                ("mstore 0.i256 22.i256 i256;", false),
+            ] {
+                let (ty, projection, object) = if aggregate {
+                    ("@pair", "v2.objref<i256> = obj.proj v0 0.i8;", "v2")
+                } else {
+                    ("i256", "", "v0")
+                };
+                let dumped = scalarize_incoming_verified(&format!(
+                    r#"
+target = "evm-ethereum-osaka"
+type @pair = {{ i256, i256 }};
+declare external %opaque();
+func private %readonly(v0.objref<i256>) {{
+block0:
+    v1.i256 = obj.load v0;
+    return;
+}}
+func private %write(v0.objref<i256>) {{
+block0:
+    obj.store v0 22.i256;
+    return;
+}}
+func private %f(v0.objref<{ty}>, v1.objref<i256>) -> i256 {{
+block0:
+    {projection}
+    v3.i256 = obj.load {object};
+    {effect}
+    v4.i256 = obj.load {object};
+    v5.i256 = add v3 v4;
+    return v5;
+}}
+"#
+                ));
+                assert_eq!(
+                    dumped.matches("obj.load").count(),
+                    if preserves_entry { 1 } else { 2 },
+                    "aggregate={aggregate}, effect={effect}: {dumped}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incoming_promotion_allows_alias_writes_after_the_last_read() {
+        let dumped = scalarize_incoming_verified(
+            r#"
+target = "evm-ethereum-osaka"
+func private %f(v0.objref<i256>, v1.objref<i256>) -> i256 {
+block0:
+    v2.i256 = obj.load v0;
+    v3.i256 = obj.load v0;
+    obj.store v1 22.i256;
+    v4.i256 = add v2 v3;
+    return v4;
+}
+"#,
+        );
+        assert_eq!(dumped.matches("obj.load").count(), 1, "{dumped}");
+        assert!(dumped.contains("obj.store v1 22.i256"), "{dumped}");
+    }
+
+    #[test]
+    fn incoming_promotion_requires_an_unconditional_read_before_a_call() {
+        for conditional in [false, true] {
+            let body = if conditional {
+                "br v1 block1 block2;\nblock1:"
+            } else {
+                "call %readonly;"
+            };
+            let exit = if conditional {
+                "block2:\nreturn 0.i256;"
+            } else {
+                ""
+            };
+            let dumped = scalarize_incoming_verified(&format!(
+                r#"
+target = "evm-ethereum-osaka"
+func private %readonly() {{
+block0:
+    return;
+}}
+func private %f(v0.objref<i256>, v1.i1) -> i256 {{
+block0:
+    {body}
+    v2.i256 = obj.load v0;
+    v3.i256 = obj.load v0;
+    v4.i256 = add v2 v3;
+    return v4;
+{exit}
+}}
+"#
+            ));
+            assert_eq!(dumped.matches("obj.load").count(), 2, "{dumped}");
+            assert!(
+                dumped.find("obj.load").unwrap()
+                    > dumped
+                        .find(if conditional { "br " } else { "call " })
+                        .unwrap(),
+                "{dumped}"
+            );
+        }
+    }
+
+    #[test]
+    fn incoming_promotion_converges_through_no_write_and_writing_loops() {
+        for write in [false, true] {
+            let effect = if write { "obj.store v1 22.i256;" } else { "" };
+            let dumped = scalarize_incoming_verified(&format!(
+                r#"
+target = "evm-ethereum-osaka"
+func private %f(v0.objref<i256>, v1.objref<i256>, v2.i1) -> i256 {{
+block0:
+    jump block1;
+block1:
+    v3.i256 = obj.load v0;
+    br v2 block2 block3;
+block2:
+    {effect}
+    jump block1;
+block3:
+    v4.i256 = obj.load v0;
+    v5.i256 = add v3 v4;
+    return v5;
+}}
+"#
+            ));
+            assert_eq!(
+                dumped.matches("obj.load").count(),
+                if write { 2 } else { 1 },
+                "{dumped}"
+            );
+            if !write {
+                assert!(
+                    dumped.find("obj.load").unwrap() < dumped.find("jump ").unwrap(),
+                    "{dumped}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incoming_promotion_demands_every_leaf_of_a_whole_object_read() {
+        let dumped = scalarize_incoming_verified(
+            r#"
+target = "evm-ethereum-osaka"
+type @pair = { i256, i256 };
+func private %f(v0.objref<@pair>) -> i256 {
+block0:
+    v1.@pair = obj.load v0;
+    v2.i256 = extract_value v1 0.i8;
+    return v2;
+}
+"#,
+        );
+        assert_eq!(dumped.matches("obj.load").count(), 2, "{dumped}");
+        assert!(!dumped.contains("undef"), "{dumped}");
+    }
+
+    #[test]
+    fn scalarize_preserves_scalar_argument_live_in_load() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+func private %f(v0.objref<i256>) -> i256 {
+    block0:
+        v1.i256 = obj.load v0;
+        return v1;
+}
+"#,
+        );
+        let func_ref = lookup_func(&module, "f");
+        run_scalarize_with_local_args(&module, func_ref);
+        let report = verify_module(
+            &module,
+            &VerifierConfig::for_level(VerificationLevel::Standard),
+        );
+        assert!(
+            !report.has_errors(),
+            "promoted IR should be valid: {report}"
+        );
+        module.func_store.view(func_ref, |func| {
+            let dumped = FuncWriter::new(func_ref, func).dump_string();
+            assert_eq!(dumped.matches("obj.load v0").count(), 1, "{dumped}");
+            let ret = func
+                .layout
+                .last_inst_of(func.layout.entry_block().unwrap())
+                .unwrap();
+            let ret =
+                downcast::<&control_flow::Return>(func.inst_set(), func.dfg.inst(ret)).unwrap();
+            let value = *ret.args().first().unwrap();
+            let load = func
+                .dfg
+                .value_inst(value)
+                .expect("return value must remain defined");
+            assert!(downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(load)).is_some());
+        });
+    }
+
+    #[test]
     fn scalarize_promotes_local_object_arg_with_live_in_loads() {
         let module = parse_test_module(
             r#"
@@ -3355,7 +4365,7 @@ func private %f(v0.objref<@one>) -> i256 {
     }
 
     #[test]
-    fn scalarize_skips_mutated_local_object_arg_to_avoid_unprofitable_writeback() {
+    fn scalarize_preserves_mutated_incoming_argument_memory() {
         let module = parse_test_module(
             r#"
 target = "evm-ethereum-osaka"
@@ -3378,7 +4388,7 @@ func private %f(v0.objref<@one>, v1.i256) -> i256 {
             let dumped = FuncWriter::new(func_ref, func).dump_string();
             assert!(
                 dumped.contains("obj.load v2"),
-                "mutated local object arg should stay in object form until writeback is profitability-aware:\n{dumped}"
+                "borrowed argument writes must remain observable at their original points:\n{dumped}"
             );
             assert!(
                 dumped.contains("obj.store v2 v1;"),
@@ -3413,6 +4423,8 @@ func private %f(v0.objref<[i256; 3]>) -> i256 {
 
         module.func_store.view(func_ref, |func| {
             let dumped = FuncWriter::new(func_ref, func).dump_string();
+            assert_eq!(dumped.matches("obj.load").count(), 2, "{dumped}");
+            assert!(!dumped.contains("obj.index v0 2."), "{dumped}");
             assert!(
                 dumped.contains("obj.index v0 0."),
                 "array arg live-ins should keep obj.index for the first element:\n{dumped}"
@@ -3426,6 +4438,86 @@ func private %f(v0.objref<[i256; 3]>) -> i256 {
                 "array arg live-ins must not be rewritten to obj.proj:\n{dumped}"
             );
         });
+    }
+
+    #[test]
+    fn output_contract_binding_requires_explicit_argument_remapping() {
+        for remap in [false, true] {
+            let module = parse_test_module(
+                r#"
+target = "evm-ethereum-osaka"
+type @one = { i256 };
+func private %make(v0.objref<@one>) -> objref<@one> {
+block0:
+    v1.objref<@one> = obj.alloc @one;
+    v2.@one = obj.load v0;
+    obj.store v1 v2;
+    return v1;
+}
+"#,
+            );
+            let func_ref = lookup_func(&module, "make");
+            let mut outputs = ObjectReturnOutParam.run_with_synthetic_out_args(&module);
+            module.func_store.modify(func_ref, |func| {
+                // Same-typed parameters leave the declaration valid, but index zero
+                // now denotes the borrowed input instead of the compiler's output.
+                func.arg_values.swap(0, 1);
+                for (idx, &arg) in func.arg_values.iter().enumerate() {
+                    func.dfg.values[arg] = Value::Arg {
+                        ty: func.dfg.value_ty(arg),
+                        idx,
+                    };
+                }
+            });
+            let config = VerifierConfig::for_level(VerificationLevel::Full);
+            let report = verify_module(&module, &config);
+            assert!(report.is_ok(), "{report}");
+            if remap {
+                let args = outputs.get_mut(&func_ref).unwrap();
+                let output = args.remove(&0).unwrap();
+                args.insert(1, output);
+            }
+            let object_effects = compute_object_effect_summaries(&module);
+            module.func_store.modify(func_ref, |func| {
+                let mut memory = ObjectMemoryAnalysis::default();
+                memory.compute_with_loaded_value_carriers(func, outputs.get(&func_ref), None);
+                let load = func
+                    .layout
+                    .iter_all_insts()
+                    .find(|&inst| {
+                        downcast::<&data::ObjLoad>(func.inst_set(), func.dfg.inst(inst)).is_some()
+                    })
+                    .unwrap();
+                assert!(
+                    memory
+                        .read_state(load)
+                        .is_none_or(|read| !read.may_be_undef())
+                );
+                AggregateScalarize::default().run_for_func(
+                    func_ref,
+                    func,
+                    &outputs,
+                    &object_effects,
+                    None,
+                );
+                let text = FuncWriter::new(func_ref, func).dump_string();
+                assert!(
+                    text.contains("obj.load"),
+                    "borrowed input must remain live-in:\n{text}"
+                );
+                assert!(
+                    !text.contains("undef.i256"),
+                    "stale output fact must not seed the input:\n{text}"
+                );
+                assert_eq!(
+                    text.contains("obj.proj"),
+                    remap,
+                    "only a correctly remapped output should scalarize:\n{text}"
+                );
+            });
+            let report = verify_module(&module, &config);
+            assert!(report.is_ok(), "{report}");
+        }
     }
 
     #[test]
@@ -3451,11 +4543,19 @@ func private %make(v0.i256) -> objref<@one> {
         let synthetic_out_args =
             crate::transform::aggregate::ObjectReturnOutParam.run_with_synthetic_out_args(&module);
         crate::transform::aggregate::merge_local_object_arg_info(
+            &module,
             &mut local_object_args,
             &synthetic_out_args,
         );
+        let object_effects = compute_object_effect_summaries(&module);
         module.func_store.modify(func_ref, |func| {
-            AggregateScalarize::default().run_for_func(func_ref, func, &local_object_args);
+            AggregateScalarize::default().run_for_func(
+                func_ref,
+                func,
+                &local_object_args,
+                &object_effects,
+                None,
+            );
         });
 
         module.func_store.view(func_ref, |func| {
@@ -3511,11 +4611,19 @@ func private %choose_pair(v0.i1, v1.i256, v2.i256) -> objref<@pair> {
         let synthetic_out_args =
             crate::transform::aggregate::ObjectReturnOutParam.run_with_synthetic_out_args(&module);
         crate::transform::aggregate::merge_local_object_arg_info(
+            &module,
             &mut local_object_args,
             &synthetic_out_args,
         );
+        let object_effects = compute_object_effect_summaries(&module);
         module.func_store.modify(func_ref, |func| {
-            AggregateScalarize::default().run_for_func(func_ref, func, &local_object_args);
+            AggregateScalarize::default().run_for_func(
+                func_ref,
+                func,
+                &local_object_args,
+                &object_effects,
+                None,
+            );
         });
 
         module.func_store.view(func_ref, |func| {
@@ -3559,7 +4667,13 @@ func private %f(v0.objref<@one>, v1.i256) -> i256 {
         module.func_store.modify(func_ref, |func| {
             crate::transform::aggregate::object_load_store::ObjectLoadStore::default()
                 .run_for_func(func_ref, func, &local_object_args, &object_effects);
-            AggregateScalarize::default().run_for_func(func_ref, func, &local_object_args);
+            AggregateScalarize::default().run_for_func(
+                func_ref,
+                func,
+                &local_object_args,
+                &object_effects,
+                None,
+            );
         });
 
         module.func_store.view(func_ref, |func| {
@@ -3614,6 +4728,57 @@ func private %f(v0.i256, v1.i256, v2.i256) -> i256 {
 
         module.func_store.view(func_ref, |func| {
             assert_no_promoted_aggregate_artifacts(func, &ctx);
+        });
+    }
+
+    #[test]
+    fn scalarization_budget_counts_nested_and_zero_sized_leaves() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+type @Empty = {};
+type @Sixteen = { [i256; 16], @Empty, [i256; 0] };
+type @Seventeen = { @Sixteen, i8 };
+type @ZeroSizedLeaves = { [@Empty; 1000000], [i256; 0] };
+type @Large = { [i8; 1000000] };
+type @Choice = enum { #None, #Some([i256; 15]) };
+type @Fits = { @Choice };
+type @TooWide = { @Choice, i8 };
+func private %f() {
+block0:
+    return;
+}
+"#,
+        );
+        let config = VerifierConfig::for_level(VerificationLevel::Full);
+        assert!(verify_module(&module, &config).is_ok());
+        module.func_store.modify(lookup_func(&module, "f"), |func| {
+            let values: Vec<_> = [
+                ("Empty", true),
+                ("Sixteen", true),
+                ("Seventeen", false),
+                ("ZeroSizedLeaves", true),
+                ("Large", false),
+                ("Fits", true),
+                ("TooWide", false),
+            ]
+            .into_iter()
+            .map(|(name, expected)| {
+                let ty = module
+                    .ctx
+                    .with_ty_store(|types| Type::Compound(types.lookup_struct(name).unwrap()));
+                (name, func.dfg.make_undef_value(ty), expected)
+            })
+            .collect();
+            let mut pass = AggregateScalarize::default();
+            let const_paths = analyze_const_paths(func, &collect_constref_value_tys(func));
+            let (_, projections) =
+                pass.find_promotable_roots(func, &module.ctx, None, None, None, &const_paths);
+            let scalarizable =
+                pass.compute_scalarizable_aggregates(func, &module.ctx, &projections, &[], &[]);
+            for (name, value, expected) in values {
+                assert_eq!(scalarizable[value], expected, "{name}");
+            }
         });
     }
 

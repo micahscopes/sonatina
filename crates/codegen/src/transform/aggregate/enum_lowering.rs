@@ -3,9 +3,11 @@ use smallvec::smallvec;
 use sonatina_ir::{
     Function, I256, Immediate, Module, Type, Value, ValueId,
     func_cursor::{CursorLocation, FuncCursor, InstInserter},
+    global_variable::GvInitializer,
     inst::{cmp, data, downcast},
+    isa::TypeLayoutError,
     module::ModuleCtx,
-    types::{CompoundType, CompoundTypeRef, EnumData, EnumVariantRef},
+    types::{CompoundType, CompoundTypeRef, EnumData, EnumVariantRef, TypeStore},
     visitor::VisitorMut,
 };
 
@@ -47,7 +49,17 @@ struct EnumTypeLowerer {
 impl EnumTypeLowerer {
     fn rewrite_type(&mut self, ctx: &ModuleCtx, ty: Type) -> Type {
         match ty {
-            Type::EnumTag(enum_ty) => self.layout(ctx, enum_ty).tag_ty,
+            // Tags depend only on the variant count; building the product layout
+            // here would recurse forever when a payload holds its own enum's tag.
+            Type::EnumTag(enum_ty) => ctx.with_ty_store(|store| {
+                choose_tag_ty(
+                    store
+                        .enum_data(enum_ty)
+                        .expect("enum tag must reference an enum")
+                        .variants
+                        .len(),
+                )
+            }),
             Type::Compound(compound) => Type::Compound(self.rewrite_compound(ctx, compound)),
             _ => ty,
         }
@@ -191,14 +203,75 @@ impl EnumTypeLowerer {
     }
 }
 
+/// Concrete target layout after enum legalization, without rewriting the source
+/// module. The private context also preserves named structs, which enum lowering
+/// normally rewrites in place. Create a new query after changing source types.
+pub struct EnumLoweredLayout {
+    ctx: ModuleCtx,
+    ty: Type,
+    enumeration: Option<EnumLayoutInfo>,
+}
+
+impl EnumLoweredLayout {
+    pub fn new(ctx: &ModuleCtx, ty: Type) -> Self {
+        let ctx = ctx.fork();
+        let mut lowerer = EnumTypeLowerer::default();
+        let lowered = lowerer.rewrite_type(&ctx, ty);
+        let enumeration = match ty {
+            Type::Compound(compound) => lowerer.layouts.remove(&compound),
+            _ => None,
+        };
+        Self {
+            ctx,
+            ty: lowered,
+            enumeration,
+        }
+    }
+
+    pub fn tag_type(&self) -> Option<Type> {
+        self.enumeration
+            .as_ref()
+            .map(|enumeration| enumeration.tag_ty)
+    }
+
+    pub fn size(&self) -> Result<usize, TypeLayoutError> {
+        self.ctx.size_of(self.ty)
+    }
+
+    pub fn field_offset(&self, field: usize) -> Option<usize> {
+        // Enum payload coordinates are variant-relative, never struct indices.
+        if self.enumeration.is_some() {
+            return None;
+        }
+        self.ctx
+            .aggregate_elem_offset(self.ty, field)
+            .map(|(offset, _)| offset)
+    }
+
+    pub fn variant_field_offset(&self, variant: usize, field: usize) -> Option<usize> {
+        let enumeration = self.enumeration.as_ref()?;
+        enumeration
+            .lowered_variant_field_tys
+            .get(variant)?
+            .get(field)?;
+        let start = usize::try_from(*enumeration.variant_field_starts.get(variant)?).ok()?;
+        self.ctx
+            .aggregate_elem_offset(self.ty, start.checked_add(field)?)
+            .map(|(offset, _)| offset)
+    }
+}
+
 #[derive(Default)]
 pub struct EnumLowerToProduct;
 
 impl EnumLowerToProduct {
     pub fn run(&mut self, module: &Module) -> bool {
+        // Named structs are rewritten in place. Initializers must still be
+        // interpreted using their original field types, across all globals.
+        let original_types = module.ctx.with_ty_store(Clone::clone);
         let mut lowerer = EnumTypeLowerer::default();
         let mut changed = rewrite_declared_signatures(module, &mut lowerer);
-        changed |= rewrite_global_types(module, &mut lowerer);
+        changed |= rewrite_global_types(module, &mut lowerer, &original_types);
 
         for func_ref in module.funcs() {
             changed |= module.func_store.modify(func_ref, |function| {
@@ -212,12 +285,15 @@ impl EnumLowerToProduct {
 }
 
 fn rewrite_declared_signatures(module: &Module, lowerer: &mut EnumTypeLowerer) -> bool {
-    let funcs: Vec<_> = module
+    // Declaration maps iterate in hash order; rewriting in that order would
+    // create the lowered structs in a different order on each run.
+    let mut funcs: Vec<_> = module
         .ctx
         .declared_funcs
         .iter()
         .map(|entry| *entry.key())
         .collect();
+    funcs.sort_unstable();
     let mut changed = false;
 
     for func in funcs {
@@ -255,26 +331,100 @@ fn rewrite_declared_signatures(module: &Module, lowerer: &mut EnumTypeLowerer) -
     changed
 }
 
-fn rewrite_global_types(module: &Module, lowerer: &mut EnumTypeLowerer) -> bool {
+fn rewrite_global_types(
+    module: &Module,
+    lowerer: &mut EnumTypeLowerer,
+    original_types: &TypeStore,
+) -> bool {
     let globals: Vec<_> = module
         .ctx
         .with_gv_store(|store| store.all_gv_refs().collect());
     let mut changed = false;
 
-    module.ctx.with_gv_store_mut(|store| {
-        for gv in globals {
-            let Some(gv_data) = store.get(gv).cloned() else {
-                continue;
-            };
-            let new_ty = lowerer.rewrite_type(&module.ctx, gv_data.ty);
-            if new_ty != gv_data.ty {
+    for gv in globals {
+        let Some(gv_data) = module.ctx.with_gv_store(|store| store.get(gv).cloned()) else {
+            continue;
+        };
+        let (new_ty, new_initializer) = if let Some(initializer) = gv_data.initializer.clone() {
+            let (new_ty, initializer) = rewrite_global_initializer(
+                &module.ctx,
+                lowerer,
+                original_types,
+                gv_data.ty,
+                initializer,
+            );
+            (new_ty, Some(initializer))
+        } else {
+            (lowerer.rewrite_type(&module.ctx, gv_data.ty), None)
+        };
+
+        if new_ty != gv_data.ty || new_initializer != gv_data.initializer {
+            module.ctx.with_gv_store_mut(|store| {
                 store.update_ty(gv, new_ty);
-                changed = true;
-            }
+                store.update_initializer(gv, new_initializer);
+            });
+            changed = true;
         }
-    });
+    }
 
     changed
+}
+
+fn rewrite_global_initializer(
+    ctx: &ModuleCtx,
+    lowerer: &mut EnumTypeLowerer,
+    original_types: &TypeStore,
+    ty: Type,
+    initializer: GvInitializer,
+) -> (Type, GvInitializer) {
+    let compound = match ty {
+        Type::Compound(compound) => Some(original_types.resolve_compound(compound)),
+        _ => None,
+    };
+    let new_ty = lowerer.rewrite_type(ctx, ty);
+    let initializer = match (ty, compound, initializer) {
+        (
+            Type::EnumTag(expected_enum),
+            _,
+            GvInitializer::Immediate(Immediate::EnumTag { enum_ty, value }),
+        ) if enum_ty == expected_enum => {
+            GvInitializer::Immediate(Immediate::from_i256(value, new_ty))
+        }
+        (
+            Type::Compound(_),
+            Some(CompoundType::Array { elem, .. }),
+            GvInitializer::Array(items),
+        ) => GvInitializer::Array(
+            items
+                .into_iter()
+                .map(|item| rewrite_global_initializer(ctx, lowerer, original_types, *elem, item).1)
+                .collect(),
+        ),
+        (Type::Compound(_), Some(CompoundType::Struct(data)), GvInitializer::Struct(fields)) => {
+            GvInitializer::Struct(
+                fields
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        if let Some(field_ty) = data.fields.get(index) {
+                            rewrite_global_initializer(
+                                ctx,
+                                lowerer,
+                                original_types,
+                                *field_ty,
+                                field,
+                            )
+                            .1
+                        } else {
+                            field
+                        }
+                    })
+                    .collect(),
+            )
+        }
+        (_, _, initializer) => initializer,
+    };
+    (new_ty, initializer)
 }
 
 fn rewrite_function_enum_insts(function: &mut Function, lowerer: &mut EnumTypeLowerer) -> bool {
@@ -648,7 +798,7 @@ fn insert_result_inst(
     ty: Type,
 ) -> ValueId {
     let mut cursor = InstInserter::at_location(inst_insert_loc(function, before));
-    let inst = cursor.insert_inst_data_dyn(function, data);
+    let inst = cursor.insert_inst_data_dyn_from(function, before, data);
     let value = cursor.make_result(function, inst, ty);
     cursor.attach_result(function, inst, value);
     value
@@ -660,7 +810,7 @@ fn insert_no_result_inst(
     data: Box<dyn sonatina_ir::Inst>,
 ) {
     let mut cursor = InstInserter::at_location(inst_insert_loc(function, before));
-    let _ = cursor.insert_inst_data_dyn(function, data);
+    let _ = cursor.insert_inst_data_dyn_from(function, before, data);
 }
 
 fn inst_insert_loc(function: &Function, inst: sonatina_ir::InstId) -> CursorLocation {

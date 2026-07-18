@@ -15,7 +15,7 @@ use sonatina_ir::{
     module::FuncRef,
 };
 use sonatina_parser::parse_module;
-use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_module};
+use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_module, verify_module_or_panic};
 
 #[dir_test(
     dir: "$CARGO_MANIFEST_DIR/test_files/opt_pipeline/",
@@ -23,10 +23,179 @@ use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_module};
 )]
 fn test_opt_pipeline(fixture: Fixture<&str>) {
     let mut parsed = common::parse_module(fixture.path());
+    let verifier_cfg = VerifierConfig::for_level(VerificationLevel::Full);
+    verify_module_or_panic(&parsed.module, &verifier_cfg);
     Pipeline::size().run(&mut parsed.module);
+    verify_module_or_panic(&parsed.module, &verifier_cfg);
 
     let mut writer = ModuleWriter::with_debug_provider(&parsed.module, &parsed.debug);
     snap_test!(writer.dump_string(), fixture.path());
+}
+
+#[test]
+fn optimized_ir_roundtrips_with_debug_names_after_inlining() {
+    let source = r#"
+target = "evm-ethereum-osaka"
+
+func inline(always) private %checked_add(v0.i256, v1.i256) -> i256 {
+    block0:
+        (v2.i256, v3.i1) = uaddo v0 v1;
+        br v3 block1 block2;
+    block1:
+        evm_revert 0.i256 0.i256;
+    block2:
+        return v2;
+}
+
+func public %entry(v3.i256, v4.i256) -> i256 {
+    block0:
+        v5.i256 = call %checked_add v3 v4;
+        return v5;
+}
+"#;
+    for pipeline in [Pipeline::size(), Pipeline::speed()] {
+        let mut parsed = parse_module(source).unwrap();
+        pipeline.run(&mut parsed.module);
+        let text = ModuleWriter::with_debug_provider(&parsed.module, &parsed.debug).dump_string();
+        assert!(!text.contains("call %checked_add"), "{text}");
+        assert!(text.contains("uaddo"), "{text}");
+        let reparsed = parse_module(&text)
+            .unwrap_or_else(|errors| panic!("optimized output should parse: {errors:?}\n{text}"));
+        let cfg = VerifierConfig::for_level(VerificationLevel::Full);
+        assert!(verify_module(&parsed.module, &cfg).is_ok());
+        assert!(verify_module(&reparsed.module, &cfg).is_ok());
+        let canonical = parse_module(&ModuleWriter::new(&parsed.module).dump_string()).unwrap();
+        assert_eq!(
+            ModuleWriter::new(&reparsed.module).dump_string(),
+            ModuleWriter::new(&canonical.module).dump_string()
+        );
+        assert_eq!(
+            ModuleWriter::with_debug_provider(&reparsed.module, &reparsed.debug).dump_string(),
+            text
+        );
+    }
+}
+
+#[test]
+fn enum_extract_keeps_its_variant_proof() {
+    // LICM must not hoist the guarded payload read out of the loop.
+    let loop_source = r#"
+target = "evm-ethereum-osaka"
+
+type @OptionI64 = enum {
+    #None,
+    #Some(i64),
+};
+
+func inline(never) private %sum(v0.@OptionI64, v1.i64) -> i64 {
+    block0:
+        jump block1;
+
+    block1:
+        v2.i64 = phi (0.i64 block0) (v8 block3);
+        v3.i64 = phi (0.i64 block0) (v7 block3);
+        v4.i1 = lt v2 v1;
+        br v4 block2 block5;
+
+    block2:
+        v5.i1 = enum.is_variant v0 #Some;
+        br v5 block3 block4;
+
+    block3:
+        enum.assert_variant v0 #Some;
+        v6.i64 = enum.extract v0 #Some 0.i8;
+        v7.i64 = add v3 v6;
+        v8.i64 = add v2 1.i64;
+        jump block1;
+
+    block4:
+        return v3;
+
+    block5:
+        return v3;
+}
+
+func public %entry(v0.i1, v1.i64, v2.i64) -> i64 {
+    block0:
+        br v0 block1 block2;
+    block1:
+        v3.@OptionI64 = enum.make @OptionI64 #Some (v1);
+        jump block3;
+    block2:
+        v4.@OptionI64 = enum.make @OptionI64 #None;
+        jump block3;
+    block3:
+        v5.@OptionI64 = phi (v3 block1) (v4 block2);
+        v6.i64 = call %sum v5 v2;
+        return v6;
+}
+"#;
+    // Jump threading must not recompute the payload read in `block5`, ahead
+    // of the branch whose `block1` edge has not proven the variant yet.
+    let join_source = r#"
+target = "evm-ethereum-osaka"
+
+type @Res = enum {
+    #Err(i256),
+    #Ok(i256),
+};
+
+func inline(never) private %guarded(v0.@Res, v1.i1, v2.i256, v3.i1) -> i256 {
+    block0:
+        br v1 block5 block6;
+
+    block5:
+        v4.i1 = enum.is_variant v0 #Ok;
+        br v4 block2 block1;
+
+    block1:
+        enum.assert_variant v0 #Ok;
+        jump block2;
+
+    block2:
+        v5.i1 = phi (1.i1 block5) (0.i1 block1);
+        v6.i256 = enum.extract v0 #Ok 0.i256;
+        br v5 block3 block4;
+
+    block6:
+        br v3 block3 block4;
+
+    block3:
+        v7.i256 = phi (v6 block2) (v2 block6);
+        return v7;
+
+    block4:
+        v8.i256 = phi (v6 block2) (0.i256 block6);
+        v9.i256 = add v8 1.i256;
+        return v9;
+}
+
+func public %entry(v0.i1, v1.i256, v2.i1, v3.i1) -> i256 {
+    block0:
+        br v0 block1 block2;
+    block1:
+        v4.@Res = enum.make @Res #Ok (v1);
+        jump block3;
+    block2:
+        v5.@Res = enum.make @Res #Err (v1);
+        jump block3;
+    block3:
+        v6.@Res = phi (v4 block1) (v5 block2);
+        v7.i256 = call %guarded v6 v2 v1 v3;
+        return v7;
+}
+"#;
+    let config = VerifierConfig::for_level(VerificationLevel::Full);
+    for (source, pass) in [(loop_source, Pass::Licm), (join_source, Pass::JumpThread)] {
+        let mut single = Pipeline::new();
+        single.add_step(Step::FuncPasses(vec![pass]));
+        for pipeline in [single, Pipeline::size(), Pipeline::speed()] {
+            let mut parsed = parse_module(source).unwrap();
+            verify_module_or_panic(&parsed.module, &config);
+            pipeline.run(&mut parsed.module);
+            verify_module_or_panic(&parsed.module, &config);
+        }
+    }
 }
 
 #[test]
@@ -101,6 +270,110 @@ func public %entry(v0.i256) -> i256 {
         SccpSolver::new().run(func, &mut cfg);
     });
     assert_func_not_contains(&module, func_ref, "uaddo");
+    assert_fast_verified(&module);
+}
+
+#[test]
+fn checked_arith_elim_folds_constant_malloc_offset() {
+    let (mut module, func_ref) = parse_test_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %entry() -> i256 {
+    block0:
+        v0.*i8 = evm_malloc 64.i256;
+        v1.i256 = ptr_to_int v0 i256;
+        (v2.i256, v3.i1) = uaddo v1 32.i256;
+        br v3 block1 block2;
+
+    block1:
+        return 99.i256;
+
+    block2:
+        return v2;
+}
+"#,
+    );
+    Pipeline::size().run(&mut module);
+    assert_func_not_contains(&module, func_ref, "uaddo");
+    assert_func_not_contains(&module, func_ref, "return 99.i256");
+    assert_fast_verified(&module);
+}
+
+#[test]
+fn checked_arith_elim_keeps_malloc_offset_past_alloc_size() {
+    let (mut module, func_ref) = parse_test_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %entry() -> i256 {
+    block0:
+        v0.*i8 = evm_malloc 64.i256;
+        v1.i256 = ptr_to_int v0 i256;
+        (v2.i256, v3.i1) = uaddo v1 96.i256;
+        br v3 block1 block2;
+
+    block1:
+        return 99.i256;
+
+    block2:
+        return v2;
+}
+"#,
+    );
+    Pipeline::size().run(&mut module);
+    assert_func_contains(&module, func_ref, "uaddo");
+    assert_fast_verified(&module);
+}
+
+#[test]
+fn checked_arith_elim_keeps_dynamic_malloc_offset() {
+    let (mut module, func_ref) = parse_test_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %entry(v0.i256) -> i256 {
+    block0:
+        v1.*i8 = evm_malloc v0;
+        v2.i256 = ptr_to_int v1 i256;
+        (v3.i256, v4.i1) = uaddo v2 32.i256;
+        br v4 block1 block2;
+
+    block1:
+        return 99.i256;
+
+    block2:
+        return v3;
+}
+"#,
+    );
+    Pipeline::size().run(&mut module);
+    assert_func_contains(&module, func_ref, "uaddo");
+    assert_fast_verified(&module);
+}
+
+#[test]
+fn checked_arith_elim_keeps_non_malloc_pointer_offset() {
+    let (mut module, func_ref) = parse_test_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %entry(v0.*i8) -> i256 {
+    block0:
+        v1.i256 = ptr_to_int v0 i256;
+        (v2.i256, v3.i1) = uaddo v1 32.i256;
+        br v3 block1 block2;
+
+    block1:
+        return 99.i256;
+
+    block2:
+        return v2;
+}
+"#,
+    );
+    Pipeline::size().run(&mut module);
+    assert_func_contains(&module, func_ref, "uaddo");
     assert_fast_verified(&module);
 }
 
@@ -1610,4 +1883,87 @@ fn assert_func_contains(module: &Module, func_ref: FuncRef, needle: &str) {
 fn assert_fast_verified(module: &Module) {
     let report = verify_module(module, &VerifierConfig::for_level(VerificationLevel::Fast));
     assert!(report.is_ok(), "module failed verification: {report:?}");
+}
+
+#[test]
+fn undefined_reference_merges_verify_after_passes() {
+    // A merge of `undef` with a defined reference, dispatched on a correlated
+    // site tag, must still verify after the passes that thread or merge the
+    // dispatch. The object comes in as an argument so it stays an object.
+    let shape = |undefined_arm: &str, defined_arm: &str, ty: &str, defined: &str, read: &str| {
+        format!(
+            r#"
+target = "evm-ethereum-osaka"
+type @E = enum {{ #None, #Some(i256) }};
+func inline(never) private %shape(v100.i1, v0.objref<@E>) -> i256 {{
+block0:
+ br v100 block1 block2;
+block1:
+{undefined_arm}
+ jump block3;
+block2:
+{defined_arm}
+ jump block3;
+block3:
+ v2.{ty} = phi (undef.{ty} block1) ({defined} block2);
+ v3.i8 = phi (0.i8 block1) (1.i8 block2);
+ br_table v3 block5 (1.i8 block4);
+block4:
+{read}
+block5:
+ return 0.i256;
+}}
+func public %entry(v100.i1) -> i256 {{
+block0:
+ v0.objref<@E> = obj.alloc @E;
+ enum.set_tag v0 #None;
+ v1.i256 = call %shape v100 v0;
+ return v1;
+}}
+"#
+        )
+    };
+    let cases = [
+        // A guarded read through the merge.
+        shape(
+            "",
+            " enum.write_variant v0 #Some (17.i256);",
+            "objref<@E>",
+            "v0",
+            " v4.objref<i256> = enum.proj v2 #Some 0.i8;\n v5.i256 = obj.load v4;\n return v5;",
+        ),
+        // A strong write through the merge, read back through the object.
+        shape(
+            "",
+            "",
+            "objref<@E>",
+            "v0",
+            " enum.write_variant v2 #Some (17.i256);\n v4.objref<i256> = enum.proj v0 #Some 0.i8;\n v5.i256 = obj.load v4;\n return v5;",
+        ),
+        // A guarded payload view through the merge.
+        shape(
+            " enum.set_tag v0 #None;",
+            " enum.write_variant v0 #Some (17.i256);\n v1.objref<i256> = enum.proj v0 #Some 0.i8;",
+            "objref<i256>",
+            "v1",
+            " v4.i256 = obj.load v2;\n return v4;",
+        ),
+    ];
+    let config = VerifierConfig::for_level(VerificationLevel::Full);
+    for source in &cases {
+        let mut single = Pipeline::new();
+        single.add_step(Step::FuncPasses(vec![Pass::JumpThread]));
+        for pipeline in [single, Pipeline::size(), Pipeline::speed()] {
+            let mut parsed = parse_module(source).unwrap();
+            verify_module_or_panic(&parsed.module, &config);
+            pipeline.run(&mut parsed.module);
+            verify_module_or_panic(&parsed.module, &config);
+            // The merge and its read survive, so the check is not vacuous.
+            let text = ModuleWriter::new(&parsed.module).dump_string();
+            assert!(
+                text.contains("phi (undef.objref") && text.contains("obj.load"),
+                "{text}"
+            );
+        }
+    }
 }

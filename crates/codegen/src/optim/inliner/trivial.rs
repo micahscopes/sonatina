@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use sonatina_ir::{
-    Function, GlobalVariableRef, Immediate, Inst, InstDowncast, InstId, Module, Type, Value,
-    ValueId, inst::control_flow, module::FuncRef,
+    Function, GlobalVariableRef, Immediate, Inst, InstAttribution, InstDowncast, InstId, Module,
+    Type, Value, ValueId, inst::control_flow, module::FuncRef,
 };
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
     optim::call_purity::is_nonmutating_returning_call,
 };
 
-use super::{InlineStats, InlinerConfig};
+use super::{CallChanges, InlineStats, InlinerConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ValueTemplate {
@@ -44,6 +44,7 @@ pub(super) enum InlinePlan {
 }
 
 struct TemplateInst {
+    attribution: InstAttribution,
     inst: Box<dyn Inst>,
     old_results: InstResultTemplates,
 }
@@ -65,6 +66,7 @@ struct TerminatorSplicePlan {
     callee_args: Vec<ValueId>,
     const_values: BTreeMap<ValueId, ValueTemplate>,
     body: Vec<TemplateInst>,
+    terminator_attribution: InstAttribution,
     terminator: Box<dyn Inst>,
 }
 
@@ -112,6 +114,7 @@ pub(super) fn analyze_callee(
     callee_ref: FuncRef,
     callee: &Function,
     callee_call_count: usize,
+    reconstruction_insts: usize,
     config: &InlinerConfig,
     stats: &mut InlineStats,
 ) -> Option<InlinePlanSummary> {
@@ -157,6 +160,7 @@ pub(super) fn analyze_callee(
         return analyze_terminator_splice(
             callee,
             callee_call_count,
+            reconstruction_insts,
             config,
             stats,
             term_inst_id,
@@ -197,6 +201,7 @@ pub(super) fn analyze_callee(
             return analyze_splice(
                 callee,
                 callee_call_count,
+                reconstruction_insts,
                 config,
                 stats,
                 &ret_values,
@@ -227,6 +232,7 @@ pub(super) fn analyze_callee(
     analyze_splice(
         callee,
         callee_call_count,
+        reconstruction_insts,
         config,
         stats,
         &ret_values,
@@ -237,6 +243,7 @@ pub(super) fn analyze_callee(
 fn analyze_splice(
     callee: &Function,
     callee_call_count: usize,
+    reconstruction_insts: usize,
     config: &InlinerConfig,
     stats: &mut InlineStats,
     ret_values: &[ValueId],
@@ -247,7 +254,14 @@ fn analyze_splice(
     }
 
     let (_, body_insts) = insts.split_last()?;
-    let mut collected = collect_splice_body(callee, callee_call_count, config, stats, body_insts)?;
+    let mut collected = collect_splice_body(
+        callee,
+        callee_call_count,
+        reconstruction_insts,
+        config,
+        stats,
+        body_insts,
+    )?;
 
     for &ret_value in ret_values {
         if let Some(tpl) = classify_value_template(callee, ret_value) {
@@ -269,6 +283,7 @@ fn analyze_splice(
 fn analyze_terminator_splice(
     callee: &Function,
     callee_call_count: usize,
+    reconstruction_insts: usize,
     config: &InlinerConfig,
     stats: &mut InlineStats,
     term_inst_id: InstId,
@@ -284,7 +299,14 @@ fn analyze_terminator_splice(
     }
 
     let (_, body_insts) = insts.split_last()?;
-    let mut collected = collect_splice_body(callee, callee_call_count, config, stats, body_insts)?;
+    let mut collected = collect_splice_body(
+        callee,
+        callee_call_count,
+        reconstruction_insts,
+        config,
+        stats,
+        body_insts,
+    )?;
 
     extend_const_values_from_inst_operands(callee, term_inst_id, &mut collected.const_values);
     let callee_args: Vec<ValueId> = callee.arg_values.iter().copied().collect();
@@ -301,12 +323,15 @@ fn analyze_terminator_splice(
 fn collect_splice_body(
     callee: &Function,
     callee_call_count: usize,
+    reconstruction_insts: usize,
     config: &InlinerConfig,
     stats: &mut InlineStats,
     body_insts: &[InstId],
 ) -> Option<CollectedSpliceBody> {
     let is_single_use = callee_call_count == 1;
-    if !is_single_use && body_insts.len() > config.splice_max_insts {
+    if !is_single_use
+        && body_insts.len().saturating_sub(reconstruction_insts) > config.splice_max_insts
+    {
         stats.skipped_too_large += 1;
         return None;
     }
@@ -377,6 +402,7 @@ pub(super) fn materialize_plan(callee: &Function, summary: &InlinePlanSummary) -
                 callee_args: summary.callee_args.clone(),
                 const_values: summary.const_values.clone(),
                 body: materialize_body_templates(callee, &summary.body),
+                terminator_attribution: callee.inst_attribution(summary.term_inst_id),
                 terminator: callee.dfg.clone_inst(summary.term_inst_id),
             })
         }
@@ -389,6 +415,7 @@ fn materialize_body_templates(
 ) -> Vec<TemplateInst> {
     body.iter()
         .map(|summary| TemplateInst {
+            attribution: callee.inst_attribution(summary.inst_id),
             inst: callee.dfg.clone_inst(summary.inst_id),
             old_results: summary.old_results.clone(),
         })
@@ -400,18 +427,15 @@ pub(super) fn apply_plan(
     call_inst_id: InstId,
     plan: InlinePlan,
     stats: &mut InlineStats,
-) -> bool {
+) -> Option<CallChanges> {
     if !caller.layout.is_inst_inserted(call_inst_id) {
-        return false;
+        return None;
     }
 
     let is = caller.inst_set();
-    let Some((call_args, original_callee)) =
+    let (call_args, original_callee) =
         <&control_flow::Call as InstDowncast>::downcast(is, caller.dfg.inst(call_inst_id))
-            .map(|call_inst| (call_inst.args().clone(), *call_inst.callee()))
-    else {
-        return false;
-    };
+            .map(|call_inst| (call_inst.args().clone(), *call_inst.callee()))?;
     let call_results: ReturnedValues = caller
         .dfg
         .inst_results(call_inst_id)
@@ -419,16 +443,44 @@ pub(super) fn apply_plan(
         .copied()
         .collect();
 
-    match plan {
+    let mut call_changes = CallChanges::default();
+    if matches!(plan, InlinePlan::SpliceSingleBlockTerminator(_)) {
+        // A terminating splice drops the entire tail, including its calls.
+        let mut next = Some(call_inst_id);
+        while let Some(inst) = next {
+            if let Some(call) = caller.dfg.call_info(inst) {
+                call_changes.removed.push(call.callee());
+            }
+            next = caller.layout.next_inst_of(inst);
+        }
+    } else {
+        call_changes.removed.push(original_callee);
+    }
+    let body = match &plan {
+        InlinePlan::RewriteCall { new_callee, .. } => {
+            call_changes.added.push(*new_callee);
+            &[][..]
+        }
+        InlinePlan::RemoveCall { .. } => &[][..],
+        InlinePlan::SpliceSingleBlock(plan) => plan.body.as_slice(),
+        InlinePlan::SpliceSingleBlockTerminator(plan) => plan.body.as_slice(),
+    };
+    for template in body {
+        if let Some(call) =
+            <&control_flow::Call as InstDowncast>::downcast(is, template.inst.as_ref())
+        {
+            call_changes.added.push(*call.callee());
+        }
+    }
+
+    let changed = match plan {
         InlinePlan::RemoveCall { returned } => {
             if call_results.len() != returned.len() {
-                return false;
+                return None;
             }
 
             for (&call_res, tpl) in call_results.iter().zip(returned.iter()) {
-                let Some(alias) = materialize(tpl, caller, &call_args) else {
-                    return false;
-                };
+                let alias = materialize(tpl, caller, &call_args)?;
                 debug_assert_alias_type_match(caller, call_res, alias);
                 caller.dfg.change_to_alias(call_res, alias);
             }
@@ -442,15 +494,12 @@ pub(super) fn apply_plan(
             new_callee,
             new_args,
         } => {
-            let Some(args) = new_args
+            let args = new_args
                 .iter()
                 .map(|tpl| materialize(tpl, caller, &call_args))
-                .collect::<Option<SmallVec<[ValueId; 8]>>>()
-            else {
-                return false;
-            };
+                .collect::<Option<SmallVec<[ValueId; 8]>>>()?;
             if original_callee == new_callee && call_args.as_slice() == args.as_slice() {
-                return false;
+                return None;
             }
 
             let new_call = control_flow::Call::new(caller.inst_set(), new_callee, args);
@@ -476,7 +525,8 @@ pub(super) fn apply_plan(
                 stats,
             )
         }
-    }
+    };
+    changed.then_some(call_changes)
 }
 
 fn apply_splice_single_block(
@@ -504,25 +554,30 @@ fn apply_splice_single_block(
         return false;
     }
 
-    apply_splice_body(splice_plan.body, &mut value_map, |new_inst, result_tys| {
-        let new_inst_id = caller.dfg.make_inst_dyn(new_inst);
-        caller.layout.insert_inst_before(new_inst_id, call_inst_id);
-        let new_results: SmallVec<[ValueId; 2]> = result_tys
-            .iter()
-            .enumerate()
-            .map(|(result_idx, ty)| {
-                caller.dfg.make_value(Value::Inst {
-                    inst: new_inst_id,
-                    result_idx: result_idx.try_into().expect("too many instruction results"),
-                    ty: *ty,
+    apply_splice_body(
+        splice_plan.body,
+        &mut value_map,
+        |attribution, new_inst, result_tys| {
+            let new_inst_id = caller.dfg.make_inst_dyn(new_inst);
+            caller.layout.insert_inst_before(new_inst_id, call_inst_id);
+            let new_results: SmallVec<[ValueId; 2]> = result_tys
+                .iter()
+                .enumerate()
+                .map(|(result_idx, ty)| {
+                    caller.dfg.make_value(Value::Inst {
+                        inst: new_inst_id,
+                        result_idx: result_idx.try_into().expect("too many instruction results"),
+                        ty: *ty,
+                    })
                 })
-            })
-            .collect();
-        caller
-            .dfg
-            .attach_results(new_inst_id, new_results.as_slice());
-        new_results
-    });
+                .collect();
+            caller
+                .dfg
+                .attach_results(new_inst_id, new_results.as_slice());
+            caller.apply_inst_attribution(new_inst_id, attribution);
+            new_results
+        },
+    );
 
     for (&old_ret, &call_res) in splice_plan.ret_values.iter().zip(call_results.iter()) {
         let new_ret = *value_map
@@ -581,14 +636,25 @@ fn apply_splice_single_block_terminator(
 
     let mut editor = CfgEditor::new(caller, CleanupMode::Strict);
     let call_block = editor.truncate_block_from_inst(call_inst_id);
-    apply_splice_body(splice_plan.body, &mut value_map, |new_inst, result_tys| {
-        let (_, new_results) = editor.append_inst_with_results(call_block, new_inst, result_tys);
-        new_results
-    });
+    apply_splice_body(
+        splice_plan.body,
+        &mut value_map,
+        |attribution, new_inst, result_tys| {
+            let (new_inst_id, new_results) =
+                editor.append_inst_with_results(call_block, new_inst, result_tys);
+            editor
+                .func_mut()
+                .apply_inst_attribution(new_inst_id, attribution);
+            new_results
+        },
+    );
 
     let mut new_term = splice_plan.terminator;
     rewrite_inst_values_checked(new_term.as_mut(), &value_map);
-    editor.append_inst_with_results(call_block, new_term, &[]);
+    let (new_term_id, _) = editor.append_inst_with_results(call_block, new_term, &[]);
+    editor
+        .func_mut()
+        .apply_inst_attribution(new_term_id, &splice_plan.terminator_attribution);
     editor.recompute_cfg();
 
     stats.calls_spliced += 1;
@@ -618,7 +684,7 @@ fn build_splice_value_map(
 fn apply_splice_body(
     body: Vec<TemplateInst>,
     value_map: &mut FxHashMap<ValueId, ValueId>,
-    mut insert: impl FnMut(Box<dyn Inst>, &[Type]) -> SmallVec<[ValueId; 2]>,
+    mut insert: impl FnMut(&InstAttribution, Box<dyn Inst>, &[Type]) -> SmallVec<[ValueId; 2]>,
 ) {
     for template_inst in body {
         let mut new_inst = template_inst.inst;
@@ -628,7 +694,7 @@ fn apply_splice_body(
             .iter()
             .map(|(_, ty)| *ty)
             .collect();
-        let inserted_results = insert(new_inst, result_tys.as_slice());
+        let inserted_results = insert(&template_inst.attribution, new_inst, result_tys.as_slice());
         assert_eq!(
             inserted_results.len(),
             template_inst.old_results.len(),
@@ -781,4 +847,84 @@ fn rewrite_inst_values(inst: &mut dyn Inst, value_map: &FxHashMap<ValueId, Value
         }
     });
     all_mapped
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use smallvec::smallvec;
+    use sonatina_ir::{
+        Linkage, Signature, Type, builder::test_util::test_module_builder,
+        func_cursor::InstInserter, inst::arith::Add,
+    };
+
+    use super::*;
+    use crate::optim::inliner::Inliner;
+
+    #[test]
+    fn single_block_splice_preserves_frontend_origin() {
+        let mb = test_module_builder();
+        let callee_ref = mb
+            .declare_function(Signature::new_single(
+                "callee",
+                Linkage::Private,
+                &[],
+                Type::I32,
+            ))
+            .unwrap();
+        let caller_ref = mb
+            .declare_function(Signature::new_single(
+                "caller",
+                Linkage::Public,
+                &[],
+                Type::I32,
+            ))
+            .unwrap();
+
+        {
+            let mut callee = mb.func_builder::<InstInserter>(callee_ref);
+            let block = callee.append_block();
+            callee.switch_to_block(block);
+            let lhs = callee.make_imm_value(1i32);
+            let rhs = callee.make_imm_value(2i32);
+            let has_add = callee.inst_set().has_add().unwrap();
+            let result = callee.insert_inst(Add::new(has_add, lhs, rhs), Type::I32);
+            let add_inst = callee.func.dfg.value_inst(result).unwrap();
+            callee
+                .func
+                .set_inst_frontend_origin(add_inst, Arc::from("callee-origin://add"));
+            callee.insert_return(result);
+            callee.seal_all();
+            callee.finish();
+        }
+
+        {
+            let mut caller = mb.func_builder::<InstInserter>(caller_ref);
+            let block = caller.append_block();
+            caller.switch_to_block(block);
+            let result = caller.insert_call(callee_ref, smallvec![]).unwrap();
+            caller.insert_return(result);
+            caller.seal_all();
+            caller.finish();
+        }
+
+        let mut module = mb.build();
+        let mut inliner = Inliner::new(InlinerConfig::default());
+        let stats = inliner.run(&mut module);
+        assert_eq!(stats.calls_spliced, 1);
+
+        module.func_store.view(caller_ref, |caller| {
+            let inlined_add = caller
+                .layout
+                .iter_all_insts()
+                .find(|&inst| caller.dfg.inst(inst).as_text() == "add")
+                .expect("callee add should be spliced into caller");
+
+            assert_eq!(
+                caller.inst_frontend_origin(inlined_add),
+                Some("callee-origin://add")
+            );
+        });
+    }
 }

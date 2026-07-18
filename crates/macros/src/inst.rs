@@ -393,18 +393,18 @@ impl InstStruct {
         let has_inst_method = ty_name_to_method_name(&self.struct_name);
         quote! {
             #[allow(clippy::too_many_arguments)]
-            pub fn new(isb: &dyn crate::InstSetBase, #(#ctor_args),*) -> Self {
-                debug_assert!(isb.#has_inst_method().is_some(),
-                    "instruction set does not support this instruction");
+            pub fn new(hi: &dyn crate::HasInst<Self>, #(#ctor_args),*) -> Self {
                 Self {
-                    #(#field_names: #field_names),*
+                    #(#field_names),*
                 }
             }
 
             #[allow(clippy::too_many_arguments)]
-            #[deprecated(note = "use `new` instead — it now accepts &dyn InstSetBase")]
             pub fn new_unchecked(isb: &dyn crate::InstSetBase, #(#ctor_args),*) -> Self {
-                Self::new(isb, #(#field_names),*)
+                isb.#has_inst_method().unwrap();
+                Self {
+                    #(#field_names),*
+                }
             }
         }
     }
@@ -437,23 +437,22 @@ impl InstStruct {
         quote! {
             impl<'a> crate::InstDowncast<'a> for &'a #struct_name {
                 fn downcast(isb: &dyn crate::InstSetBase, inst: &'a dyn crate::Inst) -> Option<Self> {
-                    let hi = isb.#has_inst_method()?;
-                    if hi.is(inst) {
-                        unsafe { Some(&*(inst as *const dyn crate::Inst as *const #struct_name)) }
-                    } else {
-                        None
+                    // Most downcasts fail, so compare the type before asking the ISA.
+                    if inst.type_id() != ::std::any::TypeId::of::<#struct_name>() {
+                        return None;
                     }
+                    isb.#has_inst_method()?;
+                    unsafe { Some(&*(inst as *const dyn crate::Inst as *const #struct_name)) }
                 }
             }
 
             impl<'a> crate::InstDowncastMut<'a> for &'a mut #struct_name {
                 fn downcast_mut(isb: &dyn crate::InstSetBase, inst: &'a mut dyn crate::Inst) -> Option<Self> {
-                    let hi = isb.#has_inst_method()?;
-                    if hi.is(inst) {
-                        unsafe { Some(&mut *(inst as *mut dyn crate::Inst as *mut #struct_name)) }
-                    } else {
-                        None
+                    if inst.type_id() != ::std::any::TypeId::of::<#struct_name>() {
+                        return None;
                     }
+                    isb.#has_inst_method()?;
+                    unsafe { Some(&mut *(inst as *mut dyn crate::Inst as *mut #struct_name)) }
                 }
             }
         }

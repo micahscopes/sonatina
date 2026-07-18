@@ -1,16 +1,15 @@
 use super::ConstDataLower;
 use crate::{
-    isa::evm::EvmBackend,
+    isa::evm::test_util::osaka_backend,
     object::{CompileOptions, SymbolId, compile_all_objects},
 };
 use sonatina_ir::{
     global_variable::GvInitializer,
     ir_writer::{FuncWriter, ModuleWriter},
-    isa::evm::Evm,
     module::FuncRef,
 };
 use sonatina_parser::parse_module;
-use sonatina_triple::{Architecture, EvmVersion, OperatingSystem, TargetTriple, Vendor};
+use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_module_or_panic};
 
 fn parse(src: &str) -> sonatina_parser::ParsedModule {
     parse_module(src).unwrap_or_else(|errs| panic!("parse failed: {errs:?}"))
@@ -28,15 +27,6 @@ fn find_func_ref(parsed: &sonatina_parser::ParsedModule, name: &str) -> FuncRef 
                 .func_sig(func_ref, |sig| sig.name() == name)
         })
         .unwrap_or_else(|| panic!("function `{name}` should exist"))
-}
-
-fn test_backend() -> EvmBackend {
-    let triple = TargetTriple::new(
-        Architecture::Evm,
-        Vendor::Ethereum,
-        OperatingSystem::Evm(EvmVersion::Osaka),
-    );
-    EvmBackend::new(Evm::new(triple))
 }
 
 fn global_symbols_with_prefix(parsed: &sonatina_parser::ParsedModule, prefix: &str) -> Vec<String> {
@@ -824,7 +814,7 @@ func private %entry() -> i256 {
     let blob_bytes = lowered_blob_bytes(&parsed, "value");
     assert_eq!(blob_bytes.len(), 32 * 5);
 
-    let words: Vec<_> = blob_bytes.chunks_exact(32).collect();
+    let words = blob_bytes.as_chunks::<32>().0;
     assert!(words[0][..31].iter().all(|&byte| byte == 0));
     assert_eq!(words[0][31], 1);
 
@@ -1050,7 +1040,7 @@ object @Contract {
     );
 
     let opts = CompileOptions::default();
-    compile_all_objects(&parsed.module, &test_backend(), &opts)
+    compile_all_objects(&parsed.module, &osaka_backend(), &opts)
         .expect("object compilation should include backend-synthesized const blobs");
 }
 
@@ -1081,7 +1071,7 @@ object @Contract {
         emit_symtab: true,
         ..Default::default()
     };
-    let artifacts = compile_all_objects(&parsed.module, &test_backend(), &opts)
+    let artifacts = compile_all_objects(&parsed.module, &osaka_backend(), &opts)
         .expect("object compilation should drop dead private const data");
     let runtime = artifacts[0]
         .sections
@@ -1126,7 +1116,7 @@ object @Contract {
         emit_symtab: true,
         ..Default::default()
     };
-    let artifacts = compile_all_objects(&parsed.module, &test_backend(), &opts)
+    let artifacts = compile_all_objects(&parsed.module, &osaka_backend(), &opts)
         .expect("object compilation should preserve section-size-observed data");
     let runtime = artifacts[0]
         .sections
@@ -1171,7 +1161,7 @@ object @Contract {
         emit_symtab: true,
         ..Default::default()
     };
-    let artifacts = compile_all_objects(&parsed.module, &test_backend(), &opts)
+    let artifacts = compile_all_objects(&parsed.module, &osaka_backend(), &opts)
         .expect("object compilation should preserve code-size-observed data");
     let runtime = artifacts[0]
         .sections
@@ -1217,7 +1207,7 @@ object @Contract {
         emit_symtab: true,
         ..Default::default()
     };
-    let artifacts = compile_all_objects(&parsed.module, &test_backend(), &opts)
+    let artifacts = compile_all_objects(&parsed.module, &osaka_backend(), &opts)
         .expect("object compilation should reuse compatible explicit data");
     let runtime = artifacts[0]
         .sections
@@ -1229,7 +1219,7 @@ object @Contract {
         .get(&SymbolId::Global(arr))
         .expect("arr symbol should be present");
     assert_eq!(arr_def.size, 160);
-    assert_eq!(runtime.bytes.len(), 177);
+    assert_eq!(runtime.bytes.len(), 176);
 }
 
 #[test]
@@ -1260,7 +1250,7 @@ object @Contract {
     );
 
     let opts = CompileOptions::default();
-    compile_all_objects(&parsed.module, &test_backend(), &opts)
+    compile_all_objects(&parsed.module, &osaka_backend(), &opts)
         .expect("object compilation should succeed with colliding synthesized blob symbols");
 }
 
@@ -1317,7 +1307,7 @@ object @Contract {
     );
 
     let opts = CompileOptions::default();
-    compile_all_objects(&parsed.module, &test_backend(), &opts)
+    compile_all_objects(&parsed.module, &osaka_backend(), &opts)
         .expect("constref helper calls should lower before object compile");
 }
 
@@ -1371,6 +1361,29 @@ object @Contract {
     );
 
     let opts = CompileOptions::default();
-    compile_all_objects(&parsed.module, &test_backend(), &opts)
+    compile_all_objects(&parsed.module, &osaka_backend(), &opts)
         .expect("looped dynamic const loads should lower before object compile");
+}
+
+#[test]
+fn nested_const_indices_remain_valid_after_lowering() {
+    let parsed = parse(include_str!(
+        "../../../../test_files/const_data/nested_indices.sntn"
+    ));
+    let config = VerifierConfig::for_level(VerificationLevel::Full);
+    verify_module_or_panic(&parsed.module, &config);
+    ConstDataLower::default().run(&parsed.module);
+    verify_module_or_panic(&parsed.module, &config);
+
+    let static_index = find_func_ref(&parsed, "static_index");
+    let dumped = parsed.module.func_store.view(static_index, |func| {
+        FuncWriter::new(static_index, func).dump_string()
+    });
+    assert!(dumped.contains("return 11.i256;"), "{dumped}");
+
+    let nested_rows = find_func_ref(&parsed, "nested_rows");
+    let dumped = parsed.module.func_store.view(nested_rows, |func| {
+        FuncWriter::new(nested_rows, func).dump_string()
+    });
+    assert_eq!(dumped.matches("alloca [i256; 3]").count(), 2, "{dumped}");
 }

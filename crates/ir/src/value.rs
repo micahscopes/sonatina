@@ -21,7 +21,7 @@ impl IrWrite<FuncWriteCtx<'_>> for ValueId {
     where
         W: io::Write,
     {
-        if let Some(name) = ctx.dbg.value_name(ctx.func, ctx.func_ref, *self) {
+        if let Some(name) = ctx.value_name(*self) {
             write!(w, "{name}")
         } else {
             match ctx.func.dfg.value(*self) {
@@ -50,6 +50,11 @@ impl IrWrite<FuncWriteCtx<'_>> for ValueId {
 }
 
 /// An value data definition.
+///
+/// An `Undef` object reference names no location: copying, merging, passing,
+/// returning or storing it as a value is defined, but a load, store, tag read
+/// or write, constant initialization, materialization or trusted variant
+/// assumption that needs its location has no defined behavior.
 #[derive(Debug, Clone)]
 pub enum Value {
     /// The value is defined by an instruction.
@@ -162,6 +167,20 @@ impl Immediate {
     pub fn sext(self, ty: Type) -> Self {
         debug_assert!(self.ty() <= ty);
         Self::from_i256(self.as_i256(), ty)
+    }
+
+    /// Reverses the order of the value's bytes; `i1` and `i8` values are
+    /// unchanged.
+    pub fn bswap(self) -> Self {
+        match self {
+            Self::I1(_) | Self::I8(_) => self,
+            Self::I16(val) => Self::I16(val.swap_bytes()),
+            Self::I32(val) => Self::I32(val.swap_bytes()),
+            Self::I64(val) => Self::I64(val.swap_bytes()),
+            Self::I128(val) => Self::I128(val.swap_bytes()),
+            Self::I256(val) => Self::I256(I256::from_le_bytes(&val.to_u256().to_big_endian())),
+            Self::EnumTag { .. } => panic!("enum tags have no byte order"),
+        }
     }
 
     pub fn zext(self, ty: Type) -> Self {

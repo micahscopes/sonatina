@@ -8,7 +8,7 @@ use sonatina_verifier::{VerifierConfig, verify_function};
 
 use crate::cfg_edit::{CfgEditor, CleanupMode};
 
-use super::{InlinerConfig, rewrite::OperandRewriter};
+use super::{CallChanges, cost::SummaryKey, rewrite::OperandRewriter};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum FullInlineFail {
@@ -20,7 +20,6 @@ pub(super) enum FullInlineFail {
     MalformedCallee,
 }
 
-#[derive(Debug, Clone, Copy)]
 pub(super) struct FullInlineResult {
     pub blocks_cloned: usize,
     pub insts_cloned: usize,
@@ -28,6 +27,7 @@ pub(super) struct FullInlineResult {
     pub net_growth: usize,
     pub cont_block: BlockId,
     pub cont_reachable: bool,
+    pub call_changes: CallChanges,
 }
 
 #[derive(Debug, Clone)]
@@ -43,15 +43,17 @@ struct PhiFixupRecord {
     old_value: ValueId,
 }
 
+/// `validated_callees` holds callee bodies already known to be rewriteable;
+/// the caller must remove a function's key whenever it edits that function.
 pub(super) fn try_inline_callsite_full(
     module: &Module,
-    _caller_ref: FuncRef,
     caller: &mut Function,
     call_inst: InstId,
     callee_ref: FuncRef,
-    callee: &Function,
-    _config: &InlinerConfig,
+    callee: (SummaryKey, &Function),
+    validated_callees: &mut FxHashSet<SummaryKey>,
 ) -> Result<FullInlineResult, FullInlineFail> {
+    let (callee_key, callee) = callee;
     if !caller.layout.is_inst_inserted(call_inst) {
         return Err(FullInlineFail::CallGone);
     }
@@ -111,7 +113,10 @@ pub(super) fn try_inline_callsite_full(
     }
 
     let reachable: FxHashSet<BlockId> = rpo.iter().copied().collect();
-    validate_full_inline_callee_rewriteability(module, callee_ref, callee, &rpo, &reachable)?;
+    if !validated_callees.contains(&callee_key) {
+        validate_full_inline_callee_rewriteability(module, callee_ref, callee, &rpo, &reachable)?;
+        validated_callees.insert(callee_key);
+    }
 
     let mut editor = CfgEditor::new(caller, CleanupMode::Strict);
     let (callsite_block, cont_block) = editor.split_block_at(call_inst);
@@ -149,6 +154,8 @@ pub(super) fn try_inline_callsite_full(
     let mut phi_fixups = Vec::new();
     let mut returns = Vec::new();
     let mut inserted_insts = 0usize;
+    let mut call_changes = CallChanges::default();
+    call_changes.removed.push(callee_ref);
 
     for old_block in rpo {
         let new_block = block_map[&old_block];
@@ -161,6 +168,9 @@ pub(super) fn try_inline_callsite_full(
         let body = &inst_ids[..inst_ids.len() - 1];
 
         for &old_inst in body {
+            if let Some(call) = callee.dfg.call_info(old_inst) {
+                call_changes.added.push(call.callee());
+            }
             let old_results = callee.dfg.inst_results(old_inst);
             let result_tys: SmallVec<[Type; 2]> = old_results
                 .iter()
@@ -180,6 +190,9 @@ pub(super) fn try_inline_callsite_full(
 
             let (new_inst, new_results) =
                 editor.append_inst_with_results(new_block, cloned, result_tys.as_slice());
+            editor
+                .func_mut()
+                .import_inst_attribution_from(callee, old_inst, new_inst);
             inserted_insts += 1;
 
             assert_eq!(
@@ -217,7 +230,10 @@ pub(super) fn try_inline_callsite_full(
                 .unwrap_or_default();
 
             let jump = editor.func_mut().dfg.make_jump(cont_block);
-            editor.append_inst_with_result(new_block, Box::new(jump), None);
+            let (new_jump, _) = editor.append_inst_with_result(new_block, Box::new(jump), None);
+            editor
+                .func_mut()
+                .import_inst_attribution_from(callee, term_id, new_jump);
             inserted_insts += 1;
 
             returns.push(ReturnSite {
@@ -233,7 +249,10 @@ pub(super) fn try_inline_callsite_full(
                     .rewrite_inst_operands(term.as_mut(), false)
                     .expect("validated callee should be rewriteable");
             }
-            editor.append_inst_with_result(new_block, term, None);
+            let (new_term, _) = editor.append_inst_with_result(new_block, term, None);
+            editor
+                .func_mut()
+                .import_inst_attribution_from(callee, term_id, new_term);
             inserted_insts += 1;
         }
     }
@@ -244,13 +263,11 @@ pub(super) fn try_inline_callsite_full(
             .expect("verified phi fixup should resolve");
 
         let func = editor.func_mut();
-        func.dfg.untrack_inst(fixup.phi_inst);
-        if let Some(phi) = func.dfg.cast_phi_mut(fixup.phi_inst)
-            && fixup.arg_index < phi.args().len()
-        {
-            phi.args_mut()[fixup.arg_index].0 = mapped;
-        }
-        func.dfg.attach_user(fixup.phi_inst);
+        func.dfg.edit_phi(fixup.phi_inst, |phi| {
+            if fixup.arg_index < phi.args().len() {
+                phi.args_mut()[fixup.arg_index].0 = mapped;
+            }
+        });
     }
 
     {
@@ -284,7 +301,7 @@ pub(super) fn try_inline_callsite_full(
                     func.dfg.change_to_alias(call_result, value);
                 }
                 _ => {
-                    let mut args = Vec::with_capacity(returns.len());
+                    let mut args = SmallVec::with_capacity(returns.len());
                     for return_site in &returns {
                         let value = return_site
                             .values
@@ -297,6 +314,10 @@ pub(super) fn try_inline_callsite_full(
 
                     let phi = func.dfg.make_phi(args);
                     let phi_inst = func.dfg.make_inst(phi);
+                    // The return-merge phi carries the call's result; it
+                    // inherits the call instruction's attribution like every
+                    // other transplanted instruction.
+                    func.propagate_inst_attribution(phi_inst, call_inst);
                     func.layout.prepend_inst(phi_inst, cont_block);
 
                     let phi_value = func.dfg.make_value(Value::Inst {
@@ -325,9 +346,11 @@ pub(super) fn try_inline_callsite_full(
         blocks_cloned: block_map.len(),
         insts_cloned: inserted_insts,
         phi_fixups: phi_fixups.len(),
-        net_growth: inserted_insts.saturating_sub(1),
+        // split_block_at added a jump and we removed the original call.
+        net_growth: inserted_insts,
         cont_block,
         cont_reachable,
+        call_changes,
     })
 }
 

@@ -1,7 +1,11 @@
 use macros::Inst;
 pub mod inst_set;
+pub mod machine_inst_set;
 
-use crate::{Type, value::ValueId};
+use smallvec::SmallVec;
+use tiny_keccak::{Hasher, Keccak};
+
+use crate::{Type, U256, value::ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(kind(binary(EvmUdiv)))]
@@ -166,6 +170,29 @@ pub struct EvmKeccak256 {
     len: ValueId,
 }
 
+/// Keccak-256 of `words`, each taken as 32 big-endian bytes, in order. It
+/// reads no memory: the digest is a value of the words alone, so it folds
+/// and value-numbers like arithmetic. EVM lowering builds the preimage in
+/// compiler-owned memory after optimization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Inst)]
+#[inst(arity(at_least(0)))]
+pub struct EvmKeccak256Words {
+    words: SmallVec<[ValueId; 2]>,
+}
+
+impl EvmKeccak256Words {
+    /// The digest of `words`, as `evm_keccak256_words` defines it.
+    pub fn digest(words: impl IntoIterator<Item = U256>) -> U256 {
+        let mut keccak = Keccak::v256();
+        for word in words {
+            keccak.update(&word.to_big_endian());
+        }
+        let mut digest = [0; 32];
+        keccak.finalize(&mut digest);
+        U256::from_big_endian(&digest)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(side_effect(crate::inst::SideEffect::Read))]
 pub struct EvmAddress {}
@@ -210,6 +237,19 @@ pub struct EvmCalldataCopy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(side_effect(crate::inst::SideEffect::Read))]
 pub struct EvmCodeSize {}
+
+/// Read a big-endian 256-bit word from the executing code, padding past its end
+/// with zero. It does not modify program-addressable memory. EVM legalization
+/// supplies compiler-owned scratch memory for CODECOPY and MLOAD; those accesses
+/// may expand physical EVM memory and affect `evm_msize` and `evm_gas` observations.
+/// Eliminating or combining code loads can therefore change those observations,
+/// as with other compiler-generated memory accesses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(crate::inst::SideEffect::Read))]
+pub struct EvmCodeLoad {
+    #[inst(value)]
+    code_offset: ValueId,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(side_effect(crate::inst::SideEffect::Write))]
@@ -305,6 +345,19 @@ pub struct EvmBlobHash {
 pub struct EvmBlobBaseFee {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(crate::inst::SideEffect::Read))]
+pub struct EvmMload {
+    addr: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(crate::inst::SideEffect::Write))]
+pub struct EvmMstore {
+    addr: ValueId,
+    value: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(side_effect(crate::inst::SideEffect::Write))]
 pub struct EvmMstore8 {
     addr: ValueId,
@@ -324,6 +377,9 @@ pub struct EvmSstore {
     val: ValueId,
 }
 
+/// Observe the physical EVM memory high-water mark, including compiler-owned
+/// scratch space and spills. Its value depends on memory layout and optimization;
+/// it is not a stable measure of program allocations or an allocation frontier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(side_effect(crate::inst::SideEffect::Read))]
 pub struct EvmMsize {}
@@ -415,7 +471,7 @@ pub struct EvmCall {
     arg_addr: ValueId,
     arg_len: ValueId,
     ret_addr: ValueId,
-    ret_offset: ValueId,
+    ret_len: ValueId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
@@ -427,7 +483,7 @@ pub struct EvmCallCode {
     arg_addr: ValueId,
     arg_len: ValueId,
     ret_addr: ValueId,
-    ret_offset: ValueId,
+    ret_len: ValueId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]

@@ -7,33 +7,39 @@
 //! Rekha R. Pai.: Detection of Redundant Expressions: A Complete and Polynomial-Time Algorithm in SSA:
 //! APLAS 2015 pp49-65: <https://link.springer.com/chapter/10.1007/978-3-319-26529-2_4>
 
-use std::{cell::RefCell, collections::BTreeSet};
+use std::{
+    cell::{OnceCell, RefCell},
+    collections::BTreeSet,
+};
 
 use cranelift_entity::{PrimaryMap, SecondaryMap, entity_impl, packed_option::PackedOption};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use sonatina_ir::{
-    BlockId, ControlFlowGraph, DataFlowGraph, Function, Immediate, InstId, Type, Value, ValueId,
+    BlockId, ControlFlowGraph, DataFlowGraph, Function, I256, Immediate, InstId, Type, Value,
+    ValueId,
     func_cursor::{CursorLocation, FuncCursor, InstInserter},
     inst::{
-        BinaryInstKind, CastInstKind, InstClassKind, InstKeyExt, OwnedInstKey, UnaryInstKind,
-        arith, cmp, control_flow::BranchKind,
+        BinaryInstKind, InstClassKind, InstKeyExt, OwnedInstKey, UnaryInstKind, arith, cmp,
+        control_flow::BranchKind,
     },
 };
 
 use crate::{
-    analysis::known_bits::{KnownBits, KnownBitsQuery},
+    analysis::{
+        definedness::value_may_be_undef,
+        known_bits::{KnownBits, KnownBitsQuery},
+    },
     cfg_edit::{CfgEditor, CleanupMode},
     domtree::{DomTree, DominatorTreeTraversable},
     optim::{
-        aggregate::{ObjectMemoryAnalysis, ObjectReadGvnKey},
+        adce::divergent_blocks,
+        aggregate::{CarrierSource, ObjectMemoryAnalysis, ObjectReadGvnKey},
         simplify_expr::{
-            EvmModOp, ExprFactProvider, KnownValueFact, SimplifyExprResult, fold_evm_clz,
-            shift_amount_for_pow2_mul, simplify_binary_with_facts, simplify_cast,
-            simplify_evm_byte_known, simplify_evm_exp_known, simplify_evm_modop_known,
-            simplify_evm_signextend_known, simplify_unary_with_same_inner,
+            ExprFactProvider, SimplifiedResult, nontrivial_pow2_shift, simplify_key_with_facts,
         },
     },
+    post_domtree::PostDomTree,
 };
 
 ///  An initial class that assigned to all values.
@@ -55,27 +61,6 @@ fn inst_to_gvn_key(func: &Function, inst_id: InstId) -> OwnedInstKey {
     inst.owned_key(&result_tys)
 }
 
-fn fold_evm_saturating(
-    kind: BinaryInstKind,
-    lhs: Immediate,
-    rhs: Immediate,
-    sat_ty: Type,
-    result_ty: Type,
-) -> Option<Immediate> {
-    let lhs = lhs.trunc(sat_ty);
-    let rhs = rhs.trunc(sat_ty);
-
-    match kind {
-        BinaryInstKind::EvmUaddsat => Some(lhs.saturating_uadd(rhs).zext(result_ty)),
-        BinaryInstKind::EvmSaddsat => Some(lhs.saturating_sadd(rhs).sext(result_ty)),
-        BinaryInstKind::EvmUsubsat => Some(lhs.saturating_usub(rhs).zext(result_ty)),
-        BinaryInstKind::EvmSsubsat => Some(lhs.saturating_ssub(rhs).sext(result_ty)),
-        BinaryInstKind::EvmUmulsat => Some(lhs.saturating_umul(rhs).zext(result_ty)),
-        BinaryInstKind::EvmSmulsat => Some(lhs.saturating_smul(rhs).sext(result_ty)),
-        _ => None,
-    }
-}
-
 fn make_gvn_unary_key(
     func: &Function,
     kind: UnaryInstKind,
@@ -88,9 +73,11 @@ fn make_gvn_unary_key(
             is.has_is_zero()?;
             Some(cmp::IsZero::new(is, arg).owned_key(&[result_ty]))
         }
-        UnaryInstKind::Neg | UnaryInstKind::Not | UnaryInstKind::Snego | UnaryInstKind::EvmClz => {
-            None
-        }
+        UnaryInstKind::Neg
+        | UnaryInstKind::Not
+        | UnaryInstKind::Bswap
+        | UnaryInstKind::Snego
+        | UnaryInstKind::EvmClz => None,
     }
 }
 
@@ -282,7 +269,6 @@ impl GvnSolver {
                         }
                         BranchKind::Br(branch) => {
                             let cond = *branch.cond();
-                            debug_assert_eq!(func.dfg.value_ty(cond), Type::I1);
 
                             let then_block = *branch.nz_dest();
                             let else_block = *branch.z_dest();
@@ -294,23 +280,27 @@ impl GvnSolver {
                             let else_predicate =
                                 self.extract_edge_predicate(func, &known_bits, cond, false);
 
-                            // Make immediates to which the predicate and `cond` is evaluated when the edge is selected.
-                            let then_imm = self.make_imm(&mut func.dfg, true);
-                            let else_imm = self.make_imm(&mut func.dfg, false);
+                            // Make immediates to which the predicate and `cond` is evaluated when
+                            // the edge is selected. Word branches are truthy, so the zero edge is
+                            // exact but the nonzero edge is only exact when the condition is known
+                            // to be normalized to 0/1.
+                            let then_imm = self.branch_resolved_cond(func, &known_bits, cond, true);
+                            let else_imm =
+                                self.branch_resolved_cond(func, &known_bits, cond, false);
 
                             self.add_edge_info(
                                 block,
                                 then_block,
                                 Some(cond),
                                 then_predicate,
-                                Some(then_imm),
+                                then_imm,
                             );
                             self.add_edge_info(
                                 block,
                                 else_block,
                                 Some(cond),
                                 else_predicate,
-                                Some(else_imm),
+                                else_imm,
                             );
                         }
                         BranchKind::BrTable(br_table) => {
@@ -665,29 +655,17 @@ impl GvnSolver {
             return None;
         }
 
-        match read.key() {
-            ObjectReadGvnKey::ValueCarrier {
-                value,
-                carrier_slice,
-                read_slice,
-            } => {
-                if self.may_be_undef(func, value) {
-                    return None;
-                }
-                if carrier_slice == read_slice
-                    && func.dfg.value_ty(value) == func.dfg.value_ty(inst_result)
-                {
-                    Some(GvnInsn::Value(value))
-                } else {
-                    Some(GvnInsn::ObjectRead(ObjectReadGvnKey::ValueCarrier {
-                        value,
-                        carrier_slice,
-                        read_slice,
-                    }))
-                }
-            }
-            key @ ObjectReadGvnKey::Memory { .. } => Some(GvnInsn::ObjectRead(key)),
+        // ObjectMemory proves the demanded contents defined, including
+        // reconstructed aggregates and immutable load snapshots. Its covering
+        // carrier proof is stronger than the generic SSA walk.
+        let key = read.key();
+        if let CarrierSource::Value(value) = key.source
+            && key.carrier_slice == key.read_slice
+            && func.dfg.value_ty(value) == func.dfg.value_ty(inst_result)
+        {
+            return Some(GvnInsn::Value(value));
         }
+        Some(GvnInsn::ObjectRead(key))
     }
 
     /// Perform value phi computation for the value.
@@ -751,7 +729,7 @@ impl GvnSolver {
         // If `resolved_cond` doesn't exist, then the edge must be non conditional jump.
         let resolved_cond = match edge_data.resolved_cond.expand() {
             Some(cond) => cond,
-            None => return true,
+            None => return edge_data.cond.expand().is_none(),
         };
 
         let inferred_value = self.infer_value_at_block(func, domtree, cond, edge_data.from);
@@ -851,8 +829,10 @@ impl GvnSolver {
         let edge_data = self.edge_data(edge);
         let edge_cond = edge_data.cond.expand()?;
         // If value is congruent to edge cond value, then return resolved cond of the edge.
-        if self.is_congruent_value(edge_cond, value) {
-            return Some(edge_data.resolved_cond.unwrap());
+        if self.is_congruent_value(edge_cond, value)
+            && let Some(resolved_cond) = edge_data.resolved_cond.expand()
+        {
+            return Some(resolved_cond);
         }
 
         let predicate = edge_data.predicate.as_ref()?;
@@ -918,7 +898,7 @@ impl GvnSolver {
         // And if the insn is phi, arguments from unreachable edges are omitted.
         let insn_expr = if let Some(phi_args) = insn_expr.phi_args() {
             let edges = &self.blocks[block].in_edges;
-            let mut canonical_phi_args = Vec::with_capacity(phi_args.len());
+            let mut canonical_phi_args = SmallVec::with_capacity(phi_args.len());
             for &(value, from) in phi_args {
                 match self.reachable_edge_state(edges, from, block) {
                     ReachableEdgeState::None => continue,
@@ -969,365 +949,12 @@ impl GvnSolver {
             }
         };
 
-        if let Some(imm) = self.perform_constant_folding(func, &insn_expr, result_idx) {
-            GvnInsn::Value(imm)
-        } else if let Some(result) =
-            self.perform_simplification(func, known_bits, &insn_expr, result_idx)
+        if let Some(result) = self.perform_simplification(func, known_bits, &insn_expr, result_idx)
         {
             result
         } else {
             GvnInsn::expr(insn_expr, result_idx)
         }
-    }
-
-    /// Perform constant folding.
-    fn perform_constant_folding(
-        &mut self,
-        func: &mut Function,
-        insn_expr: &OwnedInstKey,
-        result_idx: usize,
-    ) -> Option<ValueId> {
-        let imm = if let InstClassKind::Unary(kind) = insn_expr.kind() {
-            let arg = func.dfg.value_imm(insn_expr.unary_arg()?)?;
-            match kind {
-                UnaryInstKind::Neg => -arg,
-                UnaryInstKind::Snego => match result_idx {
-                    0 => arg.overflowing_sneg().0,
-                    1 => Immediate::from(arg.overflowing_sneg().1),
-                    _ => return None,
-                },
-                UnaryInstKind::Not => !arg,
-                UnaryInstKind::IsZero => arg.is_zero().into(),
-                UnaryInstKind::EvmClz => fold_evm_clz(arg)?,
-            }
-        } else if let InstClassKind::Binary(kind) = insn_expr.kind() {
-            let (lhs, rhs) = insn_expr.binary_args()?;
-            match kind {
-                BinaryInstKind::Add => func.dfg.value_imm(lhs)? + func.dfg.value_imm(rhs)?,
-                BinaryInstKind::Uaddo => match result_idx {
-                    0 => {
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_uadd(func.dfg.value_imm(rhs)?)
-                            .0
-                    }
-                    1 => Immediate::from(
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_uadd(func.dfg.value_imm(rhs)?)
-                            .1,
-                    ),
-                    _ => return None,
-                },
-                BinaryInstKind::Uaddsat => func
-                    .dfg
-                    .value_imm(lhs)?
-                    .saturating_uadd(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Saddo => match result_idx {
-                    0 => {
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_sadd(func.dfg.value_imm(rhs)?)
-                            .0
-                    }
-                    1 => Immediate::from(
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_sadd(func.dfg.value_imm(rhs)?)
-                            .1,
-                    ),
-                    _ => return None,
-                },
-                BinaryInstKind::Saddsat => func
-                    .dfg
-                    .value_imm(lhs)?
-                    .saturating_sadd(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Mul => func.dfg.value_imm(lhs)? * func.dfg.value_imm(rhs)?,
-                BinaryInstKind::Umulo => match result_idx {
-                    0 => {
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_umul(func.dfg.value_imm(rhs)?)
-                            .0
-                    }
-                    1 => Immediate::from(
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_umul(func.dfg.value_imm(rhs)?)
-                            .1,
-                    ),
-                    _ => return None,
-                },
-                BinaryInstKind::Umulsat => func
-                    .dfg
-                    .value_imm(lhs)?
-                    .saturating_umul(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Smulo => match result_idx {
-                    0 => {
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_smul(func.dfg.value_imm(rhs)?)
-                            .0
-                    }
-                    1 => Immediate::from(
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_smul(func.dfg.value_imm(rhs)?)
-                            .1,
-                    ),
-                    _ => return None,
-                },
-                BinaryInstKind::Smulsat => func
-                    .dfg
-                    .value_imm(lhs)?
-                    .saturating_smul(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Sub => func.dfg.value_imm(lhs)? - func.dfg.value_imm(rhs)?,
-                BinaryInstKind::Usubo => match result_idx {
-                    0 => {
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_usub(func.dfg.value_imm(rhs)?)
-                            .0
-                    }
-                    1 => Immediate::from(
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_usub(func.dfg.value_imm(rhs)?)
-                            .1,
-                    ),
-                    _ => return None,
-                },
-                BinaryInstKind::Usubsat => func
-                    .dfg
-                    .value_imm(lhs)?
-                    .saturating_usub(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Ssubo => match result_idx {
-                    0 => {
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_ssub(func.dfg.value_imm(rhs)?)
-                            .0
-                    }
-                    1 => Immediate::from(
-                        func.dfg
-                            .value_imm(lhs)?
-                            .overflowing_ssub(func.dfg.value_imm(rhs)?)
-                            .1,
-                    ),
-                    _ => return None,
-                },
-                BinaryInstKind::Ssubsat => func
-                    .dfg
-                    .value_imm(lhs)?
-                    .saturating_ssub(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Sdiv => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    (!rhs.is_zero()).then_some(lhs.sdiv(rhs))?
-                }
-                BinaryInstKind::Udiv => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    (!rhs.is_zero()).then_some(lhs.udiv(rhs))?
-                }
-                BinaryInstKind::Umod => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    (!rhs.is_zero()).then_some(lhs.urem(rhs))?
-                }
-                BinaryInstKind::Smod => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    (!rhs.is_zero()).then_some(lhs.srem(rhs))?
-                }
-                BinaryInstKind::Lt => func.dfg.value_imm(lhs)?.lt(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Gt => func.dfg.value_imm(lhs)?.gt(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Slt => func.dfg.value_imm(lhs)?.slt(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Sgt => func.dfg.value_imm(lhs)?.sgt(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Le => func.dfg.value_imm(lhs)?.le(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Ge => func.dfg.value_imm(lhs)?.ge(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Sle => func.dfg.value_imm(lhs)?.sle(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Sge => func.dfg.value_imm(lhs)?.sge(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Eq => func.dfg.value_imm(lhs)?.imm_eq(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::Ne => func.dfg.value_imm(lhs)?.imm_ne(func.dfg.value_imm(rhs)?),
-                BinaryInstKind::And => func.dfg.value_imm(lhs)? & func.dfg.value_imm(rhs)?,
-                BinaryInstKind::Or => func.dfg.value_imm(lhs)? | func.dfg.value_imm(rhs)?,
-                BinaryInstKind::Xor => func.dfg.value_imm(lhs)? ^ func.dfg.value_imm(rhs)?,
-                BinaryInstKind::Shl => {
-                    let bits = func.dfg.value_imm(lhs)?;
-                    let value = func.dfg.value_imm(rhs)?;
-                    value << bits
-                }
-                BinaryInstKind::Shr => {
-                    let bits = func.dfg.value_imm(lhs)?;
-                    let value = func.dfg.value_imm(rhs)?;
-                    value >> bits
-                }
-                BinaryInstKind::Sar => {
-                    let bits = func.dfg.value_imm(lhs)?;
-                    let value = func.dfg.value_imm(rhs)?;
-                    value.ashr(bits)
-                }
-                BinaryInstKind::EvmUdiv => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    if rhs.is_zero() { rhs } else { lhs.udiv(rhs) }
-                }
-                BinaryInstKind::EvmSdiv => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    if rhs.is_zero() { rhs } else { lhs.sdiv(rhs) }
-                }
-                BinaryInstKind::EvmUdivo => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    match result_idx {
-                        0 => {
-                            if rhs.is_zero() {
-                                rhs
-                            } else {
-                                lhs.udiv(rhs)
-                            }
-                        }
-                        1 => Immediate::from(rhs.is_zero()),
-                        _ => return None,
-                    }
-                }
-                BinaryInstKind::EvmSdivo => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    let overflow = rhs.is_zero() || (rhs.is_all_one() && lhs.overflowing_sneg().1);
-                    match result_idx {
-                        0 => {
-                            if rhs.is_zero() {
-                                rhs
-                            } else {
-                                lhs.sdiv(rhs)
-                            }
-                        }
-                        1 => Immediate::from(overflow),
-                        _ => return None,
-                    }
-                }
-                BinaryInstKind::EvmUmod => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    if rhs.is_zero() { rhs } else { lhs.urem(rhs) }
-                }
-                BinaryInstKind::EvmSmod => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    if rhs.is_zero() { rhs } else { lhs.srem(rhs) }
-                }
-                BinaryInstKind::EvmUmodo | BinaryInstKind::EvmSmodo => {
-                    let lhs = func.dfg.value_imm(lhs)?;
-                    let rhs = func.dfg.value_imm(rhs)?;
-                    match result_idx {
-                        0 => {
-                            if rhs.is_zero() {
-                                rhs
-                            } else if matches!(kind, BinaryInstKind::EvmUmodo) {
-                                lhs.urem(rhs)
-                            } else {
-                                lhs.srem(rhs)
-                            }
-                        }
-                        1 => Immediate::from(rhs.is_zero()),
-                        _ => return None,
-                    }
-                }
-                BinaryInstKind::EvmUaddsat
-                | BinaryInstKind::EvmSaddsat
-                | BinaryInstKind::EvmUsubsat
-                | BinaryInstKind::EvmSsubsat
-                | BinaryInstKind::EvmUmulsat
-                | BinaryInstKind::EvmSmulsat => fold_evm_saturating(
-                    kind,
-                    func.dfg.value_imm(lhs)?,
-                    func.dfg.value_imm(rhs)?,
-                    insn_expr.extra_ty()?,
-                    *insn_expr.result_tys().get(result_idx)?,
-                )?,
-                BinaryInstKind::EvmExp => simplify_evm_exp_known(
-                    KnownValueFact {
-                        imm: func.dfg.value_imm(lhs),
-                        may_be_undef: self.may_be_undef(func, lhs),
-                    },
-                    KnownValueFact {
-                        imm: func.dfg.value_imm(rhs),
-                        may_be_undef: self.may_be_undef(func, rhs),
-                    },
-                    *insn_expr.result_tys().get(result_idx)?,
-                )?,
-                BinaryInstKind::EvmSignExtend => simplify_evm_signextend_known(
-                    KnownValueFact {
-                        imm: func.dfg.value_imm(lhs),
-                        may_be_undef: self.may_be_undef(func, lhs),
-                    },
-                    KnownValueFact {
-                        imm: func.dfg.value_imm(rhs),
-                        may_be_undef: self.may_be_undef(func, rhs),
-                    },
-                    *insn_expr.result_tys().get(result_idx)?,
-                )?,
-                BinaryInstKind::EvmByte => simplify_evm_byte_known(
-                    KnownValueFact {
-                        imm: func.dfg.value_imm(lhs),
-                        may_be_undef: self.may_be_undef(func, lhs),
-                    },
-                    KnownValueFact {
-                        imm: func.dfg.value_imm(rhs),
-                        may_be_undef: self.may_be_undef(func, rhs),
-                    },
-                    *insn_expr.result_tys().get(result_idx)?,
-                )?,
-            }
-        } else if let InstClassKind::Cast(kind) = insn_expr.kind() {
-            let (arg, ty) = insn_expr.cast_arg_ty()?;
-            if !ty.is_integral() {
-                return None;
-            }
-
-            let value = func.dfg.value_imm(arg)?;
-            match kind {
-                CastInstKind::Sext => value.sext(ty),
-                CastInstKind::Zext => value.zext(ty),
-                CastInstKind::Trunc => value.trunc(ty),
-                CastInstKind::Bitcast => value.bitcast(ty),
-                CastInstKind::IntToPtr | CastInstKind::PtrToInt => {
-                    Immediate::from_i256(value.as_i256(), ty)
-                }
-            }
-        } else if insn_expr.kind() == InstClassKind::Opaque {
-            let [lhs, rhs, modulus] = insn_expr.values() else {
-                return None;
-            };
-            let op = match insn_expr.opcode_text() {
-                "evm_add_mod" => EvmModOp::Add,
-                "evm_mul_mod" => EvmModOp::Mul,
-                _ => return None,
-            };
-            simplify_evm_modop_known(
-                KnownValueFact {
-                    imm: func.dfg.value_imm(*lhs),
-                    may_be_undef: self.may_be_undef(func, *lhs),
-                },
-                KnownValueFact {
-                    imm: func.dfg.value_imm(*rhs),
-                    may_be_undef: self.may_be_undef(func, *rhs),
-                },
-                KnownValueFact {
-                    imm: func.dfg.value_imm(*modulus),
-                    may_be_undef: self.may_be_undef(func, *modulus),
-                },
-                *insn_expr.result_tys().get(result_idx)?,
-                op,
-            )?
-        } else {
-            return None;
-        };
-
-        Some(self.make_imm(&mut func.dfg, imm))
     }
 
     /// Perform insn simplification.
@@ -1338,61 +965,22 @@ impl GvnSolver {
         insn_expr: &OwnedInstKey,
         result_idx: usize,
     ) -> Option<GvnInsn> {
-        if let InstClassKind::Unary(kind) = insn_expr.kind() {
-            let arg = insn_expr.unary_arg()?;
-            if matches!(kind, UnaryInstKind::Snego) && !func.dfg.value_ty(arg).is_integral() {
-                return None;
-            }
-            if matches!(kind, UnaryInstKind::Snego)
-                && result_idx == 0
-                && func.dfg.value_imm(arg).is_some_and(Immediate::is_zero)
-            {
-                let zero = Immediate::zero(func.dfg.value_ty(arg));
-                let zero = self.make_imm(&mut func.dfg, zero);
-                return Some(GvnInsn::Value(zero));
-            }
-            if matches!(kind, UnaryInstKind::Snego)
-                && result_idx == 1
-                && func.dfg.value_imm(arg).is_some_and(Immediate::is_zero)
-            {
-                let no_overflow = self.make_imm(&mut func.dfg, false);
-                return Some(GvnInsn::Value(no_overflow));
-            }
-            let simplified = simplify_unary_with_same_inner(kind, arg, |arg, expected| {
-                let Value::Inst { inst, .. } = func.dfg.value(arg) else {
-                    return None;
-                };
-                let inner = inst_to_gvn_key(func, *inst);
-                (inner.kind() == InstClassKind::Unary(expected))
-                    .then_some(())
-                    .and_then(|_| inner.unary_arg())
-            });
-            if !simplified.is_no_change() {
-                return Some(self.simplify_expr_result_to_gvn(func, simplified));
-            }
-        }
-
-        if let InstClassKind::Binary(kind) = insn_expr.kind() {
-            let (lhs, rhs) = insn_expr.binary_args()?;
-            if let Some(result) =
-                self.perform_checked_overflow_simplification(func, kind, lhs, rhs, result_idx)
-            {
-                return Some(result);
-            }
-            if result_idx == 0
-                && let Some(result) = self.perform_saturating_simplification(func, kind, lhs, rhs)
-            {
-                return Some(result);
-            }
+        let simplified = {
             let facts = GvnExprFacts {
                 func,
                 solver: self,
                 known_bits,
             };
-            let simplified = simplify_binary_with_facts(func, kind, lhs, rhs, &facts);
-            if !simplified.is_no_change() {
-                return Some(self.simplify_expr_result_to_gvn(func, simplified));
-            }
+            simplify_key_with_facts(func, insn_expr, &facts).result(result_idx)
+        };
+        if let Some(result_ty) = insn_expr.result_tys().get(result_idx).copied()
+            && let Some(result) = self.simplified_result_to_gvn(func, simplified, result_ty)
+        {
+            return Some(result);
+        }
+
+        if let InstClassKind::Binary(kind) = insn_expr.kind() {
+            let (lhs, rhs) = insn_expr.binary_args()?;
 
             if matches!(kind, BinaryInstKind::Sub)
                 && let Some(value) = self.simplify_sub_add_cancellation(func, lhs, rhs)
@@ -1452,7 +1040,7 @@ impl GvnSolver {
 
                 if kind == BinaryInstKind::Mul {
                     if let Some(imm) = func.dfg.value_imm(lhs)
-                        && let Some(shift) = shift_amount_for_pow2_mul(imm)
+                        && let Some(shift) = nontrivial_pow2_shift(imm)
                     {
                         let shift = self.make_imm(
                             &mut func.dfg,
@@ -1465,7 +1053,7 @@ impl GvnSolver {
                         }
                     }
                     if let Some(imm) = func.dfg.value_imm(rhs)
-                        && let Some(shift) = shift_amount_for_pow2_mul(imm)
+                        && let Some(shift) = nontrivial_pow2_shift(imm)
                     {
                         let shift = self.make_imm(
                             &mut func.dfg,
@@ -1481,175 +1069,12 @@ impl GvnSolver {
             }
         }
 
-        if let InstClassKind::Cast(kind) = insn_expr.kind() {
-            let (arg, ty) = insn_expr.cast_arg_ty()?;
-            let simplified = simplify_cast(func, kind, arg, ty);
-            if !simplified.is_no_change() {
-                return Some(self.simplify_expr_result_to_gvn(func, simplified));
-            }
-        }
-
         if let Some(phi_args) = insn_expr.phi_args() {
             return phi_args
                 .first()
                 .map(|(value, _)| *value)
                 .filter(|first| phi_args.iter().all(|(value, _)| value == first))
                 .map(GvnInsn::Value);
-        }
-
-        None
-    }
-
-    fn perform_saturating_simplification(
-        &mut self,
-        func: &mut Function,
-        kind: BinaryInstKind,
-        lhs: ValueId,
-        rhs: ValueId,
-    ) -> Option<GvnInsn> {
-        let ty = func.dfg.value_ty(lhs);
-        if !ty.is_integral() {
-            return None;
-        }
-        let zero = Immediate::zero(ty);
-        let one = Immediate::one(ty);
-        let lhs_imm = func.dfg.value_imm(lhs);
-        let rhs_imm = func.dfg.value_imm(rhs);
-
-        match kind {
-            BinaryInstKind::Uaddsat | BinaryInstKind::Saddsat => {
-                if rhs_imm == Some(zero) {
-                    return Some(GvnInsn::Value(lhs));
-                }
-                if lhs_imm == Some(zero) {
-                    return Some(GvnInsn::Value(rhs));
-                }
-            }
-            BinaryInstKind::Usubsat => {
-                if rhs_imm == Some(zero) {
-                    return Some(GvnInsn::Value(lhs));
-                }
-                if lhs_imm == Some(zero) && !self.may_be_undef(func, rhs) {
-                    return Some(GvnInsn::Value(self.make_imm(&mut func.dfg, zero)));
-                }
-            }
-            BinaryInstKind::Ssubsat if rhs_imm == Some(zero) => {
-                return Some(GvnInsn::Value(lhs));
-            }
-            BinaryInstKind::Umulsat | BinaryInstKind::Smulsat => {
-                if (lhs_imm == Some(zero) && !self.may_be_undef(func, rhs))
-                    || (rhs_imm == Some(zero) && !self.may_be_undef(func, lhs))
-                {
-                    return Some(GvnInsn::Value(self.make_imm(&mut func.dfg, zero)));
-                }
-                if lhs_imm == Some(one) {
-                    return Some(GvnInsn::Value(rhs));
-                }
-                if rhs_imm == Some(one) {
-                    return Some(GvnInsn::Value(lhs));
-                }
-            }
-            _ => {}
-        }
-
-        None
-    }
-
-    fn perform_checked_overflow_simplification(
-        &mut self,
-        func: &mut Function,
-        kind: BinaryInstKind,
-        lhs: ValueId,
-        rhs: ValueId,
-        result_idx: usize,
-    ) -> Option<GvnInsn> {
-        let ty = func.dfg.value_ty(lhs);
-        if !ty.is_integral() {
-            return None;
-        }
-        let zero = Immediate::zero(ty);
-        let one = Immediate::one(ty);
-        let lhs_imm = func.dfg.value_imm(lhs);
-        let rhs_imm = func.dfg.value_imm(rhs);
-
-        match kind {
-            BinaryInstKind::Uaddo | BinaryInstKind::Saddo => {
-                if rhs_imm == Some(zero) {
-                    return Some(if result_idx == 0 {
-                        GvnInsn::Value(lhs)
-                    } else if result_idx == 1 {
-                        GvnInsn::Value(self.make_imm(&mut func.dfg, false))
-                    } else {
-                        return None;
-                    });
-                }
-                if lhs_imm == Some(zero) {
-                    return Some(if result_idx == 0 {
-                        GvnInsn::Value(rhs)
-                    } else if result_idx == 1 {
-                        GvnInsn::Value(self.make_imm(&mut func.dfg, false))
-                    } else {
-                        return None;
-                    });
-                }
-            }
-            BinaryInstKind::Usubo | BinaryInstKind::Ssubo if rhs_imm == Some(zero) => {
-                return Some(if result_idx == 0 {
-                    GvnInsn::Value(lhs)
-                } else if result_idx == 1 {
-                    GvnInsn::Value(self.make_imm(&mut func.dfg, false))
-                } else {
-                    return None;
-                });
-            }
-            BinaryInstKind::Umulo | BinaryInstKind::Smulo => {
-                if lhs_imm == Some(zero) || rhs_imm == Some(zero) {
-                    return Some(if result_idx == 0 {
-                        GvnInsn::Value(self.make_imm(&mut func.dfg, zero))
-                    } else if result_idx == 1 {
-                        GvnInsn::Value(self.make_imm(&mut func.dfg, false))
-                    } else {
-                        return None;
-                    });
-                }
-                if lhs_imm == Some(one) {
-                    return Some(if result_idx == 0 {
-                        GvnInsn::Value(rhs)
-                    } else if result_idx == 1 {
-                        GvnInsn::Value(self.make_imm(&mut func.dfg, false))
-                    } else {
-                        return None;
-                    });
-                }
-                if rhs_imm == Some(one) {
-                    return Some(if result_idx == 0 {
-                        GvnInsn::Value(lhs)
-                    } else if result_idx == 1 {
-                        GvnInsn::Value(self.make_imm(&mut func.dfg, false))
-                    } else {
-                        return None;
-                    });
-                }
-            }
-            BinaryInstKind::EvmUdivo | BinaryInstKind::EvmSdivo if rhs_imm == Some(one) => {
-                return Some(if result_idx == 0 {
-                    GvnInsn::Value(lhs)
-                } else if result_idx == 1 {
-                    GvnInsn::Value(self.make_imm(&mut func.dfg, false))
-                } else {
-                    return None;
-                });
-            }
-            BinaryInstKind::EvmUmodo | BinaryInstKind::EvmSmodo if rhs_imm == Some(one) => {
-                return Some(if result_idx == 0 {
-                    GvnInsn::Value(self.make_imm(&mut func.dfg, zero))
-                } else if result_idx == 1 {
-                    GvnInsn::Value(self.make_imm(&mut func.dfg, false))
-                } else {
-                    return None;
-                });
-            }
-            _ => {}
         }
 
         None
@@ -1743,102 +1168,51 @@ impl GvnSolver {
     }
 
     fn may_be_undef(&self, func: &Function, value: ValueId) -> bool {
-        if let Some(may_be_undef) = self.may_be_undef_cache.borrow().get(&value).copied() {
-            return may_be_undef;
-        }
-
-        let mut cache = self.may_be_undef_cache.borrow_mut();
-        let mut visiting = FxHashSet::default();
-        let mut stack = vec![(value, false)];
-        while let Some((value, post_order)) = stack.pop() {
-            if cache.contains_key(&value) {
-                continue;
-            }
-
-            if post_order {
-                visiting.remove(&value);
-                let may_be_undef = match func.dfg.value(value) {
-                    Value::Undef { .. } => true,
-                    Value::Immediate { .. } | Value::Arg { .. } | Value::Global { .. } => false,
-                    Value::Inst { inst, .. } => self.inst_result_may_be_undef(func, *inst, &cache),
-                };
-                cache.insert(value, may_be_undef);
-                continue;
-            }
-
-            if !visiting.insert(value) {
-                // Be conservative for cyclic value definitions.
-                cache.insert(value, true);
-                continue;
-            }
-
-            stack.push((value, true));
-            if let Value::Inst { inst, .. } = func.dfg.value(value) {
-                for used in func.dfg.inst(*inst).collect_values().into_iter().rev() {
-                    if cache.contains_key(&used) {
-                        continue;
-                    }
-
-                    if visiting.contains(&used) {
-                        // Be conservative for cyclic value definitions.
-                        cache.insert(used, true);
-                    } else {
-                        stack.push((used, false));
-                    }
-                }
-            }
-        }
-
-        cache.get(&value).copied().unwrap_or(true)
+        value_may_be_undef(
+            func,
+            value,
+            &mut self.may_be_undef_cache.borrow_mut(),
+            |_| None,
+        )
     }
 
-    fn inst_result_may_be_undef(
-        &self,
-        func: &Function,
-        inst: InstId,
-        cache: &FxHashMap<ValueId, bool>,
-    ) -> bool {
-        let inst_data = func.dfg.inst(inst);
-        let values = inst_data.collect_values();
-        if values
-            .iter()
-            .copied()
-            .any(|value| cache.get(&value).copied().unwrap_or(true))
-        {
-            return true;
-        }
-
-        if let InstClassKind::Binary(kind) = inst_data.kind()
-            && matches!(
-                kind,
-                BinaryInstKind::Udiv
-                    | BinaryInstKind::Sdiv
-                    | BinaryInstKind::Umod
-                    | BinaryInstKind::Smod
-            )
-        {
-            let [_, rhs] = values.as_slice() else {
-                return true;
-            };
-            return func.dfg.value_imm(*rhs).is_none_or(Immediate::is_zero);
-        }
-
-        false
-    }
-
-    fn simplify_expr_result_to_gvn(
+    fn simplified_result_to_gvn(
         &mut self,
         func: &mut Function,
-        simplified: SimplifyExprResult,
-    ) -> GvnInsn {
+        simplified: SimplifiedResult,
+        result_ty: Type,
+    ) -> Option<GvnInsn> {
         match simplified {
-            SimplifyExprResult::Const(imm) => {
+            SimplifiedResult::Const(imm) if imm.ty() == result_ty => {
                 let value = self.make_imm(&mut func.dfg, imm);
-                GvnInsn::Value(value)
+                Some(GvnInsn::Value(value))
             }
-            SimplifyExprResult::Copy(value) => GvnInsn::Value(value),
-            SimplifyExprResult::NoChange => unreachable!(),
+            SimplifiedResult::Copy(value) if func.dfg.value_ty(value) == result_ty => {
+                Some(GvnInsn::Value(value))
+            }
+            SimplifiedResult::Const(_) | SimplifiedResult::Copy(_) | SimplifiedResult::NoChange => {
+                None
+            }
         }
+    }
+
+    fn branch_resolved_cond(
+        &mut self,
+        func: &mut Function,
+        known_bits: &KnownBitsQuery,
+        cond: ValueId,
+        edge_truth: bool,
+    ) -> Option<ValueId> {
+        let cond_ty = func.dfg.value_ty(cond);
+        if cond_ty == Type::I1 {
+            return self.make_bool_imm(&mut func.dfg, cond_ty, edge_truth);
+        }
+
+        if cond_ty == Type::I256 && (!edge_truth || known_bits.fits_in_low_bits(func, cond, 1)) {
+            return self.make_bool_imm(&mut func.dfg, cond_ty, edge_truth);
+        }
+
+        None
     }
 
     fn extract_edge_predicate(
@@ -1877,7 +1251,8 @@ impl GvnSolver {
             if let InstClassKind::Binary(kind @ (BinaryInstKind::Eq | BinaryInstKind::Ne)) =
                 insn_expr.kind()
                 && let Some((lhs, rhs)) = insn_expr.binary_args()
-                && let Some((arg, imm)) = self.bool_compare_arg_and_const(func, lhs, rhs)
+                && let Some((arg, imm)) =
+                    self.bool_compare_arg_and_const(func, known_bits, lhs, rhs)
             {
                 expected_true = match kind {
                     BinaryInstKind::Eq => expected_true == imm,
@@ -1890,7 +1265,8 @@ impl GvnSolver {
                     continue;
                 }
 
-                let expected = self.make_imm(&mut func.dfg, expected_true);
+                let arg_ty = func.dfg.value_ty(arg);
+                let expected = self.make_bool_imm(&mut func.dfg, arg_ty, expected_true)?;
                 return Some(PredicateRelation::Eq {
                     lhs: arg,
                     rhs: expected,
@@ -1923,8 +1299,9 @@ impl GvnSolver {
                     });
                 }
 
-                if func.dfg.value_ty(arg) == Type::I1 {
-                    let one = self.make_imm(&mut func.dfg, true);
+                let arg_ty = func.dfg.value_ty(arg);
+                if arg_ty == Type::I1 || known_bits.fits_in_low_bits(func, arg, 1) {
+                    let one = self.make_bool_imm(&mut func.dfg, arg_ty, true)?;
                     return Some(PredicateRelation::Eq { lhs: arg, rhs: one });
                 }
             }
@@ -1935,24 +1312,54 @@ impl GvnSolver {
         None
     }
 
+    fn make_bool_imm(&mut self, dfg: &mut DataFlowGraph, ty: Type, value: bool) -> Option<ValueId> {
+        let imm = match ty {
+            Type::I1 => Immediate::from(value),
+            Type::I256 => Immediate::from_i256(I256::from(u8::from(value)), Type::I256),
+            _ => return None,
+        };
+        Some(self.make_imm(dfg, imm))
+    }
+
     fn bool_compare_arg_and_const(
         &self,
         func: &Function,
+        known_bits: &KnownBitsQuery,
         lhs: ValueId,
         rhs: ValueId,
     ) -> Option<(ValueId, bool)> {
-        match (Self::value_i1_imm(func, lhs), Self::value_i1_imm(func, rhs)) {
-            (Some(lhs_imm), None) => Some((rhs, lhs_imm)),
-            (None, Some(rhs_imm)) => Some((lhs, rhs_imm)),
+        match (
+            Self::value_bool_imm(func, lhs),
+            Self::value_bool_imm(func, rhs),
+        ) {
+            (Some(lhs_imm), None) if Self::is_normalized_bool(func, known_bits, rhs) => {
+                Some((rhs, lhs_imm))
+            }
+            (None, Some(rhs_imm)) if Self::is_normalized_bool(func, known_bits, lhs) => {
+                Some((lhs, rhs_imm))
+            }
             _ => None,
         }
     }
 
-    fn value_i1_imm(func: &Function, value: ValueId) -> Option<bool> {
-        let Immediate::I1(imm) = func.dfg.value_imm(value)? else {
-            return None;
-        };
-        Some(imm)
+    fn is_normalized_bool(func: &Function, known_bits: &KnownBitsQuery, value: ValueId) -> bool {
+        let ty = func.dfg.value_ty(value);
+        ty == Type::I1 || (ty == Type::I256 && known_bits.fits_in_low_bits(func, value, 1))
+    }
+
+    fn value_bool_imm(func: &Function, value: ValueId) -> Option<bool> {
+        let imm = func.dfg.value_imm(value)?;
+        match imm.ty() {
+            Type::I1 => {
+                let Immediate::I1(value) = imm else {
+                    unreachable!("i1 immediate must carry an i1 payload");
+                };
+                Some(value)
+            }
+            Type::I256 if imm.as_i256() == I256::from(0) => Some(false),
+            Type::I256 if imm.as_i256() == I256::from(1) => Some(true),
+            _ => None,
+        }
     }
 
     /// Make edge data and append incoming/outgoing edges of corresponding blocks.
@@ -1996,7 +1403,7 @@ impl GvnSolver {
         self.values[value].class = class;
 
         // Remove `value` from `old` class.
-        self.classes[old_class].values.remove(&(value_rank, value));
+        let removed = self.classes[old_class].values.remove(&(value_rank, value));
 
         let old_leader_after = self.class_leader_if_nonempty(old_class);
         let new_leader_after = self.class_leader_if_nonempty(class);
@@ -2008,8 +1415,9 @@ impl GvnSolver {
             (Some(before), Some(after)) if before != after
         );
 
-        // Remove all stale indexes that still point to the emptied class.
-        if self.classes[old_class].values.is_empty() {
+        // Only a transition to empty invalidates indexes. The initial class
+        // has no members, so first assignments must not scan both tables.
+        if removed && self.classes[old_class].values.is_empty() {
             self.insn_table
                 .retain(|_, mapped_class| *mapped_class != old_class);
             self.value_phi_table
@@ -2661,11 +2069,9 @@ impl<'a, 'b> ValuePhiFinder<'a, 'b> {
 
     /// Lookup value phi argument.
     fn lookup_value_phi_arg(&mut self, func: &mut Function, query: GvnInsn) -> Option<ValuePhi> {
-        // Perform constant folding and insn simplification to canonicalize query.
+        // Perform shared simplification and GVN expression canonicalization on the query.
         let query = if let GvnInsn::Expr { key, result_idx } = query {
-            if let Some(imm) = self.solver.perform_constant_folding(func, &key, result_idx) {
-                return Some(ValuePhi::Value(imm));
-            } else if let Some(simplified) =
+            if let Some(simplified) =
                 self.solver
                     .perform_simplification(func, self.known_bits, &key, result_idx)
             {
@@ -2785,6 +2191,11 @@ impl ValuePhiInsn {
     }
 
     /// Canonicalize the value phi insn and convert into value phi.
+    ///
+    /// Returns `None` if resolving the value phi would need two different phi insns in one
+    /// block. Such a value phi tells apart the paths through a chain of joins, e.g. an if-ladder
+    /// that accumulates constants, and resolving it can insert a phi for every path:
+    /// exponentially many in the length of the chain.
     fn canonicalize(mut self) -> Option<ValuePhi> {
         let first_arg = &self.args.first()?.0;
 
@@ -2798,8 +2209,27 @@ impl ValuePhiInsn {
         } else {
             // Sort arguments in block order.
             self.args.sort_by_key(|(_, block)| *block);
-            Some(ValuePhi::PhiInsn(self))
+            self.places_one_phi_per_block()
+                .then_some(ValuePhi::PhiInsn(self))
         }
+    }
+
+    /// Returns `true` if no two different phi insns of this value phi share a block. Equal phi
+    /// insns are resolved to a single phi.
+    fn places_one_phi_per_block(&self) -> bool {
+        let mut placed = FxHashMap::default();
+        let mut pending = vec![self];
+        while let Some(insn) = pending.pop() {
+            match placed.insert(insn.block, insn) {
+                Some(placed_insn) if placed_insn != insn => return false,
+                Some(_) => {}
+                None => pending.extend(insn.args.iter().filter_map(|(arg, _)| match arg {
+                    ValuePhi::PhiInsn(insn) => Some(insn),
+                    ValuePhi::Value(_) => None,
+                })),
+            }
+        }
+        true
     }
 }
 
@@ -2822,6 +2252,10 @@ struct RedundantCodeRemover<'a> {
     /// Record resolved value phis.
     resolved_value_phis: FxHashMap<ValuePhi, ValueId>,
 
+    /// Computed on demand when resolving a value phi of constants. Inserting phis doesn't
+    /// change the CFG, so it stays valid while value phis are resolved.
+    post_domtree: OnceCell<PostDomTree>,
+
     renames: FxHashMap<ValueId, ValueId>,
     changed: bool,
 }
@@ -2832,6 +2266,7 @@ impl<'a> RedundantCodeRemover<'a> {
             solver,
             avail_set: SecondaryMap::default(),
             resolved_value_phis: FxHashMap::default(),
+            post_domtree: OnceCell::new(),
             renames: FxHashMap::default(),
             changed: false,
         }
@@ -2921,7 +2356,7 @@ impl<'a> RedundantCodeRemover<'a> {
         // Resolve value phis in the function.
         let mut next_block = Some(entry);
         while let Some(block) = next_block {
-            self.resolve_value_phi_in_block(func, block);
+            self.resolve_value_phi_in_block(func, cfg, block);
             next_block = func.layout.next_block_of(block);
         }
         self.changed
@@ -3014,7 +2449,12 @@ impl<'a> RedundantCodeRemover<'a> {
     }
 
     /// Resolve value phis in the block.
-    fn resolve_value_phi_in_block(&mut self, func: &mut Function, block: BlockId) {
+    fn resolve_value_phi_in_block(
+        &mut self,
+        func: &mut Function,
+        cfg: &ControlFlowGraph,
+        block: BlockId,
+    ) {
         let mut inserter = InstInserter::at_location(CursorLocation::BlockTop(block));
         loop {
             match inserter.loc() {
@@ -3037,7 +2477,10 @@ impl<'a> RedundantCodeRemover<'a> {
                         let class = self.solver.value_class(inst_result);
                         if let Some(value_phi) = &self.solver.classes[class].value_phi {
                             let ty = func.dfg.value_ty(inst_result);
-                            if self.is_value_phi_resolvable(value_phi, block) {
+                            if self.is_value_phi_resolvable(value_phi, block)
+                                && self
+                                    .pushes_constants_only_where_used(func, cfg, value_phi, block)
+                            {
                                 let value = self.resolve_value_phi(
                                     func,
                                     &mut inserter,
@@ -3070,12 +2513,14 @@ impl<'a> RedundantCodeRemover<'a> {
         object_memory: Option<&ObjectMemoryAnalysis>,
         insn: InstId,
     ) -> bool {
-        let [inst_result] = func.dfg.inst_results(insn) else {
+        let [_] = func.dfg.inst_results(insn) else {
             return false;
         };
-        self.solver
-            .object_read_gvn_insn(func, object_memory, insn, *inst_result)
-            .is_some()
+        // The analysis predates code removal, so its carrier may already have
+        // been erased. Only the initialization proof is needed to eliminate a read.
+        object_memory
+            .and_then(|memory| memory.read_state(insn))
+            .is_some_and(|read| !read.may_be_undef())
     }
 
     /// Returns `true` if the `value_phi` can be resolved, i.e. all phi args are dominated by
@@ -3102,6 +2547,72 @@ impl<'a> RedundantCodeRemover<'a> {
         }
     }
 
+    /// Require each new constant phi to be consumed on every path to an exit.
+    ///
+    /// Nested phis are consumed on their parents' incoming edges, not just by reaching the
+    /// final instruction's block. Check shared phis against all their consuming edges together,
+    /// and follow their results through intermediate phis even if those have no immediate args.
+    /// Blocks that cannot reach a CFG exit remain extra exits; loops with exit paths may fold.
+    fn pushes_constants_only_where_used(
+        &self,
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        value_phi: &ValuePhi,
+        block: BlockId,
+    ) -> bool {
+        let mut pending = vec![value_phi];
+        let mut seen = FxHashSet::default();
+        let mut uses = FxHashMap::<BlockId, FxHashSet<(BlockId, BlockId)>>::default();
+        let mut needs_check = Vec::new();
+        while let Some(value_phi) = pending.pop() {
+            let ValuePhi::PhiInsn(phi_insn) = value_phi else {
+                continue;
+            };
+            // Canonical value phis place at most one distinct phi in each block.
+            if self.resolved_value_phis.contains_key(value_phi) || !seen.insert(phi_insn.block) {
+                continue;
+            }
+            if phi_insn.args.iter().any(|(arg, _)| {
+                matches!(arg, ValuePhi::Value(value) if func.dfg.value_is_imm(self.resolve_alias(*value)))
+            }) {
+                needs_check.push(phi_insn.block);
+            }
+            for (arg, pred) in &phi_insn.args {
+                if let ValuePhi::PhiInsn(child) = arg
+                    && !self.resolved_value_phis.contains_key(arg)
+                {
+                    uses.entry(child.block)
+                        .or_default()
+                        .insert((*pred, phi_insn.block));
+                    pending.push(arg);
+                }
+            }
+        }
+
+        seen.clear();
+        while let Some(phi_block) = needs_check.pop() {
+            if !seen.insert(phi_block) {
+                continue;
+            }
+            let post_domtree = self.post_domtree.get_or_init(|| {
+                let divergent_blocks = divergent_blocks(cfg);
+                let mut post_domtree = PostDomTree::new();
+                post_domtree.compute_with_extra_exits(func, &divergent_blocks);
+                post_domtree
+            });
+            if let Some(edges) = uses.get(&phi_block) {
+                if !post_domtree.edges_post_dominate(edges, phi_block) {
+                    return false;
+                }
+                // Consuming a constant in another phi only pays if that result is used too.
+                needs_check.extend(edges.iter().map(|(_, parent)| *parent));
+            } else if !post_domtree.post_dominates(block, phi_block) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Insert phi insn to appropriate location and returns the value that defined by
     /// the inserted phi insn.
     fn resolve_value_phi(
@@ -3120,8 +2631,9 @@ impl<'a> RedundantCodeRemover<'a> {
 
         match value_phi {
             ValuePhi::Value(value) => {
+                // An earlier resolution may have replaced the class's leader.
                 let class = self.solver.value_class(*value);
-                self.lookup_avail_from(Some(block), class).unwrap()
+                self.resolve_alias(self.lookup_avail_from(Some(block), class).unwrap())
             }
 
             ValuePhi::PhiInsn(phi_insn) => {
@@ -3129,7 +2641,7 @@ impl<'a> RedundantCodeRemover<'a> {
                 let current_inserter_loc = inserter.loc();
 
                 // Resolve phi value's arguments and append them to the newly inserted phi.
-                let mut phi_args = Vec::with_capacity(phi_insn.args.len());
+                let mut phi_args = SmallVec::with_capacity(phi_insn.args.len());
                 for (value_phi, phi_block) in &phi_insn.args {
                     let resolved =
                         self.resolve_value_phi(func, inserter, value_phi, ty, *phi_block);
@@ -3205,18 +2717,16 @@ impl<'a> RedundantCodeRemover<'a> {
         }
 
         let edges = &self.solver.blocks[block].in_edges;
-        let old_len = func.dfg.cast_phi(insn).unwrap().args().len();
-        func.dfg.untrack_inst(insn);
-        let phi = func.dfg.cast_phi_mut(insn).unwrap();
-        phi.retain(|from| {
-            !matches!(
-                self.solver.reachable_edge_state(edges, from, block),
-                ReachableEdgeState::None
-            )
-        });
-        let changed = old_len != phi.args().len();
-        func.dfg.attach_user(insn);
-        changed
+        func.dfg.edit_phi(insn, |phi| {
+            let old_len = phi.args().len();
+            phi.retain(|from| {
+                !matches!(
+                    self.solver.reachable_edge_state(edges, from, block),
+                    ReachableEdgeState::None
+                )
+            });
+            old_len != phi.args().len()
+        })
     }
 }
 
@@ -3232,15 +2742,96 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        BinaryInstKind, CanonicalRetouch, ClassData, GvnInsn, GvnSolver, InstClassKind, ValuePhi,
-        ValuePhiFinder, ValuePhiInsn, inst_to_gvn_key, make_gvn_binary_key,
+        BinaryInstKind, CanonicalRetouch, ClassData, GvnInsn, GvnSolver, InstClassKind,
+        RedundantCodeRemover, ValuePhi, ValuePhiFinder, ValuePhiInsn, inst_to_gvn_key,
+        make_gvn_binary_key,
     };
     use crate::{
         analysis::known_bits::{KnownBitsQuery, count_query_news_for_test},
         domtree::DomTree,
+        optim::aggregate::ObjectMemoryAnalysis,
     };
-    use sonatina_ir::{ControlFlowGraph, Immediate, Type, ValueId};
+    use sonatina_ir::{
+        BlockId, ControlFlowGraph, Function, Immediate, Type, ValueId,
+        inst::{CastInstKind, OwnedInstKey},
+        ir_writer::FuncWriter,
+    };
     use sonatina_parser::parse_module;
+    use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_module_or_panic};
+
+    fn run_gvn(source: &str) -> String {
+        let module = parse_module(source).expect("parse should succeed").module;
+        let func_ref = module.funcs()[0];
+        module.func_store.modify(func_ref, |func| {
+            let mut cfg = ControlFlowGraph::default();
+            cfg.compute(func);
+            let mut domtree = DomTree::default();
+            domtree.compute(&cfg);
+            GvnSolver::new().run(func, &mut cfg, &mut domtree);
+        });
+        module.func_store.view(func_ref, |func| {
+            FuncWriter::new(func_ref, func).dump_string()
+        })
+    }
+
+    #[test]
+    fn gvn_eliminates_object_reads_after_their_carrier_is_removed() {
+        let module = parse_module(
+            r#"
+target = "evm-ethereum-london"
+
+func public %f(v0.i256) -> i256 {
+block0:
+    v1.i256 = add v0 0.i256;
+    v2.objref<i256> = obj.alloc i256;
+    obj.store v2 v1;
+    v3.i256 = obj.load v2;
+    return v3;
+}
+"#,
+        )
+        .expect("module parses")
+        .module;
+        let func_ref = module.funcs()[0];
+        module.func_store.modify(func_ref, |func| {
+            let mut cfg = ControlFlowGraph::default();
+            cfg.compute(func);
+            let mut domtree = DomTree::default();
+            domtree.compute(&cfg);
+            let mut object_memory = ObjectMemoryAnalysis::default();
+            object_memory.compute(func, None, None);
+
+            GvnSolver::new().run_with_object_memory(
+                func,
+                &mut cfg,
+                &mut domtree,
+                Some(&object_memory),
+            );
+        });
+        verify_module_or_panic(&module, &VerifierConfig::for_level(VerificationLevel::Full));
+        let dumped = module.func_store.view(func_ref, |func| {
+            FuncWriter::new(func_ref, func).dump_string()
+        });
+        assert!(!dumped.contains("obj.load"), "{dumped}");
+        assert!(dumped.contains("return v0;"), "{dumped}");
+    }
+
+    fn simplify_to_value(
+        func: &mut Function,
+        solver: &mut GvnSolver,
+        key: &OwnedInstKey,
+        result_idx: usize,
+        expect_msg: &str,
+    ) -> ValueId {
+        let known_bits = KnownBitsQuery::new(func);
+        let simplified = solver
+            .perform_simplification(func, &known_bits, key, result_idx)
+            .expect(expect_msg);
+        let GvnInsn::Value(value) = simplified else {
+            panic!("{expect_msg}");
+        };
+        value
+    }
 
     #[test]
     fn update_class_value_phi_keeps_value_phi_table_synchronized() {
@@ -3301,6 +2892,59 @@ block2:
                 "GVN should build one known-bits snapshot per run"
             );
         });
+    }
+
+    #[test]
+    fn gvn_does_not_treat_i256_eq_one_as_bool_predicate_without_normalized_fact() {
+        let dumped = run_gvn(
+            r#"
+target = "evm-ethereum-london"
+
+func private %promo_piece(v0.i1, v1.i256) -> i256 {
+    block0:
+        br v0 block1 block2;
+
+    block1:
+        v2.i1 = eq v1 1.i256;
+        br v2 block3 block4;
+
+    block2:
+        v3.i1 = eq v1 1.i256;
+        br v3 block3 block7;
+
+    block3:
+        v4.i256 = phi (2.i256 block1) (3.i256 block4) (4.i256 block5) (5.i256 block6) (10.i256 block2) (11.i256 block7) (12.i256 block8) (13.i256 block9);
+        return v4;
+
+    block4:
+        v5.i1 = eq v1 2.i256;
+        br v5 block3 block5;
+
+    block5:
+        v6.i1 = eq v1 3.i256;
+        br v6 block3 block6;
+
+    block6:
+        jump block3;
+
+    block7:
+        v7.i1 = eq v1 2.i256;
+        br v7 block3 block8;
+
+    block8:
+        v8.i1 = eq v1 3.i256;
+        br v8 block3 block9;
+
+    block9:
+        jump block3;
+}
+"#,
+        );
+
+        assert!(dumped.contains("eq v1 2.i256"), "{dumped}");
+        assert!(dumped.contains("eq v1 3.i256"), "{dumped}");
+        assert!(dumped.contains("(3.i256 block4)"), "{dumped}");
+        assert!(dumped.contains("(11.i256 block7)"), "{dumped}");
     }
 
     #[test]
@@ -3424,8 +3068,7 @@ func private %entry(v0.i32, v1.i32) -> i32 {
         module.func_store.modify(func_ref, |func| {
             let add_inst = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find(|&inst| {
                     matches!(
                         inst_to_gvn_key(func, inst).kind(),
@@ -3501,8 +3144,7 @@ func private %entry(v0.i1) -> i32 {
 
             let phi_inst = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find(|&inst| func.dfg.is_phi(inst))
                 .expect("test function should contain a phi instruction");
             let phi_value = func
@@ -3566,8 +3208,7 @@ func private %entry(v0.i1) -> i32 {
 
             let phi_inst = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find(|&inst| func.dfg.is_phi(inst))
                 .expect("test function should contain a phi instruction");
             let phi_value = func
@@ -3686,8 +3327,7 @@ func private %entry(v0.i256, v1.i256) -> i256 {
 
             let uaddo_inst = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find(|&inst| {
                     matches!(
                         inst_to_gvn_key(func, inst).kind(),
@@ -3744,8 +3384,7 @@ func private %entry(v0.i32, v9.i1) -> i32 {
 
             let arg_plus_one: Vec<_> = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .filter(|&inst| {
                     matches!(
                         inst_to_gvn_key(func, inst).kind(),
@@ -3827,8 +3466,7 @@ func private %entry() -> i8 {
         module.func_store.modify(func_ref, |func| {
             let shr_inst = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find(|&inst| {
                     matches!(
                         inst_to_gvn_key(func, inst).kind(),
@@ -3838,9 +3476,13 @@ func private %entry() -> i8 {
                 .expect("test function should contain a shr instruction");
             let key = inst_to_gvn_key(func, shr_inst);
             let mut solver = GvnSolver::new();
-            let folded = solver
-                .perform_constant_folding(func, &key, 0)
-                .expect("shr constant folding should succeed");
+            let folded = simplify_to_value(
+                func,
+                &mut solver,
+                &key,
+                0,
+                "shr constant folding should succeed",
+            );
             assert_eq!(func.dfg.value_imm(folded), Some(Immediate::I8(124)));
         });
     }
@@ -3862,8 +3504,7 @@ func private %entry() -> i8 {
         module.func_store.modify(func_ref, |func| {
             let sar_inst = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find(|&inst| {
                     matches!(
                         inst_to_gvn_key(func, inst).kind(),
@@ -3873,9 +3514,13 @@ func private %entry() -> i8 {
                 .expect("test function should contain a sar instruction");
             let key = inst_to_gvn_key(func, sar_inst);
             let mut solver = GvnSolver::new();
-            let folded = solver
-                .perform_constant_folding(func, &key, 0)
-                .expect("sar constant folding should succeed");
+            let folded = simplify_to_value(
+                func,
+                &mut solver,
+                &key,
+                0,
+                "sar constant folding should succeed",
+            );
             assert_eq!(func.dfg.value_imm(folded), Some(Immediate::I8(-4)));
         });
     }
@@ -3897,21 +3542,181 @@ func private %entry() -> i256 {
         module.func_store.modify(func_ref, |func| {
             let bitcast_inst = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find(|&inst| {
                     matches!(
                         inst_to_gvn_key(func, inst).kind(),
-                        InstClassKind::Cast(sonatina_ir::inst::CastInstKind::Bitcast)
+                        InstClassKind::Cast(CastInstKind::Bitcast)
                     )
                 })
                 .expect("test function should contain a bitcast instruction");
             let key = inst_to_gvn_key(func, bitcast_inst);
             let mut solver = GvnSolver::new();
-            let folded = solver
-                .perform_constant_folding(func, &key, 0)
-                .expect("bitcast constant folding should succeed");
+            let folded = simplify_to_value(
+                func,
+                &mut solver,
+                &key,
+                0,
+                "bitcast constant folding should succeed",
+            );
             assert_eq!(func.dfg.value_imm(folded), Some(Immediate::one(Type::I256)));
         });
+    }
+
+    // Construct the candidate directly so these tests cover placement independently of GVN's
+    // ability to discover nested value phis at unbalanced joins.
+    fn phi_tree(func: &Function, value: ValueId) -> ValuePhi {
+        if let Some(inst) = func.dfg.value_inst(value)
+            && let Some(args) = inst_to_gvn_key(func, inst).phi_args()
+        {
+            ValuePhiInsn {
+                block: func.layout.inst_block(inst),
+                args: args
+                    .iter()
+                    .map(|&(arg, pred)| (phi_tree(func, arg), pred))
+                    .collect(),
+            }
+            .canonicalize()
+            .unwrap()
+        } else {
+            ValuePhi::Value(value)
+        }
+    }
+
+    #[test]
+    fn constant_phi_placement_collects_shared_consuming_edges() {
+        let module = parse_module(
+            r#"
+target = "evm-ethereum-london"
+func public %shared(v0.i1, v1.i1, v2.i1, v3.i256) -> i256 {
+    block0:
+        br v0 block1 block2;
+    block1:
+        br v1 block3 block4;
+    block2:
+        jump block8;
+    block3:
+        jump block5;
+    block4:
+        jump block5;
+    block5:
+        v4.i256 = phi (1.i256 block3) (2.i256 block4);
+        br v2 block6 block7;
+    block6:
+        jump block8;
+    block7:
+        jump block8;
+    block8:
+        v5.i256 = phi (v3 block2) (v4 block6) (v4 block7);
+        return v5;
+}
+"#,
+        )
+        .unwrap()
+        .module;
+        verify_module_or_panic(&module, &VerifierConfig::for_level(VerificationLevel::Full));
+        module.func_store.view(module.funcs()[0], |func| {
+            let mut cfg = ControlFlowGraph::new();
+            cfg.compute(func);
+            let solver = GvnSolver::new();
+            let mut remover = RedundantCodeRemover::new(&solver);
+            let block = BlockId(8);
+            let shared = phi_tree(func, ValueId(5));
+            assert!(remover.pushes_constants_only_where_used(func, &cfg, &shared, block));
+
+            let mut partial = shared.clone();
+            let ValuePhi::PhiInsn(parent) = &mut partial else {
+                panic!("expected outer phi");
+            };
+            let inner = parent.args[1].0.clone();
+            parent.args[1].0 = ValuePhi::Value(ValueId(3));
+            assert!(!remover.pushes_constants_only_where_used(func, &cfg, &partial, block));
+
+            // An existing inner phi has no new materialization cost, even on the unused edge.
+            remover.resolved_value_phis.insert(inner, ValueId(4));
+            assert!(remover.pushes_constants_only_where_used(func, &cfg, &partial, block));
+        });
+    }
+
+    #[test]
+    fn constant_phi_placement_follows_nonconstant_parent_results() {
+        let module = parse_module(
+            r#"
+target = "evm-ethereum-london"
+func public %intermediate(v0.i1, v1.i1, v2.i1, v3.i256) -> i256 {
+    block0:
+        br v0 block1 block2;
+    block1:
+        br v1 block3 block4;
+    block2:
+        jump block6;
+    block3:
+        jump block5;
+    block4:
+        jump block5;
+    block5:
+        v4.i256 = phi (1.i256 block3) (2.i256 block4);
+        jump block6;
+    block6:
+        v5.i256 = phi (v3 block2) (v4 block5);
+        br v2 block7 block8;
+    block7:
+        jump block9;
+    block8:
+        jump block9;
+    block9:
+        v6.i256 = phi (v5 block7) (v3 block8);
+        return v6;
+}
+"#,
+        )
+        .unwrap()
+        .module;
+        verify_module_or_panic(&module, &VerifierConfig::for_level(VerificationLevel::Full));
+        module.func_store.view(module.funcs()[0], |func| {
+            let mut cfg = ControlFlowGraph::new();
+            cfg.compute(func);
+            let solver = GvnSolver::new();
+            let remover = RedundantCodeRemover::new(&solver);
+            let block = BlockId(9);
+            let intermediate = phi_tree(func, ValueId(5));
+            // The inner constant phi is always consumed by the intermediate phi.
+            assert!(remover.pushes_constants_only_where_used(func, &cfg, &intermediate, block));
+            // But the outer phi can discard that intermediate result.
+            let outer = phi_tree(func, ValueId(6));
+            assert!(!remover.pushes_constants_only_where_used(func, &cfg, &outer, block));
+        });
+    }
+
+    #[test]
+    fn value_phi_needs_at_most_one_phi_per_block() {
+        let value = |value| ValuePhi::Value(ValueId::from_u32(value));
+        let join = |lhs, rhs| {
+            ValuePhiInsn {
+                block: BlockId::from_u32(1),
+                args: vec![
+                    (value(lhs), BlockId::from_u32(2)),
+                    (value(rhs), BlockId::from_u32(3)),
+                ],
+            }
+            .canonicalize()
+            .unwrap()
+        };
+        let top = |lhs, rhs| {
+            ValuePhiInsn {
+                block: BlockId::from_u32(4),
+                args: vec![
+                    (lhs, BlockId::from_u32(1)),
+                    (rhs, BlockId::from_u32(5)),
+                    (value(9), BlockId::from_u32(6)),
+                ],
+            }
+            .canonicalize()
+        };
+
+        // The same phi in `block1` reached over two edges resolves to one phi.
+        assert!(top(join(10, 11), join(10, 11)).is_some());
+        // Two different phis in `block1` tell apart the paths through both joins.
+        assert_eq!(top(join(10, 11), join(12, 13)), None);
     }
 }

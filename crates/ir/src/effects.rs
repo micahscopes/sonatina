@@ -6,17 +6,18 @@ use crate::{
     DataFlowGraph, I256, Immediate, InstDowncast, InstId, Type, ValueId,
     bitset::BitSet,
     inst::{
-        SideEffect, control_flow, data,
+        SideEffect, control_flow,
+        data::{self, Memzero},
         evm::{
             EvmAddress, EvmBalance, EvmBaseFee, EvmBlobBaseFee, EvmBlobHash, EvmBlockHash, EvmCall,
             EvmCallCode, EvmCallValue, EvmCalldataCopy, EvmCalldataLoad, EvmCalldataSize,
-            EvmCaller, EvmChainId, EvmCodeCopy, EvmCodeSize, EvmCoinBase, EvmCreate, EvmCreate2,
-            EvmDelegateCall, EvmExtCodeCopy, EvmExtCodeHash, EvmExtCodeSize, EvmGas, EvmGasLimit,
-            EvmGasPrice, EvmInvalid, EvmKeccak256, EvmLog0, EvmLog1, EvmLog2, EvmLog3, EvmLog4,
-            EvmMalloc, EvmMcopy, EvmMsize, EvmMstore8, EvmNumber, EvmOrigin, EvmPrevRandao,
-            EvmReturn, EvmReturnDataCopy, EvmReturnDataSize, EvmRevert, EvmSelfBalance,
-            EvmSelfDestruct, EvmSload, EvmSstore, EvmStaticCall, EvmStop, EvmTimestamp, EvmTload,
-            EvmTstore,
+            EvmCaller, EvmChainId, EvmCodeCopy, EvmCodeLoad, EvmCodeSize, EvmCoinBase, EvmCreate,
+            EvmCreate2, EvmDelegateCall, EvmExtCodeCopy, EvmExtCodeHash, EvmExtCodeSize, EvmGas,
+            EvmGasLimit, EvmGasPrice, EvmInvalid, EvmKeccak256, EvmLog0, EvmLog1, EvmLog2, EvmLog3,
+            EvmLog4, EvmMalloc, EvmMcopy, EvmMload, EvmMsize, EvmMstore, EvmMstore8, EvmNumber,
+            EvmOrigin, EvmPrevRandao, EvmReturn, EvmReturnDataCopy, EvmReturnDataSize, EvmRevert,
+            EvmSelfBalance, EvmSelfDestruct, EvmSload, EvmSstore, EvmStaticCall, EvmStop,
+            EvmTimestamp, EvmTload, EvmTstore,
         },
     },
     isa::evm::space::{CALLDATA, CODE, MEMORY, RETURNDATA, STORAGE, TRANSIENT},
@@ -90,6 +91,8 @@ pub enum AccessLoc {
 pub struct MemoryAccess {
     pub space: AddressSpaceId,
     pub kind: AccessKind,
+    /// The access happens whenever the instruction completes. A range write
+    /// that must happen writes every byte of its range.
     pub must_happen: bool,
     pub loc: AccessLoc,
 }
@@ -357,7 +360,10 @@ trait EffectSink {
     fn read_keyed(&mut self, space: AddressSpaceId, key: ValueId, bytes: u32);
     fn write_keyed(&mut self, space: AddressSpaceId, key: ValueId, bytes: u32);
     fn read_range(&mut self, space: AddressSpaceId, addr: ValueId, len: ValueId);
+    /// Writes every byte of `[addr, addr + len)`.
     fn write_range(&mut self, space: AddressSpaceId, addr: ValueId, len: ValueId);
+    /// Writes any part of `[addr, addr + len)`, possibly none of it.
+    fn may_write_range(&mut self, space: AddressSpaceId, addr: ValueId, len: ValueId);
     fn read_whole(&mut self, space: AddressSpaceId);
     fn write_whole(&mut self, space: AddressSpaceId);
     fn add_other(&mut self, other: OtherEffects);
@@ -445,6 +451,15 @@ impl EffectSink for DetailedEffectSink {
         self.push_access(MemoryAccess {
             space,
             kind: AccessKind::Write,
+            must_happen: true,
+            loc: AccessLoc::LinearRange { addr, len },
+        });
+    }
+
+    fn may_write_range(&mut self, space: AddressSpaceId, addr: ValueId, len: ValueId) {
+        self.push_access(MemoryAccess {
+            space,
+            kind: AccessKind::Write,
             must_happen: false,
             loc: AccessLoc::LinearRange { addr, len },
         });
@@ -526,6 +541,10 @@ impl EffectSink for SummaryEffectSink {
         self.record_access(AccessKind::Write);
     }
 
+    fn may_write_range(&mut self, _: AddressSpaceId, _: ValueId, _: ValueId) {
+        self.record_access(AccessKind::Write);
+    }
+
     fn read_whole(&mut self, _: AddressSpaceId) {
         self.record_access(AccessKind::Read);
     }
@@ -557,6 +576,25 @@ impl EffectSink for SummaryEffectSink {
 fn classify_inst_effects_with<S: EffectSink>(
     dfg: &DataFlowGraph,
     inst_id: InstId,
+    sink: S,
+) -> S::Output {
+    // Every instruction kind with modeled effects declares a side effect, so a
+    // declared-pure instruction matches none of them and records nothing.
+    // Most instructions are pure; skip testing them against every kind.
+    if dfg.inst(inst_id).declared_effect_hint() == SideEffect::None {
+        debug_assert_eq!(
+            classify_declared_effects_with(dfg, inst_id, DetailedEffectSink::default()),
+            InstEffects::default(),
+            "an instruction with modeled effects declares no side effect",
+        );
+        return sink.finish();
+    }
+    classify_declared_effects_with(dfg, inst_id, sink)
+}
+
+fn classify_declared_effects_with<S: EffectSink>(
+    dfg: &DataFlowGraph,
+    inst_id: InstId,
     mut sink: S,
 ) -> S::Output {
     let inst = dfg.inst(inst_id);
@@ -572,6 +610,16 @@ fn classify_inst_effects_with<S: EffectSink>(
     if let Some(mstore) = <&data::Mstore as InstDowncast>::downcast(is, inst) {
         let bytes = dfg.ctx.size_of_unchecked(*mstore.ty()) as u32;
         sink.write_exact(spaces.default_space(), *mstore.addr(), bytes, *mstore.ty());
+        return sink.finish();
+    }
+
+    if let Some(mload) = <&EvmMload as InstDowncast>::downcast(is, inst) {
+        sink.read_exact(MEMORY, *mload.addr(), EVM_WORD_BYTES, Type::I256);
+        return sink.finish();
+    }
+
+    if let Some(mstore) = <&EvmMstore as InstDowncast>::downcast(is, inst) {
+        sink.write_exact(MEMORY, *mstore.addr(), EVM_WORD_BYTES, Type::I256);
         return sink.finish();
     }
 
@@ -592,6 +640,11 @@ fn classify_inst_effects_with<S: EffectSink>(
 
     if <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some() {
         sink.add_other(OtherEffects::MUTATE);
+        return sink.finish();
+    }
+
+    if <&data::BlackBox as InstDowncast>::downcast(is, inst).is_some() {
+        sink.add_other(OtherEffects::OBSERVE | OtherEffects::MUTATE);
         return sink.finish();
     }
 
@@ -656,6 +709,11 @@ fn classify_inst_effects_with<S: EffectSink>(
         return sink.finish();
     }
 
+    if let Some(code_load) = <&EvmCodeLoad as InstDowncast>::downcast(is, inst) {
+        sink.read_exact(CODE, *code_load.code_offset(), EVM_WORD_BYTES, Type::I256);
+        return sink.finish();
+    }
+
     if let Some(keccak) = <&EvmKeccak256 as InstDowncast>::downcast(is, inst) {
         sink.read_range(MEMORY, *keccak.addr(), *keccak.len());
         return sink.finish();
@@ -686,8 +744,17 @@ fn classify_inst_effects_with<S: EffectSink>(
     }
 
     if let Some(mcopy) = <&EvmMcopy as InstDowncast>::downcast(is, inst) {
-        sink.read_range(MEMORY, *mcopy.addr(), *mcopy.len());
-        sink.write_range(MEMORY, *mcopy.dest(), *mcopy.len());
+        // EIP-5656: a zero-length copy does not access or expand memory,
+        // regardless of either address. Positive-length self-copies still can.
+        if !dfg.value_imm(*mcopy.len()).is_some_and(Immediate::is_zero) {
+            sink.read_range(MEMORY, *mcopy.addr(), *mcopy.len());
+            sink.write_range(MEMORY, *mcopy.dest(), *mcopy.len());
+        }
+        return sink.finish();
+    }
+
+    if let Some(memzero) = <&Memzero as InstDowncast>::downcast(is, inst) {
+        sink.write_range(MEMORY, *memzero.dest(), *memzero.len());
         return sink.finish();
     }
 
@@ -747,7 +814,7 @@ fn classify_inst_effects_with<S: EffectSink>(
             *call.arg_addr(),
             *call.arg_len(),
             *call.ret_addr(),
-            *call.ret_offset(),
+            *call.ret_len(),
             true,
         );
         return sink.finish();
@@ -759,7 +826,7 @@ fn classify_inst_effects_with<S: EffectSink>(
             *call.arg_addr(),
             *call.arg_len(),
             *call.ret_addr(),
-            *call.ret_offset(),
+            *call.ret_len(),
             true,
         );
         return sink.finish();
@@ -839,7 +906,8 @@ fn record_external_call_effects<S: EffectSink>(
     may_write_state: bool,
 ) {
     sink.read_range(MEMORY, arg_addr, arg_len);
-    sink.write_range(MEMORY, ret_addr, ret_len);
+    // The callee's return data fills only a prefix of the output range.
+    sink.may_write_range(MEMORY, ret_addr, ret_len);
     sink.read_whole(STORAGE);
     sink.read_whole(TRANSIENT);
     sink.write_whole(RETURNDATA);
@@ -992,8 +1060,8 @@ mod tests {
         builder::test_util::*,
         inst::{
             control_flow::Return,
-            data::{Alloca, ObjAlloc, ObjLoad, ObjStore},
-            evm::{EvmMalloc, EvmSelfDestruct},
+            data::{Alloca, BlackBox, ObjAlloc, ObjLoad, ObjStore},
+            evm::{EvmMalloc, EvmMload, EvmMstore, EvmSelfDestruct},
         },
         isa::{Isa, evm::Evm},
     };
@@ -1004,8 +1072,7 @@ mod tests {
     {
         let is = func.inst_set();
         func.layout
-            .iter_block()
-            .flat_map(|block| func.layout.iter_inst(block))
+            .iter_all_insts()
             .find(|&inst| <&T as InstDowncast>::downcast(is, func.dfg.inst(inst)).is_some())
             .expect("instruction should exist")
     }
@@ -1086,6 +1153,24 @@ mod tests {
         builder.func
     }
 
+    fn build_evm_machine_memory_func() -> crate::Function {
+        let mb = test_module_builder();
+        let (evm, mut builder) = test_func_builder(&mb, &[], Type::I256);
+        let is = evm.inst_set();
+
+        let block = builder.append_block();
+        builder.switch_to_block(block);
+
+        let addr = builder.make_imm_value(Immediate::from_i256(I256::from(0), Type::I256));
+        let value = builder.make_imm_value(Immediate::from_i256(I256::from(1), Type::I256));
+        builder.insert_inst_no_result_with(|| EvmMstore::new(is, addr, value));
+        let loaded = builder.insert_inst_with(|| EvmMload::new(is, addr), Type::I256);
+        builder.insert_inst_no_result_with(|| Return::new_single(is, loaded));
+        builder.seal_all();
+
+        builder.func
+    }
+
     fn build_object_memory_func() -> crate::Function {
         let mb = test_module_builder();
         let (evm, mut builder) = test_func_builder(&mb, &[], Type::I256);
@@ -1127,6 +1212,74 @@ mod tests {
             OperatingSystem::Evm(EvmVersion::Osaka),
         ))
         .address_spaces()
+    }
+
+    #[test]
+    fn evm_mcopy_effects_require_a_potentially_nonzero_length() {
+        for length in [Some(0), Some(1), Some(-1), None] {
+            let mb = test_module_builder();
+            let (evm, mut builder) = test_func_builder(&mb, &[Type::I256], Type::I256);
+            let is = evm.inst_set();
+            let block = builder.append_block();
+            builder.switch_to_block(block);
+            let addr = builder.make_imm_value(Immediate::from_i256(I256::from(-1), Type::I256));
+            let len = length.map_or(builder.func.arg_values[0], |length| {
+                builder.make_imm_value(Immediate::from_i256(I256::from(length), Type::I256))
+            });
+            // Even a self-copy may expand memory when its length is nonzero.
+            builder.insert_inst_no_result_with(|| EvmMcopy::new(is, addr, addr, len));
+            builder.insert_inst_no_result_with(|| Return::new_single(is, len));
+            builder.seal_all();
+
+            let effects = effects_for_inst::<EvmMcopy>(&builder.func);
+            let summary = summary_for_inst::<EvmMcopy>(&builder.func);
+            assert_eq!(effects.summary(), summary, "length={length:?}");
+            if length == Some(0) {
+                assert_eq!(effects, InstEffects::default());
+                assert!(!summary.has_effect());
+            } else {
+                assert_eq!(effects.accesses.len(), 2);
+                assert!(has_access(&effects, MEMORY, AccessKind::Read));
+                assert!(has_access(&effects, MEMORY, AccessKind::Write));
+                assert!(summary.may_mutate_state());
+            }
+        }
+    }
+
+    #[test]
+    fn fills_write_their_whole_range_but_call_outputs_may_not() {
+        let mb = test_module_builder();
+        let (evm, mut builder) = test_func_builder(&mb, &[Type::I256], Type::I256);
+        let is = evm.inst_set();
+        let block = builder.append_block();
+        builder.switch_to_block(block);
+        let arg = builder.func.arg_values[0];
+        builder.insert_inst_no_result_with(|| Memzero::new(is, arg, arg));
+        builder.insert_inst_no_result_with(|| EvmCalldataCopy::new(is, arg, arg, arg));
+        builder.insert_inst_with(
+            || EvmCall::new(is, arg, arg, arg, arg, arg, arg, arg),
+            Type::I256,
+        );
+        builder.insert_inst_no_result_with(|| Return::new_single(is, arg));
+        builder.seal_all();
+
+        let memory_write_must_happen = |effects: InstEffects| {
+            effects
+                .accesses
+                .into_iter()
+                .find(|access| access.space == MEMORY && access.kind == AccessKind::Write)
+                .expect("memory write")
+                .must_happen
+        };
+        assert!(memory_write_must_happen(effects_for_inst::<Memzero>(
+            &builder.func
+        )));
+        assert!(memory_write_must_happen(
+            effects_for_inst::<EvmCalldataCopy>(&builder.func)
+        ));
+        assert!(!memory_write_must_happen(effects_for_inst::<EvmCall>(
+            &builder.func
+        )));
     }
 
     #[test]
@@ -1244,6 +1397,47 @@ mod tests {
     }
 
     #[test]
+    fn evm_machine_memory_ops_have_word_memory_effects() {
+        let func = build_evm_machine_memory_func();
+        let load = inst_id_for::<EvmMload>(&func);
+        let store = inst_id_for::<EvmMstore>(&func);
+        let load_addr = func.dfg.inst(load).collect_values()[0];
+        let store_addr = func.dfg.inst(store).collect_values()[0];
+
+        let load_effects = func.dfg.effects(load);
+        assert_eq!(load_effects.accesses.len(), 1);
+        assert_eq!(
+            load_effects.accesses[0],
+            MemoryAccess {
+                space: MEMORY,
+                kind: AccessKind::Read,
+                must_happen: true,
+                loc: AccessLoc::LinearExact {
+                    addr: load_addr,
+                    bytes: EVM_WORD_BYTES,
+                    ty: Type::I256,
+                },
+            }
+        );
+
+        let store_effects = func.dfg.effects(store);
+        assert_eq!(store_effects.accesses.len(), 1);
+        assert_eq!(
+            store_effects.accesses[0],
+            MemoryAccess {
+                space: MEMORY,
+                kind: AccessKind::Write,
+                must_happen: true,
+                loc: AccessLoc::LinearExact {
+                    addr: store_addr,
+                    bytes: EVM_WORD_BYTES,
+                    ty: Type::I256,
+                },
+            }
+        );
+    }
+
+    #[test]
     fn obj_alloc_effects_are_tracked_as_alloc() {
         let func = build_object_memory_func();
         let effects = effects_for_inst::<ObjAlloc>(&func);
@@ -1263,6 +1457,29 @@ mod tests {
         let store_effects = effects_for_inst::<ObjStore>(&func);
         assert!(store_effects.accesses.is_empty());
         assert_eq!(store_effects.other, OtherEffects::MUTATE);
+    }
+
+    #[test]
+    fn black_box_is_opaque_without_accessing_memory() {
+        let mb = test_module_builder();
+        let (evm, mut builder) = test_func_builder(&mb, &[], Type::I32);
+        let is = evm.inst_set();
+        let block = builder.append_block();
+        builder.switch_to_block(block);
+        let input = builder.make_imm_value(1i32);
+        let output = builder.insert_inst_with(|| BlackBox::new(is, input), Type::I32);
+        builder.insert_inst_no_result_with(|| Return::new_single(is, output));
+        builder.seal_all();
+
+        let func = builder.func;
+        let inst = inst_id_for::<BlackBox>(&func);
+        let effects = func.dfg.effects(inst);
+        assert!(effects.accesses.is_empty());
+        assert_eq!(effects.other, OtherEffects::OBSERVE | OtherEffects::MUTATE);
+        assert_eq!(func.dfg.effect_summary(inst), effects.summary());
+        assert!(!func.dfg.has_value_semantics(inst));
+        assert!(!func.dfg.can_drop_if_unused(inst));
+        assert!(!func.dfg.can_speculate(inst));
     }
 
     #[test]

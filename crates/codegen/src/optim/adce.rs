@@ -60,7 +60,9 @@ impl AdceSolver {
     fn run_dce(&mut self, func: &mut Function) -> bool {
         self.clear();
 
-        let divergent_blocks = divergent_blocks(func);
+        let mut cfg = ControlFlowGraph::new();
+        cfg.compute(func);
+        let divergent_blocks = divergent_blocks(&cfg);
         self.post_domtree
             .compute_with_extra_exits(func, &divergent_blocks);
         let pdf_set = self.post_domtree.compute_df();
@@ -245,12 +247,10 @@ impl AdceSolver {
     }
 }
 
-fn divergent_blocks(func: &Function) -> Vec<BlockId> {
-    let mut cfg = ControlFlowGraph::new();
-    cfg.compute(func);
-
+/// Returns entry-reachable blocks with no path to a CFG exit.
+pub(crate) fn divergent_blocks(cfg: &ControlFlowGraph) -> Vec<BlockId> {
     let mut sccs = CfgSccAnalysis::new();
-    sccs.compute(&cfg);
+    sccs.compute(cfg);
 
     let mut reaches_real_exit = SecondaryMap::<SccId, bool>::with_capacity(sccs.scc_count());
     for &scc in sccs.topo_order().iter().rev() {
@@ -368,6 +368,39 @@ mod tests {
             FuncWriter::new(func_ref, func).dump_string()
         });
         (changed, dumped)
+    }
+
+    #[test]
+    fn removes_empty_mcopy_and_dead_addresses_but_keeps_operand_effects() {
+        let source = r#"
+target = "evm-ethereum-osaka"
+func private %f(v0.i256) -> i256 {
+block0:
+    evm_sstore 7.i256 v0;
+    v1.i256 = add v0 32.i256;
+    v2.i256 = evm_mload v1;
+    evm_mcopy v1 v2 0.i256;
+    v3.i256 = call %f v0;
+    evm_mcopy v3 v3 0.i256;
+    evm_mcopy v0 v0 1.i256;
+    evm_mcopy v0 v0 v0;
+    evm_return_data_copy v0 1.i256 0.i256;
+    return v0;
+}
+"#;
+        let (changed, dumped) = run_default_adce(source);
+        assert!(changed);
+        assert!(
+            !dumped.contains("add ") && !dumped.contains("evm_mload"),
+            "{dumped}"
+        );
+        assert_eq!(dumped.matches("evm_mcopy").count(), 2, "{dumped}");
+        assert!(dumped.contains("evm_sstore 7.i256 v0;"), "{dumped}");
+        assert!(dumped.contains("call %f v0;"), "{dumped}");
+        assert!(
+            dumped.contains("evm_return_data_copy v0 1.i256 0.i256;"),
+            "{dumped}"
+        );
     }
 
     #[test]

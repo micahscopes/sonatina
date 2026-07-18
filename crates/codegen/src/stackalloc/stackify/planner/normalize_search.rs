@@ -1,11 +1,12 @@
-use crate::bitset::BitSet;
+use crate::{bitset::BitSet, isa::evm::immediate_materialization_cost_i256};
 use rustc_hash::{FxHashMap, FxHasher};
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 use sonatina_ir::{I256, Immediate, ValueId};
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, VecDeque},
     hash::{Hash, Hasher},
+    iter,
     sync::OnceLock,
 };
 
@@ -93,31 +94,11 @@ impl CostModel for EstimatedCostModel {
     }
 
     fn cost_push_imm(&self, imm: I256) -> Cost {
-        if imm.is_zero() {
-            // PUSH0
-            return Cost { gas: 2, bytes: 1 };
+        let cost = immediate_materialization_cost_i256(imm);
+        Cost {
+            gas: cost.gas,
+            bytes: cost.bytes,
         }
-
-        let n = minimal_push_bytes(imm) as u32;
-        let mut cost = Cost {
-            gas: 3,
-            bytes: 1 + n,
-        };
-
-        // Approximate the EVM lowerer's sign-extension behavior for negative literals.
-        if imm.is_negative() && n < 32 {
-            // PUSH (n-1)
-            if n == 1 {
-                cost = cost.saturating_add(Cost { gas: 2, bytes: 1 }); // PUSH0
-            } else {
-                cost = cost.saturating_add(Cost { gas: 3, bytes: 2 }); // PUSH1 <idx>
-            }
-
-            // SIGNEXTEND
-            cost = cost.saturating_add(Cost { gas: 5, bytes: 1 });
-        }
-
-        cost
     }
 
     fn cost_load(&self, _v: ValueId) -> Cost {
@@ -285,19 +266,19 @@ impl PackedState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct QueueEntry {
+struct SearchQueueEntry<S> {
     f: Cost,
     g: Cost,
-    state: PackedState,
+    state: S,
 }
 
-impl PartialOrd for QueueEntry {
+impl<S: Ord> PartialOrd for SearchQueueEntry<S> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for QueueEntry {
+impl<S: Ord> Ord for SearchQueueEntry<S> {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering for min-heap behavior.
         other
@@ -327,29 +308,6 @@ impl Ord for PrepState {
             .cmp(&other.window)
             .then_with(|| self.tail.cmp(&other.tail))
             .then_with(|| self.mem.cmp(&other.mem))
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct PrepQueueEntry {
-    f: Cost,
-    g: Cost,
-    state: PrepState,
-}
-
-impl PartialOrd for PrepQueueEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for PrepQueueEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .f
-            .cmp(&self.f)
-            .then_with(|| other.g.cmp(&self.g))
-            .then_with(|| other.state.cmp(&self.state))
     }
 }
 
@@ -402,9 +360,9 @@ struct PlanCache {
 
 const SEARCH_SCRATCH_REUSE_CAP: usize = 65_536;
 
-struct SearchScratch<S, Q> {
+struct SearchScratch<S> {
     nodes: FxHashMap<S, SearchNode<S>>,
-    open: BinaryHeap<Q>,
+    open: BinaryHeap<SearchQueueEntry<S>>,
 }
 
 #[derive(Clone, Copy)]
@@ -413,7 +371,7 @@ struct SearchNode<S> {
     parent: Option<(S, Step)>,
 }
 
-impl<S, Q> Default for SearchScratch<S, Q> {
+impl<S: Ord> Default for SearchScratch<S> {
     fn default() -> Self {
         Self {
             nodes: FxHashMap::default(),
@@ -422,7 +380,7 @@ impl<S, Q> Default for SearchScratch<S, Q> {
     }
 }
 
-impl<S: Eq + Hash, Q> SearchScratch<S, Q> {
+impl<S: Eq + Hash + Ord> SearchScratch<S> {
     fn clear(&mut self) {
         clear_hash_map(&mut self.nodes);
         clear_heap(&mut self.open);
@@ -431,19 +389,38 @@ impl<S: Eq + Hash, Q> SearchScratch<S, Q> {
 
 #[derive(Default)]
 pub(in crate::stackalloc::stackify) struct NormalizeSearchScratch {
-    exact: SearchScratch<PackedState, QueueEntry>,
-    prep: SearchScratch<PrepState, PrepQueueEntry>,
+    exact: SearchScratch<PackedState>,
+    prep: SearchScratch<PrepState>,
     plan_cache: PlanCache,
     pub(super) operand_prep_plan_cache: OperandPrepPlanCache,
 }
 
+/// Bounded search results for one function under a fixed search profile.
+/// Entries use relative key IDs and cost hashes, not IR values or spill facts.
+/// Transient search graphs and the operand query cache stay with each builder.
+#[derive(Default)]
+pub(crate) struct StackifySearchCache {
+    plans: PlanCache,
+}
+
+impl StackifySearchCache {
+    pub(crate) fn plan_count(&self) -> usize {
+        self.plans.map.len()
+    }
+}
+
 impl NormalizeSearchScratch {
-    fn clear_exact(&mut self) {
-        self.exact.clear();
+    pub(in crate::stackalloc::stackify) fn with_cache(cache: StackifySearchCache) -> Self {
+        Self {
+            plan_cache: cache.plans,
+            ..Self::default()
+        }
     }
 
-    fn clear_prep(&mut self) {
-        self.prep.clear();
+    pub(in crate::stackalloc::stackify) fn into_cache(self) -> StackifySearchCache {
+        StackifySearchCache {
+            plans: self.plan_cache,
+        }
     }
 }
 
@@ -662,6 +639,13 @@ fn find_push0_kid(key_infos: &[KeyInfo], materializable_imm: &[u8]) -> Option<u8
     })
 }
 
+fn cost_push0_kid(kid: Option<u8>, key_infos: &[KeyInfo], cost: &impl CostModel) -> Option<Cost> {
+    kid.map(|kid| match key_infos[kid as usize] {
+        KeyInfo::Imm { canon, .. } => cost.cost_push_imm(canon),
+        _ => unreachable!("expected imm key info"),
+    })
+}
+
 fn common_suffix_len(state: PackedState, goal: PackedState) -> usize {
     let n = state.len();
     let m = goal.len();
@@ -691,6 +675,361 @@ fn should_prune(f: Cost, upper_bound: Cost, have_incumbent: bool) -> bool {
         f >= upper_bound
     } else {
         f > upper_bound
+    }
+}
+
+trait BoundedAStarProblem {
+    type State: Copy + Eq + Hash + Ord;
+
+    fn is_goal(&self, state: Self::State) -> bool;
+
+    fn heuristic(&self, state: Self::State) -> Cost;
+
+    fn max_states(&self, have_incumbent: bool) -> usize;
+
+    fn expand_successors<F>(
+        &self,
+        state: Self::State,
+        g: Cost,
+        prev_step: Option<Step>,
+        emit: &mut F,
+    ) where
+        F: FnMut(Self::State, Cost, Step);
+}
+
+fn run_bounded_astar<P>(
+    problem: &P,
+    scratch: &mut SearchScratch<P::State>,
+    start: P::State,
+    mut upper_bound: Cost,
+    mut have_incumbent: bool,
+    max_expansions: usize,
+    debug_label: Option<&'static str>,
+) -> Option<(P::State, Cost)>
+where
+    P: BoundedAStarProblem,
+{
+    scratch.clear();
+
+    let start_h = problem.heuristic(start);
+
+    scratch.nodes.insert(
+        start,
+        SearchNode {
+            cost: Cost::default(),
+            parent: None,
+        },
+    );
+
+    scratch.open.push(SearchQueueEntry {
+        f: start_h,
+        g: Cost::default(),
+        state: start,
+    });
+
+    let mut best_goal: Option<(P::State, Cost)> = None;
+    let mut expansions = 0usize;
+
+    while let Some(entry) = scratch.open.pop() {
+        let Some(node) = scratch.nodes.get(&entry.state).copied() else {
+            continue;
+        };
+        let g = node.cost;
+        if entry.g != g {
+            continue;
+        }
+
+        if problem.is_goal(entry.state) {
+            if !have_incumbent || g < upper_bound {
+                upper_bound = g;
+                have_incumbent = true;
+                best_goal = Some((entry.state, g));
+            }
+            continue;
+        }
+
+        if should_prune(entry.f, upper_bound, have_incumbent) {
+            break;
+        }
+
+        let max_states = problem.max_states(have_incumbent);
+        if scratch.nodes.len() > max_states || scratch.open.len() > max_states {
+            if let Some(label) = debug_label {
+                eprintln!(
+                    "{label}: exceeded max_states={max_states} (best_states={} open={})",
+                    scratch.nodes.len(),
+                    scratch.open.len()
+                );
+            }
+            return best_goal;
+        }
+
+        expansions += 1;
+        if expansions > max_expansions {
+            if let Some(label) = debug_label {
+                eprintln!(
+                    "{label}: exceeded max_expansions={max_expansions} (best_states={} open={})",
+                    scratch.nodes.len(),
+                    scratch.open.len()
+                );
+            }
+            return best_goal;
+        }
+
+        let parent_state = entry.state;
+        let prev_step = node.parent.map(|(_, step)| step);
+        let nodes = &mut scratch.nodes;
+        let open = &mut scratch.open;
+        let mut emit = |state: P::State, next_g: Cost, step: Step| {
+            let h = problem.heuristic(state);
+            let f = next_g.saturating_add(h);
+            if should_prune(f, upper_bound, have_incumbent) {
+                return;
+            }
+
+            let should_update = match nodes.get(&state) {
+                None => true,
+                Some(prev) => next_g < prev.cost,
+            };
+            if !should_update {
+                return;
+            }
+
+            nodes.insert(
+                state,
+                SearchNode {
+                    cost: next_g,
+                    parent: Some((parent_state, step)),
+                },
+            );
+            open.push(SearchQueueEntry {
+                f,
+                g: next_g,
+                state,
+            });
+        };
+
+        problem.expand_successors(parent_state, g, prev_step, &mut emit);
+    }
+
+    if let Some(label) = debug_label {
+        eprintln!(
+            "{label}: exhausted search (best_states={} upper_bound={upper_bound:?})",
+            scratch.nodes.len(),
+        );
+    }
+
+    best_goal
+}
+
+struct NormalizeWindowProblem<'a, C: CostModel> {
+    goal: PackedState,
+    cfg: SearchCfg,
+    key_infos: &'a [KeyInfo],
+    materializable_imm: &'a [u8],
+    materializable_val: &'a [u8],
+    goal_counts: [u8; 64],
+    goal_mask: u64,
+    suffix_ctx_keys: &'a [u8],
+    ctx_present: u64,
+    pop_gas: u32,
+    dup_gas_lb: u32,
+    cost: &'a C,
+    push0_kid: Option<u8>,
+    push0_cost: Option<Cost>,
+    dup_goal_keys_only: bool,
+    max_states: [usize; 2],
+}
+
+impl<'a, C: CostModel> NormalizeWindowProblem<'a, C> {
+    fn dup_source_at(&self, state: PackedState, pos: usize) -> Option<u8> {
+        if pos < state.len() {
+            Some(state.get(pos))
+        } else {
+            self.suffix_ctx_keys.get(pos - state.len()).copied()
+        }
+    }
+
+    fn max_dup_pos(&self, state: PackedState) -> Option<usize> {
+        let total_len = state.len().saturating_add(self.suffix_ctx_keys.len());
+        (self.cfg.dup_max != 0 && total_len != 0)
+            .then_some(total_len.saturating_sub(1).min(self.cfg.dup_max - 1))
+    }
+
+    fn allow_dup_key(&self, kid: u8) -> bool {
+        !self.dup_goal_keys_only || self.goal_counts[kid as usize] != 0
+    }
+
+    fn collect_duplicable(&self, state: PackedState) -> (u64, [Cost; 64]) {
+        let mut mask = 0;
+        let mut best_cost_by_kid = [UNAVAILABLE_COST; 64];
+        let Some(max_pos) = self.max_dup_pos(state) else {
+            return (mask, best_cost_by_kid);
+        };
+
+        for pos in 0..=max_pos {
+            let Some(kid) = self.dup_source_at(state, pos) else {
+                continue;
+            };
+
+            mask |= 1u64 << kid;
+            best_cost_by_kid[kid as usize] =
+                best_cost_by_kid[kid as usize].min(self.cost.cost_dup(pos as u8));
+        }
+
+        (mask, best_cost_by_kid)
+    }
+}
+
+impl<C: CostModel> BoundedAStarProblem for NormalizeWindowProblem<'_, C> {
+    type State = PackedState;
+
+    fn is_goal(&self, state: PackedState) -> bool {
+        state == self.goal
+    }
+
+    fn heuristic(&self, state: PackedState) -> Cost {
+        let heuristic = NormalizeHeuristic {
+            goal_counts: &self.goal_counts,
+            goal_mask: self.goal_mask,
+            ctx_present: self.ctx_present,
+            pop_gas: self.pop_gas,
+            dup_gas: self.dup_gas_lb,
+            key_infos: self.key_infos,
+            cost: self.cost,
+        };
+        heuristic_with_ctx(state, &heuristic)
+    }
+
+    fn max_states(&self, have_incumbent: bool) -> usize {
+        self.max_states[usize::from(have_incumbent)]
+    }
+
+    fn expand_successors<F>(
+        &self,
+        state: PackedState,
+        g: Cost,
+        prev_step: Option<Step>,
+        emit: &mut F,
+    ) where
+        F: FnMut(PackedState, Cost, Step),
+    {
+        let cur_len = state.len();
+        let suffix_k = common_suffix_len(state, self.goal);
+        let suffix_start = cur_len.saturating_sub(suffix_k);
+        let (duplicable, dup_cost_for_kid) = self.collect_duplicable(state);
+
+        if cur_len != 0 {
+            emit(
+                state.pop(),
+                g.saturating_add(self.cost.cost_pop()),
+                Step::Pop,
+            );
+        }
+
+        if cur_len < self.cfg.max_len
+            && let (Some(kid), Some(push0_cost)) = (self.push0_kid, self.push0_cost)
+        {
+            emit(
+                state.push(kid),
+                g.saturating_add(push0_cost),
+                Step::PushImm(kid),
+            );
+        }
+
+        if cur_len >= 2 {
+            let max_depth = cur_len
+                .saturating_sub(1)
+                .min(self.cfg.swap_max.saturating_sub(1));
+            for depth in 1..=max_depth {
+                if matches!(prev_step, Some(Step::Swap(d)) if d as usize == depth) {
+                    continue;
+                }
+                if state.get(0) == state.get(depth) {
+                    continue;
+                }
+                if depth >= suffix_start && depth < self.cfg.dup_max {
+                    continue;
+                }
+                emit(
+                    state.swap(depth),
+                    g.saturating_add(self.cost.cost_swap(depth as u8)),
+                    Step::Swap(depth as u8),
+                );
+            }
+        }
+
+        if cur_len < self.cfg.max_len
+            && let Some(max_pos) = self.max_dup_pos(state)
+        {
+            let mut seen: u64 = 0;
+            for pos in 0..=max_pos {
+                let Some(kid) = self.dup_source_at(state, pos) else {
+                    continue;
+                };
+                if !self.allow_dup_key(kid) {
+                    continue;
+                }
+                let bit = 1u64 << kid;
+                if (seen & bit) != 0 {
+                    continue;
+                }
+                seen |= bit;
+
+                if Some(kid) == self.push0_kid {
+                    continue;
+                }
+                let next = if pos < cur_len {
+                    state.dup(pos)
+                } else {
+                    state.push(kid)
+                };
+                emit(
+                    next,
+                    g.saturating_add(self.cost.cost_dup(pos as u8)),
+                    Step::Dup(pos as u8),
+                );
+            }
+        }
+
+        if cur_len < self.cfg.max_len {
+            for &kid in self.materializable_imm {
+                if Some(kid) == self.push0_kid {
+                    continue;
+                }
+
+                let KeyInfo::Imm { canon, .. } = self.key_infos[kid as usize] else {
+                    unreachable!("expected imm key info")
+                };
+                let push_cost = self.cost.cost_push_imm(canon);
+                let bit = 1u64 << kid;
+                let dominated =
+                    (duplicable & bit) != 0 && push_cost >= dup_cost_for_kid[kid as usize];
+                if dominated {
+                    continue;
+                }
+
+                emit(
+                    state.push(kid),
+                    g.saturating_add(push_cost),
+                    Step::PushImm(kid),
+                );
+            }
+
+            for &kid in self.materializable_val {
+                if (duplicable & (1u64 << kid)) != 0 {
+                    continue;
+                }
+                let KeyInfo::Val { vid } = self.key_infos[kid as usize] else {
+                    unreachable!("expected val key info")
+                };
+                emit(
+                    state.push(kid),
+                    g.saturating_add(self.cost.cost_load(vid)),
+                    Step::LoadVal(kid),
+                );
+            }
+        }
     }
 }
 
@@ -834,282 +1173,73 @@ pub(super) fn solve_optimal_normalize_plan(
     let goal_counts = compute_goal_counts(&goal_keys);
     let goal_mask = key_mask_from_counts(&goal_counts);
 
-    let mut upper_bound = estimate_flush_rebuild_cost(ctx, stack, desired, cost);
-    let mut incumbent_steps: Option<StepList> = None;
-
-    if let Some(steps) = build_delete_tail_under_prefix_upper_bound(&start_keys, &goal_keys, cfg) {
-        let greedy_cost = cost_for_steps(&steps, &key_infos, cost);
-        if greedy_cost <= upper_bound {
-            if debug && greedy_cost < upper_bound {
-                eprintln!(
-                    "normalize_search: upper_bound improved by prefix-tail plan: ub={upper_bound:?} greedy={greedy_cost:?}"
-                );
-            }
-            upper_bound = greedy_cost;
-            incumbent_steps = Some(steps);
-        }
-    }
-
-    if let Some(steps) =
-        build_dup_and_star_swap_upper_bound(&start_keys, &goal_keys, &goal_counts, cfg)
-    {
-        let greedy_cost = cost_for_steps(&steps, &key_infos, cost);
-        if greedy_cost <= upper_bound {
-            if debug && greedy_cost < upper_bound {
-                eprintln!(
-                    "normalize_search: upper_bound improved by greedy plan: ub={upper_bound:?} greedy={greedy_cost:?}"
-                );
-            }
-            upper_bound = greedy_cost;
-            incumbent_steps = Some(steps);
-        }
-    }
-
-    let push0_kid = find_push0_kid(&key_infos, &materializable_imm);
-    let push0_cost = push0_kid.map(|kid| {
-        let KeyInfo::Imm { canon, .. } = key_infos[kid as usize] else {
-            unreachable!("expected imm key info")
-        };
-        cost.cost_push_imm(canon)
-    });
-
-    let heuristic = NormalizeHeuristic {
-        goal_counts: &goal_counts,
-        goal_mask,
-        ctx_present: 0,
-        pop_gas,
-        dup_gas: dup_gas_lb,
-        key_infos: &key_infos,
+    let (upper_bound, mut incumbent_steps) = best_normalize_incumbent(
+        estimate_flush_rebuild_cost(ctx, stack, desired, cost),
+        [
+            build_greedy_repair_prefix_upper_bound(
+                &start_keys,
+                &goal_keys,
+                &[],
+                &key_infos,
+                cost,
+                cfg,
+            ),
+            build_delete_tail_under_prefix_upper_bound(&start_keys, &goal_keys, cfg),
+            build_dup_and_star_swap_upper_bound(
+                &start_keys,
+                &goal_keys,
+                &goal_counts,
+                &key_infos,
+                cfg,
+            ),
+        ],
+        &key_infos,
         cost,
-    };
-    let start_h = heuristic_with_ctx(start, &heuristic);
-
-    scratch.clear_exact();
-    let exact = &mut scratch.exact;
-    let nodes = &mut exact.nodes;
-    let open = &mut exact.open;
-
-    nodes.insert(
-        start,
-        SearchNode {
-            cost: Cost::default(),
-            parent: None,
-        },
     );
 
-    open.push(QueueEntry {
-        f: start_h,
-        g: Cost::default(),
-        state: start,
-    });
+    let push0_kid = find_push0_kid(&key_infos, &materializable_imm);
+    let push0_cost = cost_push0_kid(push0_kid, &key_infos, cost);
 
-    let mut expansions: usize = 0;
-    while let Some(entry) = open.pop() {
-        let Some(node) = nodes.get(&entry.state) else {
-            continue;
-        };
-        let g = node.cost;
-        if entry.g != g {
-            continue;
-        }
+    let problem = NormalizeWindowProblem {
+        goal,
+        cfg,
+        key_infos: &key_infos,
+        materializable_imm: &materializable_imm,
+        materializable_val: &materializable_val,
+        goal_counts,
+        goal_mask,
+        suffix_ctx_keys: &[],
+        ctx_present: 0,
+        pop_gas,
+        dup_gas_lb,
+        cost,
+        push0_kid,
+        push0_cost,
+        dup_goal_keys_only: false,
+        max_states: [
+            ctx.search_profile.budgets().normalize_max_states(false),
+            ctx.search_profile.budgets().normalize_max_states(true),
+        ],
+    };
 
-        if entry.state == goal {
-            let Some(steps) = reconstruct_steps(start, goal, nodes) else {
-                break;
-            };
-            if incumbent_steps.is_none() || g < upper_bound {
-                upper_bound = g;
-                incumbent_steps = Some(steps);
-            }
-            continue;
-        }
+    let run = (cfg.max_expansions != 0)
+        .then(|| {
+            run_bounded_astar(
+                &problem,
+                &mut scratch.exact,
+                start,
+                upper_bound,
+                incumbent_steps.is_some(),
+                cfg.max_expansions,
+                debug.then_some("normalize_search"),
+            )
+        })
+        .flatten();
 
-        if should_prune(entry.f, upper_bound, incumbent_steps.is_some()) {
-            break;
-        }
-
-        // If we already have a feasible incumbent (greedy or found) plan, don't let the exact
-        // search blow up compile time or memory trying to prove optimality.
-        let max_states = ctx
-            .search_profile
-            .normalize_max_states(incumbent_steps.is_some());
-        if nodes.len() > max_states || open.len() > max_states {
-            if debug {
-                eprintln!(
-                    "normalize_search: exceeded max_states={} (best_states={} open={})",
-                    max_states,
-                    nodes.len(),
-                    open.len()
-                );
-            }
-            break;
-        }
-
-        expansions += 1;
-        if expansions > cfg.max_expansions {
-            if debug {
-                eprintln!(
-                    "normalize_search: exceeded max_expansions={} (best_states={} open={})",
-                    cfg.max_expansions,
-                    nodes.len(),
-                    open.len()
-                );
-            }
-            break;
-        }
-
-        let cur_len = entry.state.len();
-        let suffix_k = common_suffix_len(entry.state, goal);
-        let suffix_start = cur_len.saturating_sub(suffix_k);
-
-        let prev_step = node.parent.map(|(_, s)| s);
-
-        let mut dup_cost_for_kid = [Cost {
-            gas: u32::MAX,
-            bytes: u32::MAX,
-        }; 64];
-        let mut duplicable: u64 = 0;
-        if cur_len != 0 && cfg.dup_max != 0 {
-            let max_pos = cur_len.saturating_sub(1).min(cfg.dup_max.saturating_sub(1));
-            for pos in 0..=max_pos {
-                let kid = entry.state.get(pos) as usize;
-                duplicable |= 1u64 << kid;
-                dup_cost_for_kid[kid] = dup_cost_for_kid[kid].min(cost.cost_dup(pos as u8));
-            }
-        }
-
-        let mut consider_ctx = ConsiderCtx {
-            heuristic,
-            upper_bound,
-            have_incumbent: incumbent_steps.is_some(),
-            nodes: &mut *nodes,
-            open: &mut *open,
-        };
-
-        // POP
-        if cur_len != 0 {
-            consider_succ(
-                entry.state.pop(),
-                g.saturating_add(cost.cost_pop()),
-                entry.state,
-                Step::Pop,
-                &mut consider_ctx,
-            );
-        }
-
-        // PUSH0 (if present in the goal) before the 3-gas moves.
-        if cur_len < cfg.max_len
-            && let (Some(kid), Some(push0_cost)) = (push0_kid, push0_cost)
-        {
-            consider_succ(
-                entry.state.push(kid),
-                g.saturating_add(push0_cost),
-                entry.state,
-                Step::PushImm(kid),
-                &mut consider_ctx,
-            );
-        }
-
-        // SWAP
-        if cur_len >= 2 {
-            let max_depth = cur_len
-                .saturating_sub(1)
-                .min(cfg.swap_max.saturating_sub(1));
-            for depth in 1..=max_depth {
-                if matches!(prev_step, Some(Step::Swap(d)) if d as usize == depth) {
-                    continue;
-                }
-                if entry.state.get(0) == entry.state.get(depth) {
-                    continue;
-                }
-                if depth >= suffix_start && depth < cfg.dup_max {
-                    continue;
-                }
-                consider_succ(
-                    entry.state.swap(depth),
-                    g.saturating_add(cost.cost_swap(depth as u8)),
-                    entry.state,
-                    Step::Swap(depth as u8),
-                    &mut consider_ctx,
-                );
-            }
-        }
-
-        // DUP
-        if cur_len != 0 && cfg.dup_max != 0 && cur_len < cfg.max_len {
-            let max_pos = cur_len.saturating_sub(1).min(cfg.dup_max.saturating_sub(1));
-            let mut seen: u64 = 0;
-            for pos in 0..=max_pos {
-                let kid = entry.state.get(pos);
-                let bit = 1u64 << kid;
-                if (seen & bit) != 0 {
-                    continue;
-                }
-                seen |= bit;
-
-                if Some(kid) == push0_kid {
-                    continue;
-                }
-                consider_succ(
-                    entry.state.dup(pos),
-                    g.saturating_add(cost.cost_dup(pos as u8)),
-                    entry.state,
-                    Step::Dup(pos as u8),
-                    &mut consider_ctx,
-                );
-            }
-        }
-
-        if cur_len < cfg.max_len {
-            for &kid in &materializable_imm {
-                if Some(kid) == push0_kid {
-                    continue;
-                }
-
-                let KeyInfo::Imm { canon, .. } = key_infos[kid as usize] else {
-                    unreachable!("expected imm key info")
-                };
-                let push_cost = cost.cost_push_imm(canon);
-                let bit = 1u64 << kid;
-                let dominated =
-                    (duplicable & bit) != 0 && push_cost >= dup_cost_for_kid[kid as usize];
-                if dominated {
-                    continue;
-                }
-
-                consider_succ(
-                    entry.state.push(kid),
-                    g.saturating_add(push_cost),
-                    entry.state,
-                    Step::PushImm(kid),
-                    &mut consider_ctx,
-                );
-            }
-
-            for &kid in &materializable_val {
-                // If a value is duplicable, `DUP` dominates `LOAD` to the same successor state.
-                if (duplicable & (1u64 << kid)) != 0 {
-                    continue;
-                }
-                let KeyInfo::Val { vid } = key_infos[kid as usize] else {
-                    unreachable!("expected val key info")
-                };
-                consider_succ(
-                    entry.state.push(kid),
-                    g.saturating_add(cost.cost_load(vid)),
-                    entry.state,
-                    Step::LoadVal(kid),
-                    &mut consider_ctx,
-                );
-            }
-        }
-    }
-
-    if debug {
-        eprintln!(
-            "normalize_search: exhausted search (best_states={} upper_bound={upper_bound:?})",
-            nodes.len()
-        );
+    if let Some((goal_state, _goal_cost)) = run {
+        debug_assert_eq!(goal_state, goal);
+        let steps = reconstruct_steps(start, goal_state, &scratch.exact.nodes)?;
+        incumbent_steps = Some(steps);
     }
 
     scratch.plan_cache.insert(
@@ -1322,299 +1452,72 @@ pub(super) fn solve_optimal_repair_prefix_plan(
             upper_bound = upper_bound.saturating_add(cost.cost_load(v));
         }
     }
-    let mut incumbent_steps: Option<StepList> = None;
-
-    if let Some(steps) = build_greedy_repair_prefix_upper_bound(
-        &start_keys,
-        &goal_keys,
-        &suffix_ctx_keys,
+    let (upper_bound, mut incumbent_steps) = best_normalize_incumbent(
+        upper_bound,
+        [
+            build_dup_and_star_swap_upper_bound(
+                &start_keys,
+                &goal_keys,
+                &goal_counts,
+                &key_infos,
+                cfg,
+            ),
+            build_greedy_repair_prefix_upper_bound(
+                &start_keys,
+                &goal_keys,
+                &suffix_ctx_keys,
+                &key_infos,
+                cost,
+                cfg,
+            ),
+        ],
         &key_infos,
         cost,
-        cfg,
-    ) {
-        let greedy_cost = cost_for_steps(&steps, &key_infos, cost);
-        if greedy_cost <= upper_bound {
-            if debug && greedy_cost < upper_bound {
-                eprintln!(
-                    "repair_normalize_search: upper_bound improved by greedy repair plan: ub={upper_bound:?} greedy={greedy_cost:?}"
-                );
-            }
-            upper_bound = greedy_cost;
-            incumbent_steps = Some(steps);
-        }
-    }
-
-    let push0_kid = find_push0_kid(&key_infos, &materializable_imm);
-    let push0_cost = push0_kid.map(|kid| {
-        let KeyInfo::Imm { canon, .. } = key_infos[kid as usize] else {
-            unreachable!("expected imm key info")
-        };
-        cost.cost_push_imm(canon)
-    });
-
-    let heuristic = NormalizeHeuristic {
-        goal_counts: &goal_counts,
-        goal_mask,
-        ctx_present,
-        pop_gas,
-        dup_gas: dup_gas_lb,
-        key_infos: &key_infos,
-        cost,
-    };
-    let start_h = heuristic_with_ctx(start, &heuristic);
-
-    scratch.clear_exact();
-    let exact = &mut scratch.exact;
-    let nodes = &mut exact.nodes;
-    let open = &mut exact.open;
-
-    nodes.insert(
-        start,
-        SearchNode {
-            cost: Cost::default(),
-            parent: None,
-        },
     );
 
-    open.push(QueueEntry {
-        f: start_h,
-        g: Cost::default(),
-        state: start,
-    });
+    let push0_kid = find_push0_kid(&key_infos, &materializable_imm);
+    let push0_cost = cost_push0_kid(push0_kid, &key_infos, cost);
 
-    let mut expansions: usize = 0;
-    while let Some(entry) = open.pop() {
-        let Some(node) = nodes.get(&entry.state) else {
-            continue;
-        };
-        let g = node.cost;
-        if entry.g != g {
-            continue;
-        }
+    let problem = NormalizeWindowProblem {
+        goal,
+        cfg,
+        key_infos: &key_infos,
+        materializable_imm: &materializable_imm,
+        materializable_val: &materializable_val,
+        goal_counts,
+        goal_mask,
+        suffix_ctx_keys: &suffix_ctx_keys,
+        ctx_present,
+        pop_gas,
+        dup_gas_lb,
+        cost,
+        push0_kid,
+        push0_cost,
+        dup_goal_keys_only: true,
+        max_states: [
+            ctx.search_profile.budgets().normalize_max_states(false),
+            ctx.search_profile.budgets().normalize_max_states(true),
+        ],
+    };
 
-        if entry.state == goal {
-            let Some(steps) = reconstruct_steps(start, goal, nodes) else {
-                break;
-            };
-            if incumbent_steps.is_none() || g < upper_bound {
-                upper_bound = g;
-                incumbent_steps = Some(steps);
-            }
-            continue;
-        }
+    let run = (cfg.max_expansions != 0)
+        .then(|| {
+            run_bounded_astar(
+                &problem,
+                &mut scratch.exact,
+                start,
+                upper_bound,
+                incumbent_steps.is_some(),
+                cfg.max_expansions,
+                debug.then_some("repair_normalize_search"),
+            )
+        })
+        .flatten();
 
-        if should_prune(entry.f, upper_bound, incumbent_steps.is_some()) {
-            break;
-        }
-
-        let max_states = ctx
-            .search_profile
-            .normalize_max_states(incumbent_steps.is_some());
-        if nodes.len() > max_states || open.len() > max_states {
-            if debug {
-                eprintln!(
-                    "repair_normalize_search: exceeded max_states={} (best_states={} open={})",
-                    max_states,
-                    nodes.len(),
-                    open.len()
-                );
-            }
-            break;
-        }
-
-        expansions += 1;
-        if expansions > cfg.max_expansions {
-            if debug {
-                eprintln!(
-                    "repair_normalize_search: exceeded max_expansions={} (best_states={} open={})",
-                    cfg.max_expansions,
-                    nodes.len(),
-                    open.len()
-                );
-            }
-            break;
-        }
-
-        let cur_len = entry.state.len();
-        let suffix_k = common_suffix_len(entry.state, goal);
-        let suffix_start = cur_len.saturating_sub(suffix_k);
-
-        let prev_step = node.parent.map(|(_, s)| s);
-
-        let mut dup_cost_for_kid = [Cost {
-            gas: u32::MAX,
-            bytes: u32::MAX,
-        }; 64];
-        let mut duplicable: u64 = 0;
-        if cfg.dup_max != 0 {
-            let total_len = cur_len.saturating_add(base_len);
-            if total_len != 0 {
-                let max_pos = total_len
-                    .saturating_sub(1)
-                    .min(cfg.dup_max.saturating_sub(1));
-                for pos in 0..=max_pos {
-                    let kid = if pos < cur_len {
-                        entry.state.get(pos)
-                    } else {
-                        let off = pos - cur_len;
-                        debug_assert!(off < suffix_ctx_keys.len());
-                        suffix_ctx_keys[off]
-                    } as usize;
-                    duplicable |= 1u64 << kid;
-                    dup_cost_for_kid[kid] = dup_cost_for_kid[kid].min(cost.cost_dup(pos as u8));
-                }
-            }
-        }
-
-        let mut consider_ctx = ConsiderCtx {
-            heuristic,
-            upper_bound,
-            have_incumbent: incumbent_steps.is_some(),
-            nodes: &mut *nodes,
-            open: &mut *open,
-        };
-
-        // POP (only within the repair region).
-        if cur_len != 0 {
-            consider_succ(
-                entry.state.pop(),
-                g.saturating_add(cost.cost_pop()),
-                entry.state,
-                Step::Pop,
-                &mut consider_ctx,
-            );
-        }
-
-        // PUSH0 (if present in the goal) before the 3-gas moves.
-        if cur_len < cfg.max_len
-            && let (Some(kid), Some(push0_cost)) = (push0_kid, push0_cost)
-        {
-            consider_succ(
-                entry.state.push(kid),
-                g.saturating_add(push0_cost),
-                entry.state,
-                Step::PushImm(kid),
-                &mut consider_ctx,
-            );
-        }
-
-        // SWAP (restricted to the repair region).
-        if cur_len >= 2 {
-            let max_depth = cur_len
-                .saturating_sub(1)
-                .min(cfg.swap_max.saturating_sub(1));
-            for depth in 1..=max_depth {
-                if matches!(prev_step, Some(Step::Swap(d)) if d as usize == depth) {
-                    continue;
-                }
-                if entry.state.get(0) == entry.state.get(depth) {
-                    continue;
-                }
-                if depth >= suffix_start && depth < cfg.dup_max {
-                    continue;
-                }
-                consider_succ(
-                    entry.state.swap(depth),
-                    g.saturating_add(cost.cost_swap(depth as u8)),
-                    entry.state,
-                    Step::Swap(depth as u8),
-                    &mut consider_ctx,
-                );
-            }
-        }
-
-        // DUP (can read from the repair region or the frozen suffix context).
-        if cfg.dup_max != 0 && cur_len < cfg.max_len {
-            let total_len = cur_len.saturating_add(base_len);
-            if total_len != 0 {
-                let max_pos = total_len
-                    .saturating_sub(1)
-                    .min(cfg.dup_max.saturating_sub(1));
-
-                let mut seen: u64 = 0;
-                for pos in 0..=max_pos {
-                    let kid = if pos < cur_len {
-                        entry.state.get(pos)
-                    } else {
-                        let off = pos - cur_len;
-                        debug_assert!(off < suffix_ctx_keys.len());
-                        suffix_ctx_keys[off]
-                    };
-
-                    if goal_counts[kid as usize] == 0 {
-                        continue;
-                    }
-
-                    let bit = 1u64 << kid;
-                    if (seen & bit) != 0 {
-                        continue;
-                    }
-                    seen |= bit;
-
-                    if Some(kid) == push0_kid {
-                        continue;
-                    }
-
-                    consider_succ(
-                        entry.state.push(kid),
-                        g.saturating_add(cost.cost_dup(pos as u8)),
-                        entry.state,
-                        Step::Dup(pos as u8),
-                        &mut consider_ctx,
-                    );
-                }
-            }
-        }
-
-        if cur_len < cfg.max_len {
-            for &kid in &materializable_imm {
-                if Some(kid) == push0_kid {
-                    continue;
-                }
-
-                let KeyInfo::Imm { canon, .. } = key_infos[kid as usize] else {
-                    unreachable!("expected imm key info")
-                };
-                let push_cost = cost.cost_push_imm(canon);
-                let bit = 1u64 << kid;
-                let dominated =
-                    (duplicable & bit) != 0 && push_cost >= dup_cost_for_kid[kid as usize];
-                if dominated {
-                    continue;
-                }
-
-                consider_succ(
-                    entry.state.push(kid),
-                    g.saturating_add(push_cost),
-                    entry.state,
-                    Step::PushImm(kid),
-                    &mut consider_ctx,
-                );
-            }
-
-            for &kid in &materializable_val {
-                if (duplicable & (1u64 << kid)) != 0 {
-                    continue;
-                }
-                let KeyInfo::Val { vid } = key_infos[kid as usize] else {
-                    unreachable!("expected val key info")
-                };
-                consider_succ(
-                    entry.state.push(kid),
-                    g.saturating_add(cost.cost_load(vid)),
-                    entry.state,
-                    Step::LoadVal(kid),
-                    &mut consider_ctx,
-                );
-            }
-        }
-    }
-
-    if debug {
-        eprintln!(
-            "repair_normalize_search: exhausted search (best_states={} upper_bound={upper_bound:?})",
-            nodes.len()
-        );
+    if let Some((goal_state, _goal_cost)) = run {
+        debug_assert_eq!(goal_state, goal);
+        let steps = reconstruct_steps(start, goal_state, &scratch.exact.nodes)?;
+        incumbent_steps = Some(steps);
     }
 
     scratch.plan_cache.insert(
@@ -1651,6 +1554,219 @@ struct OperandPrepProblem {
 impl OperandPrepProblem {
     fn push0_kid(&self) -> Option<u8> {
         find_push0_kid(&self.key_infos, &self.materializable_imm)
+    }
+}
+
+struct OperandPrepSearchProblem<'a> {
+    problem: &'a OperandPrepProblem,
+    costs: &'a OperandPrepCostTable,
+    cfg: SearchCfg,
+    load_mask: u64,
+    dup_gas_lb: u32,
+    surplus_last_use_penalty: Cost,
+    push0_kid: Option<u8>,
+    push0_cost: Option<Cost>,
+    max_states: usize,
+}
+
+impl BoundedAStarProblem for OperandPrepSearchProblem<'_> {
+    type State = PrepState;
+
+    fn is_goal(&self, state: PrepState) -> bool {
+        operand_prep_goal(
+            state,
+            &self.problem.goal_keys,
+            self.problem.preserve_mask,
+            &self.problem.goal_counts,
+        )
+    }
+
+    fn heuristic(&self, state: PrepState) -> Cost {
+        heuristic_operand_prep(
+            state,
+            &self.problem.goal_counts,
+            self.problem.goal_mask,
+            self.problem.preserve_mask,
+            self.load_mask,
+            self.dup_gas_lb,
+            self.costs,
+        )
+    }
+
+    fn max_states(&self, _have_incumbent: bool) -> usize {
+        self.max_states
+    }
+
+    fn expand_successors<F>(&self, state: PrepState, g: Cost, prev_step: Option<Step>, emit: &mut F)
+    where
+        F: FnMut(PrepState, Cost, Step),
+    {
+        let cur_len = state.window.len();
+
+        let mut win_counts = [0u8; 64];
+        for pos in 0..cur_len {
+            let kid = state.window.get(pos) as usize;
+            win_counts[kid] = win_counts[kid].saturating_add(1);
+        }
+
+        let mut dup_cost_for_kid = [UNAVAILABLE_COST; 64];
+        let mut duplicable: u64 = 0;
+        if self.cfg.dup_max != 0 && cur_len != 0 {
+            let max_pos = (cur_len - 1).min(self.cfg.dup_max.saturating_sub(1));
+            for pos in 0..=max_pos {
+                let kid = state.window.get(pos) as usize;
+                duplicable |= 1u64 << kid;
+                dup_cost_for_kid[kid] = dup_cost_for_kid[kid].min(self.costs.dup[pos]);
+            }
+        }
+
+        if cur_len >= 2 {
+            let max_depth = cur_len
+                .saturating_sub(1)
+                .min(self.cfg.swap_max.saturating_sub(1));
+            for depth in 1..=max_depth {
+                if matches!(prev_step, Some(Step::Swap(d)) if d as usize == depth) {
+                    continue;
+                }
+                if state.window.get(0) == state.window.get(depth) {
+                    continue;
+                }
+                let next = PrepState {
+                    window: state.window.swap(depth),
+                    ..state
+                };
+                emit(
+                    next,
+                    g.saturating_add(self.costs.swap[depth]),
+                    Step::Swap(depth as u8),
+                );
+            }
+        }
+
+        if self.cfg.dup_max != 0 && cur_len != 0 {
+            let max_pos = (cur_len - 1).min(self.cfg.dup_max.saturating_sub(1));
+            let mut seen: u64 = 0;
+            for pos in 0..=max_pos {
+                let kid = state.window.get(pos);
+                if self.problem.goal_counts[kid as usize] == 0 {
+                    continue;
+                }
+                let bit = 1u64 << kid;
+                if (seen & bit) != 0 {
+                    continue;
+                }
+                seen |= bit;
+
+                if Some(kid) == self.push0_kid {
+                    continue;
+                }
+
+                let next = prep_insert(
+                    state,
+                    kid,
+                    self.problem.preserve_mask,
+                    false,
+                    self.cfg.max_len,
+                );
+                emit(
+                    next,
+                    g.saturating_add(operand_prep_insert_cost(
+                        state,
+                        next,
+                        kid,
+                        &self.problem.goal_counts,
+                        self.problem.last_use_mask,
+                        self.costs.dup[pos],
+                        self.surplus_last_use_penalty,
+                    )),
+                    Step::Dup(pos as u8),
+                );
+            }
+        }
+
+        if let (Some(kid), Some(push0_cost)) = (self.push0_kid, self.push0_cost) {
+            let next = prep_insert(
+                state,
+                kid,
+                self.problem.preserve_mask,
+                false,
+                self.cfg.max_len,
+            );
+            emit(
+                next,
+                g.saturating_add(operand_prep_insert_cost(
+                    state,
+                    next,
+                    kid,
+                    &self.problem.goal_counts,
+                    self.problem.last_use_mask,
+                    push0_cost,
+                    self.surplus_last_use_penalty,
+                )),
+                Step::PushImm(kid),
+            );
+        }
+
+        for &kid in &self.problem.materializable_imm {
+            if Some(kid) == self.push0_kid {
+                continue;
+            }
+            let push_cost = self.costs.materialize[kid as usize];
+            let bit = 1u64 << kid;
+            let dominated = (duplicable & bit) != 0 && push_cost >= dup_cost_for_kid[kid as usize];
+            if dominated {
+                continue;
+            }
+
+            let next = prep_insert(
+                state,
+                kid,
+                self.problem.preserve_mask,
+                false,
+                self.cfg.max_len,
+            );
+            emit(
+                next,
+                g.saturating_add(operand_prep_insert_cost(
+                    state,
+                    next,
+                    kid,
+                    &self.problem.goal_counts,
+                    self.problem.last_use_mask,
+                    push_cost,
+                    self.surplus_last_use_penalty,
+                )),
+                Step::PushImm(kid),
+            );
+        }
+
+        for &kid in &self.problem.materializable_val {
+            let bit = 1u64 << kid;
+            if !operand_prep_copy_can_help(self.problem, state, kid, win_counts[kid as usize]) {
+                continue;
+            }
+            let set_mem = (self.problem.preserve_mask & bit) != 0;
+            let next = prep_insert(
+                state,
+                kid,
+                self.problem.preserve_mask,
+                set_mem,
+                self.cfg.max_len,
+            );
+            emit(
+                next,
+                g.saturating_add(operand_prep_insert_cost(
+                    state,
+                    next,
+                    kid,
+                    &self.problem.goal_counts,
+                    self.problem.last_use_mask,
+                    self.costs.materialize[kid as usize],
+                    self.surplus_last_use_penalty,
+                )),
+                Step::LoadVal(kid),
+            );
+        }
     }
 }
 
@@ -1767,6 +1883,9 @@ fn build_operand_prep_problem(
         }
     }
 
+    // Values that are not operands are never copied, materialized, or checked, so one shared
+    // key stands for all of them; the search then does not tell their orders apart.
+    let mut ignored_kid: Option<u8> = None;
     let mut start_keys: StackKeyIds = SmallVec::new();
     for depth in 0..window_len {
         let Some(StackItem::Value(v)) = stack.item_at(depth) else {
@@ -1775,12 +1894,15 @@ fn build_operand_prep_problem(
         let key = canonical_key(ctx, *v);
         let kid = if let Some(&kid) = key_ids.get(&key) {
             kid
+        } else if let Some(kid) = ignored_kid {
+            kid
         } else {
             if key_infos.len() >= 64 {
                 return None;
             }
             let kid = key_infos.len() as u8;
             key_infos.push(KeyInfo::Ignored);
+            ignored_kid = Some(kid);
             kid
         };
         start_keys.push(kid);
@@ -2093,6 +2215,154 @@ fn build_linear_operand_prep_upper_bound(
     .then_some((steps, total_cost))
 }
 
+const OPERAND_PREP_STAR_SWAP_SELECTIONS: usize = 64;
+
+/// Swap-only operand preparation for windows that already hold every operand and preserve
+/// copy. Chooses which copies feed the operand prefix, treats every other window slot as one
+/// interchangeable filler key, and routes each choice exactly with [`build_star_swap_plan`].
+fn build_star_swap_operand_prep_upper_bound(
+    problem: &OperandPrepProblem,
+    swap_max: usize,
+) -> Option<StepList> {
+    let start = problem.start_state;
+    let window: StackKeyIds = (0..start.window.len())
+        .map(|pos| start.window.get(pos))
+        .collect();
+    let filler = u8::try_from(problem.key_infos.len())
+        .ok()
+        .filter(|&kid| kid < 64)?;
+    if window.len() < problem.goal_keys.len()
+        || operand_prep_missing_count(start, &problem.goal_counts, problem.preserve_mask) != 0
+    {
+        return None;
+    }
+
+    // Per operand key, every way to pick its operand copies, as window-position masks.
+    let mut choices: SmallVec<[SmallVec<[u32; 4]>; 8]> = SmallVec::new();
+    let mut selections = 1usize;
+    let mut goal_mask = problem.goal_mask;
+    while goal_mask != 0 {
+        let kid = goal_mask.trailing_zeros() as u8;
+        goal_mask &= goal_mask - 1;
+        let copies: SmallVec<[usize; 8]> = (0..window.len())
+            .filter(|&pos| window[pos] == kid)
+            .collect();
+        let mut masks: SmallVec<[u32; 4]> = SmallVec::new();
+        // Gosper's hack: visit every subset of `copies` with `goal_counts[kid]` members.
+        let mut subset = (1u32 << problem.goal_counts[kid as usize]) - 1;
+        while subset < 1 << copies.len() {
+            if masks.len() == OPERAND_PREP_STAR_SWAP_SELECTIONS {
+                return None;
+            }
+            masks.push(
+                copies
+                    .iter()
+                    .enumerate()
+                    .filter(|&(idx, _)| subset & (1 << idx) != 0)
+                    .fold(0u32, |mask, (_, &pos)| mask | 1 << pos),
+            );
+            let low = subset.isolate_lowest_one();
+            let ripple = subset + low;
+            subset = (((ripple ^ subset) >> 2) / low) | ripple;
+        }
+        selections = selections.saturating_mul(masks.len());
+        if selections > OPERAND_PREP_STAR_SWAP_SELECTIONS {
+            return None;
+        }
+        choices.push(masks);
+    }
+
+    let target: StackKeyIds = problem
+        .goal_keys
+        .iter()
+        .copied()
+        .chain(iter::repeat_n(
+            filler,
+            window.len() - problem.goal_keys.len(),
+        ))
+        .collect();
+    let mut digits: SmallVec<[usize; 8]> = smallvec![0; choices.len()];
+    let mut best: Option<StepList> = None;
+    'select: loop {
+        let chosen = choices
+            .iter()
+            .zip(&digits)
+            .fold(0u32, |mask, (masks, &digit)| mask | masks[digit]);
+        let mut cur: Vec<u8> = window
+            .iter()
+            .enumerate()
+            .map(|(pos, &kid)| {
+                if chosen & (1 << pos) != 0 {
+                    kid
+                } else {
+                    filler
+                }
+            })
+            .collect();
+        if let Some(steps) = build_star_swap_plan(&mut cur, &target, swap_max)
+            && best.as_ref().is_none_or(|best| steps.len() < best.len())
+        {
+            best = Some(steps);
+        }
+
+        for (digit, masks) in digits.iter_mut().zip(&choices) {
+            *digit += 1;
+            if *digit < masks.len() {
+                continue 'select;
+            }
+            *digit = 0;
+        }
+        break;
+    }
+
+    let steps = best?;
+    let window = steps.iter().fold(start.window, |window, step| match *step {
+        Step::Swap(depth) => window.swap(depth as usize),
+        _ => unreachable!("star swap plans only swap"),
+    });
+    operand_prep_goal(
+        PrepState { window, ..start },
+        &problem.goal_keys,
+        problem.preserve_mask,
+        &problem.goal_counts,
+    )
+    .then_some(steps)
+}
+
+/// The cheapest constructive operand-prep plan. The linear builder and the beam search bounded
+/// by it come first, so exact swap-only routing only replaces them when strictly cheaper: equal
+/// local costs keep their layouts for the instructions that follow.
+fn build_operand_prep_incumbent(
+    ctx: &StackifyContext<'_>,
+    problem: &OperandPrepProblem,
+    allow_copy_swap: bool,
+    cost: &impl CostModel,
+    cfg: SearchCfg,
+) -> Option<(StepList, Cost)> {
+    let linear = build_linear_operand_prep_upper_bound(problem, allow_copy_swap, cost, cfg);
+    let linear_cost = linear
+        .as_ref()
+        .map_or(UNAVAILABLE_COST, |&(_, plan_cost)| plan_cost);
+    let budgets = ctx.search_profile.budgets();
+    let greedy = build_greedy_operand_prep_upper_bound(
+        problem,
+        cost,
+        cfg,
+        linear_cost,
+        budgets.operand_prep_beam_width,
+        budgets.operand_prep_beam_depth_slack.resolve(cfg.swap_max),
+    )
+    .filter(|&(_, greedy_cost)| greedy_cost < linear_cost);
+    let swap = build_star_swap_operand_prep_upper_bound(problem, cfg.swap_max).map(|steps| {
+        let swap_cost = cost_for_steps(&steps, &problem.key_infos, cost);
+        (steps, swap_cost)
+    });
+    [greedy.or(linear), swap]
+        .into_iter()
+        .flatten()
+        .min_by_key(|&(_, plan_cost)| plan_cost)
+}
+
 fn operand_prep_goal_run_anywhere(state: PrepState, goal_keys: &[u8]) -> (usize, usize, usize) {
     let window_len = state.window.len().min(goal_keys.len());
     if window_len == 0 {
@@ -2240,12 +2510,7 @@ fn build_greedy_operand_prep_upper_bound(
     }
 
     let push0_kid = problem.push0_kid();
-    let push0_cost = push0_kid.map(|kid| {
-        let KeyInfo::Imm { canon, .. } = problem.key_infos[kid as usize] else {
-            unreachable!("expected imm key info")
-        };
-        cost.cost_push_imm(canon)
-    });
+    let push0_cost = cost_push0_kid(push0_kid, &problem.key_infos, cost);
     let surplus_last_use_penalty = cost.cost_pop().saturating_add(cost.cost_swap(1));
     let max_depth = problem.goal_keys.len().saturating_add(depth_slack).min(24);
     let mut nodes = vec![prep_greedy_node(
@@ -2496,19 +2761,7 @@ pub(super) fn solve_greedy_operand_prep_plan(
         max_len: problem.max_len,
         ..cfg
     };
-    let (linear_steps, linear_cost) =
-        build_linear_operand_prep_upper_bound(&problem, allow_copy_swap, cost, cfg)?;
-    let (steps, cost) = build_greedy_operand_prep_upper_bound(
-        &problem,
-        cost,
-        cfg,
-        linear_cost,
-        ctx.search_profile.operand_prep_beam_width(),
-        ctx.search_profile
-            .operand_prep_beam_depth_slack(cfg.swap_max),
-    )
-    .filter(|(_, greedy_cost)| *greedy_cost < linear_cost)
-    .unwrap_or((linear_steps, linear_cost));
+    let (steps, cost) = build_operand_prep_incumbent(ctx, &problem, allow_copy_swap, cost, cfg)?;
     Some(NormalizePlan {
         cost,
         steps,
@@ -2597,11 +2850,11 @@ pub(super) fn solve_optimal_operand_prep_plan(
     let push0_kid = problem.push0_kid();
     let push0_cost = push0_kid.map(|kid| prep_costs.materialize_cost(kid));
     let surplus_last_use_penalty = prep_costs.surplus_last_use_penalty;
-    let Some((linear_steps, linear_cost)) =
-        build_linear_operand_prep_upper_bound(&problem, true, cost, cfg)
+    let Some((mut incumbent_steps, mut incumbent_cost)) =
+        build_operand_prep_incumbent(ctx, &problem, true, cost, cfg)
     else {
         if debug {
-            eprintln!("operand_prep_search: linear greedy plan failed goal check");
+            eprintln!("operand_prep_search: no constructive plan reached the goal");
         }
         scratch.plan_cache.insert(cache_key, PlanCacheVal::None);
         return None;
@@ -2612,30 +2865,6 @@ pub(super) fn solve_optimal_operand_prep_plan(
             .iter()
             .all(|&v| constraints.consume_last_use.contains(v))
         && problem.preserve_mask == 0;
-
-    let mut upper_bound = linear_cost;
-    let mut incumbent_steps = linear_steps;
-    let mut incumbent_cost = upper_bound;
-
-    if let Some((steps, greedy_cost)) = build_greedy_operand_prep_upper_bound(
-        &problem,
-        cost,
-        cfg,
-        upper_bound,
-        ctx.search_profile.operand_prep_beam_width(),
-        ctx.search_profile
-            .operand_prep_beam_depth_slack(cfg.swap_max),
-    ) && greedy_cost < upper_bound
-    {
-        if debug {
-            eprintln!(
-                "operand_prep_search: upper_bound improved by greedy plan: ub={upper_bound:?} greedy={greedy_cost:?}"
-            );
-        }
-        upper_bound = greedy_cost;
-        incumbent_steps = steps;
-        incumbent_cost = greedy_cost;
-    }
 
     let finish_incumbent = |scratch: &mut NormalizeSearchScratch,
                             steps: StepList,
@@ -2674,274 +2903,35 @@ pub(super) fn solve_optimal_operand_prep_plan(
         );
     }
 
-    let dup_gas_lb = prep_costs.min_dup_gas;
-    let start_h = heuristic_operand_prep(
+    let search_problem = OperandPrepSearchProblem {
+        problem: &problem,
+        costs: &prep_costs,
+        cfg,
+        load_mask: problem
+            .materializable_val
+            .iter()
+            .fold(0, |mask, &kid| mask | 1u64 << kid),
+        dup_gas_lb: prep_costs.min_dup_gas,
+        surplus_last_use_penalty,
+        push0_kid,
+        push0_cost,
+        max_states: ctx.search_profile.budgets().operand_prep_max_states,
+    };
+
+    let run = run_bounded_astar(
+        &search_problem,
+        &mut scratch.prep,
         problem.start_state,
-        &problem.goal_counts,
-        problem.goal_mask,
-        problem.preserve_mask,
-        dup_gas_lb,
-        &prep_costs,
+        incumbent_cost,
+        true,
+        cfg.max_expansions,
+        debug.then_some("operand_prep_search"),
     );
 
-    if should_prune(start_h, upper_bound, true) {
-        return finish_incumbent(
-            scratch,
-            incumbent_steps,
-            incumbent_cost,
-            problem.key_infos,
-            problem.goal_keys,
-        );
-    }
-
-    scratch.clear_prep();
-    let prep = &mut scratch.prep;
-    let nodes = &mut prep.nodes;
-    let open = &mut prep.open;
-
-    nodes.insert(
-        problem.start_state,
-        SearchNode {
-            cost: Cost::default(),
-            parent: None,
-        },
-    );
-
-    open.push(PrepQueueEntry {
-        f: start_h,
-        g: Cost::default(),
-        state: problem.start_state,
-    });
-
-    let mut expansions: usize = 0;
-    while let Some(entry) = open.pop() {
-        let Some(node) = nodes.get(&entry.state) else {
-            continue;
-        };
-        let g = node.cost;
-        if entry.g != g {
-            continue;
-        }
-
-        if operand_prep_goal(
-            entry.state,
-            &problem.goal_keys,
-            problem.preserve_mask,
-            &problem.goal_counts,
-        ) {
-            let steps = reconstruct_steps(problem.start_state, entry.state, nodes)?;
-            if g < upper_bound {
-                upper_bound = g;
-                incumbent_steps = steps;
-                incumbent_cost = g;
-            }
-            continue;
-        }
-
-        if should_prune(entry.f, upper_bound, true) {
-            break;
-        }
-
-        let max_states = ctx.search_profile.operand_prep_max_states();
-        if nodes.len() > max_states || open.len() > max_states {
-            if debug {
-                eprintln!(
-                    "operand_prep_search: exceeded max_states={} (best_states={} open={})",
-                    max_states,
-                    nodes.len(),
-                    open.len()
-                );
-            }
-            break;
-        }
-
-        expansions += 1;
-        if expansions > cfg.max_expansions {
-            if debug {
-                eprintln!(
-                    "operand_prep_search: exceeded max_expansions={} (best_states={} open={})",
-                    cfg.max_expansions,
-                    nodes.len(),
-                    open.len()
-                );
-            }
-            break;
-        }
-
-        let prev_step = node.parent.map(|(_, s)| s);
-
-        let cur_len = entry.state.window.len();
-
-        let mut win_counts = [0u8; 64];
-        for pos in 0..cur_len {
-            let kid = entry.state.window.get(pos) as usize;
-            win_counts[kid] = win_counts[kid].saturating_add(1);
-        }
-
-        let mut dup_cost_for_kid = [Cost {
-            gas: u32::MAX,
-            bytes: u32::MAX,
-        }; 64];
-        let mut duplicable: u64 = 0;
-        if cfg.dup_max != 0 && cur_len != 0 {
-            let max_pos = (cur_len - 1).min(cfg.dup_max.saturating_sub(1));
-            for pos in 0..=max_pos {
-                let kid = entry.state.window.get(pos) as usize;
-                duplicable |= 1u64 << kid;
-                dup_cost_for_kid[kid] = dup_cost_for_kid[kid].min(prep_costs.dup[pos]);
-            }
-        }
-
-        let mut consider_ctx = PrepConsiderCtx {
-            goal_counts: &problem.goal_counts,
-            goal_mask: problem.goal_mask,
-            preserve_mask: problem.preserve_mask,
-            dup_gas: dup_gas_lb,
-            costs: &prep_costs,
-            upper_bound,
-            nodes: &mut *nodes,
-            open: &mut *open,
-        };
-
-        if cur_len >= 2 {
-            let max_depth = cur_len
-                .saturating_sub(1)
-                .min(cfg.swap_max.saturating_sub(1));
-            for depth in 1..=max_depth {
-                if matches!(prev_step, Some(Step::Swap(d)) if d as usize == depth) {
-                    continue;
-                }
-                if entry.state.window.get(0) == entry.state.window.get(depth) {
-                    continue;
-                }
-                let next = PrepState {
-                    window: entry.state.window.swap(depth),
-                    ..entry.state
-                };
-                consider_prep_succ(
-                    next,
-                    g.saturating_add(prep_costs.swap[depth]),
-                    entry.state,
-                    Step::Swap(depth as u8),
-                    &mut consider_ctx,
-                );
-            }
-        }
-
-        if cfg.dup_max != 0 && cur_len != 0 {
-            let max_pos = (cur_len - 1).min(cfg.dup_max.saturating_sub(1));
-            let mut seen: u64 = 0;
-            for pos in 0..=max_pos {
-                let kid = entry.state.window.get(pos);
-                if problem.goal_counts[kid as usize] == 0 {
-                    continue;
-                }
-                let bit = 1u64 << kid;
-                if (seen & bit) != 0 {
-                    continue;
-                }
-                seen |= bit;
-
-                if Some(kid) == push0_kid {
-                    continue;
-                }
-
-                let next = prep_insert(entry.state, kid, problem.preserve_mask, false, cfg.max_len);
-                consider_prep_succ(
-                    next,
-                    g.saturating_add(operand_prep_insert_cost(
-                        entry.state,
-                        next,
-                        kid,
-                        &problem.goal_counts,
-                        problem.last_use_mask,
-                        prep_costs.dup[pos],
-                        surplus_last_use_penalty,
-                    )),
-                    entry.state,
-                    Step::Dup(pos as u8),
-                    &mut consider_ctx,
-                );
-            }
-        }
-
-        if let (Some(kid), Some(push0_cost)) = (push0_kid, push0_cost) {
-            let next = prep_insert(entry.state, kid, problem.preserve_mask, false, cfg.max_len);
-            consider_prep_succ(
-                next,
-                g.saturating_add(operand_prep_insert_cost(
-                    entry.state,
-                    next,
-                    kid,
-                    &problem.goal_counts,
-                    problem.last_use_mask,
-                    push0_cost,
-                    surplus_last_use_penalty,
-                )),
-                entry.state,
-                Step::PushImm(kid),
-                &mut consider_ctx,
-            );
-        }
-
-        for &kid in &problem.materializable_imm {
-            if Some(kid) == push0_kid {
-                continue;
-            }
-            let push_cost = prep_costs.materialize[kid as usize];
-            let bit = 1u64 << kid;
-            let dominated = (duplicable & bit) != 0 && push_cost >= dup_cost_for_kid[kid as usize];
-            if dominated {
-                continue;
-            }
-
-            let next = prep_insert(entry.state, kid, problem.preserve_mask, false, cfg.max_len);
-            consider_prep_succ(
-                next,
-                g.saturating_add(operand_prep_insert_cost(
-                    entry.state,
-                    next,
-                    kid,
-                    &problem.goal_counts,
-                    problem.last_use_mask,
-                    push_cost,
-                    surplus_last_use_penalty,
-                )),
-                entry.state,
-                Step::PushImm(kid),
-                &mut consider_ctx,
-            );
-        }
-
-        for &kid in &problem.materializable_val {
-            let bit = 1u64 << kid;
-            if !operand_prep_copy_can_help(&problem, entry.state, kid, win_counts[kid as usize]) {
-                continue;
-            }
-            let set_mem = (problem.preserve_mask & bit) != 0;
-            let next = prep_insert(
-                entry.state,
-                kid,
-                problem.preserve_mask,
-                set_mem,
-                cfg.max_len,
-            );
-            consider_prep_succ(
-                next,
-                g.saturating_add(operand_prep_insert_cost(
-                    entry.state,
-                    next,
-                    kid,
-                    &problem.goal_counts,
-                    problem.last_use_mask,
-                    prep_costs.materialize[kid as usize],
-                    surplus_last_use_penalty,
-                )),
-                entry.state,
-                Step::LoadVal(kid),
-                &mut consider_ctx,
-            );
-        }
+    if let Some((goal_state, goal_cost)) = run {
+        let steps = reconstruct_steps(problem.start_state, goal_state, &scratch.prep.nodes)?;
+        incumbent_steps = steps;
+        incumbent_cost = goal_cost;
     }
 
     finish_incumbent(
@@ -3027,6 +3017,26 @@ fn intern_key(
     };
     infos.push(info);
     Some(kid)
+}
+
+/// The cheapest constructive plan that does not exceed `flush_cost`; later candidates win ties.
+fn best_normalize_incumbent<const N: usize>(
+    flush_cost: Cost,
+    candidates: [Option<StepList>; N],
+    key_infos: &[KeyInfo],
+    cost: &impl CostModel,
+) -> (Cost, Option<StepList>) {
+    candidates
+        .into_iter()
+        .flatten()
+        .fold((flush_cost, None), |(upper_bound, incumbent), steps| {
+            let plan_cost = cost_for_steps(&steps, key_infos, cost);
+            if plan_cost <= upper_bound {
+                (plan_cost, Some(steps))
+            } else {
+                (upper_bound, incumbent)
+            }
+        })
 }
 
 fn estimate_flush_rebuild_cost(
@@ -3198,95 +3208,73 @@ fn apply_repair_step_to_vec(cur: &mut Vec<u8>, suffix_ctx_keys: &[u8], step: Ste
     }
 }
 
+const NO_STAR_ARC: u8 = u8::MAX;
+
+/// Minimal `SWAP` sequence turning `cur` into `goal` (same keys, same multiset), where equal
+/// keys are interchangeable: colored token swapping on a star, solved exactly by Euler tours
+/// (Bonnet, Miltzow, Rzążewski, "Complexity of Token Swapping and Its Variants", Theorem 7).
+///
+/// Each misplaced non-top slot `i` is an arc `goal[i] -> cur[i]`; swapping it while the top
+/// holds `goal[i]` fixes the slot and leaves `cur[i]` on top. An Euler trail from the top's key
+/// covers its component, and every other component costs one extra swap to enter. Slots at
+/// depth `swap_max` or deeper must already be in place.
 fn build_star_swap_plan(cur: &mut Vec<u8>, goal: &[u8], swap_max: usize) -> Option<StepList> {
-    if cur.len() != goal.len() {
-        return None;
-    }
-    if cur.len() > swap_max {
-        return None;
-    }
-
-    if compute_counts(cur) != compute_counts(goal) {
+    if cur.len() != goal.len()
+        || cur.len() > PackedState::MAX_LEN
+        || compute_counts(cur) != compute_counts(goal)
+    {
         return None;
     }
 
-    let n = cur.len();
-    if n <= 1 {
-        return Some(StepList::new());
-    }
-
-    let mut goal_pos: Vec<Vec<usize>> = vec![Vec::new(); 64];
-    for (idx, &kid) in goal.iter().enumerate() {
-        goal_pos[kid as usize].push(idx);
-    }
-
-    let mut next_idx = [0usize; 64];
-    let mut p: Vec<usize> = vec![0usize; n];
-    for (i, &kid) in cur.iter().enumerate() {
-        let kid = kid as usize;
-        let pos_list = &goal_pos[kid];
-        let next = next_idx[kid];
-        if next >= pos_list.len() {
+    // `head[key]` lists, through `next`, the misplaced slots that need `key`.
+    let mut head = [NO_STAR_ARC; 64];
+    let mut next = [NO_STAR_ARC; PackedState::MAX_LEN];
+    for pos in (1..cur.len()).rev().filter(|&pos| cur[pos] != goal[pos]) {
+        if pos >= swap_max {
             return None;
         }
-        p[i] = pos_list[next];
-        next_idx[kid] += 1;
+        next[pos] = head[goal[pos] as usize];
+        head[goal[pos] as usize] = pos as u8;
     }
 
-    // Generate a minimal star-transposition sequence for `p`:
-    // - cycle containing 0: (0 a1 a2 .. ak) => (0 a1)(0 a2)...(0 ak)
-    // - other cycle: (a1 a2 .. ak) => (0 a1)(0 a2)...(0 ak)(0 a1)
-    let mut visited = vec![false; n];
-    let mut steps = StepList::new();
+    let trail = |start: u8, head: &mut [u8; 64]| {
+        let mut stack: SmallVec<[(u8, u8); 16]> = smallvec![(start, NO_STAR_ARC)];
+        let mut slots: SmallVec<[u8; 16]> = SmallVec::new();
+        while let Some(&(key, slot)) = stack.last() {
+            let pos = head[key as usize];
+            if pos == NO_STAR_ARC {
+                stack.pop();
+                if slot != NO_STAR_ARC {
+                    slots.push(slot);
+                }
+            } else {
+                head[key as usize] = next[pos as usize];
+                stack.push((cur[pos as usize], pos));
+            }
+        }
+        slots.reverse();
+        slots
+    };
 
-    for i in 0..n {
-        if visited[i] {
+    let Some(&top) = cur.first() else {
+        return Some(StepList::new());
+    };
+    let mut steps: StepList = trail(top, &mut head).into_iter().map(Step::Swap).collect();
+    for key in 0..64u8 {
+        if head[key as usize] == NO_STAR_ARC {
             continue;
         }
-        let mut cycle: Vec<usize> = Vec::new();
-        let mut cur_idx = i;
-        while !visited[cur_idx] {
-            visited[cur_idx] = true;
-            cycle.push(cur_idx);
-            cur_idx = p[cur_idx];
-        }
-
-        if cycle.len() <= 1 {
-            continue;
-        }
-
-        if let Some(z) = cycle.iter().position(|&x| x == 0) {
-            cycle.rotate_left(z);
-            debug_assert_eq!(cycle[0], 0);
-            for &idx in &cycle[1..] {
-                if idx >= swap_max {
-                    return None;
-                }
-                steps.push(Step::Swap(idx as u8));
-            }
-        } else {
-            for &idx in &cycle {
-                if idx >= swap_max {
-                    return None;
-                }
-                steps.push(Step::Swap(idx as u8));
-            }
-            let first = cycle[0];
-            if first >= swap_max {
-                return None;
-            }
-            steps.push(Step::Swap(first as u8));
-        }
+        let circuit = trail(key, &mut head);
+        let (&enter, rest) = circuit.split_last()?;
+        steps.push(Step::Swap(enter));
+        steps.extend(rest.iter().copied().map(Step::Swap));
+        steps.push(Step::Swap(enter));
     }
 
-    for step in steps.iter().copied() {
+    for &step in &steps {
         apply_step_to_vec(cur, step);
     }
-    if cur.as_slice() != goal {
-        return None;
-    }
-
-    Some(steps)
+    (cur.as_slice() == goal).then_some(steps)
 }
 
 fn build_delete_tail_under_prefix_upper_bound(
@@ -3900,6 +3888,7 @@ fn build_dup_and_star_swap_upper_bound(
     start_keys: &[u8],
     goal_keys: &[u8],
     goal_counts: &[u8; 64],
+    key_infos: &[KeyInfo],
     cfg: SearchCfg,
 ) -> Option<StepList> {
     if goal_keys.len() > cfg.max_len {
@@ -3908,15 +3897,6 @@ fn build_dup_and_star_swap_upper_bound(
 
     let mut cur: Vec<u8> = start_keys.to_vec();
     let mut cur_counts = compute_counts(&cur);
-
-    // This upper-bound builder only handles cases where every required key already exists
-    // (so we never need PUSH/LOAD).
-    for (kid, &want) in goal_counts.iter().enumerate() {
-        if want != 0 && cur_counts[kid] == 0 {
-            return None;
-        }
-    }
-
     let mut steps = StepList::new();
 
     trim_excess_keys(
@@ -3928,38 +3908,33 @@ fn build_dup_and_star_swap_upper_bound(
         apply_step_to_vec,
     )?;
 
-    // 2) Duplicate keys to satisfy any remaining deficits.
-    if cfg.dup_max == 0 {
-        return None;
-    }
+    // Copy keys to cover the remaining deficits, materializing the ones the stack lacks; the
+    // final star routing puts every copy in place.
     for (kid, &want) in goal_counts.iter().enumerate() {
-        let mut have = cur_counts[kid];
-        while have < want {
+        let kid = kid as u8;
+        while cur_counts[kid as usize] < want {
             if cur.len() >= cfg.max_len {
                 return None;
             }
 
-            let pos = cur
-                .iter()
-                .position(|&x| x == kid as u8)
-                .expect("deficit key missing from vector");
-
-            if pos < cfg.dup_max {
-                steps.push(Step::Dup(pos as u8));
-                apply_step_to_vec(&mut cur, Step::Dup(pos as u8));
-            } else {
+            let step = match cur.iter().position(|&x| x == kid) {
+                Some(pos) if pos < cfg.dup_max => Step::Dup(pos as u8),
                 // Only reachable when `pos == 16` and `dup_max == 16`.
-                if pos >= cfg.swap_max {
-                    return None;
+                Some(pos) if cfg.dup_max != 0 && pos < cfg.swap_max => {
+                    steps.push(Step::Swap(pos as u8));
+                    apply_step_to_vec(&mut cur, Step::Swap(pos as u8));
+                    Step::Dup(0)
                 }
-                steps.push(Step::Swap(pos as u8));
-                apply_step_to_vec(&mut cur, Step::Swap(pos as u8));
-                steps.push(Step::Dup(0));
-                apply_step_to_vec(&mut cur, Step::Dup(0));
-            }
-
-            have += 1;
-            cur_counts[kid] = have;
+                Some(_) => return None,
+                None => match key_infos[kid as usize] {
+                    KeyInfo::Imm { .. } => Step::PushImm(kid),
+                    KeyInfo::Val { .. } => Step::LoadVal(kid),
+                    KeyInfo::Ignored => return None,
+                },
+            };
+            steps.push(step);
+            apply_step_to_vec(&mut cur, step);
+            cur_counts[kid as usize] += 1;
         }
     }
 
@@ -4154,6 +4129,7 @@ fn heuristic_operand_prep(
     goal_counts: &[u8; 64],
     goal_mask: u64,
     preserve_mask: u64,
+    load_mask: u64,
     dup_gas: u32,
     costs: &OperandPrepCostTable,
 ) -> Cost {
@@ -4172,10 +4148,16 @@ fn heuristic_operand_prep(
         missing_mask &= missing_mask - 1;
         let need_operands = goal_counts[kid as usize];
         let bit = 1u64 << kid;
-        let preserve_extra = u8::from((preserve_mask & bit) != 0 && (state.mem & bit) == 0);
+        let have_window = win_counts[kid as usize];
+        // Without a window copy, a loadable key's first copy is a load, and loading a preserved
+        // value already keeps it in memory.
+        let preserve_extra = u8::from(
+            (preserve_mask & bit) != 0
+                && (state.mem & bit) == 0
+                && (have_window != 0 || (load_mask & bit) == 0),
+        );
         let need_total = need_operands.saturating_add(preserve_extra);
 
-        let have_window = win_counts[kid as usize];
         let have_total = have_window.saturating_add(u8::from((state.tail & bit) != 0));
 
         let missing_operands = need_operands.saturating_sub(have_window);
@@ -4199,114 +4181,6 @@ fn heuristic_operand_prep(
     }
 
     Cost { gas, bytes: 0 }
-}
-
-struct PrepConsiderCtx<'a> {
-    goal_counts: &'a [u8; 64],
-    goal_mask: u64,
-    preserve_mask: u64,
-    dup_gas: u32,
-    costs: &'a OperandPrepCostTable,
-    upper_bound: Cost,
-    nodes: &'a mut FxHashMap<PrepState, SearchNode<PrepState>>,
-    open: &'a mut BinaryHeap<PrepQueueEntry>,
-}
-
-fn consider_prep_succ(
-    state: PrepState,
-    g: Cost,
-    parent_state: PrepState,
-    step: Step,
-    ctx: &mut PrepConsiderCtx<'_>,
-) {
-    let h = heuristic_operand_prep(
-        state,
-        ctx.goal_counts,
-        ctx.goal_mask,
-        ctx.preserve_mask,
-        ctx.dup_gas,
-        ctx.costs,
-    );
-    let f = g.saturating_add(h);
-    if should_prune(f, ctx.upper_bound, true) {
-        return;
-    }
-
-    let should_update = match ctx.nodes.get(&state) {
-        None => true,
-        Some(prev) => g < prev.cost,
-    };
-    if !should_update {
-        return;
-    }
-
-    ctx.nodes.insert(
-        state,
-        SearchNode {
-            cost: g,
-            parent: Some((parent_state, step)),
-        },
-    );
-    ctx.open.push(PrepQueueEntry { f, g, state });
-}
-
-struct ConsiderCtx<'a, C: CostModel> {
-    heuristic: NormalizeHeuristic<'a, C>,
-    upper_bound: Cost,
-    have_incumbent: bool,
-    nodes: &'a mut FxHashMap<PackedState, SearchNode<PackedState>>,
-    open: &'a mut BinaryHeap<QueueEntry>,
-}
-
-fn consider_succ<C: CostModel>(
-    state: PackedState,
-    g: Cost,
-    parent_state: PackedState,
-    step: Step,
-    ctx: &mut ConsiderCtx<'_, C>,
-) {
-    let h = heuristic_with_ctx(state, &ctx.heuristic);
-    let f = g.saturating_add(h);
-    if should_prune(f, ctx.upper_bound, ctx.have_incumbent) {
-        return;
-    }
-
-    let should_update = match ctx.nodes.get(&state) {
-        None => true,
-        Some(prev) => g < prev.cost,
-    };
-    if !should_update {
-        return;
-    }
-
-    ctx.nodes.insert(
-        state,
-        SearchNode {
-            cost: g,
-            parent: Some((parent_state, step)),
-        },
-    );
-    ctx.open.push(QueueEntry { f, g, state });
-}
-
-fn minimal_push_bytes(val: I256) -> usize {
-    let bytes = val.to_u256().to_big_endian();
-    let is_neg = (bytes[0] & 0x80) != 0;
-    let skip = if is_neg { 0xff } else { 0x00 };
-
-    let mut idx = 0usize;
-    while idx < bytes.len() && bytes[idx] == skip {
-        idx += 1;
-    }
-
-    let mut len = bytes.len().saturating_sub(idx);
-
-    // Negative numbers need a leading 1 bit for SIGNEXTEND.
-    if is_neg && bytes.get(idx).map(|b| *b < 0x80).unwrap_or(true) {
-        len += 1;
-    }
-
-    len.max(1)
 }
 
 impl<'a, 'ctx: 'a> Planner<'a, 'ctx> {
@@ -4344,18 +4218,127 @@ mod tests {
         liveness::Liveness,
         stackalloc::stackify::{
             builder::StackifyReachability,
-            planner::{MemPlan, Planner, test_utils::build_stackify_test_context},
+            planner::{MemPlan, MemState, Planner, test_utils::build_stackify_test_context},
             slots::{FreeSlotPools, SpillSlotPools},
             spill::SpillSet,
             sym_stack::SymStack,
         },
     };
     use cranelift_entity::SecondaryMap;
-    use sonatina_ir::{I256, Immediate, Type, ValueId, cfg::ControlFlowGraph};
+    use sonatina_ir::{Function, I256, Immediate, Type, U256, ValueId, cfg::ControlFlowGraph};
     use sonatina_parser::parse_module;
+    use std::cell::Cell;
+
+    macro_rules! with_stackify_ctx {
+        ($reach:expr, |$func:ident, $ctx:ident| { $($setup:stmt;)* } $body:block) => {{
+            const SRC: &str = r#"
+target = "evm-ethereum-osaka"
+
+func public %f() {
+    block0:
+        return;
+}
+"#;
+            let parsed = parse_module(SRC).unwrap();
+            let func_ref = parsed.debug.func_order[0];
+
+            parsed.module.func_store.modify(func_ref, |$func| {
+                $($setup)*
+
+                let mut cfg = ControlFlowGraph::new();
+                cfg.compute($func);
+                let entry = cfg.entry().expect("missing entry block");
+
+                let mut liveness = Liveness::new();
+                liveness.compute($func, &cfg);
+
+                let mut dom = DomTree::new();
+                dom.compute(&cfg);
+
+                let mut scc = CfgSccAnalysis::new();
+                scc.compute(&cfg);
+
+                let reach = StackifyReachability::new($reach);
+                let $ctx = build_stackify_test_context(
+                    $func, &cfg, &dom, &liveness, entry, scc, reach,
+                );
+
+                $body
+            })
+        }};
+    }
 
     fn packed_state_ids(state: PackedState) -> Vec<u8> {
         (0..state.len()).map(|idx| state.get(idx)).collect()
+    }
+
+    fn make_undefs(func: &mut Function, count: usize) -> Vec<ValueId> {
+        (0..count)
+            .map(|_| func.dfg.make_undef_value(Type::I256))
+            .collect()
+    }
+
+    fn push_values(stack: &mut SymStack, values: &[ValueId]) {
+        for &v in values.iter().rev() {
+            stack.push_value(v);
+        }
+    }
+
+    fn default_search_cfg(ctx: &StackifyContext<'_>, max_expansions: usize) -> SearchCfg {
+        SearchCfg {
+            dup_max: ctx.reach.dup_max,
+            swap_max: ctx.reach.swap_max,
+            max_len: ctx.reach.swap_max,
+            max_expansions,
+        }
+    }
+
+    fn expensive_load_cost() -> EstimatedCostModel {
+        EstimatedCostModel {
+            load_cost: Cost {
+                gas: 1_000,
+                bytes: 1_000,
+            },
+        }
+    }
+
+    fn build_test_operand_prep_problem(
+        ctx: &StackifyContext<'_>,
+        stack: &SymStack,
+        args: &[ValueId],
+        cfg: SearchCfg,
+    ) -> OperandPrepProblem {
+        build_operand_prep_problem(
+            ctx,
+            stack,
+            args,
+            OperandPrepConstraints {
+                consume_last_use: &BitSet::default(),
+                cache_preserve: &BitSet::default(),
+            },
+            cfg,
+        )
+        .expect("expected operand-prep problem")
+    }
+
+    fn rename_immediate_stack_values(
+        ctx: &StackifyContext<'_>,
+        stack: &mut SymStack,
+        desired: &[ValueId],
+    ) {
+        for (depth, &want) in desired.iter().enumerate() {
+            if let Some(want_imm) = ctx.func.dfg.value_imm(want).map(|imm| imm.as_i256()) {
+                let StackItem::Value(cur) = *stack.item_at(depth).unwrap() else {
+                    panic!("expected value on stack");
+                };
+                assert_eq!(
+                    ctx.func.dfg.value_imm(cur).unwrap().as_i256(),
+                    want_imm,
+                    "canonical immediate mismatch"
+                );
+                stack.rename_value_at_depth(depth, want);
+            }
+        }
     }
 
     fn prep_state(ids: &[u8], tail: u64, mem: u64) -> PrepState {
@@ -4364,6 +4347,16 @@ mod tests {
             tail,
             mem,
         }
+    }
+
+    #[test]
+    fn estimated_cost_model_matches_shifted_immediate_materialization() {
+        let selector = I256::from_u256(U256::from(0x8c379a0u32) << 224usize);
+        let offset = I256::from_u256(U256::from(0x20u8) << 224usize);
+        let cost = EstimatedCostModel::default();
+
+        assert_eq!(cost.cost_push_imm(selector), Cost { gas: 9, bytes: 7 });
+        assert_eq!(cost.cost_push_imm(offset), Cost { gas: 9, bytes: 5 });
     }
 
     fn operand_prep_test_problem(goal: &[u8], preserve_mask: u64) -> OperandPrepProblem {
@@ -4397,12 +4390,120 @@ mod tests {
         operand_prep_copy_can_help(problem, state, kid, prep_window_copy_count(state, kid))
     }
 
+    struct DriverProblem<'a> {
+        goal: u8,
+        edges: &'a [(u8, u8, u32)],
+        max_states: [usize; 2],
+        expansions: Option<&'a Cell<usize>>,
+    }
+
+    impl BoundedAStarProblem for DriverProblem<'_> {
+        type State = u8;
+
+        fn is_goal(&self, state: u8) -> bool {
+            state == self.goal
+        }
+
+        fn heuristic(&self, _state: u8) -> Cost {
+            Cost::default()
+        }
+
+        fn max_states(&self, have_incumbent: bool) -> usize {
+            self.max_states[usize::from(have_incumbent)]
+        }
+
+        fn expand_successors<F>(&self, state: u8, g: Cost, _prev_step: Option<Step>, emit: &mut F)
+        where
+            F: FnMut(u8, Cost, Step),
+        {
+            if let Some(expansions) = self.expansions {
+                expansions.set(expansions.get() + 1);
+            }
+            for &(_, to, edge_cost) in self.edges.iter().filter(|(from, _, _)| *from == state) {
+                emit(
+                    to,
+                    g.saturating_add(Cost {
+                        gas: edge_cost,
+                        bytes: 0,
+                    }),
+                    Step::Pop,
+                );
+            }
+        }
+    }
+
+    fn driver_problem(goal: u8, edges: &[(u8, u8, u32)]) -> DriverProblem<'_> {
+        DriverProblem {
+            goal,
+            edges,
+            max_states: [64, 64],
+            expansions: None,
+        }
+    }
+
+    fn run_driver(
+        problem: &DriverProblem<'_>,
+        upper_bound: u32,
+        have_incumbent: bool,
+        max_expansions: usize,
+    ) -> Option<(u8, Cost)> {
+        let mut scratch = SearchScratch::default();
+        run_bounded_astar(
+            problem,
+            &mut scratch,
+            0,
+            Cost {
+                gas: upper_bound,
+                bytes: 0,
+            },
+            have_incumbent,
+            max_expansions,
+            None,
+        )
+    }
+
+    #[test]
+    fn driver_bound_semantics() {
+        let problem = driver_problem(1, &[(0, 1, 10)]);
+        assert_eq!(
+            run_driver(&problem, 10, false, 8),
+            Some((1, Cost { gas: 10, bytes: 0 }))
+        );
+        assert_eq!(run_driver(&problem, 10, true, 8), None);
+    }
+
+    #[test]
+    fn driver_ignores_stale_queue_entries() {
+        let problem = driver_problem(3, &[(0, 2, 10), (0, 1, 1), (1, 2, 1), (2, 3, 1)]);
+        assert_eq!(
+            run_driver(&problem, 100, false, 8),
+            Some((3, Cost { gas: 3, bytes: 0 }))
+        );
+    }
+
+    #[test]
+    fn driver_expansion_and_state_limits() {
+        let expansions = Cell::new(0);
+        let mut problem = driver_problem(1, &[(0, 1, 1)]);
+        problem.expansions = Some(&expansions);
+        assert_eq!(run_driver(&problem, 100, false, 0), None);
+        assert_eq!(expansions.get(), 0);
+
+        let problem = DriverProblem {
+            goal: 1,
+            edges: &[(0, 1, 1)],
+            max_states: [64, 0],
+            expansions: None,
+        };
+        assert_eq!(run_driver(&problem, 100, true, 8), None);
+    }
+
     #[test]
     fn packed_state_roundtrip_ops_and_layout() {
         assert_eq!(std::mem::size_of::<PackedState>(), 16);
         assert_eq!(std::mem::size_of::<PrepState>(), 32);
-        assert_eq!(std::mem::size_of::<QueueEntry>(), 32);
-        assert_eq!(std::mem::size_of::<PrepQueueEntry>(), 48);
+        assert_eq!(std::mem::size_of::<SearchQueueEntry<PackedState>>(), 32);
+        assert_eq!(std::mem::size_of::<SearchQueueEntry<PrepState>>(), 48);
 
         assert_eq!(PackedState::from_ids(&[]), Some(PackedState::EMPTY));
         assert_eq!(PackedState::EMPTY.len(), 0);
@@ -4424,6 +4525,75 @@ mod tests {
         assert_eq!(packed_state_ids(state.push_truncated(4, 3)), [4, 1, 2]);
         assert_eq!(packed_state_ids(state.push_truncated(4, 5)), [4, 1, 2, 3]);
         assert!(PackedState::from_ids(&[63]).unwrap() < PackedState::from_ids(&[0, 0]).unwrap());
+    }
+
+    #[test]
+    fn star_swap_plan_is_minimal_for_interchangeable_keys() {
+        for len in 1..=6u32 {
+            for code in 0..3usize.pow(len) {
+                let start: Vec<u8> = (0..len)
+                    .map(|idx| (code / 3usize.pow(idx) % 3) as u8)
+                    .collect();
+                let mut dist: FxHashMap<Vec<u8>, usize> = FxHashMap::default();
+                dist.insert(start.clone(), 0);
+                let mut queue = VecDeque::from([start.clone()]);
+                while let Some(cur) = queue.pop_front() {
+                    let d = dist[&cur];
+                    for depth in 1..cur.len() {
+                        let mut next = cur.clone();
+                        next.swap(0, depth);
+                        dist.entry(next.clone()).or_insert_with(|| {
+                            queue.push_back(next);
+                            d + 1
+                        });
+                    }
+                }
+
+                for (goal, &want) in &dist {
+                    let mut cur = start.clone();
+                    let steps = build_star_swap_plan(&mut cur, goal, 17)
+                        .unwrap_or_else(|| panic!("no plan for {start:?} -> {goal:?}"));
+                    assert_eq!(&cur, goal);
+                    assert_eq!(steps.len(), want, "{start:?} -> {goal:?}: {steps:?}");
+                }
+            }
+        }
+
+        // Two duplicate pairings close separate cycles; routing both through one tour saves a swap.
+        let mut cur = vec![0, 1, 2, 1, 3];
+        let steps = build_star_swap_plan(&mut cur, &[0, 2, 1, 3, 1], 17).unwrap();
+        assert_eq!(steps.len(), 5);
+
+        let mut cur = vec![0, 1, 2, 3];
+        assert!(build_star_swap_plan(&mut cur, &[0, 2, 1, 3], 2).is_none());
+        let mut cur = vec![1, 0, 2, 3];
+        assert_eq!(
+            build_star_swap_plan(&mut cur, &[0, 1, 2, 3], 2).as_deref(),
+            Some(&[Step::Swap(1)][..])
+        );
+    }
+
+    #[test]
+    fn operand_prep_heuristic_lets_a_load_satisfy_preservation() {
+        with_stackify_ctx!(16, |func, ctx| {
+            let x = func.dfg.make_undef_value(Type::I256);
+            let y = func.dfg.make_undef_value(Type::I256);
+        } {
+            let cost = EstimatedCostModel::default();
+            let cfg = default_search_cfg(&ctx, 0);
+            let key_infos = [KeyInfo::Val { vid: x }, KeyInfo::Val { vid: y }];
+            let costs = OperandPrepCostTable::new(&cost, &key_infos, cfg).unwrap();
+            let goal_counts = compute_goal_counts(&[0, 1]);
+            let heuristic = |state| {
+                heuristic_operand_prep(state, &goal_counts, 0b11, 0b11, 0b11, costs.min_dup_gas, &costs)
+            };
+
+            // `LoadVal(y); LoadVal(x)` reaches the goal for 30 gas: each load also preserves
+            // its value in memory, so no extra stack copy is owed.
+            assert_eq!(heuristic(prep_state(&[], 0, 0)).gas, 30);
+            // A window copy is reused by `DUP`, so the preserve copy is still owed.
+            assert_eq!(heuristic(prep_state(&[0], 0, 0)).gas, 3 + 15);
+        });
     }
 
     #[test]
@@ -4449,7 +4619,7 @@ mod tests {
         state: PackedState,
         g: Cost,
         best: &mut FxHashMap<PackedState, Cost>,
-        open: &mut BinaryHeap<QueueEntry>,
+        open: &mut BinaryHeap<SearchQueueEntry<PackedState>>,
     ) {
         let should_update = match best.get(&state) {
             None => true,
@@ -4460,7 +4630,7 @@ mod tests {
         }
 
         best.insert(state, g);
-        open.push(QueueEntry { f: g, g, state });
+        open.push(SearchQueueEntry { f: g, g, state });
     }
 
     fn brute_force_optimal_cost(
@@ -4475,8 +4645,8 @@ mod tests {
         let mut best: FxHashMap<PackedState, Cost> = FxHashMap::default();
         best.insert(start, Cost::default());
 
-        let mut open: BinaryHeap<QueueEntry> = BinaryHeap::new();
-        open.push(QueueEntry {
+        let mut open: BinaryHeap<SearchQueueEntry<PackedState>> = BinaryHeap::new();
+        open.push(SearchQueueEntry {
             f: Cost::default(),
             g: Cost::default(),
             state: start,
@@ -4665,48 +4835,16 @@ mod tests {
 
     #[test]
     fn immediate_reuse_across_value_ids() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let v0 = func.dfg.make_imm_value(Immediate::I8(0));
             let v1 = func.dfg.make_imm_value(Immediate::I256(I256::zero()));
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(v0);
             let desired = [v1];
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
+            let search_cfg = default_search_cfg(&ctx, 50_000);
 
             let plan = solve_test_optimal_normalize_plan(&ctx, &stack, &desired, &cost, search_cfg)
                 .expect("no plan");
@@ -4717,73 +4855,24 @@ func public %f() {
             );
 
             let mut replayed = stack.clone();
-            for (depth, &want) in desired.iter().enumerate() {
-                if ctx.func.dfg.value_is_imm(want) {
-                    let want_imm = ctx.func.dfg.value_imm(want).unwrap().as_i256();
-                    let StackItem::Value(cur) = *replayed.item_at(depth).unwrap() else {
-                        panic!("expected value on stack");
-                    };
-                    let cur_imm = ctx.func.dfg.value_imm(cur).unwrap().as_i256();
-                    assert_eq!(cur_imm, want_imm, "canonical immediate mismatch");
-                    replayed.rename_value_at_depth(depth, want);
-                }
-            }
-
+            rename_immediate_stack_values(&ctx, &mut replayed, &desired);
             assert!(stack_matches_exact(&replayed, &desired));
         });
     }
 
     #[test]
     fn repair_solver_can_dup_from_frozen_suffix_on_long_stacks() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             // Build a long stack with a large shared suffix and a small repair region:
             //   start:  [p0..p4, s0..s24]
             //   goal:   [s0, p0..p4, s0..s24]
             // where the shared suffix is [s0..s24] (25 items) and the repair region is <= SWAP17.
-            let mut prefix: Vec<ValueId> = Vec::new();
-            for _ in 0..5 {
-                prefix.push(func.dfg.make_undef_value(sonatina_ir::Type::I256));
-            }
-
-            let mut suffix: Vec<ValueId> = Vec::new();
-            for _ in 0..25 {
-                suffix.push(func.dfg.make_undef_value(sonatina_ir::Type::I256));
-            }
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+            let prefix = make_undefs(func, 5);
+            let suffix = make_undefs(func, 25);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
-            for &v in suffix.iter().rev() {
-                stack.push_value(v);
-            }
-            for &v in prefix.iter().rev() {
-                stack.push_value(v);
-            }
+            push_values(&mut stack, &suffix);
+            push_values(&mut stack, &prefix);
 
             let mut desired: Vec<ValueId> = Vec::new();
             desired.push(suffix[0]);
@@ -4803,12 +4892,7 @@ func public %f() {
             );
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
+            let search_cfg = default_search_cfg(&ctx, 50_000);
 
             let plan = solve_test_optimal_repair_normalize_plan(
                 &ctx,
@@ -4839,47 +4923,15 @@ func public %f() {
 
     #[test]
     fn repair_greedy_builder_inserts_missing_keys_from_goal_suffix() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let top = func.dfg.make_imm_value(Immediate::I8(9));
             let bottom = func.dfg.make_imm_value(Immediate::I8(7));
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let stack = SymStack::entry_stack(func, false);
             let desired = [top, bottom];
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 0,
-            };
+            let search_cfg = default_search_cfg(&ctx, 0);
 
             let plan = solve_test_optimal_repair_prefix_plan(
                 &ctx,
@@ -4919,37 +4971,10 @@ func public %f() {
 
     #[test]
     fn repair_greedy_builder_keeps_costly_goal_key_accessible_while_trimming() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
-            let a = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let b = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        with_stackify_ctx!(16, |func, ctx| {
+            let a = func.dfg.make_undef_value(Type::I256);
+            let b = func.dfg.make_undef_value(Type::I256);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(a);
             stack.push_value(b);
@@ -4966,17 +4991,27 @@ func public %f() {
                 max_expansions: 0,
             };
 
-            let plan =
-                solve_test_optimal_repair_prefix_plan(&ctx, &stack, &desired, 0, &cost, search_cfg)
-                    .expect("expected greedy repair plan");
-
+            let key_infos: KeyInfos = smallvec![KeyInfo::Val { vid: a }, KeyInfo::Val { vid: b }];
+            let greedy = build_greedy_repair_prefix_upper_bound(
+                &[0, 1, 1, 0],
+                &[0],
+                &[],
+                &key_infos,
+                &cost,
+                search_cfg,
+            )
+            .expect("expected greedy repair plan");
             assert!(
-                matches!(plan.steps.first(), Some(Step::Swap(1)))
-                    && matches!(plan.steps.get(1), Some(Step::Pop)),
-                "expected trim to remove the cheap surplus before popping the goal key: {:?}",
-                plan.steps
+                matches!(greedy.first(), Some(Step::Swap(1)))
+                    && matches!(greedy.get(1), Some(Step::Pop)),
+                "expected trim to remove the cheap surplus before popping the goal key: {greedy:?}"
             );
 
+            // Popping all three slots above the bottom `a` is cheaper still.
+            let plan =
+                solve_test_optimal_repair_prefix_plan(&ctx, &stack, &desired, 0, &cost, search_cfg)
+                    .expect("expected repair plan");
+            assert_eq!(plan.steps.as_slice(), [Step::Pop; 3]);
             let replayed = replay_plan(&stack, &plan);
             assert!(stack_matches_exact(&replayed, &desired));
         });
@@ -4984,51 +5019,13 @@ func public %f() {
 
     #[test]
     fn repair_greedy_builder_can_dup_from_frozen_suffix_when_search_budget_is_zero() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
-            let mut prefix: Vec<ValueId> = Vec::new();
-            for _ in 0..5 {
-                prefix.push(func.dfg.make_undef_value(sonatina_ir::Type::I256));
-            }
-
-            let mut suffix: Vec<ValueId> = Vec::new();
-            for _ in 0..25 {
-                suffix.push(func.dfg.make_undef_value(sonatina_ir::Type::I256));
-            }
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        with_stackify_ctx!(16, |func, ctx| {
+            let prefix = make_undefs(func, 5);
+            let suffix = make_undefs(func, 25);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
-            for &v in suffix.iter().rev() {
-                stack.push_value(v);
-            }
-            for &v in prefix.iter().rev() {
-                stack.push_value(v);
-            }
+            push_values(&mut stack, &suffix);
+            push_values(&mut stack, &prefix);
 
             let mut desired: Vec<ValueId> = Vec::new();
             desired.push(suffix[0]);
@@ -5036,12 +5033,7 @@ func public %f() {
             desired.extend(suffix.iter().copied());
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 0,
-            };
+            let search_cfg = default_search_cfg(&ctx, 0);
 
             let plan = solve_test_optimal_repair_normalize_plan(
                 &ctx,
@@ -5074,48 +5066,16 @@ func public %f() {
 
     #[test]
     fn repair_greedy_builder_uses_swap_dup_for_deep_repair_source() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
-            let extra = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let mut mids: Vec<ValueId> = Vec::new();
-            for _ in 0..15 {
-                mids.push(func.dfg.make_undef_value(sonatina_ir::Type::I256));
-            }
-            let target = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let suffix = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        with_stackify_ctx!(16, |func, ctx| {
+            let extra = func.dfg.make_undef_value(Type::I256);
+            let mids = make_undefs(func, 15);
+            let target = func.dfg.make_undef_value(Type::I256);
+            let suffix = func.dfg.make_undef_value(Type::I256);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(suffix);
             stack.push_value(target);
-            for &v in mids.iter().rev() {
-                stack.push_value(v);
-            }
+            push_values(&mut stack, &mids);
             stack.push_value(extra);
 
             let mut desired_prefix = Vec::with_capacity(17);
@@ -5167,40 +5127,13 @@ func public %f() {
 
     #[test]
     fn repair_greedy_builder_materializes_only_true_deficits() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
-            let extra = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let keep = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let reuse = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let suffix_tail = func.dfg.make_undef_value(sonatina_ir::Type::I256);
+        with_stackify_ctx!(16, |func, ctx| {
+            let extra = func.dfg.make_undef_value(Type::I256);
+            let keep = func.dfg.make_undef_value(Type::I256);
+            let reuse = func.dfg.make_undef_value(Type::I256);
+            let suffix_tail = func.dfg.make_undef_value(Type::I256);
             let missing = func.dfg.make_imm_value(Immediate::I8(7));
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(suffix_tail);
             stack.push_value(reuse);
@@ -5211,12 +5144,7 @@ func public %f() {
             let desired_full = [missing, reuse, keep, reuse, suffix_tail];
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 0,
-            };
+            let search_cfg = default_search_cfg(&ctx, 0);
 
             let plan = solve_test_optimal_repair_prefix_plan(
                 &ctx,
@@ -5259,40 +5187,13 @@ func public %f() {
 
     #[test]
     fn repair_greedy_builder_preserves_frozen_suffix() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
-            let extra = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let keep = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let suffix0 = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let suffix1 = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let suffix2 = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        with_stackify_ctx!(16, |func, ctx| {
+            let extra = func.dfg.make_undef_value(Type::I256);
+            let keep = func.dfg.make_undef_value(Type::I256);
+            let suffix0 = func.dfg.make_undef_value(Type::I256);
+            let suffix1 = func.dfg.make_undef_value(Type::I256);
+            let suffix2 = func.dfg.make_undef_value(Type::I256);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(suffix2);
             stack.push_value(suffix1);
@@ -5304,12 +5205,7 @@ func public %f() {
             let desired_full = [suffix1, keep, suffix0, suffix1, suffix2];
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 0,
-            };
+            let search_cfg = default_search_cfg(&ctx, 0);
 
             let plan = solve_test_optimal_repair_prefix_plan(
                 &ctx,
@@ -5336,46 +5232,14 @@ func public %f() {
 
     #[test]
     fn solver_returns_push_plan_even_when_equal_to_flush_upper_bound() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let imm1 = func.dfg.make_imm_value(Immediate::I8(1));
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let stack = SymStack::entry_stack(func, false);
             let desired = [imm1];
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
+            let search_cfg = default_search_cfg(&ctx, 50_000);
 
             let plan = solve_test_optimal_normalize_plan(&ctx, &stack, &desired, &cost, search_cfg)
                 .expect("expected push plan");
@@ -5389,49 +5253,17 @@ func public %f() {
 
     #[test]
     fn solver_returns_push0_plan_when_optimal_equals_flush_upper_bound() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let v0 = func.dfg.make_imm_value(Immediate::I8(0));
             let v1 = func.dfg.make_imm_value(Immediate::I256(I256::zero()));
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(v0);
 
             let desired = [v1, v0];
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
+            let search_cfg = default_search_cfg(&ctx, 50_000);
 
             let plan = solve_test_optimal_normalize_plan(&ctx, &stack, &desired, &cost, search_cfg)
                 .expect("expected push0 plan");
@@ -5442,101 +5274,26 @@ func public %f() {
             );
 
             // Replay the plan and apply the immediate renaming contract to validate exactness.
-            let mut replayed = stack.clone();
-            let mut actions = crate::stackalloc::Actions::new();
-            for &step in &plan.steps {
-                match step {
-                    Step::Pop => replayed.pop(&mut actions),
-                    Step::Swap(d) => replayed.swap(d as usize, &mut actions),
-                    Step::Dup(p) => replayed.dup(p as usize, &mut actions),
-                    Step::PushImm(kid) => {
-                        let KeyInfo::Imm {
-                            rep_vid, rep_imm, ..
-                        } = plan.key_infos[kid as usize]
-                        else {
-                            panic!("expected imm key info");
-                        };
-                        replayed.push_imm(rep_vid, rep_imm, &mut actions);
-                    }
-                    Step::LoadVal(_) => panic!("unexpected load"),
-                }
-            }
-
-            for (depth, &want) in desired.iter().enumerate() {
-                if ctx.func.dfg.value_is_imm(want) {
-                    let want_imm = ctx.func.dfg.value_imm(want).unwrap().as_i256();
-                    let StackItem::Value(cur) = *replayed.item_at(depth).unwrap() else {
-                        panic!("expected value on stack");
-                    };
-                    let cur_imm = ctx.func.dfg.value_imm(cur).unwrap().as_i256();
-                    assert_eq!(cur_imm, want_imm, "canonical immediate mismatch");
-                    replayed.rename_value_at_depth(depth, want);
-                }
-            }
-
+            let mut replayed = replay_plan(&stack, &plan);
+            rename_immediate_stack_values(&ctx, &mut replayed, &desired);
             assert!(stack_matches_exact(&replayed, &desired));
         });
     }
 
     #[test]
     fn dup_pop_preferred_over_load_when_expensive() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
-            let x = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let y = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(
-                func,
-                &cfg,
-                &dom,
-                &liveness,
-                entry,
-                scc,
-                reach,
-            );
-
+        with_stackify_ctx!(16, |func, ctx| {
+            let x = func.dfg.make_undef_value(Type::I256);
+            let y = func.dfg.make_undef_value(Type::I256);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(y);
             stack.push_value(x); // [x, y]
 
             let desired = [x, x];
 
-            let cost = EstimatedCostModel {
-                load_cost: Cost {
-                    gas: 1_000,
-                    bytes: 1_000,
-                },
-            };
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
+            let cost = expensive_load_cost();
+            let search_cfg = default_search_cfg(&ctx, 50_000);
 
             let plan =
                 solve_test_optimal_normalize_plan(&ctx, &stack, &desired, &cost, search_cfg)
@@ -5552,8 +5309,11 @@ func public %f() {
                 plan.steps
             );
             assert!(
-                !plan.steps.iter().any(|s| matches!(s, Step::LoadVal(_))),
-                "expected plan to avoid LOAD: {:?}",
+                !plan
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s, Step::PushImm(_) | Step::LoadVal(_))),
+                "expected plan to avoid materialization: {:?}",
                 plan.steps
             );
 
@@ -5561,83 +5321,60 @@ func public %f() {
                 .cost_load(x)
                 .saturating_add(cost.cost_swap(2))
                 .saturating_add(cost.cost_pop());
-            let plan_cost = plan.steps.iter().fold(Cost::default(), |acc, step| {
-                let c = match *step {
-                    Step::Pop => cost.cost_pop(),
-                    Step::Dup(pos) => cost.cost_dup(pos),
-                    Step::Swap(depth) => cost.cost_swap(depth),
-                    Step::PushImm(kid) => {
-                        let KeyInfo::Imm { canon, .. } = plan.key_infos[kid as usize] else {
-                            panic!("expected imm key info");
-                        };
-                        cost.cost_push_imm(canon)
-                    }
-                    Step::LoadVal(kid) => {
-                        let KeyInfo::Val { vid } = plan.key_infos[kid as usize] else {
-                            panic!("expected val key info");
-                        };
-                        cost.cost_load(vid)
-                    }
-                };
-                acc.saturating_add(c)
-            });
-
+            let plan_cost = cost_for_steps(&plan.steps, &plan.key_infos, &cost);
             assert!(
                 plan_cost < load_plan_cost,
                 "expected dup/pop plan to beat load plan: plan={plan_cost:?} load={load_plan_cost:?}"
             );
 
-            let mut replayed = stack.clone();
-            let mut actions = crate::stackalloc::Actions::new();
-            for &step in &plan.steps {
-                match step {
-                    Step::Pop => replayed.pop(&mut actions),
-                    Step::Swap(d) => replayed.swap(d as usize, &mut actions),
-                    Step::Dup(p) => replayed.dup(p as usize, &mut actions),
-                    Step::PushImm(_) | Step::LoadVal(_) => {
-                        panic!("unexpected materialization step: {step:?}");
-                    }
-                }
-            }
+            let replayed = replay_plan(&stack, &plan);
+            assert!(stack_matches_exact(&replayed, &desired));
+        });
+    }
 
+    #[test]
+    fn normalize_incumbent_materializes_missing_keys_before_routing() {
+        with_stackify_ctx!(16, |func, ctx| {
+            let vals = make_undefs(func, 5);
+            let imms = [
+                func.dfg.make_imm_value(Immediate::I8(2)),
+                func.dfg.make_imm_value(Immediate::I8(4)),
+                func.dfg.make_imm_value(Immediate::I8(6)),
+            ];
+        } {
+            let mut stack = SymStack::entry_stack(func, false);
+            push_values(&mut stack, &[vals[0], vals[2], vals[4], vals[1], vals[3]]);
+            let desired = [
+                vals[0], vals[1], imms[0], vals[2], imms[1], vals[3], imms[2], vals[4],
+            ];
+
+            let cost = EstimatedCostModel::default();
+            let plan = solve_test_optimal_normalize_plan(
+                &ctx,
+                &stack,
+                &desired,
+                &cost,
+                default_search_cfg(&ctx, 0),
+            )
+            .expect("expected constructive plan without search");
+            assert!(
+                cost_for_steps(&plan.steps, &plan.key_infos, &cost)
+                    < estimate_flush_rebuild_cost(&ctx, &stack, &desired, &cost)
+            );
+
+            let mut replayed = replay_plan(&stack, &plan);
+            rename_immediate_stack_values(&ctx, &mut replayed, &desired);
             assert!(stack_matches_exact(&replayed, &desired));
         });
     }
 
     #[test]
     fn permutation_only_sanity() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
-            let a = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let b = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let c = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        with_stackify_ctx!(16, |func, ctx| {
+            let a = func.dfg.make_undef_value(Type::I256);
+            let b = func.dfg.make_undef_value(Type::I256);
+            let c = func.dfg.make_undef_value(Type::I256);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(c);
             stack.push_value(b);
@@ -5646,88 +5383,36 @@ func public %f() {
             let desired = [b, a, c];
 
             let cost = EstimatedCostModel::default();
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
+            let search_cfg = default_search_cfg(&ctx, 50_000);
 
             let plan = solve_test_optimal_normalize_plan(&ctx, &stack, &desired, &cost, search_cfg)
                 .expect("no plan");
             assert!(
-                !plan.steps.iter().any(|s| matches!(s, Step::LoadVal(_))),
-                "expected no loads for permutation: {:?}",
+                !plan
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s, Step::PushImm(_) | Step::LoadVal(_))),
+                "expected no materialization for permutation: {:?}",
                 plan.steps
             );
 
-            let mut replayed = stack.clone();
-            let mut actions = crate::stackalloc::Actions::new();
-            for &step in &plan.steps {
-                match step {
-                    Step::Pop => replayed.pop(&mut actions),
-                    Step::Swap(d) => replayed.swap(d as usize, &mut actions),
-                    Step::Dup(p) => replayed.dup(p as usize, &mut actions),
-                    Step::PushImm(_) | Step::LoadVal(_) => {
-                        panic!("unexpected materialization step: {step:?}");
-                    }
-                }
-            }
-
+            let replayed = replay_plan(&stack, &plan);
             assert!(stack_matches_exact(&replayed, &desired));
         });
     }
 
     #[test]
     fn regression_harness_random_small_stacks() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-    block0:
-        return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let imm0_a = func.dfg.make_imm_value(Immediate::I8(0));
             let imm0_b = func.dfg.make_imm_value(Immediate::I256(I256::zero()));
             let imm1 = func.dfg.make_imm_value(Immediate::I8(1));
             let imm_neg1 = func.dfg.make_imm_value(Immediate::I8(-1));
-
-            let a = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let b = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let c = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-            let d = func.dfg.make_undef_value(sonatina_ir::Type::I256);
-
-            let pool: [ValueId; 8] = [imm0_a, imm0_b, imm1, imm_neg1, a, b, c, d];
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(
-                func,
-                &cfg,
-                &dom,
-                &liveness,
-                entry,
-                scc,
-                reach,
-            );
-
+            let undef = make_undefs(func, 4);
+            let pool: [ValueId; 8] = [
+                imm0_a, imm0_b, imm1, imm_neg1, undef[0], undef[1], undef[2], undef[3],
+            ];
+        } {
             struct Rng(u64);
             impl Rng {
                 fn next_u32(&mut self) -> u32 {
@@ -5769,9 +5454,7 @@ func public %f() {
                 }
 
                 let mut stack = SymStack::entry_stack(ctx.func, false);
-                for &v in start_vals.iter().rev() {
-                    stack.push_value(v);
-                }
+                push_values(&mut stack, &start_vals);
 
                 let flush_cost = estimate_flush_rebuild_cost(&ctx, &stack, &desired, &cost);
                 let plan =
@@ -5846,64 +5529,18 @@ func public %f() {
 
     #[test]
     fn operand_prep_effective_window_shrinks_materialize_only_query() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-block0:
-    return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let args = [
                 func.dfg.make_imm_value(Immediate::I8(1)),
                 func.dfg.make_imm_value(Immediate::I8(2)),
             ];
-            let unrelated: Vec<ValueId> = (0..20)
-                .map(|_| func.dfg.make_undef_value(Type::I256))
-                .collect();
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+            let unrelated = make_undefs(func, 20);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
-            for &value in unrelated.iter().rev() {
-                stack.push_value(value);
-            }
+            push_values(&mut stack, &unrelated);
 
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 0,
-            };
-            let problem = build_operand_prep_problem(
-                &ctx,
-                &stack,
-                &args,
-                OperandPrepConstraints {
-                    consume_last_use: &BitSet::default(),
-                    cache_preserve: &BitSet::default(),
-                },
-                search_cfg,
-            )
-            .expect("expected operand-prep problem");
+            let search_cfg = default_search_cfg(&ctx, 0);
+            let problem = build_test_operand_prep_problem(&ctx, &stack, &args, search_cfg);
 
             assert_eq!(problem.start_state.window.len(), args.len());
             assert_eq!(problem.max_len, args.len());
@@ -5927,65 +5564,19 @@ block0:
 
     #[test]
     fn operand_prep_effective_window_uses_tail_for_deep_preserve_copy() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-block0:
-    return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let x = func.dfg.make_undef_value(Type::I256);
             let imm = func.dfg.make_imm_value(Immediate::I8(7));
-            let filler: Vec<ValueId> = (0..10)
-                .map(|_| func.dfg.make_undef_value(Type::I256))
-                .collect();
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+            let filler = make_undefs(func, 10);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(x);
-            for &value in filler.iter().rev() {
-                stack.push_value(value);
-            }
+            push_values(&mut stack, &filler);
             stack.push_value(x);
 
             let args = [x, imm];
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 0,
-            };
-            let problem = build_operand_prep_problem(
-                &ctx,
-                &stack,
-                &args,
-                OperandPrepConstraints {
-                    consume_last_use: &BitSet::default(),
-                    cache_preserve: &BitSet::default(),
-                },
-                search_cfg,
-            )
-            .expect("expected operand-prep problem");
+            let search_cfg = default_search_cfg(&ctx, 0);
+            let problem = build_test_operand_prep_problem(&ctx, &stack, &args, search_cfg);
 
             assert_eq!(problem.start_state.window.len(), args.len());
             assert_eq!(problem.max_len, args.len() * 2);
@@ -5999,74 +5590,23 @@ block0:
 
     #[test]
     fn operand_prep_effective_window_keeps_deep_operand_source() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-block0:
-    return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let x = func.dfg.make_undef_value(Type::I256);
             let imm = func.dfg.make_imm_value(Immediate::I8(9));
-            let filler: Vec<ValueId> = (0..15)
-                .map(|_| func.dfg.make_undef_value(Type::I256))
-                .collect();
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+            let filler = make_undefs(func, 15);
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(x);
-            for &value in filler.iter().rev() {
-                stack.push_value(value);
-            }
+            push_values(&mut stack, &filler);
 
             let args = [imm, x];
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
-            let problem = build_operand_prep_problem(
-                &ctx,
-                &stack,
-                &args,
-                OperandPrepConstraints {
-                    consume_last_use: &BitSet::default(),
-                    cache_preserve: &BitSet::default(),
-                },
-                search_cfg,
-            )
-            .expect("expected operand-prep problem");
+            let search_cfg = default_search_cfg(&ctx, 50_000);
+            let problem = build_test_operand_prep_problem(&ctx, &stack, &args, search_cfg);
 
             assert_eq!(problem.start_state.window.len(), 16);
             assert_eq!(problem.max_len, ctx.reach.swap_max);
 
-            let cost = EstimatedCostModel {
-                load_cost: Cost {
-                    gas: 1_000,
-                    bytes: 1_000,
-                },
-            };
+            let cost = expensive_load_cost();
             let plan = solve_test_optimal_operand_prep_plan(
                 &ctx,
                 &stack,
@@ -6095,62 +5635,20 @@ block0:
 
     #[test]
     fn operand_prep_anonymizes_ignored_values_in_effective_window() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-block0:
-    return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let x = func.dfg.make_undef_value(Type::I256);
             let ignored_a = func.dfg.make_undef_value(Type::I256);
             let ignored_b = func.dfg.make_undef_value(Type::I256);
             let ignored_c = func.dfg.make_undef_value(Type::I256);
             let ignored_d = func.dfg.make_undef_value(Type::I256);
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
-
+        } {
+            let search_cfg = default_search_cfg(&ctx, 50_000);
             let build_problem = |top: ValueId, mid: ValueId| {
                 let mut stack = SymStack::entry_stack(func, false);
                 stack.push_value(x);
                 stack.push_value(mid);
                 stack.push_value(top);
-                build_operand_prep_problem(
-                    &ctx,
-                    &stack,
-                    &[x],
-                    OperandPrepConstraints {
-                        consume_last_use: &BitSet::default(),
-                        cache_preserve: &BitSet::default(),
-                    },
-                    search_cfg,
-                )
-                .expect("expected operand-prep problem")
+                build_test_operand_prep_problem(&ctx, &stack, &[x], search_cfg)
             };
 
             let lhs = build_problem(ignored_a, ignored_b);
@@ -6159,8 +5657,8 @@ block0:
 
             assert_eq!(ids.len(), 3);
             assert_eq!(lhs.start_state.window, rhs.start_state.window);
-            assert_eq!(lhs.key_infos.len(), 3);
-            assert_ne!(ids[0], ids[1]);
+            assert_eq!(lhs.key_infos.len(), 2);
+            assert_eq!(ids[0], ids[1]);
             assert_ne!(ids[0], ids[2]);
             assert!(matches!(lhs.key_infos[ids[0] as usize], KeyInfo::Ignored));
             assert!(matches!(lhs.key_infos[ids[1] as usize], KeyInfo::Ignored));
@@ -6175,70 +5673,23 @@ block0:
 
     #[test]
     fn operand_prep_duplicate_non_last_use_keeps_operand_and_preserve_copies() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-block0:
-    return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let x = func.dfg.make_undef_value(Type::I256);
             let filler = func.dfg.make_undef_value(Type::I256);
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let mut stack = SymStack::entry_stack(func, false);
             stack.push_value(x);
             stack.push_value(filler);
             stack.push_value(x);
 
             let args = [x, x];
-            let search_cfg = SearchCfg {
-                dup_max: ctx.reach.dup_max,
-                swap_max: ctx.reach.swap_max,
-                max_len: ctx.reach.swap_max,
-                max_expansions: 50_000,
-            };
-            let problem = build_operand_prep_problem(
-                &ctx,
-                &stack,
-                &args,
-                OperandPrepConstraints {
-                    consume_last_use: &BitSet::default(),
-                    cache_preserve: &BitSet::default(),
-                },
-                search_cfg,
-            )
-            .expect("expected operand-prep problem");
+            let search_cfg = default_search_cfg(&ctx, 50_000);
+            let problem = build_test_operand_prep_problem(&ctx, &stack, &args, search_cfg);
 
             assert_eq!(problem.start_state.window.len(), 3);
             assert_eq!(problem.max_len, 5);
 
-            let cost = EstimatedCostModel {
-                load_cost: Cost {
-                    gas: 1_000,
-                    bytes: 1_000,
-                },
-            };
+            let cost = expensive_load_cost();
             let plan = solve_test_optimal_operand_prep_plan(
                 &ctx,
                 &stack,
@@ -6265,46 +5716,15 @@ block0:
 
     #[test]
     fn operand_prep_greedy_upper_bound_beats_linear_on_high_arity_last_use_shuffle() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-block0:
-    return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
-            let values: Vec<ValueId> = (0..9)
-                .map(|_| func.dfg.make_undef_value(Type::I256))
-                .collect();
+        with_stackify_ctx!(4, |func, ctx| {
+            let values = make_undefs(func, 9);
             let args: Vec<ValueId> = values[..8].to_vec();
             let start_vals = [
                 args[6], args[5], args[4], args[3], values[8], args[1], args[0], args[7],
             ];
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(4);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let mut stack = SymStack::entry_stack(func, false);
-            for &v in start_vals.iter().rev() {
-                stack.push_value(v);
-            }
+            push_values(&mut stack, &start_vals);
 
             let mut consume_last_use = BitSet::default();
             for &arg in &args {
@@ -6339,9 +5759,11 @@ block0:
                     &cost,
                     search_cfg,
                     linear_cost,
-                    ctx.search_profile.operand_prep_beam_width(),
+                    ctx.search_profile.budgets().operand_prep_beam_width,
                     ctx.search_profile
-                        .operand_prep_beam_depth_slack(search_cfg.swap_max),
+                        .budgets()
+                        .operand_prep_beam_depth_slack
+                        .resolve(search_cfg.swap_max),
                 )
                     .expect("expected greedy incumbent");
             assert!(
@@ -6366,38 +5788,46 @@ block0:
     }
 
     #[test]
+    fn operand_prep_routes_last_use_permutation_with_minimal_swaps() {
+        with_stackify_ctx!(16, |func, ctx| {
+            let args = make_undefs(func, 16);
+            let order = [14, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 13];
+            let start_vals: Vec<ValueId> = order.iter().map(|&idx| args[idx]).collect();
+        } {
+            let mut stack = SymStack::entry_stack(func, false);
+            push_values(&mut stack, &start_vals);
+
+            let mut consume_last_use = BitSet::default();
+            for &arg in &args {
+                consume_last_use.insert(arg);
+            }
+
+            let plan = solve_test_optimal_operand_prep_plan(
+                &ctx,
+                &stack,
+                &args,
+                &consume_last_use,
+                &EstimatedCostModel::default(),
+                default_search_cfg(&ctx, 0),
+            )
+            .expect("expected operand-prep plan");
+
+            // One 4-cycle through the top and six 2-cycles among the other slots.
+            assert_eq!(plan.steps.len(), 3 + 6 * 3, "{:?}", plan.steps);
+            assert!(plan.steps.iter().all(|step| matches!(step, Step::Swap(_))));
+            let replayed = replay_plan(&stack, &plan);
+            for (depth, &arg) in args.iter().enumerate() {
+                assert_eq!(replayed.item_at(depth), Some(&StackItem::Value(arg)));
+            }
+        });
+    }
+
+    #[test]
     fn operand_prep_replay_failure_rolls_back_state() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-block0:
-    return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let imm1 = func.dfg.make_imm_value(Immediate::I8(1));
             let imm2 = func.dfg.make_imm_value(Immediate::I8(2));
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let spill_set = BitSet::default();
             let mut spill_requests = BitSet::default();
             let mut object_spill_requests = BitSet::default();
@@ -6405,17 +5835,15 @@ block0:
             let spill_obj = SecondaryMap::new();
             let mut free_slots = FreeSlotPools::default();
             let mut slots = SpillSlotPools::default();
-            let mem = MemPlan::new(
-                SpillSet::new(&spill_set),
-                &mut spill_requests,
-                &ctx,
-                &spill_obj,
-                &ctx.exact_local_addr,
-                &mut object_spill_requests,
-                &forced_object_spills,
-                &mut free_slots,
-                &mut slots,
-            );
+            let mut mem_state = MemState {
+                spill: SpillSet::new(&spill_set),
+                spill_obj: &spill_obj,
+                spill_requests: &mut spill_requests,
+                object_spill_requests: &mut object_spill_requests,
+                forced_object_spills: &forced_object_spills,
+                slots: &mut slots,
+            };
+            let mem = MemPlan::new(&mut mem_state, &ctx, &ctx.remat_actions, &mut free_slots);
 
             let mut stack = SymStack::entry_stack(func, false);
             let mut actions = crate::stackalloc::Actions::new();
@@ -6447,37 +5875,10 @@ block0:
 
     #[test]
     fn normalize_replay_failure_rolls_back_state() {
-        const SRC: &str = r#"
-target = "evm-ethereum-osaka"
-
-func public %f() {
-block0:
-    return;
-}
-"#;
-        let parsed = parse_module(SRC).unwrap();
-        let func_ref = parsed.debug.func_order[0];
-
-        parsed.module.func_store.modify(func_ref, |func| {
+        with_stackify_ctx!(16, |func, ctx| {
             let imm1 = func.dfg.make_imm_value(Immediate::I8(1));
             let imm2 = func.dfg.make_imm_value(Immediate::I8(2));
-
-            let mut cfg = ControlFlowGraph::new();
-            cfg.compute(func);
-            let entry = cfg.entry().expect("missing entry block");
-
-            let mut liveness = Liveness::new();
-            liveness.compute(func, &cfg);
-
-            let mut dom = DomTree::new();
-            dom.compute(&cfg);
-
-            let mut scc = CfgSccAnalysis::new();
-            scc.compute(&cfg);
-
-            let reach = StackifyReachability::new(16);
-            let ctx = build_stackify_test_context(func, &cfg, &dom, &liveness, entry, scc, reach);
-
+        } {
             let spill_set = BitSet::default();
             let mut spill_requests = BitSet::default();
             let mut object_spill_requests = BitSet::default();
@@ -6485,17 +5886,15 @@ block0:
             let spill_obj = SecondaryMap::new();
             let mut free_slots = FreeSlotPools::default();
             let mut slots = SpillSlotPools::default();
-            let mem = MemPlan::new(
-                SpillSet::new(&spill_set),
-                &mut spill_requests,
-                &ctx,
-                &spill_obj,
-                &ctx.exact_local_addr,
-                &mut object_spill_requests,
-                &forced_object_spills,
-                &mut free_slots,
-                &mut slots,
-            );
+            let mut mem_state = MemState {
+                spill: SpillSet::new(&spill_set),
+                spill_obj: &spill_obj,
+                spill_requests: &mut spill_requests,
+                object_spill_requests: &mut object_spill_requests,
+                forced_object_spills: &forced_object_spills,
+                slots: &mut slots,
+            };
+            let mem = MemPlan::new(&mut mem_state, &ctx, &ctx.remat_actions, &mut free_slots);
 
             let mut stack = SymStack::entry_stack(func, false);
             let mut actions = crate::stackalloc::Actions::new();

@@ -1,5 +1,5 @@
 use rustc_hash::{FxHashMap, FxHashSet};
-use sonatina_ir::{BlockId, Module, module::FuncRef};
+use sonatina_ir::{BlockId, Module, U256, module::FuncRef};
 
 use crate::machinst::{
     lower::{LoweredFunction, SectionCodeUnit},
@@ -7,18 +7,22 @@ use crate::machinst::{
 };
 
 use super::{
+    LateCleanupProfile,
+    emit::{dup_op, push_immediate_u256, push_op},
     is_plain_inst, is_push_opcode,
     late_block_merge::{
-        FixupKey, InstKey, block_insts, inst_estimated_size, inst_key, is_non_fallthrough_terminal,
-        layout_fallthrough_targets, replace_block_insts, sequence_summary,
+        FixupKey, InstKey, StackSummary, block_insts, inst_estimated_size, inst_key,
+        is_non_fallthrough_terminal, layout_fallthrough_targets, replace_block_insts,
+        sequence_summary,
     },
     opcode::OpCode,
-    referenced_insn_label_targets,
+    referenced_insn_label_targets, u256_to_be,
 };
 
 pub(super) fn run_late_section_terminal_outline(
     module: &Module,
     lowered: &mut [(FuncRef, LoweredFunction<OpCode>)],
+    profile: LateCleanupProfile,
 ) -> Vec<SectionCodeUnit<OpCode>> {
     let mut section_units = Vec::new();
     let mut helpers_by_key: FxHashMap<Vec<InstKey>, SectionCodeUnitId> = FxHashMap::default();
@@ -70,8 +74,19 @@ pub(super) fn run_late_section_terminal_outline(
         }
     }
 
+    run_parameterized_terminal_payload_outline(
+        lowered,
+        profile,
+        &mut section_units,
+        &mut next_helper_id,
+    );
+
     section_units
 }
+
+const MAX_PARAMETERIZED_PAYLOAD_PARAMS: usize = 4;
+const MIN_PARAMETERIZED_PAYLOAD_SAVINGS: isize = 1;
+const SECTION_HELPER_FIXUP_SIZE: usize = 5;
 
 #[derive(Clone)]
 struct TerminalOccurrence {
@@ -121,6 +136,94 @@ struct SectionUnlock {
     push: VCodeInst,
     has_trailing_iszero: bool,
     order_idx: usize,
+}
+
+#[derive(Clone)]
+struct LiteralSegment {
+    start: usize,
+    insts: Vec<VCodeInst>,
+    key: Vec<InstKey>,
+    estimated_size: usize,
+}
+
+#[derive(Clone)]
+struct PayloadStore {
+    value: LiteralSegment,
+    address: LiteralSegment,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PayloadSource {
+    Function(usize),
+    SectionUnit(usize),
+}
+
+impl PayloadSource {
+    fn vcode<'a>(
+        self,
+        lowered: &'a [(FuncRef, LoweredFunction<OpCode>)],
+        units: &'a [SectionCodeUnit<OpCode>],
+    ) -> &'a VCode<OpCode> {
+        match self {
+            Self::Function(idx) => &lowered[idx].1.vcode,
+            Self::SectionUnit(idx) => &units[idx].vcode,
+        }
+    }
+
+    fn vcode_mut<'a>(
+        self,
+        lowered: &'a mut [(FuncRef, LoweredFunction<OpCode>)],
+        units: &'a mut [SectionCodeUnit<OpCode>],
+    ) -> &'a mut VCode<OpCode> {
+        match self {
+            Self::Function(idx) => &mut lowered[idx].1.vcode,
+            Self::SectionUnit(idx) => &mut units[idx].vcode,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PayloadOccurrence {
+    source: PayloadSource,
+    block: BlockId,
+    order_idx: usize,
+    leading_jumpdest: Option<VCodeInst>,
+    stores: Vec<PayloadStore>,
+    terminal_len: LiteralSegment,
+    terminal_offset: LiteralSegment,
+    terminal_op: OpCode,
+    block_size: usize,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum PayloadAddresses {
+    Absolute {
+        terminal_offset: Vec<InstKey>,
+        stores: Vec<Vec<InstKey>>,
+    },
+    Relative(Vec<U256>),
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PayloadLayoutKey {
+    terminal_op: u8,
+    terminal_len: Vec<InstKey>,
+    addresses: PayloadAddresses,
+}
+
+struct PayloadGroupCandidate {
+    helper: SectionCodeUnit<OpCode>,
+    actions: Vec<PayloadRewriteAction>,
+    total_savings: isize,
+}
+
+#[derive(Clone)]
+struct PayloadRewriteAction {
+    source: PayloadSource,
+    block: BlockId,
+    order_idx: usize,
+    leading_jumpdest: Option<VCodeInst>,
+    param_values: Vec<LiteralSegment>,
 }
 
 struct FuncSectionAux {
@@ -240,6 +343,528 @@ fn build_func_aux(
             label_targets: referenced_insn_label_targets(&lowered.vcode),
         })
         .collect()
+}
+
+fn run_parameterized_terminal_payload_outline(
+    lowered: &mut [(FuncRef, LoweredFunction<OpCode>)],
+    profile: LateCleanupProfile,
+    section_units: &mut Vec<SectionCodeUnit<OpCode>>,
+    next_helper_id: &mut u32,
+) {
+    if profile == LateCleanupProfile::Off {
+        return;
+    }
+
+    while let Some(mut candidate) =
+        select_best_parameterized_payload_group(lowered, section_units, profile)
+    {
+        let helper_id = SectionCodeUnitId(*next_helper_id);
+        *next_helper_id = next_helper_id
+            .checked_add(1)
+            .expect("section helper id overflow");
+        candidate.helper.id = helper_id;
+        candidate.helper.name = format!("__evm_shared_tail_{}", helper_id.0);
+        section_units.push(candidate.helper);
+
+        candidate
+            .actions
+            .sort_by_key(|action| (action.source, action.order_idx));
+        for action in candidate.actions {
+            let vcode = action.source.vcode_mut(lowered, section_units);
+            rewrite_parameterized_payload_stub(vcode, action, helper_id);
+        }
+    }
+}
+
+fn select_best_parameterized_payload_group(
+    lowered: &[(FuncRef, LoweredFunction<OpCode>)],
+    section_units: &[SectionCodeUnit<OpCode>],
+    profile: LateCleanupProfile,
+) -> Option<PayloadGroupCandidate> {
+    let allow_return = profile == LateCleanupProfile::Size;
+    let mut occurrences_by_layout: FxHashMap<PayloadLayoutKey, Vec<PayloadOccurrence>> =
+        FxHashMap::default();
+
+    // Exact outlining runs first. Its helpers still contain stack-closed payloads
+    // and must participate in sharing, with their forwarding stub cost included.
+    let sources = lowered
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, function))| {
+            (
+                PayloadSource::Function(idx),
+                &function.vcode,
+                &function.block_order,
+            )
+        })
+        .chain(section_units.iter().enumerate().map(|(idx, unit)| {
+            (
+                PayloadSource::SectionUnit(idx),
+                &unit.vcode,
+                &unit.block_order,
+            )
+        }));
+    for (source, vcode, block_order) in sources {
+        let label_targets = referenced_insn_label_targets(vcode);
+        for (order_idx, &block) in block_order.iter().enumerate() {
+            if let Some(occurrence) = analyze_payload_occurrence(
+                source,
+                vcode,
+                block,
+                order_idx,
+                &label_targets,
+                allow_return,
+            ) {
+                if let Some(addresses) = relative_payload_addresses(&occurrence, vcode) {
+                    occurrences_by_layout
+                        .entry(PayloadLayoutKey {
+                            terminal_op: occurrence.terminal_op as u8,
+                            terminal_len: occurrence.terminal_len.key.clone(),
+                            addresses: PayloadAddresses::Relative(addresses),
+                        })
+                        .or_default()
+                        .push(occurrence.clone());
+                }
+                occurrences_by_layout
+                    .entry(payload_layout_key(&occurrence))
+                    .or_default()
+                    .push(occurrence);
+            }
+        }
+    }
+
+    occurrences_by_layout
+        .into_iter()
+        .filter_map(|(key, occurrences)| {
+            build_payload_group_candidate(occurrences, key.addresses, lowered, section_units)
+        })
+        .max_by(|a, b| a.total_savings.cmp(&b.total_savings))
+}
+
+fn build_payload_group_candidate(
+    occurrences: Vec<PayloadOccurrence>,
+    addresses: PayloadAddresses,
+    lowered: &[(FuncRef, LoweredFunction<OpCode>)],
+    section_units: &[SectionCodeUnit<OpCode>],
+) -> Option<PayloadGroupCandidate> {
+    if occurrences.len() < 2 {
+        return None;
+    }
+
+    let relative_offsets = match &addresses {
+        PayloadAddresses::Absolute { .. } => None,
+        PayloadAddresses::Relative(offsets) => {
+            if occurrences.iter().all(|occurrence| {
+                occurrence.terminal_offset.key == occurrences[0].terminal_offset.key
+            }) {
+                return None;
+            }
+            Some(offsets.as_slice())
+        }
+    };
+    let param_store_idxs = parameterized_store_indexes(&occurrences)?;
+    let param_count = param_store_idxs.len() + usize::from(relative_offsets.is_some());
+    if param_count == 0 || param_count > MAX_PARAMETERIZED_PAYLOAD_PARAMS {
+        return None;
+    }
+
+    let old_size = occurrences
+        .iter()
+        .map(|occurrence| occurrence.block_size)
+        .sum::<usize>();
+    let helper = build_parameterized_payload_helper(
+        SectionCodeUnitId(0),
+        &occurrences[0],
+        &param_store_idxs,
+        relative_offsets,
+        occurrences[0].source.vcode(lowered, section_units),
+    );
+    // Cost the actual helper instructions, including base duplication/offsets.
+    let helper_size = helper
+        .block_order
+        .iter()
+        .flat_map(|&block| block_insts(&helper.vcode, block))
+        .map(|inst| inst_estimated_size(&helper.vcode, inst))
+        .sum::<usize>();
+    let actions = occurrences
+        .iter()
+        .map(|occurrence| {
+            let mut param_values = param_store_idxs
+                .iter()
+                .map(|&idx| occurrence.stores[idx].value.clone())
+                .collect::<Vec<_>>();
+            if relative_offsets.is_some() {
+                // Stubs push in reverse: the base remains beneath every value parameter.
+                param_values.push(occurrence.terminal_offset.clone());
+            }
+            PayloadRewriteAction {
+                source: occurrence.source,
+                block: occurrence.block,
+                order_idx: occurrence.order_idx,
+                leading_jumpdest: occurrence.leading_jumpdest,
+                param_values,
+            }
+        })
+        .collect::<Vec<_>>();
+    let stub_size = actions
+        .iter()
+        .map(parameterized_stub_estimated_size)
+        .sum::<usize>();
+    let total_savings = isize::try_from(old_size).expect("payload size overflow")
+        - isize::try_from(helper_size + stub_size).expect("payload size overflow");
+
+    (total_savings >= MIN_PARAMETERIZED_PAYLOAD_SAVINGS).then_some(PayloadGroupCandidate {
+        helper,
+        actions,
+        total_savings,
+    })
+}
+
+fn parameterized_store_indexes(occurrences: &[PayloadOccurrence]) -> Option<Vec<usize>> {
+    let first = occurrences.first()?;
+    let store_count = first.stores.len();
+    if occurrences
+        .iter()
+        .any(|occurrence| occurrence.stores.len() != store_count)
+    {
+        return None;
+    }
+
+    Some(
+        (0..store_count)
+            .filter(|&idx| {
+                occurrences.iter().any(|occurrence| {
+                    occurrence.stores[idx].value.key != first.stores[idx].value.key
+                })
+            })
+            .collect(),
+    )
+}
+
+fn parameterized_stub_estimated_size(action: &PayloadRewriteAction) -> usize {
+    usize::from(action.leading_jumpdest.is_some())
+        + action
+            .param_values
+            .iter()
+            .map(|segment| segment.estimated_size)
+            .sum::<usize>()
+        + SECTION_HELPER_FIXUP_SIZE
+        + 1
+}
+
+fn payload_layout_key(occurrence: &PayloadOccurrence) -> PayloadLayoutKey {
+    PayloadLayoutKey {
+        terminal_op: occurrence.terminal_op as u8,
+        terminal_len: occurrence.terminal_len.key.clone(),
+        addresses: PayloadAddresses::Absolute {
+            terminal_offset: occurrence.terminal_offset.key.clone(),
+            stores: occurrence
+                .stores
+                .iter()
+                .map(|store| store.address.key.clone())
+                .collect(),
+        },
+    }
+}
+
+fn relative_payload_addresses(
+    occurrence: &PayloadOccurrence,
+    vcode: &VCode<OpCode>,
+) -> Option<Vec<U256>> {
+    let literal_word = |segment: &LiteralSegment| {
+        let [inst] = segment.insts.as_slice() else {
+            return None;
+        };
+        push_immediate_u256(vcode, *inst)
+    };
+    let base = literal_word(&occurrence.terminal_offset)?;
+    occurrence
+        .stores
+        .iter()
+        .map(|store| {
+            // EVM addition wraps at 256 bits. Preserve even offsets below the base;
+            // no host-width truncation or assumption about reachable memory is needed.
+            Some(literal_word(&store.address)?.overflowing_sub(base).0)
+        })
+        .collect()
+}
+
+fn analyze_payload_occurrence(
+    source: PayloadSource,
+    vcode: &VCode<OpCode>,
+    block: BlockId,
+    order_idx: usize,
+    label_targets: &FxHashSet<VCodeInst>,
+    allow_return: bool,
+) -> Option<PayloadOccurrence> {
+    let insts = block_insts(vcode, block);
+    let leading_jumpdest = insts
+        .first()
+        .copied()
+        .filter(|&inst| (vcode.insts[inst] as u8) == (OpCode::JUMPDEST as u8));
+    let semantic_start = usize::from(leading_jumpdest.is_some());
+    let semantic_insts = insts.get(semantic_start..)?;
+    if semantic_insts.is_empty()
+        || semantic_insts.iter().copied().any(|inst| {
+            (vcode.insts[inst] as u8) == (OpCode::JUMPDEST as u8) || label_targets.contains(&inst)
+        })
+    {
+        return None;
+    }
+
+    let &last = semantic_insts.last()?;
+    let terminal_op = vcode.insts[last];
+    if (terminal_op as u8) != (OpCode::REVERT as u8)
+        && (!allow_return || (terminal_op as u8) != (OpCode::RETURN as u8))
+    {
+        return None;
+    }
+
+    let terminal_offset = parse_literal_segment(
+        vcode,
+        label_targets,
+        semantic_insts,
+        semantic_insts.len() - 1,
+    )?;
+    let terminal_len =
+        parse_literal_segment(vcode, label_targets, semantic_insts, terminal_offset.start)?;
+    let mut stores = Vec::new();
+    let mut cursor = terminal_len.start;
+    while cursor > 0 {
+        let mstore_idx = cursor.checked_sub(1)?;
+        if (vcode.insts[semantic_insts[mstore_idx]] as u8) != (OpCode::MSTORE as u8) {
+            return None;
+        }
+        let address = parse_literal_segment(vcode, label_targets, semantic_insts, mstore_idx)?;
+        let value = parse_literal_segment(vcode, label_targets, semantic_insts, address.start)?;
+        cursor = value.start;
+        stores.push(PayloadStore { value, address });
+    }
+    if stores.is_empty() {
+        return None;
+    }
+    stores.reverse();
+
+    Some(PayloadOccurrence {
+        source,
+        block,
+        order_idx,
+        leading_jumpdest,
+        stores,
+        terminal_len,
+        terminal_offset,
+        terminal_op,
+        block_size: insts
+            .iter()
+            .copied()
+            .map(|inst| inst_estimated_size(vcode, inst))
+            .sum(),
+    })
+}
+
+fn parse_literal_segment(
+    vcode: &VCode<OpCode>,
+    label_targets: &FxHashSet<VCodeInst>,
+    insts: &[VCodeInst],
+    end: usize,
+) -> Option<LiteralSegment> {
+    for start in (0..end).rev() {
+        let segment = &insts[start..end];
+        if is_pure_literal_segment(vcode, label_targets, segment) {
+            let mut key = Vec::with_capacity(segment.len());
+            let mut estimated_size = 0;
+            for &inst in segment {
+                key.push(inst_key(vcode, inst)?);
+                estimated_size += inst_estimated_size(vcode, inst);
+            }
+            return Some(LiteralSegment {
+                start,
+                insts: segment.to_vec(),
+                key,
+                estimated_size,
+            });
+        }
+    }
+
+    None
+}
+
+fn is_pure_literal_segment(
+    vcode: &VCode<OpCode>,
+    label_targets: &FxHashSet<VCodeInst>,
+    insts: &[VCodeInst],
+) -> bool {
+    !insts.is_empty()
+        && insts
+            .iter()
+            .copied()
+            .all(|inst| is_pure_literal_inst(vcode, label_targets, inst))
+        && sequence_summary(vcode, insts)
+            == StackSummary {
+                min_before: 0,
+                delta: 1,
+            }
+}
+
+fn is_pure_literal_inst(
+    vcode: &VCode<OpCode>,
+    label_targets: &FxHashSet<VCodeInst>,
+    inst: VCodeInst,
+) -> bool {
+    if label_targets.contains(&inst) || vcode.fixups.get(inst).is_some() {
+        return false;
+    }
+
+    let op = vcode.insts[inst];
+    if is_push_opcode(op) {
+        return if (op as u8) == (OpCode::PUSH0 as u8) {
+            vcode.inst_imm_bytes.get(inst).is_none()
+        } else {
+            vcode.inst_imm_bytes.get(inst).is_some()
+        };
+    }
+    if vcode.inst_imm_bytes.get(inst).is_some() {
+        return false;
+    }
+
+    matches!(
+        op,
+        OpCode::ADD
+            | OpCode::MUL
+            | OpCode::SUB
+            | OpCode::DIV
+            | OpCode::SDIV
+            | OpCode::MOD
+            | OpCode::SMOD
+            | OpCode::ADDMOD
+            | OpCode::MULMOD
+            | OpCode::EXP
+            | OpCode::SIGNEXTEND
+            | OpCode::LT
+            | OpCode::GT
+            | OpCode::SLT
+            | OpCode::SGT
+            | OpCode::EQ
+            | OpCode::ISZERO
+            | OpCode::AND
+            | OpCode::OR
+            | OpCode::XOR
+            | OpCode::NOT
+            | OpCode::BYTE
+            | OpCode::SHL
+            | OpCode::SHR
+            | OpCode::SAR
+            | OpCode::CLZ
+    )
+}
+
+fn build_parameterized_payload_helper(
+    id: SectionCodeUnitId,
+    donor: &PayloadOccurrence,
+    param_store_idxs: &[usize],
+    relative_offsets: Option<&[U256]>,
+    donor_vcode: &VCode<OpCode>,
+) -> SectionCodeUnit<OpCode> {
+    let block = BlockId(0);
+    let mut vcode = VCode::<OpCode>::default();
+    vcode.add_inst_to_block(OpCode::JUMPDEST, None, block);
+    let mut remaining_params = param_store_idxs.len();
+
+    for (idx, store) in donor.stores.iter().enumerate() {
+        let is_param = param_store_idxs.contains(&idx);
+        if !is_param {
+            clone_segment(&mut vcode, donor_vcode, &store.value, block);
+        }
+        if let Some(offsets) = relative_offsets {
+            let base_depth = remaining_params + usize::from(!is_param);
+            vcode.add_inst_to_block(dup_op(base_depth as u8), None, block);
+            if !offsets[idx].is_zero() {
+                let bytes = u256_to_be(&offsets[idx]);
+                let push = vcode.add_inst_to_block(push_op(bytes.len()), None, block);
+                vcode.inst_imm_bytes.insert((push, bytes));
+                vcode.add_inst_to_block(OpCode::ADD, None, block);
+            }
+        } else {
+            clone_segment(&mut vcode, donor_vcode, &store.address, block);
+        }
+        vcode.add_inst_to_block(OpCode::MSTORE, None, block);
+        remaining_params -= usize::from(is_param);
+    }
+    clone_segment(&mut vcode, donor_vcode, &donor.terminal_len, block);
+    if relative_offsets.is_some() {
+        vcode.add_inst_to_block(OpCode::SWAP1, None, block);
+    } else {
+        clone_segment(&mut vcode, donor_vcode, &donor.terminal_offset, block);
+    }
+    vcode.add_inst_to_block(donor.terminal_op, None, block);
+
+    SectionCodeUnit {
+        id,
+        name: format!("__evm_shared_tail_{}", id.0),
+        vcode,
+        block_order: vec![block],
+    }
+}
+
+fn clone_segment(
+    dst: &mut VCode<OpCode>,
+    src: &VCode<OpCode>,
+    segment: &LiteralSegment,
+    block: BlockId,
+) {
+    for &inst in &segment.insts {
+        clone_inst(dst, src, inst, block);
+    }
+}
+
+fn rewrite_parameterized_payload_stub(
+    vcode: &mut VCode<OpCode>,
+    action: PayloadRewriteAction,
+    helper_id: SectionCodeUnitId,
+) {
+    let mut rebuilt = Vec::new();
+    if let Some(jumpdest) = action.leading_jumpdest {
+        rebuilt.push(jumpdest);
+    }
+
+    for segment in action.param_values.iter().rev() {
+        for &inst in &segment.insts {
+            let cloned = clone_inst_in_place(vcode, inst, action.block);
+            rebuilt.push(cloned);
+        }
+    }
+
+    let push = vcode.add_inst_to_block(OpCode::PUSH0, None, action.block);
+    let label = vcode.labels.push(Label::SectionCodeUnit(helper_id));
+    vcode.fixups.insert((push, VCodeFixup::Label(label)));
+    rebuilt.push(push);
+    rebuilt.push(vcode.add_inst_to_block(OpCode::JUMP, None, action.block));
+    replace_block_insts(vcode, action.block, &rebuilt);
+}
+
+fn clone_inst_in_place(vcode: &mut VCode<OpCode>, inst: VCodeInst, block: BlockId) -> VCodeInst {
+    let op = vcode.insts[inst];
+    let source_insn = vcode.inst_ir[inst].expand();
+    let imm = vcode
+        .inst_imm_bytes
+        .get(inst)
+        .map(|(_, bytes)| bytes.clone());
+    let fixup = vcode.fixups.get(inst).map(|(_, fixup)| fixup.clone());
+    let new_inst = vcode.add_inst_to_block(op, source_insn, block);
+    if let Some(bytes) = imm {
+        vcode.inst_imm_bytes.insert((new_inst, bytes));
+    }
+    if let Some(fixup) = fixup {
+        let cloned_fixup = match fixup {
+            VCodeFixup::Label(label) => {
+                let cloned = vcode.labels.push(vcode.labels[label]);
+                VCodeFixup::Label(cloned)
+            }
+            VCodeFixup::Sym(sym) => VCodeFixup::Sym(sym),
+        };
+        vcode.fixups.insert((new_inst, cloned_fixup));
+    }
+    new_inst
 }
 
 fn analyze_terminal_occurrence(
@@ -410,11 +1035,10 @@ fn rewrite_block_labels_to_section_unit(
     block: BlockId,
     helper_id: SectionCodeUnitId,
 ) {
-    for label in vcode.labels.keys().collect::<Vec<_>>() {
-        if vcode.labels[label] == Label::Block(block) {
-            vcode.labels[label] = Label::SectionCodeUnit(helper_id);
-        }
-    }
+    vcode.rewrite_labels(|label| match label {
+        Label::Block(label_block) if label_block == block => Label::SectionCodeUnit(helper_id),
+        label => label,
+    });
 }
 
 fn apply_unlock_to_section_helper(
@@ -448,6 +1072,7 @@ fn apply_unlock_to_section_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
     use sonatina_parser::parse_module;
 
     fn test_module() -> (Module, FxHashMap<String, FuncRef>) {
@@ -496,10 +1121,76 @@ block0:
     fn build_unique_stop_block(vcode: &mut VCode<OpCode>, block: BlockId, tag: u8) {
         vcode.add_inst_to_block(OpCode::JUMPDEST, None, block);
         let inst = vcode.add_inst_to_block(OpCode::PUSH1, None, block);
-        vcode
-            .inst_imm_bytes
-            .insert((inst, smallvec::smallvec![tag]));
+        vcode.inst_imm_bytes.insert((inst, smallvec![tag]));
         vcode.add_inst_to_block(OpCode::STOP, None, block);
+    }
+
+    fn push_bytes(vcode: &mut VCode<OpCode>, block: BlockId, bytes: &[u8]) -> VCodeInst {
+        let op = match bytes.len() {
+            1 => OpCode::PUSH1,
+            4 => OpCode::PUSH4,
+            32 => OpCode::PUSH32,
+            len => panic!("test helper does not support PUSH{len}"),
+        };
+        let inst = vcode.add_inst_to_block(op, None, block);
+        vcode.inst_imm_bytes.insert((inst, bytes.into()));
+        inst
+    }
+
+    fn push_u8(vcode: &mut VCode<OpCode>, block: BlockId, value: u8) -> VCodeInst {
+        push_bytes(vcode, block, &[value])
+    }
+
+    fn build_parameterized_payload_block(
+        vcode: &mut VCode<OpCode>,
+        block: BlockId,
+        value_byte: u8,
+        terminal: OpCode,
+        leading_jumpdest: bool,
+        dynamic_address: bool,
+    ) {
+        if leading_jumpdest {
+            vcode.add_inst_to_block(OpCode::JUMPDEST, None, block);
+        }
+
+        push_bytes(vcode, block, &[0xde, 0xad, 0xbe, 0xef]);
+        push_u8(vcode, block, 0x80);
+        vcode.add_inst_to_block(OpCode::MSTORE, None, block);
+        push_bytes(vcode, block, &[value_byte; 32]);
+        if dynamic_address {
+            vcode.add_inst_to_block(OpCode::CALLVALUE, None, block);
+        } else {
+            push_u8(vcode, block, 0xa0);
+        }
+        vcode.add_inst_to_block(OpCode::MSTORE, None, block);
+        vcode.add_inst_to_block(OpCode::PUSH0, None, block);
+        push_u8(vcode, block, 0xc0);
+        vcode.add_inst_to_block(OpCode::MSTORE, None, block);
+        push_u8(vcode, block, 0x60);
+        push_u8(vcode, block, 0x80);
+        vcode.add_inst_to_block(terminal, None, block);
+    }
+
+    fn block_ops(vcode: &VCode<OpCode>, block: BlockId) -> Vec<u8> {
+        block_insts(vcode, block)
+            .into_iter()
+            .map(|inst| vcode.insts[inst] as u8)
+            .collect()
+    }
+
+    fn helper_ops(helper: &SectionCodeUnit<OpCode>) -> Vec<u8> {
+        block_insts(&helper.vcode, BlockId(0))
+            .into_iter()
+            .map(|inst| helper.vcode.insts[inst] as u8)
+            .collect()
+    }
+
+    fn helper_contains_imm(helper: &SectionCodeUnit<OpCode>, bytes: &[u8]) -> bool {
+        helper
+            .vcode
+            .inst_imm_bytes
+            .values()
+            .any(|(_, imm)| imm.as_slice() == bytes)
     }
 
     fn block_label_kinds(vcode: &VCode<OpCode>, block: BlockId) -> Vec<Label> {
@@ -531,7 +1222,8 @@ block0:
             ));
         }
 
-        let helpers = run_late_section_terminal_outline(&module, &mut lowered);
+        let helpers =
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Speed);
         assert_eq!(helpers.len(), 1, "expected one shared helper");
         assert_eq!(helpers[0].block_order, vec![BlockId(0)]);
 
@@ -566,7 +1258,8 @@ block0:
             ));
         }
 
-        let helpers = run_late_section_terminal_outline(&module, &mut lowered);
+        let helpers =
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Speed);
         assert_eq!(helpers.len(), 1, "expected one shared helper");
 
         for (_, lowered) in &lowered {
@@ -613,7 +1306,8 @@ block0:
             ));
         }
 
-        let helpers = run_late_section_terminal_outline(&module, &mut lowered);
+        let helpers =
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Speed);
         assert!(helpers.is_empty(), "local block fixups must stay local");
         for (_, lowered) in &lowered {
             assert_eq!(
@@ -621,5 +1315,379 @@ block0:
                 vec![BlockId(0), BlockId(1), BlockId(2)]
             );
         }
+    }
+
+    #[test]
+    fn parameterized_payload_shares_different_buffer_bases() {
+        let (module, names) = test_module();
+        let mut lowered = Vec::new();
+        for (func, shift) in [(names["a"], 0), (names["b"], 0x20)] {
+            let mut vcode = VCode::<OpCode>::default();
+            build_parameterized_payload_block(
+                &mut vcode,
+                BlockId(0),
+                0x11,
+                OpCode::REVERT,
+                true,
+                false,
+            );
+            let immediates = vcode.inst_imm_bytes.values().cloned().collect::<Vec<_>>();
+            for (inst, mut bytes) in immediates {
+                if bytes.len() == 1 && [0x80, 0xa0, 0xc0].contains(&bytes[0]) {
+                    bytes[0] += shift;
+                    vcode.inst_imm_bytes.insert((inst, bytes));
+                }
+            }
+            lowered.push((
+                func,
+                LoweredFunction {
+                    vcode,
+                    block_order: vec![BlockId(0)],
+                },
+            ));
+        }
+        let helpers =
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Size);
+        assert_eq!(
+            helpers.len(),
+            1,
+            "equal payloads at different addresses should share a helper"
+        );
+        for (_, function) in &lowered {
+            assert_eq!(
+                block_ops(&function.vcode, BlockId(0)),
+                vec![
+                    OpCode::JUMPDEST as u8,
+                    OpCode::PUSH1 as u8,
+                    OpCode::PUSH0 as u8,
+                    OpCode::JUMP as u8,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn parameterized_payload_includes_exact_section_helpers() {
+        let (module, names) = test_module();
+        let mut lowered = Vec::new();
+        for func in [names["a"], names["b"]] {
+            let mut vcode = VCode::<OpCode>::default();
+            vcode.add_inst_to_block(OpCode::CALLVALUE, None, BlockId(0));
+            push_block(&mut vcode, BlockId(0), BlockId(1));
+            vcode.add_inst_to_block(OpCode::JUMPI, None, BlockId(0));
+            for (block, shift) in [(BlockId(1), 0), (BlockId(2), 0x20)] {
+                build_parameterized_payload_block(
+                    &mut vcode,
+                    block,
+                    0x11,
+                    OpCode::REVERT,
+                    true,
+                    false,
+                );
+                let immediates = block_insts(&vcode, block);
+                for inst in immediates {
+                    if let Some((_, bytes)) = vcode.inst_imm_bytes.get_mut(inst)
+                        && bytes.len() == 1
+                        && [0x80, 0xa0, 0xc0].contains(&bytes[0])
+                    {
+                        bytes[0] += shift;
+                    }
+                }
+            }
+            // Both payloads are non-fallthrough targets; exact outlining moves
+            // each pair into a helper before address parameterization runs.
+            push_block(&mut vcode, BlockId(0), BlockId(2));
+            vcode.add_inst_to_block(OpCode::JUMP, None, BlockId(0));
+            lowered.push((
+                func,
+                LoweredFunction {
+                    vcode,
+                    block_order: vec![BlockId(0), BlockId(1), BlockId(2)],
+                },
+            ));
+        }
+        let helpers =
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Size);
+        assert_eq!(helpers.len(), 3);
+        for helper in &helpers[..2] {
+            assert!(matches!(
+                block_label_kinds(&helper.vcode, BlockId(0)).as_slice(),
+                [Label::SectionCodeUnit(SectionCodeUnitId(2))]
+            ));
+        }
+        assert!(helper_ops(&helpers[2]).contains(&(OpCode::SWAP1 as u8)));
+    }
+
+    #[test]
+    fn parameterized_payload_preserves_full_width_relative_addresses() {
+        let mut vcode = VCode::<OpCode>::default();
+        let block = BlockId(0);
+        for (address, value) in [(U256::MAX, 1), (U256::zero(), 2)] {
+            push_u8(&mut vcode, block, value);
+            push_bytes(&mut vcode, block, &address.to_big_endian());
+            vcode.add_inst_to_block(OpCode::MSTORE, None, block);
+        }
+        push_u8(&mut vcode, block, 32);
+        push_bytes(&mut vcode, block, &U256::MAX.to_big_endian());
+        vcode.add_inst_to_block(OpCode::REVERT, None, block);
+        let occurrence = analyze_payload_occurrence(
+            PayloadSource::Function(0),
+            &vcode,
+            block,
+            0,
+            &FxHashSet::default(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            relative_payload_addresses(&occurrence, &vcode),
+            Some(vec![U256::zero(), U256::one()])
+        );
+        let offsets = [U256::zero(), U256::one()];
+        let helper = build_parameterized_payload_helper(
+            SectionCodeUnitId(0),
+            &occurrence,
+            &[],
+            Some(&offsets),
+            &vcode,
+        );
+        assert_eq!(
+            helper_ops(&helper),
+            vec![
+                OpCode::JUMPDEST as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::DUP2 as u8,
+                OpCode::MSTORE as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::DUP2 as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::ADD as u8,
+                OpCode::MSTORE as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::SWAP1 as u8,
+                OpCode::REVERT as u8,
+            ]
+        );
+    }
+
+    #[test]
+    fn parameterized_payload_rejects_unprofitable_base_stubs() {
+        let (module, names) = test_module();
+        let mut lowered = Vec::new();
+        for (func, base) in [(names["a"], 0x80), (names["b"], 0xa0)] {
+            let mut vcode = VCode::<OpCode>::default();
+            push_u8(&mut vcode, BlockId(0), 1);
+            push_u8(&mut vcode, BlockId(0), base);
+            vcode.add_inst_to_block(OpCode::MSTORE, None, BlockId(0));
+            push_u8(&mut vcode, BlockId(0), 32);
+            push_u8(&mut vcode, BlockId(0), base);
+            vcode.add_inst_to_block(OpCode::REVERT, None, BlockId(0));
+            lowered.push((
+                func,
+                LoweredFunction {
+                    vcode,
+                    block_order: vec![BlockId(0)],
+                },
+            ));
+        }
+        assert!(
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Size)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parameterized_revert_payload_outlines_different_literal_words() {
+        let (module, names) = test_module();
+        let mut lowered = Vec::new();
+
+        for (func, value_byte) in [(names["a"], 0x11), (names["b"], 0x22)] {
+            let mut vcode = VCode::<OpCode>::default();
+            build_parameterized_payload_block(
+                &mut vcode,
+                BlockId(0),
+                value_byte,
+                OpCode::REVERT,
+                true,
+                false,
+            );
+            lowered.push((
+                func,
+                LoweredFunction {
+                    vcode,
+                    block_order: vec![BlockId(0)],
+                },
+            ));
+        }
+
+        let helpers =
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Speed);
+        assert_eq!(helpers.len(), 1, "expected one shared payload helper");
+        assert!(
+            !helper_contains_imm(&helpers[0], &[0x11; 32])
+                && !helper_contains_imm(&helpers[0], &[0x22; 32]),
+            "parameter words should stay in caller stubs"
+        );
+        assert_eq!(
+            helper_ops(&helpers[0]),
+            vec![
+                OpCode::JUMPDEST as u8,
+                OpCode::PUSH4 as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::MSTORE as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::MSTORE as u8,
+                OpCode::PUSH0 as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::MSTORE as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::PUSH1 as u8,
+                OpCode::REVERT as u8,
+            ]
+        );
+
+        for (_, lowered) in &lowered {
+            assert_eq!(
+                block_ops(&lowered.vcode, BlockId(0)),
+                vec![
+                    OpCode::JUMPDEST as u8,
+                    OpCode::PUSH32 as u8,
+                    OpCode::PUSH0 as u8,
+                    OpCode::JUMP as u8,
+                ]
+            );
+            assert!(matches!(
+                block_label_kinds(&lowered.vcode, BlockId(0)).as_slice(),
+                [Label::SectionCodeUnit(SectionCodeUnitId(0))]
+            ));
+        }
+    }
+
+    #[test]
+    fn parameterized_revert_payload_keeps_fallthrough_stub_in_layout() {
+        let (module, names) = test_module();
+        let mut lowered = Vec::new();
+
+        for (func, value_byte) in [(names["a"], 0x33), (names["b"], 0x44)] {
+            let mut vcode = VCode::<OpCode>::default();
+            vcode.add_inst_to_block(OpCode::PUSH0, None, BlockId(0));
+            push_block(&mut vcode, BlockId(0), BlockId(2));
+            vcode.add_inst_to_block(OpCode::JUMPI, None, BlockId(0));
+            build_parameterized_payload_block(
+                &mut vcode,
+                BlockId(1),
+                value_byte,
+                OpCode::REVERT,
+                false,
+                false,
+            );
+            build_unique_stop_block(&mut vcode, BlockId(2), value_byte);
+            lowered.push((
+                func,
+                LoweredFunction {
+                    vcode,
+                    block_order: vec![BlockId(0), BlockId(1), BlockId(2)],
+                },
+            ));
+        }
+
+        let helpers =
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Speed);
+        assert_eq!(helpers.len(), 1, "expected one shared payload helper");
+
+        for (_, lowered) in &lowered {
+            assert_eq!(
+                lowered.block_order,
+                vec![BlockId(0), BlockId(1), BlockId(2)]
+            );
+            assert_eq!(
+                block_ops(&lowered.vcode, BlockId(1)),
+                vec![
+                    OpCode::PUSH32 as u8,
+                    OpCode::PUSH0 as u8,
+                    OpCode::JUMP as u8,
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn parameterized_payload_skips_dynamic_store_address() {
+        let (module, names) = test_module();
+        let mut lowered = Vec::new();
+
+        for (func, value_byte) in [(names["a"], 0x55), (names["b"], 0x66)] {
+            let mut vcode = VCode::<OpCode>::default();
+            build_parameterized_payload_block(
+                &mut vcode,
+                BlockId(0),
+                value_byte,
+                OpCode::REVERT,
+                true,
+                true,
+            );
+            lowered.push((
+                func,
+                LoweredFunction {
+                    vcode,
+                    block_order: vec![BlockId(0)],
+                },
+            ));
+        }
+
+        let helpers =
+            run_late_section_terminal_outline(&module, &mut lowered, LateCleanupProfile::Speed);
+        assert!(
+            helpers.is_empty(),
+            "dynamic store addresses are not safe to outline"
+        );
+    }
+
+    #[test]
+    fn parameterized_return_payload_outlines_only_in_size_profile() {
+        let (module, names) = test_module();
+        let build_lowered = || {
+            [(names["a"], 0x77), (names["b"], 0x88)]
+                .into_iter()
+                .map(|(func, value_byte)| {
+                    let mut vcode = VCode::<OpCode>::default();
+                    build_parameterized_payload_block(
+                        &mut vcode,
+                        BlockId(0),
+                        value_byte,
+                        OpCode::RETURN,
+                        true,
+                        false,
+                    );
+                    (
+                        func,
+                        LoweredFunction {
+                            vcode,
+                            block_order: vec![BlockId(0)],
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut speed_lowered = build_lowered();
+        let mut size_lowered = build_lowered();
+
+        let speed_helpers = run_late_section_terminal_outline(
+            &module,
+            &mut speed_lowered,
+            LateCleanupProfile::Speed,
+        );
+        assert!(
+            speed_helpers.is_empty(),
+            "speed profile should avoid adding jumps to return paths"
+        );
+
+        let size_helpers =
+            run_late_section_terminal_outline(&module, &mut size_lowered, LateCleanupProfile::Size);
+        assert_eq!(
+            size_helpers.len(),
+            1,
+            "size profile should outline profitable return payloads"
+        );
     }
 }

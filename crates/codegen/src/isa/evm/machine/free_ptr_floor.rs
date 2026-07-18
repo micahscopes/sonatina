@@ -1,0 +1,375 @@
+use cranelift_entity::SecondaryMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use sonatina_ir::{
+    BlockId, Function, InstId, InstSetExt, Module,
+    inst::evm::inst_set::{EvmInstKind, EvmInstSet},
+    module::{FuncRef, ModuleCtx},
+};
+use std::iter;
+
+use crate::{
+    isa::evm::{FREE_PTR_SLOT, WORD_BYTES, memory_plan::FuncPreAnalysis, prepare::value_imm_u32},
+    module_analysis::CallGraphSchedule,
+};
+
+use super::heap_state::{inst_writes_free_ptr_slot, run_forward_heap_dataflow};
+
+use super::placement::MallocPlacement;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FreePtrFloor {
+    #[default]
+    Unknown,
+    Known(u32),
+}
+
+impl FreePtrFloor {
+    fn join(self, rhs: Self) -> Self {
+        match (self, rhs) {
+            (Self::Known(lhs), Self::Known(rhs)) => Self::Known(lhs.min(rhs)),
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+        }
+    }
+
+    fn establish_min(self, min_base: u32) -> Self {
+        match self {
+            Self::Unknown => Self::Known(min_base),
+            Self::Known(floor) => Self::Known(floor.max(min_base)),
+        }
+    }
+
+    fn as_option(self) -> Option<u32> {
+        match self {
+            Self::Unknown => None,
+            Self::Known(floor) => Some(floor),
+        }
+    }
+}
+
+/// Whether each function may (transitively) write the free-pointer slot.
+///
+/// All callees are section-internal at this stage (the memory planner asserts
+/// it), so a join over callees on the condensation suffices.
+pub(crate) fn compute_free_ptr_write_summaries(
+    schedule: &CallGraphSchedule,
+    local_writes: &FxHashMap<FuncRef, bool>,
+) -> FxHashMap<FuncRef, bool> {
+    schedule.join_over_callees(
+        |func| local_writes.get(&func).copied().unwrap_or(true),
+        |acc, callee_writes| *acc |= *callee_writes,
+    )
+}
+
+pub(crate) struct ProgramFreePtrFloorInput<'a> {
+    pub(crate) module: &'a Module,
+    pub(crate) funcs: &'a [FuncRef],
+    pub(crate) section_entry: FuncRef,
+    /// The free pointer the section entry stores before anything else runs.
+    pub(crate) section_entry_free_ptr: Option<u32>,
+    pub(crate) section_includes: &'a [FuncRef],
+    pub(crate) analyses: &'a FxHashMap<FuncRef, FuncPreAnalysis>,
+    pub(crate) source_is: &'a EvmInstSet,
+    pub(crate) malloc_placements: &'a FxHashMap<FuncRef, FxHashMap<InstId, MallocPlacement>>,
+    pub(crate) free_ptr_write_summaries: &'a FxHashMap<FuncRef, bool>,
+}
+
+pub(crate) fn compute_program_free_ptr_floor_before_malloc(
+    input: ProgramFreePtrFloorInput<'_>,
+) -> FxHashMap<FuncRef, FxHashMap<InstId, Option<u32>>> {
+    let ProgramFreePtrFloorInput {
+        module,
+        funcs,
+        section_entry,
+        section_entry_free_ptr,
+        section_includes,
+        analyses,
+        source_is,
+        malloc_placements,
+        free_ptr_write_summaries,
+    } = input;
+    let funcs_set: FxHashSet<FuncRef> = funcs.iter().copied().collect();
+    let exit_floor_summaries = compute_exit_floor_summaries(
+        module,
+        funcs,
+        analyses,
+        source_is,
+        malloc_placements,
+        free_ptr_write_summaries,
+    );
+    let mut entry_floors: FxHashMap<FuncRef, Option<FreePtrFloor>> =
+        funcs.iter().copied().map(|func| (func, None)).collect();
+    for root in iter::once(section_entry).chain(section_includes.iter().copied()) {
+        if funcs_set.contains(&root) {
+            entry_floors.insert(root, Some(FreePtrFloor::Unknown));
+        }
+    }
+    if let Some(floor) = section_entry_free_ptr
+        && funcs_set.contains(&section_entry)
+    {
+        entry_floors.insert(section_entry, Some(FreePtrFloor::Known(floor)));
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut next_entry_floors = entry_floors.clone();
+        for &func in funcs {
+            let Some(entry_floor) = entry_floors.get(&func).copied().flatten() else {
+                continue;
+            };
+            let call_floors = module.func_store.view(func, |function| {
+                let empty_placements = FxHashMap::default();
+                let malloc_placements = malloc_placements.get(&func).unwrap_or(&empty_placements);
+                FuncFreePtrFloorCtx {
+                    module: &module.ctx,
+                    analysis: &analyses[&func],
+                    source_is,
+                    malloc_placements,
+                    free_ptr_write_summaries,
+                    exit_floor_summaries: &exit_floor_summaries,
+                }
+                .compute(function, entry_floor)
+                .before_call
+            });
+
+            for (callee, floor) in call_floors {
+                if funcs_set.contains(&callee) {
+                    let next = next_entry_floors.entry(callee).or_insert(None);
+                    *next = Some(next.map_or(floor, |old| old.join(floor)));
+                }
+            }
+        }
+        for &func in funcs {
+            if next_entry_floors.get(&func) != entry_floors.get(&func) {
+                changed = true;
+                break;
+            }
+        }
+        entry_floors = next_entry_floors;
+    }
+
+    funcs
+        .iter()
+        .copied()
+        .map(|func| {
+            let entry_floor = entry_floors
+                .get(&func)
+                .copied()
+                .flatten()
+                .unwrap_or(FreePtrFloor::Unknown);
+            let before_malloc = module.func_store.view(func, |function| {
+                let empty_placements = FxHashMap::default();
+                let malloc_placements = malloc_placements.get(&func).unwrap_or(&empty_placements);
+                FuncFreePtrFloorCtx {
+                    module: &module.ctx,
+                    analysis: &analyses[&func],
+                    source_is,
+                    malloc_placements,
+                    free_ptr_write_summaries,
+                    exit_floor_summaries: &exit_floor_summaries,
+                }
+                .compute(function, entry_floor)
+                .before_malloc
+            });
+            (func, before_malloc)
+        })
+        .collect()
+}
+
+fn compute_exit_floor_summaries(
+    module: &Module,
+    funcs: &[FuncRef],
+    analyses: &FxHashMap<FuncRef, FuncPreAnalysis>,
+    source_is: &EvmInstSet,
+    malloc_placements: &FxHashMap<FuncRef, FxHashMap<InstId, MallocPlacement>>,
+    free_ptr_write_summaries: &FxHashMap<FuncRef, bool>,
+) -> FxHashMap<FuncRef, Option<u32>> {
+    let mut summaries: FxHashMap<FuncRef, Option<u32>> =
+        funcs.iter().copied().map(|func| (func, None)).collect();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &func in funcs {
+            let summary = module.func_store.view(func, |function| {
+                let empty_placements = FxHashMap::default();
+                let malloc_placements = malloc_placements.get(&func).unwrap_or(&empty_placements);
+                FuncFreePtrFloorCtx {
+                    module: &module.ctx,
+                    analysis: &analyses[&func],
+                    source_is,
+                    malloc_placements,
+                    free_ptr_write_summaries,
+                    exit_floor_summaries: &summaries,
+                }
+                .compute(function, FreePtrFloor::Unknown)
+                .exit_floor
+                .as_option()
+            });
+            if summaries.insert(func, summary) != Some(summary) {
+                changed = true;
+            }
+        }
+    }
+
+    summaries
+}
+
+struct FuncFreePtrFloors {
+    before_malloc: FxHashMap<InstId, Option<u32>>,
+    before_call: Vec<(FuncRef, FreePtrFloor)>,
+    exit_floor: FreePtrFloor,
+}
+
+struct FuncFreePtrFloorCtx<'a> {
+    module: &'a ModuleCtx,
+    analysis: &'a FuncPreAnalysis,
+    source_is: &'a EvmInstSet,
+    malloc_placements: &'a FxHashMap<InstId, MallocPlacement>,
+    free_ptr_write_summaries: &'a FxHashMap<FuncRef, bool>,
+    exit_floor_summaries: &'a FxHashMap<FuncRef, Option<u32>>,
+}
+
+impl FuncFreePtrFloorCtx<'_> {
+    fn compute(&self, function: &Function, entry_floor: FreePtrFloor) -> FuncFreePtrFloors {
+        let cfg = &self.analysis.cfg;
+
+        let transfer_ctx = TransferCtx {
+            function,
+            module: self.module,
+            source_is: self.source_is,
+            malloc_placements: self.malloc_placements,
+            free_ptr_write_summaries: self.free_ptr_write_summaries,
+            exit_floor_summaries: self.exit_floor_summaries,
+        };
+        let transfer = |inst, floor| transfer_ctx.transfer_inst(inst, floor);
+        let states = run_forward_heap_dataflow(
+            function,
+            entry_floor,
+            |block, block_out| {
+                // Entry also has the initial invocation as an incoming edge.
+                // A backedge cannot establish a floor for the first iteration.
+                let boundary =
+                    (Some(block) == function.layout.entry_block()).then_some(entry_floor);
+                boundary
+                    .into_iter()
+                    .chain(cfg.preds_of(block).map(|pred| block_out[*pred]))
+                    .reduce(FreePtrFloor::join)
+                    .unwrap_or(entry_floor)
+            },
+            transfer,
+        );
+
+        let mut before_malloc = FxHashMap::default();
+        let mut before_call = Vec::new();
+        states.for_each_inst_state(function, transfer, |inst, floor| {
+            match self.source_is.resolve_inst(function.dfg.inst(inst)) {
+                EvmInstKind::EvmMalloc(_) => {
+                    if self.malloc_placements.contains_key(&inst) {
+                        before_malloc.insert(inst, floor.as_option());
+                    }
+                }
+                EvmInstKind::Call(call) => before_call.push((*call.callee(), floor)),
+                _ => {}
+            }
+        });
+        FuncFreePtrFloors {
+            before_malloc,
+            before_call,
+            exit_floor: function_exit_floor(function, self.source_is, &states.block_out),
+        }
+    }
+}
+
+fn function_exit_floor(
+    function: &Function,
+    source_is: &EvmInstSet,
+    block_out: &SecondaryMap<BlockId, FreePtrFloor>,
+) -> FreePtrFloor {
+    let mut out = None;
+    for block in function.layout.iter_block() {
+        let returns_to_caller = function.layout.iter_inst(block).last().is_some_and(|inst| {
+            matches!(
+                source_is.resolve_inst(function.dfg.inst(inst)),
+                EvmInstKind::Return(_)
+            )
+        });
+        if returns_to_caller {
+            out = Some(out.map_or(block_out[block], |floor: FreePtrFloor| {
+                floor.join(block_out[block])
+            }));
+        }
+    }
+    out.unwrap_or(FreePtrFloor::Unknown)
+}
+
+struct TransferCtx<'a> {
+    function: &'a Function,
+    module: &'a ModuleCtx,
+    source_is: &'a EvmInstSet,
+    malloc_placements: &'a FxHashMap<InstId, MallocPlacement>,
+    free_ptr_write_summaries: &'a FxHashMap<FuncRef, bool>,
+    exit_floor_summaries: &'a FxHashMap<FuncRef, Option<u32>>,
+}
+
+impl TransferCtx<'_> {
+    fn transfer_inst(&self, inst: InstId, mut floor: FreePtrFloor) -> FreePtrFloor {
+        match self.source_is.resolve_inst(self.function.dfg.inst(inst)) {
+            EvmInstKind::EvmMalloc(_) => {
+                if let Some(MallocPlacement::Heap {
+                    min_base,
+                    update_free_ptr: true,
+                    ..
+                }) = self.malloc_placements.get(&inst).copied()
+                {
+                    // Compiler-managed free-pointer updates are part of the allocator
+                    // invariant: they cannot wrap below the established floor.
+                    floor = floor.establish_min(min_base);
+                }
+            }
+            EvmInstKind::Call(call) => {
+                if self
+                    .free_ptr_write_summaries
+                    .get(call.callee())
+                    .copied()
+                    .unwrap_or(true)
+                {
+                    floor = FreePtrFloor::Unknown;
+                } else if let Some(exit_floor) = self
+                    .exit_floor_summaries
+                    .get(call.callee())
+                    .copied()
+                    .flatten()
+                {
+                    floor = floor.establish_min(exit_floor);
+                }
+            }
+            _ => {
+                if let Some(stored_floor) = self.exact_free_ptr_store_floor(inst) {
+                    floor = stored_floor.map_or(FreePtrFloor::Unknown, FreePtrFloor::Known);
+                } else if inst_writes_free_ptr_slot(self.function, inst) {
+                    floor = FreePtrFloor::Unknown;
+                }
+            }
+        }
+        floor
+    }
+
+    fn exact_free_ptr_store_floor(&self, inst: InstId) -> Option<Option<u32>> {
+        match self.source_is.resolve_inst(self.function.dfg.inst(inst)) {
+            EvmInstKind::Mstore(mstore)
+                if self.module.size_of(*mstore.ty()).ok() == Some(WORD_BYTES as usize)
+                    && value_imm_u32(self.function, *mstore.addr())
+                        == Some(FREE_PTR_SLOT as u32) =>
+            {
+                Some(value_imm_u32(self.function, *mstore.value()))
+            }
+            EvmInstKind::EvmMstore(mstore)
+                if value_imm_u32(self.function, *mstore.addr()) == Some(FREE_PTR_SLOT as u32) =>
+            {
+                Some(value_imm_u32(self.function, *mstore.value()))
+            }
+            _ => None,
+        }
+    }
+}

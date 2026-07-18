@@ -70,6 +70,14 @@ impl SectionWorkModule {
         self.entry
     }
 
+    pub fn includes(&self) -> &[FuncRef] {
+        &self.includes
+    }
+
+    pub fn data(&self) -> &[GlobalVariableRef] {
+        &self.data
+    }
+
     pub fn membership(&self) -> SectionMembership {
         build_section_membership(&self.module, self.entry, &self.includes, &self.data)
     }
@@ -338,10 +346,10 @@ impl<'a, Op: Default> Lower<'a, Op> {
 
     pub fn lower(
         mut self,
-        alloc: &mut dyn Allocator,
-        mut enter_block: impl FnMut(&mut Self, &mut dyn Allocator, BlockId),
-        mut enter_function: impl FnMut(&mut Self, &mut dyn Allocator, &Function),
-        mut lower_insn: impl FnMut(&mut Self, &mut dyn Allocator, InstId),
+        alloc: &dyn Allocator,
+        mut enter_block: impl FnMut(&mut Self, &dyn Allocator, BlockId),
+        mut enter_function: impl FnMut(&mut Self, &dyn Allocator, &Function),
+        mut lower_insn: impl FnMut(&mut Self, &dyn Allocator, InstId),
     ) -> CodegenResult<VCode<Op>> {
         let function = self.function;
         let entry = function.layout.entry_block();

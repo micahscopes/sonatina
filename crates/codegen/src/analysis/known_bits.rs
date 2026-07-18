@@ -347,6 +347,17 @@ impl KnownBitsQuery {
 
                 KnownBits::normalized(ty, arg_known.known_one, arg_known.known_zero)
             }
+            UnaryInstKind::Bswap => {
+                if !supports_known_bits(ty) {
+                    return KnownBits::unknown(ty);
+                }
+
+                KnownBits::normalized(
+                    ty,
+                    bswap_bits(ty, arg_known.known_zero),
+                    bswap_bits(ty, arg_known.known_one),
+                )
+            }
             UnaryInstKind::Neg | UnaryInstKind::Snego | UnaryInstKind::EvmClz => {
                 KnownBits::unknown(ty)
             }
@@ -668,6 +679,15 @@ pub(crate) fn type_mask(ty: Type) -> U256 {
     low_mask(type_bits(ty))
 }
 
+/// Reverses the order of the bytes in the low `ty` bits of `bits`.
+pub(crate) fn bswap_bits(ty: Type, bits: U256) -> U256 {
+    Immediate::from_i256(bits.into(), ty)
+        .bswap()
+        .as_i256()
+        .to_u256()
+        & type_mask(ty)
+}
+
 pub(crate) fn low_mask(bits: u16) -> U256 {
     match bits {
         0 => U256::zero(),
@@ -682,6 +702,7 @@ fn bool_shape() -> KnownBits {
 
 #[cfg(test)]
 mod tests {
+    use smallvec::smallvec;
     use sonatina_ir::{
         Function, I256, Immediate, Type, U256,
         builder::test_util::*,
@@ -1082,8 +1103,10 @@ mod tests {
         builder.insert_inst_no_result_with(|| Jump::new(is, join));
 
         builder.switch_to_block(join);
-        let phi =
-            builder.insert_inst_with(|| Phi::new(is, vec![(lhs, left), (rhs, right)]), Type::I8);
+        let phi = builder.insert_inst_with(
+            || Phi::new(is, smallvec![(lhs, left), (rhs, right)]),
+            Type::I8,
+        );
         builder.insert_inst_no_result_with(|| Return::new_single(is, phi));
 
         builder.seal_all();
@@ -1272,8 +1295,10 @@ block0:
         builder.insert_inst_no_result_with(|| Jump::new(is, join));
 
         builder.switch_to_block(join);
-        let phi =
-            builder.insert_inst_with(|| Phi::new(is, vec![(ptr, left), (undef, right)]), ptr_ty);
+        let phi = builder.insert_inst_with(
+            || Phi::new(is, smallvec![(ptr, left), (undef, right)]),
+            ptr_ty,
+        );
         builder.insert_inst_no_result_with(|| Return::new_unit(is));
         builder.seal_all();
         builder.finish();

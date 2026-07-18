@@ -1,17 +1,35 @@
 use std::collections::VecDeque;
 
 use cranelift_entity::SecondaryMap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::{SmallVec, smallvec};
 use sonatina_ir::{
-    BlockId, ControlFlowGraph, Function, I256, Immediate, InstId, Type, U256, Value, ValueId,
-    inst::{BinaryInstKind, CastInstKind, InstClassKind, UnaryInstKind, control_flow::BranchKind},
+    BlockId, ControlFlowGraph, Function, I256, Immediate, InstDowncast, InstId, Type, U256, Value,
+    ValueId,
+    inst::{
+        BinaryInstKind, CastInstKind, InstClassKind, UnaryInstKind,
+        control_flow::BranchKind,
+        evm::{
+            EvmCalldataSize, EvmCodeSize, EvmExtCodeSize, EvmMalloc, EvmMsize, EvmReturnDataSize,
+        },
+    },
 };
 
-use crate::loop_analysis::LoopTree;
+use crate::{
+    analysis::definedness::{requires_definedness_evidence, value_may_be_undef},
+    domtree::{DomTree, DominatorTreeTraversable},
+    loop_analysis::LoopTree,
+};
 
 pub type RangeEnv = FxHashMap<ValueId, RangeFact>;
 
 const LOOP_WIDEN_CAP: u8 = 4;
+
+/// Descending sweeps over a widened fixpoint. Widening jumps a loop header's
+/// bounds to the type extrema; recomputing each entry from its predecessors
+/// recovers the bounds the loop's own exit tests impose on its back edges,
+/// such as `i < n` for a counter `i`.
+const NARROWING_SWEEPS: usize = 2;
 
 #[derive(Clone, Debug, Default)]
 pub struct RangeAnalysis {
@@ -19,6 +37,7 @@ pub struct RangeAnalysis {
     exit_envs: SecondaryMap<BlockId, RangeEnv>,
     reachable: SecondaryMap<BlockId, bool>,
     initialized: SecondaryMap<BlockId, bool>,
+    guarded_subs: FxHashSet<InstId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,11 +59,18 @@ pub struct SignedInterval {
 }
 
 impl RangeAnalysis {
-    pub fn compute(&mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree) {
+    pub fn compute(
+        &mut self,
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        dom: &DomTree,
+        lpt: &LoopTree,
+    ) {
         self.entry_envs.clear();
         self.exit_envs.clear();
         self.reachable.clear();
         self.initialized.clear();
+        self.guarded_subs = guarded_subtractions(func, cfg, dom);
 
         let Some(entry) = cfg.entry() else {
             return;
@@ -57,6 +83,7 @@ impl RangeAnalysis {
         let mut worklist = VecDeque::new();
         let mut queued = SecondaryMap::<BlockId, bool>::default();
         let mut revisit_count = SecondaryMap::<BlockId, u8>::default();
+        let mut widened = false;
 
         for &block in &rpo {
             if static_reachable[block] {
@@ -89,6 +116,7 @@ impl RangeAnalysis {
             }
             if is_loop_header(lpt, block) && revisit_count[block] > LOOP_WIDEN_CAP {
                 new_entry = widen_env(func, &self.entry_envs[block], &new_entry);
+                widened = true;
             }
 
             let entry_changed = !old_initialized || new_entry != self.entry_envs[block];
@@ -101,7 +129,7 @@ impl RangeAnalysis {
             self.reachable[block] = true;
             self.initialized[block] = true;
 
-            let new_exit = simulate_block_from_entry(func, block, &new_entry);
+            let new_exit = simulate_block_from_entry(func, block, &new_entry, &self.guarded_subs);
             let exit_changed = new_exit != self.exit_envs[block];
             if exit_changed {
                 self.exit_envs[block] = new_exit;
@@ -109,6 +137,42 @@ impl RangeAnalysis {
 
             if exit_changed || reachability_changed {
                 enqueue_succs(cfg, block, &mut worklist, &mut queued);
+            }
+        }
+
+        // Each step recomputes one block from environments that already
+        // cover every execution, so it covers every execution too: the
+        // sweeps need no monotonicity and stop after a fixed count. A block
+        // the fixpoint left unreachable stays so.
+        if !widened {
+            return;
+        }
+        for _ in 0..NARROWING_SWEEPS {
+            let mut changed = false;
+            for &block in &rpo {
+                if !self.reachable[block] {
+                    continue;
+                }
+                let Some(new_entry) =
+                    compute_block_entry(func, cfg, block, entry, &self.exit_envs, &self.reachable)
+                else {
+                    self.reachable[block] = false;
+                    self.initialized[block] = false;
+                    self.entry_envs[block].clear();
+                    self.exit_envs[block].clear();
+                    changed = true;
+                    continue;
+                };
+                if new_entry == self.entry_envs[block] {
+                    continue;
+                }
+                self.exit_envs[block] =
+                    simulate_block_from_entry(func, block, &new_entry, &self.guarded_subs);
+                self.entry_envs[block] = new_entry;
+                changed = true;
+            }
+            if !changed {
+                break;
             }
         }
     }
@@ -123,6 +187,146 @@ impl RangeAnalysis {
 
     pub fn is_reachable(&self, block: BlockId) -> bool {
         self.reachable[block]
+    }
+
+    /// Whether `inst` is a `sub` or `usubo` that cannot wrap because a
+    /// dominating unsigned comparison orders its operands.
+    pub fn is_guarded_sub(&self, inst: InstId) -> bool {
+        self.guarded_subs.contains(&inst)
+    }
+
+    pub(crate) fn transfer_inst(&self, func: &Function, env: &mut RangeEnv, inst: InstId) {
+        transfer_inst(func, env, inst, &self.guarded_subs);
+    }
+}
+
+/// The `sub` and `usubo` instructions whose `lhs >= rhs` a dominating unsigned
+/// comparison proves, walking each dominator subtree once. Reference counts
+/// retain repeated facts established by both an ancestor and a nested branch.
+fn guarded_subtractions(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dom: &DomTree,
+) -> FxHashSet<InstId> {
+    let mut guarded = FxHashSet::default();
+    let Some(entry) = func.layout.entry_block() else {
+        return guarded;
+    };
+    if !func
+        .layout
+        .iter_block()
+        .any(|block| func.layout.iter_inst(block).any(|inst| is_sub(func, inst)))
+    {
+        return guarded;
+    }
+
+    let mut tree = DominatorTreeTraversable::default();
+    tree.compute(dom);
+    let mut definedness = FxHashMap::default();
+    let mut guards = FxHashMap::<(ValueId, ValueId), usize>::default();
+    let mut pending = vec![(entry, None)];
+    while let Some((block, exiting)) = pending.pop() {
+        if let Some(relations) = exiting {
+            for relation in relations {
+                let count = guards.get_mut(&relation).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    guards.remove(&relation);
+                }
+            }
+            continue;
+        }
+        let relations = edge_guard_relations(func, cfg, dom, block, &mut definedness);
+        for &relation in &relations {
+            *guards.entry(relation).or_default() += 1;
+        }
+        pending.push((block, Some(relations)));
+        pending.extend(tree.children_of(block).iter().map(|&child| (child, None)));
+
+        if guards.is_empty() {
+            continue;
+        }
+        for inst in func.layout.iter_inst(block) {
+            if is_sub(func, inst)
+                && let [lhs, rhs] = func.dfg.inst(inst).collect_values().as_slice()
+                && guards.contains_key(&(*lhs, *rhs))
+            {
+                guarded.insert(inst);
+            }
+        }
+    }
+    guarded
+}
+
+fn is_sub(func: &Function, inst: InstId) -> bool {
+    matches!(
+        func.dfg.inst(inst).kind(),
+        InstClassKind::Binary(BinaryInstKind::Sub | BinaryInstKind::Usubo)
+    )
+}
+
+/// A single-predecessor dominator child certifies the selected branch edge.
+/// Ordinary merges and loop headers with backedges do not create facts.
+fn edge_guard_relations(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    dom: &DomTree,
+    child: BlockId,
+    definedness: &mut FxHashMap<ValueId, bool>,
+) -> SmallVec<[(ValueId, ValueId); 2]> {
+    let Some(parent) = dom.idom_of(child) else {
+        return SmallVec::new();
+    };
+    let mut predecessors = cfg.preds_of(child).copied();
+    if predecessors.next() != Some(parent) || predecessors.next().is_some() {
+        return SmallVec::new();
+    }
+    let Some(branch) = func
+        .layout
+        .last_inst_of(parent)
+        .and_then(|term| func.dfg.branch_info(term))
+    else {
+        return SmallVec::new();
+    };
+    let BranchKind::Br(br) = branch.branch_kind() else {
+        return SmallVec::new();
+    };
+    if br.nz_dest() == br.z_dest() {
+        return SmallVec::new();
+    }
+    let condition = *br.cond();
+    let Some(inst) = func.dfg.value_inst(condition) else {
+        return SmallVec::new();
+    };
+    let InstClassKind::Binary(kind) = func.dfg.inst(inst).kind() else {
+        return SmallVec::new();
+    };
+    let args = func.dfg.inst(inst).collect_values();
+    let [a, b] = args.as_slice() else {
+        return SmallVec::new();
+    };
+    // An undef choice cannot establish a reusable relation. Include intrinsic
+    // undef producers (such as generic division by a possibly zero divisor),
+    // transitive dependencies, and cyclic phis via the shared definedness analysis.
+    // Parameters, calls, and reads need evidence this edge-local proof does not have.
+    if value_may_be_undef(func, condition, definedness, |value| {
+        match func.dfg.value(value) {
+            Value::Arg { .. } => Some(true),
+            Value::Inst { inst, .. } => requires_definedness_evidence(func, *inst).then_some(true),
+            _ => None,
+        }
+    }) {
+        return SmallVec::new();
+    }
+    // Deliberately unsigned and pairwise, with exact SSA operand identity.
+    // No transitivity, signed reinterpretation or changed loop operands.
+    match (kind, *br.nz_dest() == child) {
+        (BinaryInstKind::Lt | BinaryInstKind::Le, true)
+        | (BinaryInstKind::Gt | BinaryInstKind::Ge, false) => smallvec![(*b, *a)],
+        (BinaryInstKind::Lt | BinaryInstKind::Le, false)
+        | (BinaryInstKind::Gt | BinaryInstKind::Ge, true) => smallvec![(*a, *b)],
+        (BinaryInstKind::Eq, true) | (BinaryInstKind::Ne, false) => smallvec![(*a, *b), (*b, *a)],
+        _ => SmallVec::new(),
     }
 }
 
@@ -259,22 +463,28 @@ pub(crate) fn exact_immediate(
     None
 }
 
-pub(crate) fn simulate_block_from_entry(
+fn simulate_block_from_entry(
     func: &Function,
     block: BlockId,
     entry: &RangeEnv,
+    guarded_subs: &FxHashSet<InstId>,
 ) -> RangeEnv {
     let mut env = entry.clone();
     for inst in func.layout.iter_inst(block) {
         if func.dfg.is_phi(inst) {
             continue;
         }
-        transfer_inst(func, &mut env, inst);
+        transfer_inst(func, &mut env, inst, guarded_subs);
     }
     env
 }
 
-pub(crate) fn transfer_inst(func: &Function, env: &mut RangeEnv, inst: InstId) {
+fn transfer_inst(
+    func: &Function,
+    env: &mut RangeEnv,
+    inst: InstId,
+    guarded_subs: &FxHashSet<InstId>,
+) {
     let kind = func.dfg.inst(inst).kind();
     match kind {
         InstClassKind::Cast(kind) => transfer_cast_inst(func, env, inst, kind),
@@ -282,9 +492,45 @@ pub(crate) fn transfer_inst(func: &Function, env: &mut RangeEnv, inst: InstId) {
         InstClassKind::Unary(UnaryInstKind::Not | UnaryInstKind::IsZero) => {
             transfer_bool_unary_inst(func, env, inst, kind)
         }
-        InstClassKind::Binary(kind) => transfer_binary_inst(func, env, inst, kind),
-        _ => clear_inst_results(func, env, inst),
+        InstClassKind::Binary(kind) => {
+            transfer_binary_inst(func, env, inst, kind, guarded_subs.contains(&inst))
+        }
+        _ => match evm_byte_len_fact(func, inst) {
+            Some((result, fact)) => set_env_fact(func, env, result, fact),
+            None => clear_inst_results(func, env, inst),
+        },
     }
+}
+
+/// Every byte length the EVM reports is below `2**62`. Gas is a `u64`, and
+/// transaction data costs at least 4 gas per byte. Memory expansion costs
+/// quadratic gas, which keeps memory below `2**42` bytes, and message-call
+/// data and return data come from memory or from a precompile's input.
+/// EIP-170 and EIP-3860 cap code. A result type too narrow for the bound
+/// keeps only what fits it.
+fn evm_byte_len_fact(func: &Function, inst: InstId) -> Option<(ValueId, RangeFact)> {
+    let (set, data) = (func.inst_set(), func.dfg.inst(inst));
+    let is_byte_len = <&EvmCalldataSize as InstDowncast>::downcast(set, data).is_some()
+        || <&EvmReturnDataSize as InstDowncast>::downcast(set, data).is_some()
+        || <&EvmCodeSize as InstDowncast>::downcast(set, data).is_some()
+        || <&EvmExtCodeSize as InstDowncast>::downcast(set, data).is_some()
+        || <&EvmMsize as InstDowncast>::downcast(set, data).is_some();
+    let result = func.dfg.inst_result_at(inst, 0)?;
+    let ty = func.dfg.value_ty(result);
+    (is_byte_len && supports_range_facts(ty)).then(|| {
+        let hi = (U256::one() << 62) - U256::one();
+        let len = RangeFact {
+            unsigned: UnsignedInterval {
+                lo: U256::zero(),
+                hi,
+            },
+            signed: SignedInterval {
+                lo: I256::zero(),
+                hi: I256::from(hi),
+            },
+        };
+        (result, trunc_fact(len, ty))
+    })
 }
 
 pub(crate) fn checked_value_fact(
@@ -402,6 +648,13 @@ fn compute_block_entry(
     exit_envs: &SecondaryMap<BlockId, RangeEnv>,
     reachable: &SecondaryMap<BlockId, bool>,
 ) -> Option<RangeEnv> {
+    // Every invocation reaches entry without traversing a CFG predecessor.
+    // Joining that unconstrained edge with any backedges leaves no entry facts.
+    // Entry phis are forbidden, so there are no initial phi facts to recover.
+    if block == entry {
+        return Some(RangeEnv::default());
+    }
+
     let mut edge_envs = Vec::new();
     for &pred in cfg.preds_of(block) {
         if !reachable[pred] {
@@ -418,7 +671,7 @@ fn compute_block_entry(
         .map(|(index, (pred, _))| (*pred, index))
         .collect();
 
-    if block != entry && edge_envs.is_empty() {
+    if edge_envs.is_empty() {
         return None;
     }
 
@@ -1086,6 +1339,15 @@ fn transfer_cast_inst(func: &Function, env: &mut RangeEnv, inst: InstId, kind: C
         return;
     };
     let arg_ty = func.dfg.value_ty(*arg);
+    if kind == CastInstKind::PtrToInt
+        && ty == Type::I256
+        && arg_ty.is_pointer(func.ctx())
+        && let Some(fact) = malloc_ptr_to_int_fact(func, *arg)
+    {
+        set_env_fact(func, env, result, fact);
+        return;
+    }
+
     if !ty.is_integral() || !arg_ty.is_integral() {
         clear_inst_results(func, env, inst);
         return;
@@ -1101,6 +1363,34 @@ fn transfer_cast_inst(func: &Function, env: &mut RangeEnv, inst: InstId, kind: C
         }
     };
     set_env_fact(func, env, result, fact);
+}
+
+fn malloc_ptr_to_int_fact(func: &Function, value: ValueId) -> Option<RangeFact> {
+    let Value::Inst {
+        inst,
+        result_idx: 0,
+        ..
+    } = func.dfg.get_value(value)?
+    else {
+        return None;
+    };
+    let malloc = <&EvmMalloc as InstDowncast>::downcast(func.inst_set(), func.dfg.inst(*inst))?;
+    let size = func.dfg.value_imm(*malloc.size())?;
+    if size.is_negative() {
+        return None;
+    }
+    let size = size.as_i256().to_u256();
+    if size > U256::from(u32::MAX) {
+        return None;
+    }
+    let full = RangeFact::full_for(Type::I256);
+    Some(RangeFact {
+        unsigned: UnsignedInterval {
+            lo: U256::zero(),
+            hi: unsigned_max(Type::I256) - size,
+        },
+        signed: full.signed,
+    })
 }
 
 fn transfer_snego_inst(func: &Function, env: &mut RangeEnv, inst: InstId) {
@@ -1174,9 +1464,18 @@ fn transfer_bool_unary_inst(
     }
 }
 
-fn transfer_binary_inst(func: &Function, env: &mut RangeEnv, inst: InstId, kind: BinaryInstKind) {
+fn transfer_binary_inst(
+    func: &Function,
+    env: &mut RangeEnv,
+    inst: InstId,
+    kind: BinaryInstKind,
+    guarded_sub: bool,
+) {
     match kind {
         BinaryInstKind::Add => transfer_plain_binary(func, env, inst, plain_add_fact),
+        BinaryInstKind::Sub if guarded_sub => {
+            transfer_plain_binary(func, env, inst, guarded_sub_fact)
+        }
         BinaryInstKind::Sub => transfer_plain_binary(func, env, inst, plain_sub_fact),
         BinaryInstKind::Mul => transfer_plain_binary(func, env, inst, plain_mul_fact),
         BinaryInstKind::Uaddo
@@ -1188,7 +1487,7 @@ fn transfer_binary_inst(func: &Function, env: &mut RangeEnv, inst: InstId, kind:
         | BinaryInstKind::EvmUdivo
         | BinaryInstKind::EvmUmodo
         | BinaryInstKind::EvmSdivo
-        | BinaryInstKind::EvmSmodo => transfer_checked_binary(func, env, inst, kind),
+        | BinaryInstKind::EvmSmodo => transfer_checked_binary(func, env, inst, kind, guarded_sub),
         kind if is_compare(kind) => transfer_compare_inst(func, env, inst, kind),
         _ => clear_inst_results(func, env, inst),
     }
@@ -1223,6 +1522,7 @@ fn transfer_checked_binary(
     env: &mut RangeEnv,
     inst: InstId,
     kind: BinaryInstKind,
+    guarded_sub: bool,
 ) {
     let Some(value_result) = func.dfg.inst_result_at(inst, 0) else {
         clear_inst_results(func, env, inst);
@@ -1241,7 +1541,9 @@ fn transfer_checked_binary(
     let lhs_fact = fact_for_value(func, env, *lhs);
     let rhs_fact = fact_for_value(func, env, *rhs);
 
-    if let Some(fact) = checked_binary_value_fact(kind, lhs_fact, rhs_fact, ty) {
+    if let Some(fact) = checked_binary_value_fact(kind, lhs_fact, rhs_fact, ty)
+        .or_else(|| guarded_sub.then(|| guarded_sub_fact(lhs_fact, rhs_fact, ty)))
+    {
         set_env_fact(func, env, value_result, fact);
         set_env_fact(
             func,
@@ -1383,6 +1685,27 @@ fn plain_sub_fact(lhs: RangeFact, rhs: RangeFact, ty: Type) -> RangeFact {
         }
     } else {
         full.signed
+    };
+    RangeFact { unsigned, signed }
+}
+
+/// `lhs - rhs` where `lhs >= rhs` cannot wrap, so it lies between
+/// `lhs.lo - rhs.hi` (or zero) and `lhs.hi - rhs.lo`.
+fn guarded_sub_fact(lhs: RangeFact, rhs: RangeFact, ty: Type) -> RangeFact {
+    let difference = |lhs: U256, rhs: U256| {
+        if lhs > rhs { lhs - rhs } else { U256::zero() }
+    };
+    let unsigned = UnsignedInterval {
+        lo: difference(lhs.unsigned.lo, rhs.unsigned.hi),
+        hi: difference(lhs.unsigned.hi, rhs.unsigned.lo),
+    };
+    let signed = if unsigned.hi <= signed_max(ty).to_u256() {
+        SignedInterval {
+            lo: I256::from(unsigned.lo),
+            hi: I256::from(unsigned.hi),
+        }
+    } else {
+        plain_sub_fact(lhs, rhs, ty).signed
     };
     RangeFact { unsigned, signed }
 }
@@ -1756,6 +2079,7 @@ fn type_bits(ty: Type) -> u16 {
 
 #[cfg(test)]
 mod tests {
+    use smallvec::smallvec;
     use sonatina_ir::{
         Function, Type,
         builder::test_util::*,
@@ -1889,7 +2213,7 @@ mod tests {
             enum_ty,
             value: I256::from(1u8),
         });
-        let phi = builder.insert_inst_with(|| Phi::new(is, vec![(lhs, b0)]), tag_ty);
+        let phi = builder.insert_inst_with(|| Phi::new(is, smallvec![(lhs, b0)]), tag_ty);
         let eq = builder.insert_inst_with(|| Eq::new(is, phi, rhs), Type::I1);
         builder.insert_inst_no_result_with(|| Return::new_single(is, eq));
         builder.seal_all();
@@ -2062,6 +2386,58 @@ mod tests {
             assert!(join_envs(func, &left, &right).is_empty());
             assert!(widen_env(func, &left, &right).is_empty());
         });
+    }
+
+    #[test]
+    fn entry_backedges_do_not_constrain_initial_arguments() {
+        for indirect in [false, true] {
+            for loop_on_true in [false, true] {
+                let mb = test_module_builder();
+                let (evm, mut builder) = test_func_builder(&mb, &[Type::I8], Type::I8);
+                let is = evm.inst_set();
+                let entry = builder.append_block();
+                let latch = if indirect {
+                    builder.append_block()
+                } else {
+                    entry
+                };
+                let exit = builder.append_block();
+
+                builder.switch_to_block(entry);
+                let arg = builder.args()[0];
+                let ten = builder.make_imm_value(10i8);
+                let cond = builder.insert_inst_with(|| Lt::new(is, arg, ten), Type::I1);
+                let (then_block, else_block) = if loop_on_true {
+                    (latch, exit)
+                } else {
+                    (exit, latch)
+                };
+                builder.insert_inst_no_result_with(|| Br::new(is, cond, then_block, else_block));
+                if indirect {
+                    builder.switch_to_block(latch);
+                    builder.insert_inst_no_result_with(|| Jump::new(is, entry));
+                }
+                builder.switch_to_block(exit);
+                builder.insert_inst_no_result_with(|| Return::new_single(is, arg));
+                builder.seal_all();
+                builder.finish();
+
+                let module = mb.build();
+                module.func_store.view(module.funcs()[0], |func| {
+                    let analysis = compute_analysis(func);
+                    assert_eq!(
+                        fact_for_value(func, analysis.entry_env(entry), arg),
+                        RangeFact::full_for(Type::I8),
+                        "indirect={indirect}, loop_on_true={loop_on_true}"
+                    );
+                    assert!(analysis.is_reachable(exit));
+                    let fact = fact_for_value(func, analysis.entry_env(exit), arg);
+                    let expected = if loop_on_true { (10u8, 255u8) } else { (0, 9) };
+                    assert_eq!(fact.unsigned.lo, U256::from(expected.0));
+                    assert_eq!(fact.unsigned.hi, U256::from(expected.1));
+                });
+            }
+        }
     }
 
     #[test]
@@ -2422,7 +2798,8 @@ mod tests {
         builder.insert_inst_no_result_with(|| Jump::new(is, b3));
 
         builder.switch_to_block(b3);
-        let phi = builder.insert_inst_with(|| Phi::new(is, vec![(one, b1), (five, b2)]), Type::I8);
+        let phi =
+            builder.insert_inst_with(|| Phi::new(is, smallvec![(one, b1), (five, b2)]), Type::I8);
         builder.insert_inst_no_result_with(|| Return::new_single(is, phi));
 
         builder.seal_all();
@@ -2454,7 +2831,7 @@ mod tests {
         builder.insert_inst_no_result_with(|| Jump::new(is, b1));
 
         builder.switch_to_block(b1);
-        let iter = builder.insert_inst_with(|| Phi::new(is, vec![(zero, b0)]), Type::I8);
+        let iter = builder.insert_inst_with(|| Phi::new(is, smallvec![(zero, b0)]), Type::I8);
         let hundred = builder.make_imm_value(100i8);
         let cond = builder.insert_inst_with(|| Lt::new(is, iter, hundred), Type::I1);
         builder.insert_inst_no_result_with(|| Br::new(is, cond, b2, b3));
@@ -2502,7 +2879,7 @@ mod tests {
 
         builder.switch_to_block(b1);
         let cond = builder.args()[0];
-        let iter = builder.insert_inst_with(|| Phi::new(is, vec![(zero, b0)]), Type::I8);
+        let iter = builder.insert_inst_with(|| Phi::new(is, smallvec![(zero, b0)]), Type::I8);
         builder.insert_inst_no_result_with(|| Br::new(is, cond, b2, b3));
 
         builder.switch_to_block(b2);
@@ -2581,7 +2958,7 @@ mod tests {
         let mut lpt = LoopTree::new();
         lpt.compute(&cfg, &domtree);
         let mut analysis = RangeAnalysis::default();
-        analysis.compute(func, &cfg, &lpt);
+        analysis.compute(func, &cfg, &domtree, &lpt);
         analysis
     }
 }

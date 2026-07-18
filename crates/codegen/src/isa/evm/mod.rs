@@ -2,45 +2,55 @@ mod backend;
 pub(crate) mod dyn_sp;
 mod emit;
 mod escape_scan;
+mod exact_func_merge;
+mod fixed_slots;
 mod frame_layout;
 mod heap_plan;
-mod late_alias;
+mod high_alias;
+mod immediate;
 mod late_block_merge;
 mod late_section_merge;
-mod lazy_frame;
+mod local_malloc;
+mod machine;
 mod malloc_plan;
-mod mem_effects;
 mod memory_plan;
 pub mod opcode;
 mod pipeline;
+mod placement_search;
 mod prepare;
-mod provenance;
+mod private_malloc;
 mod ptr_escape;
-mod scratch_effects;
-mod scratch_plan;
+mod ptr_provenance;
 pub(crate) mod static_arena_alloc;
 #[doc(hidden)]
 pub mod test_util;
 mod verify;
 
 pub use backend::{EvmBackend, ImmediateMaterializationMode, LateCleanupProfile, PushWidthPolicy};
-pub use late_alias::canonicalize_alias_value;
 pub use prepare::EvmPreparedSection;
 
 pub(crate) use dyn_sp::DynSpInitKind;
+#[cfg(test)]
+pub(crate) use emit::fold_stack_actions;
 pub(crate) use emit::{
-    fold_stack_actions, immediate_u32, is_plain_inst, is_push_opcode, referenced_insn_label_targets,
+    immediate_u32, is_plain_inst, is_push_opcode, referenced_insn_label_targets,
 };
 pub(crate) use frame_layout::{DynamicFrameLayout, FrameLocalWord};
-pub(crate) use late_alias::normalize_alias_map;
-pub(crate) use lazy_frame::{FrameSite, FrameSummary, LazyFramePlan};
+pub(crate) use high_alias::canonicalize_alias_value;
+pub(crate) use immediate::{
+    ImmediateMaterializationPlan, immediate_materialization_code_len,
+    immediate_materialization_cost_i256, immediate_materialization_plan, u32_to_be, u256_to_be,
+};
+pub(crate) use local_malloc::promote_local_mallocs;
 pub(crate) use memory_plan::{
-    DYN_SP_SLOT, FREE_PTR_SLOT, FuncMemPlan, ObjLoc, PreserveMode, STATIC_BASE, WORD_BYTES,
+    DYN_SP_SLOT, FREE_PTR_SLOT, MachineFuncPlan, ObjLoc, STATIC_BASE, WORD_BYTES,
 };
 pub(crate) use opcode::OpCode;
 pub(crate) use prepare::{EvmFunctionPlan, EvmSectionPlan, prepare_free_ptr_restore};
-pub(crate) use ptr_escape::{PtrEscapeSummary, compute_ptr_escape_summaries};
-pub(crate) use sonatina_ir::{isa::evm::Evm, module::FuncRef};
+pub(crate) use ptr_escape::{PtrEscapeSummaries, compute_ptr_escape_summaries};
+#[cfg(test)]
+pub(crate) use sonatina_ir::isa::evm::Evm;
+pub(crate) use sonatina_ir::module::FuncRef;
 pub(crate) use verify::{collect_unsupported_evm_calls, validate_supported_lowering_ir};
 
 #[cfg(test)]

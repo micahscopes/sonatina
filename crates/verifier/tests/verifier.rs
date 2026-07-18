@@ -2,15 +2,16 @@ use sonatina_ir::{
     InstDowncastMut, Linkage, Signature, Type, Value, ValueId,
     builder::ModuleBuilder,
     inst::{arith::Add, control_flow::BrTable, data::Gep},
+    ir_writer::ModuleWriter,
     isa::evm::Evm,
-    module::ModuleCtx,
+    module::{FuncRef, ModuleCtx},
     types::CompoundTypeRef,
 };
 use sonatina_parser::parse_module;
 use sonatina_triple::TargetTriple;
 use sonatina_verifier::{
     ModuleBuilderVerifyExt, ParseVerifyError, VerificationLevel, VerifierConfig, build_and_verify,
-    parse_and_verify_module, verify_module, verify_module_invariants,
+    parse_and_verify_module, verify_function_signature, verify_module, verify_module_invariants,
 };
 
 fn has_code(report: &sonatina_verifier::VerificationReport, code: &str) -> bool {
@@ -69,6 +70,65 @@ fn parse_and_verify_module_reports_parse_errors() {
         Err(err) => err,
     };
     assert!(matches!(err, ParseVerifyError::Parse(_)));
+}
+
+#[test]
+fn sparse_block_ids_parse_verify_and_roundtrip() {
+    let source = include_str!("fixtures/sparse_blocks.sntn");
+    for target in ["evm-ethereum-london", "aarch64-unknown-native"] {
+        let source = source.replace("evm-ethereum-london", target);
+        for level in [VerificationLevel::Standard, VerificationLevel::Full] {
+            let cfg = VerifierConfig::for_level(level);
+            let parsed = parse_and_verify_module(&source, &cfg)
+                .unwrap_or_else(|err| panic!("sparse blocks should verify for {target}: {err:?}"));
+            for (func_ref, expected) in parsed
+                .module
+                .funcs()
+                .into_iter()
+                .zip([vec![7, 42, 19, 90, 63], vec![11, 3, 40, 27]])
+            {
+                parsed.module.func_store.view(func_ref, |func| {
+                    let blocks: Vec<_> = func
+                        .layout
+                        .iter_block()
+                        .map(|block| block.as_u32())
+                        .collect();
+                    assert_eq!(blocks, expected);
+                    assert_eq!(func.dfg.block_ids().count(), blocks.len());
+                });
+            }
+            let text =
+                ModuleWriter::with_debug_provider(&parsed.module, &parsed.debug).dump_string();
+            let reparsed = parse_and_verify_module(&text, &cfg).expect("roundtrip should verify");
+            assert_eq!(
+                ModuleWriter::with_debug_provider(&reparsed.module, &reparsed.debug).dump_string(),
+                text
+            );
+        }
+    }
+}
+
+#[test]
+fn standalone_signature_verification_enforces_the_module_abi_rules() {
+    let module = parse_module(
+        r#"
+target = "evm-ethereum-osaka"
+declare external %consume(objref<i64>);
+"#,
+    )
+    .unwrap()
+    .module;
+    let function = module.funcs()[0];
+    let config = VerifierConfig::default();
+    let signature = verify_function_signature(&module.ctx, function, &config);
+    let whole_module = verify_module_invariants(&module, &config);
+    assert!(signature.has_errors());
+    assert_eq!(
+        diagnostic_fingerprint(&signature),
+        diagnostic_fingerprint(&whole_module)
+    );
+    let missing = verify_function_signature(&module.ctx, FuncRef::from_u32(u32::MAX - 1), &config);
+    assert!(has_message(&missing, "function has no declared signature"));
 }
 
 #[test]
@@ -201,6 +261,133 @@ block0:
     assert!(
         has_code(&report, "IR0600"),
         "expected enum.extract verification failure, got {report}"
+    );
+}
+
+#[test]
+fn dominating_enum_assert_variant_proves_value_extract() {
+    let src = r#"
+target = "evm-ethereum-osaka"
+
+type @OptionI256 = enum {
+    #None,
+    #Some(i256),
+};
+
+func private %ok(v0.@OptionI256, v1.i1) -> i256 {
+block0:
+    enum.assert_variant v0 #Some;
+    br v1 block1 block2;
+
+block1:
+    v2.i256 = enum.extract v0 #Some 0.i8;
+    return v2;
+
+block2:
+    return 0.i256;
+}
+"#;
+
+    let parsed = parse_module(src).expect("module should parse");
+    let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
+    let report = verify_module(&parsed.module, &cfg);
+    assert!(report.is_ok(), "expected no verifier errors, got {report}");
+}
+
+#[test]
+fn non_dominating_enum_assert_variant_does_not_prove_value_extract() {
+    let src = r#"
+target = "evm-ethereum-osaka"
+
+type @OptionI256 = enum {
+    #None,
+    #Some(i256),
+};
+
+func private %bad(v0.@OptionI256, v1.i1) -> i256 {
+block0:
+    br v1 block1 block2;
+
+block1:
+    enum.assert_variant v0 #Some;
+    jump block3;
+
+block2:
+    jump block3;
+
+block3:
+    v2.i256 = enum.extract v0 #Some 0.i8;
+    return v2;
+}
+"#;
+
+    let parsed = parse_module(src).expect("module should parse");
+    let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
+    let report = verify_module(&parsed.module, &cfg);
+    assert!(
+        has_code(&report, "IR0600"),
+        "expected enum.extract verification failure without dominating proof, got {report}"
+    );
+}
+
+#[test]
+fn dominating_assert_for_other_variant_does_not_prove_value_extract() {
+    let src = r#"
+target = "evm-ethereum-osaka"
+
+type @OptionI256 = enum {
+    #None,
+    #Some(i256),
+};
+
+func private %bad(v0.@OptionI256) -> i256 {
+block0:
+    enum.assert_variant v0 #None;
+    jump block1;
+
+block1:
+    v1.i256 = enum.extract v0 #Some 0.i8;
+    return v1;
+}
+"#;
+
+    let parsed = parse_module(src).expect("module should parse");
+    let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
+    let report = verify_module(&parsed.module, &cfg);
+    assert!(
+        has_code(&report, "IR0600"),
+        "expected enum.extract verification failure with wrong variant proof, got {report}"
+    );
+}
+
+#[test]
+fn dominating_assert_for_other_value_does_not_prove_value_extract() {
+    let src = r#"
+target = "evm-ethereum-osaka"
+
+type @OptionI256 = enum {
+    #None,
+    #Some(i256),
+};
+
+func private %bad(v0.@OptionI256) -> i256 {
+block0:
+    v1.@OptionI256 = enum.make @OptionI256 #Some (1.i256);
+    enum.assert_variant v1 #Some;
+    jump block1;
+
+block1:
+    v2.i256 = enum.extract v0 #Some 0.i8;
+    return v2;
+}
+"#;
+
+    let parsed = parse_module(src).expect("module should parse");
+    let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
+    let report = verify_module(&parsed.module, &cfg);
+    assert!(
+        has_code(&report, "IR0600"),
+        "expected enum.extract verification failure with wrong value proof, got {report}"
     );
 }
 
@@ -846,6 +1033,69 @@ func public %bad_i1(v0.i1, v1.i1) -> unit {
     let report = verify_module(&parsed.module, &cfg);
 
     assert!(has_code(&report, "IR0600"), "expected IR0600, got {report}");
+}
+
+#[test]
+fn bswap_rejects_i1_and_mismatched_results() {
+    let src = r#"
+target = "evm-ethereum-london"
+
+func public %bad_i1(v0.i1) -> unit {
+    block0:
+        v1.i1 = bswap v0;
+        return;
+}
+
+func public %bad_result(v0.i32) -> unit {
+    block0:
+        v1.i64 = bswap v0;
+        return;
+}
+
+func public %bad_operand(v0.*i32) -> unit {
+    block0:
+        v1.*i32 = bswap v0;
+        return;
+}
+"#;
+
+    let parsed = parse_module(src).expect("module should parse");
+    let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
+    let report = verify_module(&parsed.module, &cfg);
+
+    assert!(
+        has_message(&report, "bswap does not support i1 operands"),
+        "expected the i1 rejection, got {report}"
+    );
+    assert!(
+        has_message(&report, "bswap operand must be integral"),
+        "expected the pointer rejection, got {report}"
+    );
+    assert!(has_code(&report, "IR0601"), "expected IR0601, got {report}");
+}
+
+#[test]
+fn bswap_accepts_every_integer_width_from_i8() {
+    let src = r#"
+target = "evm-ethereum-london"
+
+func public %widths(v0.i8, v1.i16, v2.i32, v3.i64, v4.i128, v5.i256) -> unit {
+    block0:
+        v6.i8 = bswap v0;
+        v7.i16 = bswap v1;
+        v8.i32 = bswap v2;
+        v9.i64 = bswap v3;
+        v10.i128 = bswap v4;
+        v11.i256 = bswap v5;
+        return;
+}
+"#;
+
+    let parsed = parse_module(src).expect("module should parse");
+    let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
+    let report = verify_module(&parsed.module, &cfg);
+
+    assert!(!report.has_errors(), "unexpected errors: {report}");
 }
 
 #[test]
@@ -1572,6 +1822,31 @@ func public %caller() -> unit {
 }
 
 #[test]
+fn black_box_accepts_each_integer_width() {
+    let cfg = VerifierConfig::for_level(VerificationLevel::Full);
+    for ty in ["i1", "i8", "i16", "i32", "i64", "i128", "i256"] {
+        let src = format!(
+            "target = \"evm-ethereum-osaka\"\nfunc public %identity(v0.{ty}) -> {ty} {{\nblock0:\nv1.{ty} = black_box v0;\nreturn v1;\n}}"
+        );
+        parse_and_verify_module(&src, &cfg)
+            .unwrap_or_else(|err| panic!("black_box should accept {ty}: {err:?}"));
+    }
+}
+
+#[test]
+fn black_box_rejects_noninteger_operands_and_mismatched_results() {
+    let cfg = VerifierConfig::for_level(VerificationLevel::Full);
+    for (arg_ty, result_ty, code) in [("*i8", "*i8", "IR0600"), ("i32", "i64", "IR0601")] {
+        let src = format!(
+            "target = \"evm-ethereum-osaka\"\nfunc public %invalid(v0.{arg_ty}) -> {result_ty} {{\nblock0:\nv1.{result_ty} = black_box v0;\nreturn v1;\n}}"
+        );
+        let parsed = parse_module(&src).expect("module should parse");
+        let report = verify_module(&parsed.module, &cfg);
+        assert!(has_code(&report, code), "expected {code}, got {report}");
+    }
+}
+
+#[test]
 fn shift_operand_width_mismatch_is_rejected() {
     let src = r#"
 target = "evm-ethereum-london"
@@ -2159,4 +2434,817 @@ func public %bad_evm_return_result() -> unit {
     let report = verify_module(&parsed.module, &cfg);
 
     assert!(has_code(&report, "IR0601"), "expected IR0601, got {report}");
+}
+
+#[test]
+fn enum_proofs_invalidate_raw_writes_and_saved_tags() {
+    for materialize in ["stack", "heap"] {
+        for (operation, preserves) in [
+            ("", true),
+            ("v8.i256 = mload v3 i256;", true),
+            ("evm_sstore 0.i256 42.i256;", true),
+            ("mstore v3 0.i256 i256;", false),
+            ("memzero v3 64.i256;", false),
+            (
+                "v8.i256 = ptr_to_int v3 i256;\n    evm_mstore v8 0.i256;",
+                false,
+            ),
+            (
+                "v8.i256 = ptr_to_int v3 i256;\n    evm_mcopy v8 0.i256 64.i256;",
+                false,
+            ),
+        ] {
+            for mode in ["direct", "saved_tag", "fresh_tag", "reassert"] {
+                let continuation = match mode {
+                    "direct" => "v6.i256 = obj.load v2;\n    return v6;".to_owned(),
+                    "reassert" => "v5.objref<@Choice> = enum.assert_variant_ref v0 #Some;\n    v6.i256 = obj.load v2;\n    return v6;".to_owned(),
+                    _ => {
+                        let refresh = if mode == "fresh_tag" { "v5.enumtag(@Choice) = enum.get_tag v0;" } else { "" };
+                        let tag = if mode == "fresh_tag" { "v5" } else { "v4" };
+                        format!("obj.store v2 17.i256;\n    {refresh}\n    br_table {tag} block2 (1.enumtag(@Choice) block1);\nblock1:\n    v6.i256 = obj.load v2;\n    return v6;\nblock2:\n    return 0.i256;")
+                    }
+                };
+                let source = format!(
+                    r#"
+target = "evm-ethereum-osaka"
+type @Choice = enum {{ #None, #Some(i256) }};
+func private %entry(v0.objref<@Choice>) -> i256 {{
+block0:
+    v1.objref<@Choice> = enum.assert_variant_ref v0 #Some;
+    v2.objref<i256> = enum.proj v1 #Some 0.i8;
+    v3.*@Choice = obj.materialize.{materialize} v0;
+    v4.enumtag(@Choice) = enum.get_tag v0;
+    {operation}
+    {continuation}
+}}
+"#
+                );
+                let parsed = parse_module(&source).expect("parse");
+                let report = verify_module(
+                    &parsed.module,
+                    &VerifierConfig::for_level(VerificationLevel::Full),
+                );
+                let valid = preserves || matches!(mode, "fresh_tag" | "reassert");
+                assert_eq!(
+                    !report.has_errors(),
+                    valid,
+                    "{materialize}, {operation}, {mode}: {report}"
+                );
+                if !valid {
+                    assert_eq!(report.errors().count(), 1, "{report}");
+                    assert!(has_code(&report, "IR0600"), "{report}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn enum_complete_nested_writes_preserve_outer_initialization() {
+    for (field_ty, projection, write, whole) in [
+        ("@Inner", "", "enum.write_variant v2 #Some (22.i256);", true),
+        (
+            "@Pair",
+            "v3.objref<@Inner> = obj.proj v2 0.i8;",
+            "enum.write_variant v3 #Some (22.i256);",
+            false,
+        ),
+        (
+            "@Pair",
+            "v3.objref<i256> = obj.proj v2 1.i8;",
+            "obj.store v3 22.i256;",
+            false,
+        ),
+    ] {
+        for initialized in [true, false] {
+            let init = if initialized {
+                "v1.objref<@Outer> = enum.assert_variant_ref v0 #Some;"
+            } else {
+                "enum.set_tag v0 #Some;"
+            };
+            let source = format!(
+                r#"
+target = "evm-ethereum-osaka"
+type @Inner = enum {{ #None, #Some(i256) }};
+type @Pair = {{ @Inner, i256 }};
+type @Outer = enum {{ #None, #Some({field_ty}) }};
+func private %entry(v0.objref<@Outer>) -> {field_ty} {{
+block0:
+    {init}
+    v2.objref<{field_ty}> = enum.proj v0 #Some 0.i8;
+    {projection}
+    {write}
+    jump block1;
+block1:
+    v4.{field_ty} = obj.load v2;
+    return v4;
+}}
+"#
+            );
+            let parsed = parse_module(&source).expect("parse");
+            let report = verify_module(
+                &parsed.module,
+                &VerifierConfig::for_level(VerificationLevel::Full),
+            );
+            assert_eq!(
+                !report.has_errors(),
+                initialized || whole,
+                "{field_ty}, {initialized}: {report}"
+            );
+            if report.has_errors() {
+                assert_eq!(report.errors().count(), 1, "{report}");
+                assert!(has_code(&report, "IR0600"), "{report}");
+            }
+        }
+    }
+}
+
+#[test]
+fn enum_proofs_analyze_disconnected_components_from_empty_entries() {
+    for (body, valid) in [
+        (
+            "block1:\n    v2.objref<@Choice> = enum.assert_variant_ref v0 #Some;\n    v3.objref<i256> = enum.proj v2 #Some 0.i8;\n    v4.i256 = obj.load v3;\n    return v4;",
+            true,
+        ),
+        (
+            "block1:\n    v2.objref<@Choice> = enum.assert_variant_ref v0 #Some;\n    v3.objref<i256> = enum.proj v2 #Some 0.i8;\n    jump block2;\nblock2:\n    v4.i256 = obj.load v3;\n    br v1 block2 block3;\nblock3:\n    return v4;",
+            true,
+        ),
+        (
+            "block1:\n    v3.objref<i256> = enum.proj v0 #Some 0.i8;\n    v4.i256 = obj.load v3;\n    jump block1;",
+            false,
+        ),
+        (
+            "block1:\n    enum.set_tag v0 #Some;\n    v3.objref<i256> = enum.proj v0 #Some 0.i8;\n    obj.store v3 17.i256;\n    v5.enumtag(@Choice) = enum.get_tag v0;\n    br_table v5 block3 (1.enumtag(@Choice) block2);\nblock2:\n    v4.i256 = obj.load v3;\n    return v4;\nblock3:\n    return 0.i256;",
+            true,
+        ),
+        (
+            "block1:\n    v2.objref<@Choice> = enum.assert_variant_ref v0 #Some;\n    v3.objref<i256> = enum.proj v2 #Some 0.i8;\n    enum.set_tag v0 #None;\n    v4.i256 = obj.load v3;\n    return v4;",
+            false,
+        ),
+    ] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+type @Choice = enum {{ #None, #Some(i256) }};
+func private %entry(v0.objref<@Choice>, v1.i1) -> i256 {{
+block0:
+    return 0.i256;
+{body}
+}}
+"#
+        );
+        let parsed = parse_module(&source).expect("parse");
+        for level in [VerificationLevel::Standard, VerificationLevel::Full] {
+            let report = verify_module(&parsed.module, &VerifierConfig::for_level(level));
+            assert_eq!(!report.has_errors(), valid, "{body}: {report}");
+            if !valid {
+                assert_eq!(report.errors().count(), 1, "{report}");
+                assert!(has_code(&report, "IR0600"), "{report}");
+            }
+        }
+    }
+}
+
+#[test]
+fn enum_field_proofs_preserve_disjoint_payload_writes() {
+    for write in [
+        "obj.store v3 42.i256;",
+        "v5.constref<i256> = const.ref $word;\n    obj.init.const v3 v5;",
+        "v5.objref<@Choice> = enum.assert_variant_ref v1 #Some;\n    v6.objref<i256> = enum.proj v5 #Some 1.i256;\n    obj.store v6 42.i256;",
+    ] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+type @Choice = enum {{ #None, #Some(i256,i256) }};
+global private const i256 $word = 42;
+func private %entry(v0.objref<@Choice>) -> i256 {{
+block0:
+    v1.objref<@Choice> = enum.assert_variant_ref v0 #Some;
+    v2.objref<i256> = enum.proj v1 #Some 0.i8;
+    v3.objref<i256> = enum.proj v1 #Some 1.i8;
+    {write}
+    jump block1;
+block1:
+    v4.i256 = obj.load v2;
+    return v4;
+}}
+"#
+        );
+        let parsed = parse_module(&source).expect("parse");
+        let report = verify_module(
+            &parsed.module,
+            &VerifierConfig::for_level(VerificationLevel::Full),
+        );
+        assert!(!report.has_errors(), "{write}: {report}");
+    }
+}
+
+#[test]
+fn enum_field_proofs_preserve_nested_sibling_writes() {
+    let source = r#"
+target = "evm-ethereum-osaka"
+type @Pair = { i256, i256 };
+type @Choice = enum { #None, #Some(i256,@Pair) };
+func private %entry(v0.objref<@Choice>) -> i256 {
+block0:
+    v1.objref<@Choice> = enum.assert_variant_ref v0 #Some;
+    v2.objref<i256> = enum.proj v1 #Some 0.i8;
+    v3.objref<@Pair> = enum.proj v1 #Some 1.i8;
+    v4.objref<i256> = obj.proj v3 0.i8;
+    obj.store v4 42.i256;
+    v5.i256 = obj.load v2;
+    return v5;
+}
+"#;
+    let parsed = parse_module(source).expect("parse");
+    let report = verify_module(
+        &parsed.module,
+        &VerifierConfig::for_level(VerificationLevel::Full),
+    );
+    assert!(!report.has_errors(), "{report}");
+}
+
+#[test]
+fn enum_initialization_proofs_distinguish_objects_and_fields() {
+    for (object, field, proven) in [(0, 0, true), (0, 1, false), (1, 0, false), (1, 1, false)] {
+        for initialize in [
+            "obj.store v2 42.i256;",
+            "v6.constref<i256> = const.ref $word;\n    obj.init.const v2 v6;",
+        ] {
+            let source = format!(
+                r#"
+target = "evm-ethereum-osaka"
+type @Choice = enum {{ #None, #Some(i256,i256) }};
+global private const i256 $word = 42;
+func private %entry() -> i256 {{
+block0:
+    v0.objref<@Choice> = obj.alloc @Choice;
+    v1.objref<@Choice> = obj.alloc @Choice;
+    enum.set_tag v0 #Some;
+    enum.set_tag v1 #Some;
+    v2.objref<i256> = enum.proj v0 #Some 0.i8;
+    {initialize}
+    v3.i256 = obj.load v2;
+    v4.objref<i256> = enum.proj v{object} #Some {field}.i256;
+    v5.i256 = obj.load v4;
+    return v5;
+}}
+"#
+            );
+            let parsed = parse_module(&source).expect("parse");
+            let report = verify_module(
+                &parsed.module,
+                &VerifierConfig::for_level(VerificationLevel::Full),
+            );
+            assert_eq!(
+                !report.has_errors(),
+                proven,
+                "object {object}, field {field}, {initialize}: {report}"
+            );
+            if !proven {
+                assert!(has_code(&report, "IR0600"), "{report}");
+            }
+        }
+    }
+}
+
+#[test]
+fn enum_field_proofs_follow_non_topological_block_layout() {
+    for write in ["obj.store v3 42.i256;", "enum.set_tag v0 #None;"] {
+        let source = format!(
+            r#"
+target = "evm-ethereum-osaka"
+type @Choice = enum {{ #None, #Some(i256,i256) }};
+func private %entry(v0.objref<@Choice>) -> i256 {{
+block0:
+    jump block2;
+block1:
+    v4.i256 = obj.load v2;
+    return v4;
+block2:
+    v1.objref<@Choice> = enum.assert_variant_ref v0 #Some;
+    v2.objref<i256> = enum.proj v1 #Some 0.i8;
+    v3.objref<i256> = enum.proj v1 #Some 1.i8;
+    {write}
+    jump block1;
+}}
+"#
+        );
+        let parsed = parse_module(&source).expect("parse");
+        let report = verify_module(
+            &parsed.module,
+            &VerifierConfig::for_level(VerificationLevel::Full),
+        );
+        assert_eq!(
+            !report.has_errors(),
+            write.starts_with("obj.store"),
+            "{write}: {report}"
+        );
+    }
+}
+
+#[test]
+fn shared_enum_field_analysis_keeps_program_points_distinct() {
+    let source = r#"
+target = "evm-ethereum-osaka"
+type @Choice = enum { #None, #Some(i256) };
+func private %entry(v0.objref<@Choice>) -> i256 {
+block0:
+    v1.objref<@Choice> = enum.assert_variant_ref v0 #Some;
+    v2.objref<i256> = enum.proj v1 #Some 0.i8;
+    v3.i256 = obj.load v2;
+    enum.set_tag v0 #None;
+    v4.i256 = obj.load v2;
+    v5.objref<@Choice> = enum.assert_variant_ref v0 #Some;
+    v6.objref<i256> = enum.proj v5 #Some 0.i256;
+    v7.i256 = obj.load v6;
+    return v7;
+}
+"#;
+    let parsed = parse_module(source).expect("parse");
+    let report = verify_module(
+        &parsed.module,
+        &VerifierConfig::for_level(VerificationLevel::Full),
+    );
+    assert_eq!(report.errors().count(), 1, "{report}");
+    assert!(has_code(&report, "IR0600"), "{report}");
+}
+
+#[test]
+fn enum_field_load_proofs_follow_all_control_flow_paths() {
+    let cases = [
+        (
+            "unconditional edge",
+            true,
+            r#"
+block0:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    v3.objref<i256> = enum.proj v2 #Some 0.i8;
+    jump block1;
+block1:
+    v4.i256 = obj.load v3;
+    return v4;
+"#,
+        ),
+        (
+            "diamond preserves dominating assertion",
+            true,
+            r#"
+block0:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    v3.objref<i256> = enum.proj v2 #Some 0.i8;
+    br v1 block1 block2;
+block1:
+    jump block3;
+block2:
+    jump block3;
+block3:
+    v4.i256 = obj.load v3;
+    return v4;
+"#,
+        ),
+        (
+            "each incoming path proves initialization",
+            true,
+            r#"
+block0:
+    v3.objref<i256> = enum.proj v0 #Some 0.i8;
+    br v1 block1 block2;
+block1:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    jump block3;
+block2:
+    enum.write_variant v0 #Some (17.i256);
+    jump block3;
+block3:
+    v4.i256 = obj.load v3;
+    return v4;
+"#,
+        ),
+        (
+            "one incoming path lacks initialization",
+            false,
+            r#"
+block0:
+    v3.objref<i256> = enum.proj v0 #Some 0.i8;
+    br v1 block1 block2;
+block1:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    jump block3;
+block2:
+    enum.set_tag v0 #Some;
+    jump block3;
+block3:
+    v4.i256 = obj.load v3;
+    return v4;
+"#,
+        ),
+        (
+            "tag and field initialization in separate blocks",
+            true,
+            r#"
+block0:
+    enum.set_tag v0 #Some;
+    v3.objref<i256> = enum.proj v0 #Some 0.i8;
+    jump block1;
+block1:
+    obj.store v3 17.i256;
+    jump block2;
+block2:
+    v4.i256 = obj.load v3;
+    return v4;
+"#,
+        ),
+        (
+            "loop preserves preheader proof",
+            true,
+            r#"
+block0:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    v3.objref<i256> = enum.proj v2 #Some 0.i8;
+    jump block1;
+block1:
+    v4.i256 = obj.load v3;
+    br v1 block1 block2;
+block2:
+    return v4;
+"#,
+        ),
+        (
+            "loop cannot invent initialization",
+            false,
+            r#"
+block0:
+    v3.objref<i256> = enum.proj v0 #Some 0.i8;
+    jump block1;
+block1:
+    v4.i256 = obj.load v3;
+    br v1 block1 block2;
+block2:
+    return v4;
+"#,
+        ),
+        (
+            "backedge invalidates preheader proof",
+            false,
+            r#"
+block0:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    v3.objref<i256> = enum.proj v2 #Some 0.i8;
+    jump block1;
+block1:
+    v4.i256 = obj.load v3;
+    br v1 block2 block3;
+block2:
+    enum.set_tag v0 #None;
+    jump block1;
+block3:
+    return v4;
+"#,
+        ),
+        (
+            "write through asserted alias invalidates proof",
+            false,
+            r#"
+block0:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    v3.objref<i256> = enum.proj v2 #Some 0.i8;
+    jump block1;
+block1:
+    enum.set_tag v2 #None;
+    jump block2;
+block2:
+    v4.i256 = obj.load v3;
+    return v4;
+"#,
+        ),
+        (
+            "call on one incoming path invalidates proof",
+            false,
+            r#"
+block0:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    v3.objref<i256> = enum.proj v2 #Some 0.i8;
+    br v1 block1 block2;
+block1:
+    call %retag v0;
+    jump block3;
+block2:
+    jump block3;
+block3:
+    v4.i256 = obj.load v3;
+    return v4;
+"#,
+        ),
+        (
+            "reassertion after mutation restores proof",
+            true,
+            r#"
+block0:
+    v2.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    v3.objref<i256> = enum.proj v2 #Some 0.i8;
+    jump block1;
+block1:
+    call %retag v0;
+    v5.objref<@OptionI256> = enum.assert_variant_ref v2 #Some;
+    jump block2;
+block2:
+    v4.i256 = obj.load v3;
+    return v4;
+"#,
+        ),
+    ];
+    for (name, valid, blocks) in cases {
+        let src = format!(
+            r#"
+target = "evm-ethereum-osaka"
+type @OptionI256 = enum {{ #None, #Some(i256), }};
+func private %retag(v0.objref<@OptionI256>) -> unit {{
+block0:
+    enum.set_tag v0 #None;
+    return;
+}}
+func private %check(v0.objref<@OptionI256>, v1.i1) -> i256 {{
+{blocks}
+}}
+"#
+        );
+        let parsed = parse_module(&src).unwrap_or_else(|err| panic!("{name}: {err:?}"));
+        let cfg = VerifierConfig::for_level(VerificationLevel::Full);
+        let report = verify_module(&parsed.module, &cfg);
+        if valid {
+            assert!(report.is_ok(), "{name}: expected valid IR, got {report}");
+        } else {
+            assert!(
+                has_code(&report, "IR0600"),
+                "{name}: expected missing enum field proof, got {report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn enum_branch_proof_includes_every_case_and_default_reaching_a_destination() {
+    let cases = [
+        (
+            "shared case and default",
+            "block1 (1.enumtag(@OptionI256) block1)",
+            false,
+        ),
+        (
+            "distinct case and default",
+            "block2 (1.enumtag(@OptionI256) block1)",
+            true,
+        ),
+        (
+            "single remaining default variant",
+            "block1 (0.enumtag(@OptionI256) block2)",
+            true,
+        ),
+        (
+            "two cases share destination",
+            "block2 (0.enumtag(@OptionI256) block1) (1.enumtag(@OptionI256) block1)",
+            false,
+        ),
+        (
+            "exhaustive cases leave default unreachable",
+            "block1 (0.enumtag(@OptionI256) block2) (1.enumtag(@OptionI256) block1)",
+            true,
+        ),
+    ];
+    for (name, targets, valid) in cases {
+        let src = format!(
+            r#"
+target = "evm-ethereum-osaka"
+type @OptionI256 = enum {{ #None, #Some(i256), }};
+func private %check(v0.objref<@OptionI256>) -> i256 {{
+block0:
+    v1.objref<i256> = enum.proj v0 #Some 0.i8;
+    obj.store v1 17.i256;
+    v2.enumtag(@OptionI256) = enum.get_tag v0;
+    br_table v2 {targets};
+block1:
+    v3.i256 = obj.load v1;
+    return v3;
+block2:
+    return 0.i256;
+}}
+"#
+        );
+        let parsed = parse_module(&src).unwrap_or_else(|err| panic!("{name}: {err:?}"));
+        let cfg = VerifierConfig::for_level(VerificationLevel::Full);
+        let report = verify_module(&parsed.module, &cfg);
+        if valid {
+            assert!(report.is_ok(), "{name}: expected valid IR, got {report}");
+        } else {
+            assert!(
+                has_code(&report, "IR0600"),
+                "{name}: expected missing enum variant proof, got {report}"
+            );
+        }
+    }
+}
+
+#[test]
+fn enum_branch_proofs_require_a_current_tag_observation() {
+    let cases = [
+        ("payload store preserves tag", true, "", "v4"),
+        (
+            "retag invalidates observation",
+            false,
+            "enum.set_tag v0 #None;",
+            "v4",
+        ),
+        (
+            "asserted alias retag invalidates observation",
+            false,
+            r#"
+    v5.objref<@OptionI256> = enum.assert_variant_ref v0 #Some;
+    enum.set_tag v5 #None;
+"#,
+            "v4",
+        ),
+        (
+            "unknown parameter alias invalidates observation",
+            false,
+            "enum.set_tag v2 #None;",
+            "v4",
+        ),
+        (
+            "call invalidates observation",
+            false,
+            "call %retag v0;",
+            "v4",
+        ),
+        (
+            "whole object store invalidates observation",
+            false,
+            r#"
+    v5.@OptionI256 = enum.make @OptionI256 #None;
+    obj.store v0 v5;
+"#,
+            "v4",
+        ),
+        (
+            "variant write invalidates observation",
+            false,
+            "enum.write_variant v0 #None;",
+            "v4",
+        ),
+        (
+            "unconditional edge preserves observation",
+            true,
+            r#"
+    jump block1;
+block1:
+"#,
+            "v4",
+        ),
+        (
+            "diamond preserves observation",
+            true,
+            r#"
+    br v1 block4 block5;
+block4:
+    jump block1;
+block5:
+    jump block1;
+block1:
+"#,
+            "v4",
+        ),
+        (
+            "mutation on one incoming path invalidates observation",
+            false,
+            r#"
+    br v1 block4 block5;
+block4:
+    enum.set_tag v0 #None;
+    jump block1;
+block5:
+    jump block1;
+block1:
+"#,
+            "v4",
+        ),
+        (
+            "phi alias mutation invalidates observation",
+            false,
+            r#"
+    br v1 block4 block5;
+block4:
+    jump block1;
+block5:
+    jump block1;
+block1:
+    v5.objref<@OptionI256> = phi (v0 block4) (v0 block5);
+    enum.set_tag v5 #None;
+"#,
+            "v4",
+        ),
+        (
+            "read-only loop preserves observation",
+            true,
+            r#"
+    jump block4;
+block4:
+    br v1 block4 block1;
+block1:
+"#,
+            "v4",
+        ),
+        (
+            "loop mutation invalidates observation",
+            false,
+            r#"
+    jump block4;
+block4:
+    enum.set_tag v0 #None;
+    br v1 block4 block1;
+block1:
+"#,
+            "v4",
+        ),
+        (
+            "loop rereads after mutation",
+            true,
+            r#"
+    jump block4;
+block4:
+    enum.set_tag v0 #None;
+    v9.enumtag(@OptionI256) = enum.get_tag v0;
+    br v1 block4 block1;
+block1:
+"#,
+            "v9",
+        ),
+        (
+            "fresh observation after retag",
+            true,
+            r#"
+    enum.set_tag v0 #None;
+    v9.enumtag(@OptionI256) = enum.get_tag v0;
+"#,
+            "v9",
+        ),
+        (
+            "fresh observation after call",
+            true,
+            r#"
+    call %retag v0;
+    v9.enumtag(@OptionI256) = enum.get_tag v0;
+"#,
+            "v9",
+        ),
+        (
+            "explicit current variant needs no saved observation",
+            true,
+            "enum.set_tag v0 #Some;",
+            "v4",
+        ),
+    ];
+    for (name, valid, transition, scrutinee) in cases {
+        let unused_block = if transition.contains("block1:") {
+            ""
+        } else {
+            "block1:\n    unreachable;"
+        };
+        let src = format!(
+            r#"
+target = "evm-ethereum-osaka"
+type @OptionI256 = enum {{ #None, #Some(i256), }};
+func private %retag(v0.objref<@OptionI256>) -> unit {{
+block0:
+    enum.set_tag v0 #None;
+    return;
+}}
+func private %check(v0.objref<@OptionI256>, v1.i1, v2.objref<@OptionI256>) -> i256 {{
+block0:
+    v3.objref<i256> = enum.proj v0 #Some 0.i8;
+    v4.enumtag(@OptionI256) = enum.get_tag v0;
+    {transition}
+    obj.store v3 17.i256;
+    br_table {scrutinee} block3 (1.enumtag(@OptionI256) block2);
+block2:
+    v6.i256 = obj.load v3;
+    return v6;
+block3:
+    return 0.i256;
+{unused_block}
+}}
+"#
+        );
+        let parsed = parse_module(&src).unwrap_or_else(|err| panic!("{name}: {err:?}"));
+        let cfg = VerifierConfig::for_level(VerificationLevel::Full);
+        let report = verify_module(&parsed.module, &cfg);
+        if valid {
+            assert!(report.is_ok(), "{name}: expected valid IR, got {report}");
+        } else {
+            assert!(
+                has_code(&report, "IR0600"),
+                "{name}: expected missing current variant proof, got {report}"
+            );
+        }
+    }
 }

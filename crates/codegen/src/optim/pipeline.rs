@@ -19,23 +19,31 @@ use sonatina_ir::{
 use tracing::{debug_span, info_span, trace_span};
 
 use crate::{
-    analysis::func_behavior, cfg_edit::CleanupMode, domtree::DomTree, loop_analysis::LoopTree,
+    analysis::func_behavior,
+    cfg_edit::CleanupMode,
+    domtree::DomTree,
+    loop_analysis::LoopTree,
+    transform::aggregate::{
+        ObjectArgPromotion,
+        object_arg_invariance::{FunctionArgInvariance, compute_arg_invariance},
+    },
 };
 
 use super::{
     adce::{AdceCallPolicy, AdceSolver},
     aggregate::{
-        AggregateCombine, AggregateScalarize, LocalObjectArgMap, ObjectEffectSummaryMap,
-        ObjectLoadStore, ObjectMemoryAnalysis, collect_local_object_arg_info,
-        collect_local_object_arg_info_with_effects, compute_object_effect_summaries,
+        AggregateCombine, AggregateScalarize, LocalObjectArgMap, ModuleObjectFacts,
+        ObjectEffectSummaryMap, ObjectLoadStore, ObjectMemoryAnalysis,
     },
     branch_canonicalize::BranchCanonicalize,
     cfg_cleanup::CfgCleanup,
     checked_arith_elim::{CheckedArithElim, has_supported_checked_arith},
+    code_sink::CodeSink,
     dead_arg::{DeadArgElimConfig, run_dead_arg_elim},
     dead_func::{DeadFuncElimConfig, collect_object_roots, run_dead_func_elim},
     gvn::GvnSolver,
     inliner::{Inliner, InlinerConfig},
+    jump_thread::JumpThread,
     known_bits_simplify::KnownBitsSimplify,
     licm::LicmSolver,
     load_store::LoadStoreSolver,
@@ -72,6 +80,8 @@ pub enum Pass {
     KnownBitsSimplify,
     /// Eliminate checked arithmetic and div/mod overflow flags proven unreachable by range analysis.
     CheckedArithElim,
+    /// Thread predecessors past a branch on a phi of constants.
+    JumpThread,
     /// Remove conditional branches whose truth is proven by range analysis.
     RangeBranchSimplify,
     /// Sparse conditional constant propagation (composite: CfgCleanup + SCCP + CfgCleanup + ADCE).
@@ -82,6 +92,8 @@ pub enum Pass {
     Licm,
     /// Loop strength reduction for affine memory addresses.
     LoopStrengthReduce,
+    /// Sink pure instructions into the blocks that use their results.
+    CodeSink,
     /// Complete Global Value Numbering (legacy sparse predicated solver).
     Gvn,
     /// Recompute `dfg.users` from layout-inserted instructions only.
@@ -151,6 +163,11 @@ impl Pass {
                 needs_func_behavior: false,
                 invalidates_func_behavior: true,
             },
+            Pass::JumpThread => PassInfo {
+                name: "jump_thread",
+                needs_func_behavior: false,
+                invalidates_func_behavior: true,
+            },
             Pass::RangeBranchSimplify => PassInfo {
                 name: "range_branch_simplify",
                 needs_func_behavior: false,
@@ -176,6 +193,11 @@ impl Pass {
                 needs_func_behavior: false,
                 invalidates_func_behavior: true,
             },
+            Pass::CodeSink => PassInfo {
+                name: "code_sink",
+                needs_func_behavior: false,
+                invalidates_func_behavior: false,
+            },
             Pass::Gvn => PassInfo {
                 name: "gvn",
                 needs_func_behavior: true,
@@ -200,7 +222,11 @@ impl Pass {
     const fn needs_object_facts(self) -> bool {
         matches!(
             self,
-            Pass::ObjectLoadStore | Pass::AggregateScalarize | Pass::Licm | Pass::Gvn
+            Pass::AggregateCombine
+                | Pass::ObjectLoadStore
+                | Pass::AggregateScalarize
+                | Pass::Licm
+                | Pass::Gvn
         )
     }
 
@@ -209,7 +235,7 @@ impl Pass {
     }
 
     const fn invalidates_object_facts(self) -> bool {
-        !matches!(self, Pass::RebuildUsers)
+        !matches!(self, Pass::CodeSink | Pass::RebuildUsers)
     }
 }
 
@@ -227,6 +253,8 @@ pub enum Step {
     FuncPasses(Vec<Pass>),
     /// Remove dead formal arguments from rewritable functions and update direct callsites.
     DeadArgElim,
+    /// Pass private object arguments as bounded sets of unconditionally read scalar fields.
+    PromoteObjectArgs,
     /// Remove unreachable function definitions rooted at object `entry`/`include` directives.
     DeadFuncElim,
 }
@@ -237,6 +265,7 @@ impl Step {
             Step::Inline => "inline",
             Step::FuncPasses(_) => "func_passes",
             Step::DeadArgElim => "dead_arg_elim",
+            Step::PromoteObjectArgs => "promote_object_args",
             Step::DeadFuncElim => "dead_func_elim",
         }
     }
@@ -267,6 +296,7 @@ const PRIMARY_FUNC_PASSES: &[Pass] = &[
     Pass::AggregateScalarize,
     Pass::LoadStore,
     Pass::CheckedArithElim,
+    Pass::JumpThread,
     Pass::RangeBranchSimplify,
     Pass::Sccp,
     Pass::ScalarCanonicalize,
@@ -278,6 +308,7 @@ const PRIMARY_FUNC_PASSES: &[Pass] = &[
     Pass::KnownBitsSimplify,
     Pass::Sccp,
     Pass::BranchCanonicalize,
+    Pass::CodeSink,
     Pass::CfgCleanup,
 ];
 
@@ -289,11 +320,13 @@ const SECONDARY_FUNC_PASSES: &[Pass] = &[
     Pass::AggregateScalarize,
     Pass::LoadStore,
     Pass::CheckedArithElim,
+    Pass::JumpThread,
     Pass::RangeBranchSimplify,
     Pass::Sccp,
     Pass::ScalarCanonicalize,
     Pass::Gvn,
     Pass::BranchCanonicalize,
+    Pass::CodeSink,
     Pass::CfgCleanup,
 ];
 
@@ -301,6 +334,18 @@ const POST_DEAD_ARG_CLEANUP_PASSES: &[Pass] = &[
     Pass::CfgCleanup,
     Pass::Sccp,
     Pass::BranchCanonicalize,
+    Pass::CodeSink,
+    Pass::CfgCleanup,
+];
+
+const POST_INLINE_CLEANUP_PASSES: &[Pass] = &[
+    Pass::CfgCleanup,
+    Pass::AggregateCombine,
+    Pass::AggregateScalarize,
+    Pass::BranchCanonicalize,
+    Pass::Sccp,
+    Pass::ScalarCanonicalize,
+    Pass::CodeSink,
     Pass::CfgCleanup,
 ];
 
@@ -313,20 +358,28 @@ fn size_inliner_config() -> InlinerConfig {
         splice_max_insts: 6,
         max_inlinee_blocks: 8,
         max_inlinee_insts: 48,
-        max_growth_per_caller: 32,
-        max_total_growth: 160,
+        max_growth_per_caller: 64,
+        max_total_growth: 640,
         max_inline_depth: 3,
-        inline_threshold: 10,
-        inline_threshold_cold: 5,
+        inline_threshold: 16,
+        inline_threshold_cold: 10,
+        small_function_block_limit: 4,
+        small_function_inst_limit: 16,
+        small_function_bonus: 4,
+        callsite_known_arg_use_bonus: 6,
+        callsite_known_arg_bonus_cap: 32,
         single_use_bonus: 8,
         leaf_bonus: 2,
         call_overhead_bonus: 6,
+        call_return_overhead_bonus: 6,
+        call_arg_shuffle_bonus: 2,
+        call_result_shuffle_bonus: 2,
         duplicated_block_penalty: 1,
         multi_use_inst_free_allowance: 5,
         multi_use_excess_inst_penalty: 1,
         loop_penalty: 32,
-        object_scalarization_bonus_cap: 8,
-        object_helper_cluster_bonus: 3,
+        scalarization_bonus_cap: 8,
+        scalarization_helper_cluster_bonus: 3,
         ..InlinerConfig::default()
     }
 }
@@ -336,23 +389,31 @@ fn speed_inliner_config() -> InlinerConfig {
         // The speed-oriented mode stays more selective about inlining, because
         // on the EVM a smaller post-inline body often wins on runtime gas.
         enable_full_inliner: true,
-        splice_max_insts: 4,
+        splice_max_insts: 6,
         max_inlinee_blocks: 8,
         max_inlinee_insts: 32,
-        max_growth_per_caller: 24,
-        max_total_growth: 128,
+        max_growth_per_caller: 48,
+        max_total_growth: 256,
         max_inline_depth: 3,
         inline_threshold: 8,
         inline_threshold_cold: 4,
+        small_function_block_limit: 4,
+        small_function_inst_limit: 16,
+        small_function_bonus: 8,
+        callsite_known_arg_use_bonus: 8,
+        callsite_known_arg_bonus_cap: 64,
         single_use_bonus: 8,
         leaf_bonus: 2,
         call_overhead_bonus: 6,
+        call_return_overhead_bonus: 6,
+        call_arg_shuffle_bonus: 2,
+        call_result_shuffle_bonus: 2,
         duplicated_block_penalty: 1,
         multi_use_inst_free_allowance: 5,
         multi_use_excess_inst_penalty: 1,
         loop_penalty: 32,
-        object_scalarization_bonus_cap: 10,
-        object_helper_cluster_bonus: 4,
+        scalarization_bonus_cap: 10,
+        scalarization_helper_cluster_bonus: 4,
         ..InlinerConfig::default()
     }
 }
@@ -362,14 +423,19 @@ impl Pipeline {
         let mut p = Self::new();
         p.inliner_config = inliner_config;
         p.add_step(Step::Inline);
+        // Prune helpers made unreachable by inlining before analyzing their bodies.
+        p.add_step(Step::DeadFuncElim);
         p.add_step(Step::FuncPasses(PRIMARY_FUNC_PASSES.to_vec()));
         p.add_step(Step::Inline);
         p.add_step(Step::FuncPasses(SECONDARY_FUNC_PASSES.to_vec()));
         p.add_step(Step::DeadArgElim);
         p.add_step(Step::FuncPasses(POST_DEAD_ARG_CLEANUP_PASSES.to_vec()));
         p.add_step(Step::DeadFuncElim);
+        p.add_step(Step::PromoteObjectArgs);
         p.add_step(Step::Inline);
         p.add_step(Step::FuncPasses(SECONDARY_FUNC_PASSES.to_vec()));
+        p.add_step(Step::Inline);
+        p.add_step(Step::FuncPasses(POST_INLINE_CLEANUP_PASSES.to_vec()));
         p.add_step(Step::DeadFuncElim);
         p
     }
@@ -408,7 +474,8 @@ impl Pipeline {
     /// Default optimization pipeline with a speed-oriented ordering.
     ///
     /// Current sequence:
-    /// 1. `Inline` — module-level inlining (trivial + constrained full inliner)
+    /// 1. `Inline` — module-level inlining (trivial + constrained full inliner),
+    ///    followed by `DeadFuncElim` to prune helpers made unreachable by inlining
     /// 2. Per-function passes (parallel):
     ///    - `CfgCleanup`
     ///    - `AggregateCombine`
@@ -417,6 +484,7 @@ impl Pipeline {
     ///    - `AggregateScalarize`
     ///    - `LoadStore`
     ///    - `CheckedArithElim`
+    ///    - `JumpThread`
     ///    - `RangeBranchSimplify`
     ///    - `Sccp` — constant propagation + dead code elimination (composite)
     ///    - `ScalarCanonicalize` — local canonical forms for scalar SSA instructions
@@ -438,6 +506,7 @@ impl Pipeline {
     ///    - `AggregateScalarize`
     ///    - `LoadStore`
     ///    - `CheckedArithElim`
+    ///    - `JumpThread`
     ///    - `RangeBranchSimplify`
     ///    - `Sccp`
     ///    - `ScalarCanonicalize`
@@ -508,16 +577,17 @@ impl Pipeline {
                         pass_count = passes.len()
                     )
                     .entered();
-                    run_function_pass_round(
-                        module,
-                        passes,
-                        &mut func_behavior_dirty,
-                        FuncPassOverrides::default(),
-                    );
+                    run_function_pass_round(module, passes, &mut func_behavior_dirty, None);
                 }
                 Step::DeadArgElim => {
                     let _span = debug_span!("sonatina.optim.pipeline.dead_arg_elim").entered();
-                    run_dead_arg_elim(module, DeadArgElimConfig::default());
+                    run_dead_arg_elim(module, &[], DeadArgElimConfig::default());
+                    func_behavior_dirty = true;
+                }
+                Step::PromoteObjectArgs => {
+                    let _span =
+                        debug_span!("sonatina.optim.pipeline.promote_object_args").entered();
+                    ObjectArgPromotion::default().run(module);
                     func_behavior_dirty = true;
                 }
                 Step::DeadFuncElim => {
@@ -538,18 +608,11 @@ impl Default for Pipeline {
     }
 }
 
-#[derive(Default, Clone, Copy)]
-pub(crate) struct FuncPassOverrides<'a> {
-    pub(crate) funcs: Option<&'a [FuncRef]>,
-    pub(crate) local_object_args: Option<&'a LocalObjectArgMap>,
-    pub(crate) object_effects: Option<&'a ObjectEffectSummaryMap>,
-}
-
 pub(crate) fn run_function_pass_round(
     module: &Module,
     passes: &[Pass],
     func_behavior_dirty: &mut bool,
-    overrides: FuncPassOverrides<'_>,
+    funcs: Option<&[FuncRef]>,
 ) {
     let mut round_facts = RoundFacts::default();
     for &pass in passes {
@@ -558,7 +621,7 @@ pub(crate) fn run_function_pass_round(
             func_behavior::analyze_module(module);
             *func_behavior_dirty = false;
         }
-        let result = run_module_pass(pass, module, overrides, &mut round_facts);
+        let result = run_module_pass(pass, module, funcs, &mut round_facts);
         if result.changed && result.invalidates_func_behavior {
             *func_behavior_dirty = true;
         }
@@ -570,14 +633,12 @@ pub(crate) fn run_function_pass_round(
 
 #[derive(Default)]
 struct RoundFacts {
-    object_effects: Option<ObjectEffectSummaryMap>,
-    local_object_args: Option<LocalObjectArgMap>,
+    objects: Option<ModuleObjectFacts>,
 }
 
 impl RoundFacts {
     fn clear(&mut self) {
-        self.object_effects = None;
-        self.local_object_args = None;
+        self.objects = None;
     }
 }
 
@@ -601,73 +662,55 @@ impl PassResult {
 fn run_module_pass(
     pass: Pass,
     module: &Module,
-    overrides: FuncPassOverrides<'_>,
+    funcs: Option<&[FuncRef]>,
     round_facts: &mut RoundFacts,
 ) -> PassResult {
     let _span = debug_span!("sonatina.optim.pipeline.pass_round", pass = pass.as_str()).entered();
-    if pass.needs_object_facts() && overrides.object_effects.is_none() {
+    if pass.needs_object_facts() {
         round_facts
-            .object_effects
-            .get_or_insert_with(|| compute_object_effect_summaries(module));
+            .objects
+            .get_or_insert_with(|| ModuleObjectFacts::compute(module));
     }
-    let object_effects = overrides
-        .object_effects
-        .or(round_facts.object_effects.as_ref());
-    if pass.needs_object_facts() && overrides.local_object_args.is_none() {
-        round_facts.local_object_args.get_or_insert_with(|| {
-            object_effects
-                .map(|effects| collect_local_object_arg_info_with_effects(module, effects))
-                .unwrap_or_else(|| collect_local_object_arg_info(module))
-        });
-    }
-    let local_object_args = overrides
-        .local_object_args
-        .or(round_facts.local_object_args.as_ref());
+    let object_effects = round_facts.objects.as_ref().map(ModuleObjectFacts::effects);
+    let local_object_args = round_facts
+        .objects
+        .as_ref()
+        .map(ModuleObjectFacts::local_args);
+    // Infer from the complete baseline before any caller/callee is scalarized.
+    // This map is owned by this one batch, never by the reusable round cache.
+    let arg_invariance = (pass == Pass::AggregateScalarize)
+        .then(|| compute_arg_invariance(module, round_facts.objects.as_ref().unwrap()));
     let changed = AtomicBool::new(false);
-    if let Some(funcs) = overrides.funcs {
-        funcs.par_iter().copied().for_each(|func_ref| {
-            module.func_store.modify(func_ref, |func| {
-                let _span = debug_span!(
-                    "sonatina.optim.pipeline.function",
-                    func_ref = func_ref.as_u32()
-                )
-                .entered();
-                let mut ctx = PassContext::default();
-                if run_pass(
-                    pass,
-                    Some(func_ref),
-                    func,
-                    &mut ctx,
-                    local_object_args,
-                    object_effects,
-                )
-                .changed
-                {
-                    changed.store(true, Ordering::Relaxed);
-                }
-            });
-        });
-    } else {
-        module.func_store.par_for_each(|func_ref, func| {
-            let _span = debug_span!(
-                "sonatina.optim.pipeline.function",
-                func_ref = func_ref.as_u32()
-            )
-            .entered();
-            let mut ctx = PassContext::default();
-            if run_pass(
-                pass,
-                Some(func_ref),
-                func,
-                &mut ctx,
-                local_object_args,
-                object_effects,
-            )
-            .changed
-            {
-                changed.store(true, Ordering::Relaxed);
-            }
-        });
+    let run_on = |func_ref: FuncRef, func: &mut Function| {
+        let _span = debug_span!(
+            "sonatina.optim.pipeline.function",
+            func_ref = func_ref.as_u32()
+        )
+        .entered();
+        let mut ctx = PassContext::default();
+        if run_pass(
+            pass,
+            Some(func_ref),
+            func,
+            &mut ctx,
+            local_object_args,
+            object_effects,
+            arg_invariance
+                .as_ref()
+                .and_then(|proofs| proofs.get(&func_ref)),
+        )
+        .changed
+        {
+            changed.store(true, Ordering::Relaxed);
+        }
+    };
+    match funcs {
+        Some(funcs) => funcs.par_iter().copied().for_each(|func_ref| {
+            module
+                .func_store
+                .modify(func_ref, |func| run_on(func_ref, func));
+        }),
+        None => module.func_store.par_for_each(run_on),
     }
     PassResult::new(pass, changed.load(Ordering::Relaxed))
 }
@@ -693,6 +736,7 @@ fn run_pass(
     ctx: &mut PassContext,
     local_object_args: Option<&LocalObjectArgMap>,
     object_effects: Option<&ObjectEffectSummaryMap>,
+    arg_invariance: Option<&FunctionArgInvariance>,
 ) -> PassResult {
     let _span = trace_span!("sonatina.optim.pipeline.pass", pass = pass.as_str()).entered();
     let changed = match pass {
@@ -706,7 +750,7 @@ fn run_pass(
         }
         Pass::AggregateCombine => {
             let _span = trace_span!("sonatina.optim.pipeline.pass.aggregate_combine").entered();
-            AggregateCombine::default().run(func)
+            AggregateCombine::default().run_with_effects(func, object_effects)
         }
         Pass::BranchCanonicalize => {
             let _span = trace_span!("sonatina.optim.pipeline.pass.branch_canonicalize").entered();
@@ -729,8 +773,16 @@ fn run_pass(
         }
         Pass::AggregateScalarize => {
             let _span = trace_span!("sonatina.optim.pipeline.pass.aggregate_scalarize").entered();
-            if let (Some(func_ref), Some(local_object_args)) = (func_ref, local_object_args) {
-                AggregateScalarize::default().run_for_func(func_ref, func, local_object_args)
+            if let (Some(func_ref), Some(local_object_args), Some(object_effects)) =
+                (func_ref, local_object_args, object_effects)
+            {
+                AggregateScalarize::default().run_for_func(
+                    func_ref,
+                    func,
+                    local_object_args,
+                    object_effects,
+                    arg_invariance,
+                )
             } else {
                 AggregateScalarize::default().run(func)
             }
@@ -781,9 +833,13 @@ fn run_pass(
                 {
                     let _span =
                         trace_span!("sonatina.optim.pipeline.checked_arith_elim.solve").entered();
-                    CheckedArithElim::new().run(func, &ctx.cfg, &ctx.lpt)
+                    CheckedArithElim::new().run(func, &ctx.cfg, &ctx.domtree, &ctx.lpt)
                 }
             }
+        }
+        Pass::JumpThread => {
+            let _span = trace_span!("sonatina.optim.pipeline.pass.jump_thread").entered();
+            JumpThread::new().run(func)
         }
         Pass::RangeBranchSimplify => {
             let _span = trace_span!("sonatina.optim.pipeline.pass.range_branch_simplify").entered();
@@ -813,7 +869,7 @@ fn run_pass(
                 {
                     let _span = trace_span!("sonatina.optim.pipeline.range_branch_simplify.solve")
                         .entered();
-                    RangeBranchSimplify::new().run(func, &ctx.cfg, &ctx.lpt)
+                    RangeBranchSimplify::new().run(func, &ctx.cfg, &ctx.domtree, &ctx.lpt)
                 }
             }
         }
@@ -899,6 +955,24 @@ fn run_pass(
                 LoopStrengthReduce::new().run(func, &mut ctx.cfg, &mut ctx.domtree, &mut ctx.lpt)
             }
         }
+        Pass::CodeSink => {
+            let _span = trace_span!("sonatina.optim.pipeline.pass.code_sink").entered();
+            {
+                let _span = trace_span!("sonatina.optim.pipeline.code_sink.compute_cfg").entered();
+                ctx.cfg.compute(func);
+            }
+            {
+                let _span =
+                    trace_span!("sonatina.optim.pipeline.code_sink.compute_domtree").entered();
+                ctx.domtree.compute(&ctx.cfg);
+            }
+            {
+                let _span =
+                    trace_span!("sonatina.optim.pipeline.code_sink.compute_looptree").entered();
+                ctx.lpt.compute(&ctx.cfg, &ctx.domtree);
+            }
+            CodeSink::new().run(func, &ctx.cfg, &ctx.domtree, &ctx.lpt)
+        }
         Pass::Gvn => {
             let _span = trace_span!("sonatina.optim.pipeline.pass.gvn").entered();
             {
@@ -936,15 +1010,21 @@ fn run_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smallvec::smallvec;
     use sonatina_ir::{
         Type,
         builder::test_util::*,
-        inst::{arith::Add, control_flow::Return},
+        inst::{
+            arith::Add,
+            control_flow::{Call, Return},
+            downcast,
+        },
         ir_writer::FuncWriter,
         module::{FuncHints, InlineHint},
         prelude::*,
     };
     use sonatina_parser::parse_module;
+    use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_module};
 
     /// Build a module with a single function: `fn test(i32) -> i32 { arg0 + 1 }`.
     fn build_test_module() -> sonatina_ir::module::Module {
@@ -972,6 +1052,175 @@ mod tests {
     }
 
     #[test]
+    fn object_facts_are_recomputed_after_same_signature_call_changes() {
+        for change_call in [false, true] {
+            let module = parse_module(
+                r#"
+target = "evm-ethereum-osaka"
+func private %read(v0.objref<i256>) {
+block0:
+    v1.i256 = obj.load v0;
+    return;
+}
+func private %write(v0.objref<i256>) {
+block0:
+    obj.store v0 22.i256;
+    return;
+}
+func private %helper(v0.objref<i256>) {
+block0:
+    call %read v0;
+    return;
+}
+func private %f(v0.objref<i256>, v1.objref<i256>) -> i256 {
+block0:
+    v2.i256 = obj.load v0;
+    call %helper v1;
+    v3.i256 = obj.load v0;
+    v4.i256 = add v2 v3;
+    return v4;
+}
+"#,
+            )
+            .unwrap()
+            .module;
+            let lookup = |name| {
+                module
+                    .funcs()
+                    .into_iter()
+                    .find(|&func| module.ctx.func_sig(func, |sig| sig.name() == name))
+                    .unwrap()
+            };
+            let helper = lookup("helper");
+            let observer = lookup("f");
+            let writer = lookup("write");
+            let config = VerifierConfig::for_level(VerificationLevel::Full);
+            assert!(verify_module(&module, &config).is_ok());
+
+            // Warm the module analyses without rewriting the observer. The round
+            // owns its snapshot; it cannot be supplied to the next round.
+            let mut behavior_dirty = true;
+            run_function_pass_round(
+                &module,
+                &[Pass::AggregateCombine],
+                &mut behavior_dirty,
+                Some(&[helper]),
+            );
+            if change_call {
+                module.func_store.modify(helper, |func| {
+                    let inst = func
+                        .layout
+                        .iter_inst(func.layout.entry_block().unwrap())
+                        .find(|&inst| {
+                            downcast::<&Call>(func.inst_set(), func.dfg.inst(inst)).is_some()
+                        })
+                        .unwrap();
+                    let call =
+                        Call::new_unchecked(func.inst_set(), writer, smallvec![func.arg_values[0]]);
+                    func.dfg.replace_inst(inst, Box::new(call));
+                    func.rebuild_users();
+                });
+            }
+            run_function_pass_round(
+                &module,
+                &[Pass::AggregateScalarize],
+                &mut behavior_dirty,
+                Some(&[observer]),
+            );
+            assert!(verify_module(&module, &config).is_ok());
+            module.func_store.view(observer, |func| {
+                let text = FuncWriter::new(observer, func).dump_string();
+                assert_eq!(
+                    text.matches("obj.load").count(),
+                    if change_call { 2 } else { 1 },
+                    "{text}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn object_facts_refresh_within_a_round_after_cfg_rewrites() {
+        let mut module = parse_module(
+            r#"
+target = "evm-ethereum-osaka"
+func private %helper(v0.objref<i256>) {
+block0:
+    br 0.i1 block1 block2;
+block1:
+    obj.store v0 22.i256;
+    return;
+block2:
+    return;
+}
+func private %f(v0.objref<i256>, v1.objref<i256>) -> i256 {
+block0:
+    v2.i256 = obj.load v0;
+    call %helper v1;
+    v3.i256 = obj.load v0;
+    v4.i256 = add v2 v3;
+    return v4;
+}
+"#,
+        )
+        .unwrap()
+        .module;
+        let config = VerifierConfig::for_level(VerificationLevel::Full);
+        assert!(verify_module(&module, &config).is_ok());
+        run_test_func_passes(
+            &mut module,
+            &[Pass::AggregateCombine, Pass::Sccp, Pass::AggregateScalarize],
+        );
+        assert!(verify_module(&module, &config).is_ok());
+        let observer = module
+            .funcs()
+            .into_iter()
+            .find(|&func| module.ctx.func_sig(func, |sig| sig.name() == "f"))
+            .unwrap();
+        module.func_store.view(observer, |func| {
+            let text = FuncWriter::new(observer, func).dump_string();
+            assert_eq!(text.matches("obj.load").count(), 1, "{text}");
+        });
+    }
+
+    #[test]
+    fn final_inline_cleanup_scalarizes_reconstructed_aggregate_stores() {
+        let mut module = parse_module(
+            r#"
+target = "evm-ethereum-osaka"
+type @Pair = { i256, i256 };
+func private %entry(v0.objref<@Pair>, v1.i256) -> i256 {
+block0:
+    v2.objref<i256> = obj.proj v0 0.i8;
+    v3.i256 = obj.load v2;
+    v4.@Pair = insert_value undef.@Pair 0.i8 v3;
+    v5.@Pair = insert_value v4 1.i8 v1;
+    v6.objref<@Pair> = obj.alloc @Pair;
+    obj.store v6 v5;
+    v7.objref<i256> = obj.proj v6 0.i8;
+    v8.i256 = obj.load v7;
+    return v8;
+}
+"#,
+        )
+        .unwrap()
+        .module;
+        let config = VerifierConfig::for_level(VerificationLevel::Full);
+        let report = verify_module(&module, &config);
+        assert!(report.is_ok(), "{report:?}");
+        run_test_func_passes(&mut module, POST_INLINE_CLEANUP_PASSES);
+        let report = verify_module(&module, &config);
+        assert!(report.is_ok(), "{report:?}");
+        let function = module.funcs()[0];
+        let text = module.func_store.view(function, |func| {
+            FuncWriter::new(function, func).dump_string()
+        });
+        assert!(!text.contains("insert_value"), "{text}");
+        assert!(!text.contains("obj.alloc"), "{text}");
+        assert_eq!(text.matches("obj.load").count(), 1, "{text}");
+    }
+
+    #[test]
     fn default_pipeline_runs() {
         let pipeline = Pipeline::default_pipeline();
         let mut module = build_test_module();
@@ -986,12 +1235,12 @@ mod tests {
             Pipeline::speed().inliner_config.splice_max_insts
         );
         assert_eq!(
-            Pipeline::default().inliner_config.splice_max_insts,
-            Pipeline::speed().inliner_config.splice_max_insts
+            pipeline.inliner_config.max_total_growth,
+            Pipeline::speed().inliner_config.max_total_growth
         );
         assert_ne!(
-            pipeline.inliner_config.splice_max_insts,
-            Pipeline::size().inliner_config.splice_max_insts
+            pipeline.inliner_config.max_total_growth,
+            Pipeline::size().inliner_config.max_total_growth
         );
     }
 
@@ -1675,8 +1924,7 @@ func private %entry(v0.i256, v1.i1) -> i256 {
             lpt.compute(&cfg, &domtree);
             let load = func
                 .layout
-                .iter_block()
-                .flat_map(|block| func.layout.iter_inst(block))
+                .iter_all_insts()
                 .find(|&inst| {
                     sonatina_ir::inst::downcast::<&sonatina_ir::inst::data::ObjLoad>(
                         func.inst_set(),
@@ -2312,13 +2560,23 @@ func private %entry(v0.i32, v1.i32) -> i32 {
 
         let speed = Pipeline::speed();
         assert!(speed.inliner_config.enable_full_inliner);
-        assert!(size.inliner_config.splice_max_insts > speed.inliner_config.splice_max_insts);
+        assert_eq!(
+            speed.inliner_config.splice_max_insts,
+            size.inliner_config.splice_max_insts
+        );
         assert!(speed.inliner_config.max_inlinee_blocks > 0);
         assert!(speed.inliner_config.max_inlinee_insts > 0);
         assert!(
             size.inliner_config.max_growth_per_caller >= speed.inliner_config.max_growth_per_caller
         );
         assert!(size.inliner_config.max_total_growth >= speed.inliner_config.max_total_growth);
+        assert!(
+            speed.inliner_config.small_function_bonus > size.inliner_config.small_function_bonus
+        );
+        assert!(
+            speed.inliner_config.callsite_known_arg_use_bonus
+                > size.inliner_config.callsite_known_arg_use_bonus
+        );
         assert_ne!(
             speed.inliner_config.inline_threshold,
             size.inliner_config.inline_threshold
@@ -2338,6 +2596,7 @@ func private %entry(v0.i32, v1.i32) -> i32 {
             match (size_step, speed_step) {
                 (Step::Inline, Step::Inline)
                 | (Step::DeadArgElim, Step::DeadArgElim)
+                | (Step::PromoteObjectArgs, Step::PromoteObjectArgs)
                 | (Step::DeadFuncElim, Step::DeadFuncElim) => {}
                 (Step::FuncPasses(size_passes), Step::FuncPasses(speed_passes)) => {
                     assert_eq!(size_passes, speed_passes);
@@ -2410,7 +2669,19 @@ func private %costly(v0.i1, v1.i32) -> i32 {
         v5.i32 = add v4 1.i32;
         v6.i32 = add v5 1.i32;
         v7.i32 = add v6 1.i32;
-        return v7;
+        v8.i32 = add v7 1.i32;
+        v9.i32 = add v8 1.i32;
+        v10.i32 = add v9 1.i32;
+        v11.i32 = add v10 1.i32;
+        v12.i32 = add v11 1.i32;
+        v13.i32 = add v12 1.i32;
+        v14.i32 = add v13 1.i32;
+        v15.i32 = add v14 1.i32;
+        v16.i32 = add v15 1.i32;
+        v17.i32 = add v16 1.i32;
+        v18.i32 = add v17 1.i32;
+        v19.i32 = add v18 1.i32;
+        return v19;
 }
 
 func public %caller(v0.i1, v1.i32) -> i32 {
@@ -2786,10 +3057,7 @@ block2:
             &module,
             &[Pass::Sccp, Pass::CfgCleanup],
             &mut func_behavior_dirty,
-            FuncPassOverrides {
-                funcs: Some(&[selected]),
-                ..FuncPassOverrides::default()
-            },
+            Some(&[selected]),
         );
 
         module.func_store.view(selected, |func| {

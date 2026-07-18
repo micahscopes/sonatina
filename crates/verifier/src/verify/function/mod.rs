@@ -19,6 +19,7 @@ use super::type_utils;
 
 mod analysis;
 mod dominance;
+mod enum_proofs;
 mod layout_cfg;
 mod metadata;
 mod phi;
@@ -47,6 +48,7 @@ pub(super) struct FunctionVerifier<'a> {
     pub(super) declared_embed_symbols: Option<&'a FxHashSet<EmbedSymbol>>,
     pub(super) cfg: &'a VerifierConfig,
     pub(super) report: VerificationReport,
+    has_errors: bool,
 
     pub(super) block_order: Vec<BlockId>,
     pub(super) block_to_insts: FxHashMap<BlockId, Vec<InstId>>,
@@ -56,6 +58,9 @@ pub(super) struct FunctionVerifier<'a> {
     pub(super) succs: FxHashMap<BlockId, Vec<BlockId>>,
     pub(super) preds: FxHashMap<BlockId, Vec<BlockId>>,
     pub(super) reachable: FxHashSet<BlockId>,
+    pub(super) idom: FxHashMap<BlockId, BlockId>,
+    analysis_cfg: analysis::AnalysisCfg,
+    pub(super) enum_index_bindings: FxHashSet<ValueId>,
 }
 
 trait FunctionPass {
@@ -117,7 +122,7 @@ impl FunctionPass for TypePass {
 
 impl FunctionPass for DominancePass {
     fn enabled(cfg: &VerifierConfig) -> bool {
-        cfg.should_check_dominance()
+        cfg.should_check_dominance() || cfg.should_check_types()
     }
 
     fn run(verifier: &mut FunctionVerifier<'_>) {
@@ -147,6 +152,7 @@ impl<'a> FunctionVerifier<'a> {
             declared_embed_symbols,
             cfg,
             report: VerificationReport::default(),
+            has_errors: false,
             block_order: Vec::new(),
             block_to_insts: FxHashMap::default(),
             inst_to_block: FxHashMap::default(),
@@ -154,6 +160,9 @@ impl<'a> FunctionVerifier<'a> {
             succs: FxHashMap::default(),
             preds: FxHashMap::default(),
             reachable: FxHashSet::default(),
+            idom: FxHashMap::default(),
+            analysis_cfg: analysis::AnalysisCfg::default(),
+            enum_index_bindings: FxHashSet::default(),
         }
     }
 
@@ -162,10 +171,14 @@ impl<'a> FunctionVerifier<'a> {
         self.run_pass::<LayoutPass>();
         self.run_pass::<ReferentialPass>();
         self.run_pass::<CfgPass>();
+        self.compute_dominance_info();
         self.run_pass::<PhiPass>();
         self.run_pass::<TypePass>();
         self.run_pass::<DominancePass>();
         self.run_pass::<MetadataPass>();
+        if self.cfg.should_check_types() && !self.has_errors {
+            enum_proofs::verify(self);
+        }
     }
 
     fn run_pass<P: FunctionPass>(&mut self) {
@@ -175,6 +188,7 @@ impl<'a> FunctionVerifier<'a> {
     }
 
     pub(super) fn emit(&mut self, diagnostic: Diagnostic) {
+        self.has_errors |= diagnostic.is_error();
         let diagnostic = self.with_diagnostic_context(diagnostic);
         self.report.push(diagnostic, self.cfg.max_diagnostics);
     }
