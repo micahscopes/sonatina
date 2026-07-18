@@ -634,7 +634,7 @@ fn translate_function(
                 };
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     let obj_ty = function.dfg.value_ty(*obj_index.object());
-                    let elem_size = compute_element_size(obj_ty, &module.ctx);
+                    let elem_size = crate::isa::compute_element_size(obj_ty, &module.ctx);
                     let stride = builder.ins().iconst(clif::types::I64, elem_size as i64);
                     let offset = builder.ins().imul(index, stride);
                     let addr = builder.ins().iadd(base, offset);
@@ -689,7 +689,7 @@ fn translate_function(
                 };
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     let obj_ty = function.dfg.value_ty(*const_index.object());
-                    let elem_size = compute_element_size(obj_ty, &module.ctx);
+                    let elem_size = crate::isa::compute_element_size(obj_ty, &module.ctx);
                     let stride = builder.ins().iconst(clif::types::I64, elem_size as i64);
                     let offset = builder.ins().imul(index, stride);
                     let ptr = builder.ins().iadd(base, offset);
@@ -995,23 +995,6 @@ fn compute_alloc_size(ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> u32 {
     }
     let size = ctx.size_of_unchecked(ty);
     size.max(8) as u32
-}
-
-pub(crate) fn compute_element_size(obj_ty: Type, ctx: &sonatina_ir::module::ModuleCtx) -> usize {
-    if let Some(cmpd) = obj_ty.resolve_compound(ctx) {
-        match cmpd {
-            sonatina_ir::types::CompoundType::Array { elem, .. } => {
-                return ctx.size_of_unchecked(elem);
-            }
-            sonatina_ir::types::CompoundType::ObjRef(inner)
-            | sonatina_ir::types::CompoundType::ConstRef(inner) => {
-                return compute_element_size(inner, ctx);
-            }
-            _ => {}
-        }
-    }
-    // Fallback: 32 bytes (i256 size)
-    32
 }
 
 fn collect_phi_args_for_block(

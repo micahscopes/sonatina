@@ -381,7 +381,7 @@ fn translate_function(
                                 resolve_value(function, index_val_id, &value_map, &mut body, wb).ok_or("unresolved index")?
                             };
                             let obj_ty = function.dfg.value_ty(*obj_index.object());
-                            let elem_size = crate::isa::cranelift::translate::compute_element_size(obj_ty, &module.ctx) as u32;
+                            let elem_size = crate::isa::compute_element_size(obj_ty, &module.ctx) as u32;
                             let stride = body.add_op(wb, Operator::I32Const { value: elem_size }, &[], &[WType::I32]);
                             let offset = body.add_op(wb, Operator::I32Mul, &[index, stride], &[WType::I32]);
                             let addr = body.add_op(wb, Operator::I32Add, &[base, offset], &[WType::I32]);
