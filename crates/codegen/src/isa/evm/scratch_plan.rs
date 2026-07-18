@@ -240,11 +240,8 @@ mod tests {
         let entry = func_builder.append_block();
         func_builder.switch_to_block(entry);
         let arg = func_builder.func.arg_values[0];
-        func_builder.insert_inst_no_result(Call::new(
-            is.has_call().expect("machine ISA supports calls"),
-            callee,
-            smallvec![],
-        ));
+        is.has_call().expect("machine ISA supports calls");
+        func_builder.insert_inst_no_result(Call::new(is, callee, smallvec![]));
         func_builder.insert_inst_no_result(Return::new_single(is, arg));
         func_builder.seal_all();
         func_builder.finish();
