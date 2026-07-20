@@ -421,21 +421,29 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
-                    // Shr (logical shift right)
+                    // Shr (logical shift right). Keyed on the VALUE operand's type,
+                    // mirroring `Sar`: i32 -> I32ShrU, else I64ShrU. Output type
+                    // matches the value operand. The pre-word-aware emission always
+                    // used I64ShrU, so i64 values stay byte-identical.
                     else if let Some(shr) = <&sonatina_ir::inst::arith::Shr as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let val = resolve_value(function, *shr.value(), &value_map, &mut body, wb).ok_or("unresolved shr val")?;
                             let bits = resolve_value(function, *shr.bits(), &value_map, &mut body, wb).ok_or("unresolved shr bits")?;
-                            let wval = body.add_op(wb, Operator::I64ShrU, &[val, bits], &[WType::I64]);
+                            let ty = sonatina_to_waffle_type(function.dfg.value_ty(*shr.value())).unwrap_or(WType::I64);
+                            let op = if ty == WType::I32 { Operator::I32ShrU } else { Operator::I64ShrU };
+                            let wval = body.add_op(wb, op, &[val, bits], &[ty]);
                             value_map.insert(result, wval);
                         }
                     }
-                    // Shl
+                    // Shl. Keyed on the VALUE operand's type (as `Sar`/`Shr`):
+                    // i32 -> I32Shl, else I64Shl. i64 values stay byte-identical.
                     else if let Some(shl) = <&sonatina_ir::inst::arith::Shl as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let val = resolve_value(function, *shl.value(), &value_map, &mut body, wb).ok_or("unresolved shl val")?;
                             let bits = resolve_value(function, *shl.bits(), &value_map, &mut body, wb).ok_or("unresolved shl bits")?;
-                            let wval = body.add_op(wb, Operator::I64Shl, &[val, bits], &[WType::I64]);
+                            let ty = sonatina_to_waffle_type(function.dfg.value_ty(*shl.value())).unwrap_or(WType::I64);
+                            let op = if ty == WType::I32 { Operator::I32Shl } else { Operator::I64Shl };
+                            let wval = body.add_op(wb, op, &[val, bits], &[ty]);
                             value_map.insert(result, wval);
                         }
                     }
