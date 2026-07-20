@@ -342,21 +342,40 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
-                    // Lt (unsigned)
+                    // Lt (unsigned). Key on the OPERAND type, not the result (the
+                    // result is the I32 bool): an i32-operand compare must use
+                    // `i32.lt_u` or wasmtime rejects the module at validation.
                     else if let Some(lt) = <&sonatina_ir::inst::cmp::Lt as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let lhs = resolve_value(function, *lt.lhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
                             let rhs = resolve_value(function, *lt.rhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let wval = body.add_op(wb, Operator::I64LtU, &[lhs, rhs], &[WType::I32]);
+                            let ty = sonatina_to_waffle_type(function.dfg.value_ty(*lt.lhs())).unwrap_or(WType::I64);
+                            let op = if ty == WType::I32 { Operator::I32LtU } else { Operator::I64LtU };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[WType::I32]);
                             value_map.insert(result, wval);
                         }
                     }
-                    // Eq
+                    // Eq. Keyed on the operand type, same as the compares above.
                     else if let Some(eq) = <&sonatina_ir::inst::cmp::Eq as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let lhs = resolve_value(function, *eq.lhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
                             let rhs = resolve_value(function, *eq.rhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let wval = body.add_op(wb, Operator::I64Eq, &[lhs, rhs], &[WType::I32]);
+                            let ty = sonatina_to_waffle_type(function.dfg.value_ty(*eq.lhs())).unwrap_or(WType::I64);
+                            let op = if ty == WType::I32 { Operator::I32Eq } else { Operator::I64Eq };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[WType::I32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    // Slt (signed less-than). Keyed on the operand type: i32 -> I32LtS,
+                    // else I64LtS. The signed vs unsigned choice is load-bearing for
+                    // 0x80000000-class operands.
+                    else if let Some(slt) = <&sonatina_ir::inst::cmp::Slt as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *slt.lhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
+                            let rhs = resolve_value(function, *slt.rhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
+                            let ty = sonatina_to_waffle_type(function.dfg.value_ty(*slt.lhs())).unwrap_or(WType::I64);
+                            let op = if ty == WType::I32 { Operator::I32LtS } else { Operator::I64LtS };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[WType::I32]);
                             value_map.insert(result, wval);
                         }
                     }
@@ -388,12 +407,17 @@ fn translate_function(
                             }
                         }
                     }
-                    // Sar (arithmetic shift right)
+                    // Sar (arithmetic shift right). Keyed on the VALUE operand's type
+                    // (the `bits` immediate is created at the value's type by fe, so
+                    // both inputs agree): i32 -> I32ShrS, else I64ShrS. Output type
+                    // matches the value operand.
                     else if let Some(sar) = <&sonatina_ir::inst::arith::Sar as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let val = resolve_value(function, *sar.value(), &value_map, &mut body, wb).ok_or("unresolved sar val")?;
                             let bits = resolve_value(function, *sar.bits(), &value_map, &mut body, wb).ok_or("unresolved sar bits")?;
-                            let wval = body.add_op(wb, Operator::I64ShrS, &[val, bits], &[WType::I64]);
+                            let ty = sonatina_to_waffle_type(function.dfg.value_ty(*sar.value())).unwrap_or(WType::I64);
+                            let op = if ty == WType::I32 { Operator::I32ShrS } else { Operator::I64ShrS };
+                            let wval = body.add_op(wb, op, &[val, bits], &[ty]);
                             value_map.insert(result, wval);
                         }
                     }
