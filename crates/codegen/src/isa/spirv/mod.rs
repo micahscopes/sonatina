@@ -24,10 +24,94 @@ impl std::fmt::Display for SpirvError {
     }
 }
 
+/// The word scalar the shader was emitted at, content-derived from the kernel's
+/// Sonatina return type. `U32` -> naga `Uint`/width 4 (browser profile, no
+/// SHADER_INT64); `I64` -> naga `Sint`/width 8 (the original path, bit-for-bit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordKind {
+    U32,
+    I64,
+}
+
+impl WordKind {
+    /// Word width in bytes (4 for u32, 8 for i64). Drives struct spans, array
+    /// strides, member offsets and the result readback width.
+    pub fn width_bytes(self) -> u32 {
+        match self {
+            WordKind::U32 => 4,
+            WordKind::I64 => 8,
+        }
+    }
+}
+
+/// Output-buffer shape: a single-value `Output` struct (`Scalar`) or a dynamic
+/// `OutputArray` written per-invocation via `ObjAlloc` (`Batch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Scalar,
+    Batch,
+}
+
+/// Storage access a binding is declared with, mirroring the emitted naga
+/// `GlobalVariable` address space exactly (never re-derived downstream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    ReadWrite,
+}
+
+/// Whether a binding carries the kernel result (`Output`) or the kernel inputs
+/// (`Input`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Output,
+    Input,
+}
+
+/// One storage-buffer binding, as the compiler actually emitted it.
+#[derive(Debug, Clone)]
+pub struct SpirvBinding {
+    pub group: u32,
+    pub binding: u32,
+    pub name: String,
+    pub access: Access,
+    pub role: Role,
+    /// Element stride: word width for the output, per-invocation input span for
+    /// the input buffer.
+    pub stride: u32,
+}
+
+/// Where the scalar result lands for readback.
+#[derive(Debug, Clone, Copy)]
+pub struct SpirvResult {
+    pub group: u32,
+    pub binding: u32,
+    pub offset: u32,
+    pub width: u32,
+}
+
+/// The compiler-stated ABI of a compiled SPIR-V compute module. It is populated
+/// from the SAME values `translate_to_naga` used to emit the naga module, so the
+/// artifact describes its own binding layout and nothing downstream re-derives
+/// it. Plain Rust (no serde in the fork); the fe side serializes it.
+#[derive(Debug, Clone)]
+pub struct SpirvLayout {
+    pub entry_point: String,
+    pub mode: LayoutMode,
+    pub workgroup_size: [u32; 3],
+    pub word: WordKind,
+    pub bindings: Vec<SpirvBinding>,
+    pub result: SpirvResult,
+}
+
 pub struct SpirvArtifact {
     pub words: Vec<u32>,
     /// WGSL source for wgpu execution (available when spirv-backend feature is on)
     pub wgsl: Option<String>,
+    /// The compiler-stated ABI: entry point, mode, workgroup size, word kind,
+    /// bindings and result location. Emitted from the same values the naga module
+    /// was built from.
+    pub layout: SpirvLayout,
 }
 
 impl SpirvArtifact {
@@ -66,7 +150,7 @@ impl Backend for SpirvBackend {
 
     #[cfg(feature = "spirv-backend")]
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        let naga_mod = translate_to_naga(module, self.workgroup_size)
+        let (naga_mod, layout) = translate_to_naga(module, self.workgroup_size)
             .map_err(|e| vec![SpirvError::Translation(e)])?;
 
         let info = naga::valid::Validator::new(
@@ -90,7 +174,7 @@ impl Backend for SpirvBackend {
             &naga_mod, &info, naga::back::wgsl::WriterFlags::empty()
         ).ok();
 
-        Ok(SpirvArtifact { words, wgsl })
+        Ok(SpirvArtifact { words, wgsl, layout })
     }
 }
 
@@ -98,6 +182,7 @@ impl Backend for SpirvBackend {
 fn resolve_naga_value(
     vid: sonatina_ir::ValueId,
     function: &sonatina_ir::Function,
+    word: WordKind,
     vm: &std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     func: &mut naga::Function,
@@ -118,12 +203,23 @@ fn resolve_naga_value(
         return Some(loaded);
     }
     if let sonatina_ir::Value::Immediate { imm, .. } = function.dfg.value(vid) {
-        let literal = match imm {
-            sonatina_ir::Immediate::I64(v) => naga::Literal::I64(*v),
-            sonatina_ir::Immediate::I32(v) => naga::Literal::I64(*v as i64),
-            sonatina_ir::Immediate::I8(v) => naga::Literal::I64(*v as i64),
-            sonatina_ir::Immediate::I1(v) => naga::Literal::I64(*v as i64),
-            _ => return None,
+        // Literals are retyped to the word scalar. For i64 this is unchanged. For
+        // u32, an i64 immediate cannot appear in a u32-word kernel; returning None
+        // makes the caller fail closed rather than silently narrow it.
+        let literal = match word {
+            WordKind::I64 => match imm {
+                sonatina_ir::Immediate::I64(v) => naga::Literal::I64(*v),
+                sonatina_ir::Immediate::I32(v) => naga::Literal::I64(*v as i64),
+                sonatina_ir::Immediate::I8(v) => naga::Literal::I64(*v as i64),
+                sonatina_ir::Immediate::I1(v) => naga::Literal::I64(*v as i64),
+                _ => return None,
+            },
+            WordKind::U32 => match imm {
+                sonatina_ir::Immediate::I32(v) => naga::Literal::U32(*v as u32),
+                sonatina_ir::Immediate::I8(v) => naga::Literal::U32(*v as u32),
+                sonatina_ir::Immediate::I1(v) => naga::Literal::U32(*v as u32),
+                _ => return None,
+            },
         };
         return Some(func.expressions.append(
             naga::Expression::Literal(literal),
@@ -141,6 +237,7 @@ fn emit_single_inst(
     inst_id: sonatina_ir::InstId,
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
     func: &mut naga::Function,
     target: &mut naga::Block,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
@@ -157,8 +254,8 @@ fn emit_single_inst(
 
     if let Some(add) = <&sonatina_ir::inst::arith::Add as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
-            let lhs = resolve_naga_value(*add.lhs(), function, value_map, phi_locals, func).unwrap();
-            let rhs = resolve_naga_value(*add.rhs(), function, value_map, phi_locals, func).unwrap();
+            let lhs = resolve_naga_value(*add.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*add.rhs(), function, word, value_map, phi_locals, func).unwrap();
             let h = func.expressions.append(
                 naga::Expression::Binary { op: naga::BinaryOperator::Add, left: lhs, right: rhs },
                 naga::Span::UNDEFINED,
@@ -169,8 +266,8 @@ fn emit_single_inst(
         }
     } else if let Some(sub) = <&sonatina_ir::inst::arith::Sub as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
-            let lhs = resolve_naga_value(*sub.lhs(), function, value_map, phi_locals, func).unwrap();
-            let rhs = resolve_naga_value(*sub.rhs(), function, value_map, phi_locals, func).unwrap();
+            let lhs = resolve_naga_value(*sub.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*sub.rhs(), function, word, value_map, phi_locals, func).unwrap();
             let h = func.expressions.append(
                 naga::Expression::Binary { op: naga::BinaryOperator::Subtract, left: lhs, right: rhs },
                 naga::Span::UNDEFINED,
@@ -181,8 +278,8 @@ fn emit_single_inst(
         }
     } else if let Some(mul) = <&sonatina_ir::inst::arith::Mul as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
-            let lhs = resolve_naga_value(*mul.lhs(), function, value_map, phi_locals, func).unwrap();
-            let rhs = resolve_naga_value(*mul.rhs(), function, value_map, phi_locals, func).unwrap();
+            let lhs = resolve_naga_value(*mul.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*mul.rhs(), function, word, value_map, phi_locals, func).unwrap();
             let h = func.expressions.append(
                 naga::Expression::Binary { op: naga::BinaryOperator::Multiply, left: lhs, right: rhs },
                 naga::Span::UNDEFINED,
@@ -193,7 +290,7 @@ fn emit_single_inst(
         }
     } else if let Some(sar) = <&sonatina_ir::inst::arith::Sar as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
-            let val = resolve_naga_value(*sar.value(), function, value_map, phi_locals, func).unwrap();
+            let val = resolve_naga_value(*sar.value(), function, word, value_map, phi_locals, func).unwrap();
             let shift_amount = if let Some(imm) = function.dfg.value_imm(*sar.bits()) {
                 match imm {
                     sonatina_ir::Immediate::I64(v) => v as u32,
@@ -216,8 +313,8 @@ fn emit_single_inst(
         }
     } else if let Some(lt) = <&sonatina_ir::inst::cmp::Lt as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
-            let lhs = resolve_naga_value(*lt.lhs(), function, value_map, phi_locals, func).unwrap();
-            let rhs = resolve_naga_value(*lt.rhs(), function, value_map, phi_locals, func).unwrap();
+            let lhs = resolve_naga_value(*lt.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*lt.rhs(), function, word, value_map, phi_locals, func).unwrap();
             let h = func.expressions.append(
                 naga::Expression::Binary { op: naga::BinaryOperator::Less, left: lhs, right: rhs },
                 naga::Span::UNDEFINED,
@@ -237,13 +334,13 @@ fn emit_single_inst(
         }
     } else if let Some(obj_store) = <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, inst_data) {
         // ObjStore: store value at the pointer (which is an Access expression into the buffer)
-        let dest = resolve_naga_value(*obj_store.object(), function, value_map, phi_locals, func).unwrap();
-        let val = resolve_naga_value(*obj_store.value(), function, value_map, phi_locals, func).unwrap();
+        let dest = resolve_naga_value(*obj_store.object(), function, word, value_map, phi_locals, func).unwrap();
+        let val = resolve_naga_value(*obj_store.value(), function, word, value_map, phi_locals, func).unwrap();
         target.push(naga::Statement::Store { pointer: dest, value: val }, naga::Span::UNDEFINED);
         return true;
     } else if let Some(obj_load) = <&sonatina_ir::inst::data::ObjLoad as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
-            let ptr = resolve_naga_value(*obj_load.object(), function, value_map, phi_locals, func).unwrap();
+            let ptr = resolve_naga_value(*obj_load.object(), function, word, value_map, phi_locals, func).unwrap();
             let h = func.expressions.append(
                 naga::Expression::Load { pointer: ptr },
                 naga::Span::UNDEFINED,
@@ -254,8 +351,8 @@ fn emit_single_inst(
         }
     } else if let Some(obj_index) = <&sonatina_ir::inst::data::ObjIndex as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
-            let base = resolve_naga_value(*obj_index.object(), function, value_map, phi_locals, func).unwrap();
-            let index = resolve_naga_value(*obj_index.index(), function, value_map, phi_locals, func).unwrap();
+            let base = resolve_naga_value(*obj_index.object(), function, word, value_map, phi_locals, func).unwrap();
+            let index = resolve_naga_value(*obj_index.index(), function, word, value_map, phi_locals, func).unwrap();
             // Cast i64 index to i32 for array access
             let i32_idx = func.expressions.append(
                 naga::Expression::As {
@@ -276,7 +373,7 @@ fn emit_single_inst(
         }
     } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(&val_id) = ret.args().as_slice().first() {
-            let resolved = resolve_naga_value(val_id, function, value_map, phi_locals, func);
+            let resolved = resolve_naga_value(val_id, function, word, value_map, phi_locals, func);
             if let Some(h) = resolved {
                 if matches!(func.expressions[h], naga::Expression::Load { .. }) {
                     target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
@@ -294,6 +391,7 @@ fn emit_single_inst(
 fn emit_block_to_target(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
     block: sonatina_ir::BlockId,
     func: &mut naga::Function,
     target: &mut naga::Block,
@@ -302,7 +400,7 @@ fn emit_block_to_target(
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
 ) {
     for inst_id in function.layout.iter_inst(block) {
-        emit_single_inst(inst_id, function, inst_set, func, target, value_map, phi_locals, result_expr);
+        emit_single_inst(inst_id, function, inst_set, word, func, target, value_map, phi_locals, result_expr);
     }
 }
 
@@ -310,15 +408,16 @@ fn emit_block_to_target(
 fn emit_naga_block_instructions(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
     block: sonatina_ir::BlockId,
-    _i64_type: naga::Handle<naga::Type>,
+    _word_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
 ) {
     let mut target = naga::Block::new();
-    emit_block_to_target(function, inst_set, block, func, &mut target, value_map, phi_locals, result_expr);
+    emit_block_to_target(function, inst_set, word, block, func, &mut target, value_map, phi_locals, result_expr);
     func.body.extend_block(target);
 }
 
@@ -326,8 +425,9 @@ fn emit_naga_block_instructions(
 fn emit_naga_regions(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
     regions: &[crate::structurize::Region],
-    i64_type: naga::Handle<naga::Type>,
+    word_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
@@ -339,7 +439,7 @@ fn emit_naga_regions(
         match region {
             crate::structurize::Region::Block(block_id) => {
                 emit_naga_block_instructions(
-                    function, inst_set, *block_id, i64_type,
+                    function, inst_set, word, *block_id, word_type,
                     func, value_map, phi_locals, result_expr,
                 );
                 region_idx += 1;
@@ -347,13 +447,13 @@ fn emit_naga_regions(
             crate::structurize::Region::Loop { header, body } => {
                 region_idx += 1;
                 emit_loop_region(
-                    function, inst_set, *header, body, &regions[region_idx..],
-                    &mut region_idx, i64_type, func, value_map, phi_locals, result_expr,
+                    function, inst_set, word, *header, body, &regions[region_idx..],
+                    &mut region_idx, word_type, func, value_map, phi_locals, result_expr,
                 );
             }
             crate::structurize::Region::IfThenElse { header, then_branch: _, else_branch: _, merge: _ } => {
                 emit_naga_block_instructions(
-                    function, inst_set, *header, i64_type,
+                    function, inst_set, word, *header, word_type,
                     func, value_map, phi_locals, result_expr,
                 );
                 region_idx += 1;
@@ -367,11 +467,12 @@ fn emit_naga_regions(
 fn emit_loop_region(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
     header: sonatina_ir::BlockId,
     body: &[crate::structurize::Region],
     remaining_regions: &[crate::structurize::Region],
     region_idx: &mut usize,
-    i64_type: naga::Handle<naga::Type>,
+    word_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
@@ -387,7 +488,7 @@ fn emit_loop_region(
                 let local = func.local_variables.append(
                     naga::LocalVariable {
                         name: Some(format!("phi_{}", result.0)),
-                        ty: i64_type,
+                        ty: word_type,
                         init: None,
                     },
                     naga::Span::UNDEFINED,
@@ -396,7 +497,7 @@ fn emit_loop_region(
 
                 // Initialize from entry (first) phi arg
                 if let Some(&(init_val, _)) = phi.args().first() {
-                    if let Some(init) = resolve_naga_value(init_val, function, value_map, phi_locals, func) {
+                    if let Some(init) = resolve_naga_value(init_val, function, word, value_map, phi_locals, func) {
                         let ptr = func.expressions.append(
                             naga::Expression::LocalVariable(local),
                             naga::Span::UNDEFINED,
@@ -433,7 +534,7 @@ fn emit_loop_region(
         Some(func.local_variables.append(
             naga::LocalVariable {
                 name: Some("loop_result".into()),
-                ty: i64_type,
+                ty: word_type,
                 init: None,
             },
             naga::Span::UNDEFINED,
@@ -467,7 +568,7 @@ fn emit_loop_region(
         let inst_data = function.dfg.inst(inst_id);
         if <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst_data).is_some() { continue; }
         if <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, inst_data).is_some() { continue; }
-        emit_single_inst(inst_id, function, inst_set, func, &mut loop_body, value_map, phi_locals, result_expr);
+        emit_single_inst(inst_id, function, inst_set, word, func, &mut loop_body, value_map, phi_locals, result_expr);
     }
 
     // Header Br: find exit block and its return value, then emit if NOT(cond) { store exit result; break; }
@@ -476,16 +577,16 @@ fn emit_loop_region(
         let inst_data = function.dfg.inst(inst_id);
         if let Some(br) = <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, inst_data) {
             header_exit_block = Some(*br.z_dest());
-            if let Some(c) = resolve_naga_value(*br.cond(), function, value_map, phi_locals, func) {
+            if let Some(c) = resolve_naga_value(*br.cond(), function, word, value_map, phi_locals, func) {
                 let not_c = func.expressions.append(naga::Expression::Unary { op: naga::UnaryOperator::LogicalNot, expr: c }, naga::Span::UNDEFINED);
                 loop_body.push(naga::Statement::Emit(naga::Range::new_from_bounds(not_c, not_c)), naga::Span::UNDEFINED);
                 let mut break_block = naga::Block::new();
                 // Emit side effects (ObjStore etc.) from exit block before break
-                emit_obj_ops_from_block(function, inst_set, *br.z_dest(), func, &mut break_block, value_map, phi_locals);
+                emit_obj_ops_from_block(function, inst_set, word, *br.z_dest(), func, &mut break_block, value_map, phi_locals);
                 if let Some(res_local) = result_local {
                     if let Some(ret_val) = find_block_return_value(*br.z_dest(), function, inst_set) {
                         let expr_count_before = func.expressions.len();
-                        if let Some(v) = resolve_naga_value(ret_val, function, value_map, phi_locals, func) {
+                        if let Some(v) = resolve_naga_value(ret_val, function, word, value_map, phi_locals, func) {
                             if v.index() >= expr_count_before {
                                 if matches!(func.expressions[v], naga::Expression::Load { .. }
                                     | naga::Expression::Binary { .. }
@@ -536,18 +637,18 @@ fn emit_loop_region(
             for inst_id in function.layout.iter_inst(br_bid) {
                 let inst_data = function.dfg.inst(inst_id);
                 if let Some(br) = <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, inst_data) {
-                    inner_cond_handle = resolve_naga_value(*br.cond(), function, value_map, phi_locals, func);
+                    inner_cond_handle = resolve_naga_value(*br.cond(), function, word, value_map, phi_locals, func);
                     inner_escape_block = Some(*br.z_dest());
                     continue;
                 }
-                emit_single_inst(inst_id, function, inst_set, func, &mut loop_body, value_map, phi_locals, result_expr);
+                emit_single_inst(inst_id, function, inst_set, word, func, &mut loop_body, value_map, phi_locals, result_expr);
             }
 
             if let Some(cond) = inner_cond_handle {
                 // Accept branch (condition true): continue blocks + phi updates
                 let mut accept_block = naga::Block::new();
                 for &bid in &non_header_blocks[br_idx + 1..] {
-                    emit_block_to_target(function, inst_set, bid, func, &mut accept_block, value_map, phi_locals, result_expr);
+                    emit_block_to_target(function, inst_set, word, bid, func, &mut accept_block, value_map, phi_locals, result_expr);
 
                     // Phi updates for blocks that jump back to header
                     for inst_id in function.layout.iter_inst(bid) {
@@ -560,7 +661,7 @@ fn emit_loop_region(
                                         if let Some(&local) = phi_locals.get(&phi_result) {
                                             for &(val, from_block) in phi.args() {
                                                 if from_block == bid {
-                                                    if let Some(v) = resolve_naga_value(val, function, value_map, phi_locals, func) {
+                                                    if let Some(v) = resolve_naga_value(val, function, word, value_map, phi_locals, func) {
                                                         let ptr = func.expressions.append(naga::Expression::LocalVariable(local), naga::Span::UNDEFINED);
                                                         accept_block.push(naga::Statement::Store { pointer: ptr, value: v }, naga::Span::UNDEFINED);
                                                     }
@@ -578,11 +679,11 @@ fn emit_loop_region(
                 // Reject branch (condition false, escape): emit side effects, store result, break
                 let mut reject_block = naga::Block::new();
                 if let Some(esc_bid) = inner_escape_block {
-                    emit_obj_ops_from_block(function, inst_set, esc_bid, func, &mut reject_block, value_map, phi_locals);
+                    emit_obj_ops_from_block(function, inst_set, word, esc_bid, func, &mut reject_block, value_map, phi_locals);
                     if let Some(res_local) = result_local {
                         if let Some(ret_val) = find_block_return_value(esc_bid, function, inst_set) {
                             let expr_count_before = func.expressions.len();
-                            if let Some(v) = resolve_naga_value(ret_val, function, value_map, phi_locals, func) {
+                            if let Some(v) = resolve_naga_value(ret_val, function, word, value_map, phi_locals, func) {
                                 if v.index() >= expr_count_before {
                                     if matches!(func.expressions[v], naga::Expression::Load { .. }
                                         | naga::Expression::Binary { .. }
@@ -607,7 +708,7 @@ fn emit_loop_region(
     } else {
         // Simple loop body (no inner Br)
         for &bid in &non_header_blocks {
-            emit_block_to_target(function, inst_set, bid, func, &mut loop_body, value_map, phi_locals, result_expr);
+            emit_block_to_target(function, inst_set, word, bid, func, &mut loop_body, value_map, phi_locals, result_expr);
 
             // Phi updates
             for inst_id in function.layout.iter_inst(bid) {
@@ -620,7 +721,7 @@ fn emit_loop_region(
                                 if let Some(&local) = phi_locals.get(&phi_result) {
                                     for &(val, from_block) in phi.args() {
                                         if from_block == bid {
-                                            if let Some(v) = resolve_naga_value(val, function, value_map, phi_locals, func) {
+                                            if let Some(v) = resolve_naga_value(val, function, word, value_map, phi_locals, func) {
                                                 let ptr = func.expressions.append(naga::Expression::LocalVariable(local), naga::Span::UNDEFINED);
                                                 loop_body.push(naga::Statement::Store { pointer: ptr, value: v }, naga::Span::UNDEFINED);
                                             }
@@ -708,6 +809,7 @@ fn emit_loop_region(
 fn emit_obj_ops_from_block(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
     block: sonatina_ir::BlockId,
     func: &mut naga::Function,
     target: &mut naga::Block,
@@ -720,8 +822,8 @@ fn emit_obj_ops_from_block(
 
         if let Some(obj_index) = <&sonatina_ir::inst::data::ObjIndex as InstDowncast>::downcast(inst_set, inst_data) {
             if let Some(result) = function.dfg.inst_result(inst_id) {
-                let base = resolve_naga_value(*obj_index.object(), function, value_map, phi_locals, func).unwrap();
-                let index = resolve_naga_value(*obj_index.index(), function, value_map, phi_locals, func).unwrap();
+                let base = resolve_naga_value(*obj_index.object(), function, word, value_map, phi_locals, func).unwrap();
+                let index = resolve_naga_value(*obj_index.index(), function, word, value_map, phi_locals, func).unwrap();
                 let i32_idx = func.expressions.append(
                     naga::Expression::As { expr: index, kind: naga::ScalarKind::Sint, convert: Some(4) },
                     naga::Span::UNDEFINED,
@@ -734,8 +836,8 @@ fn emit_obj_ops_from_block(
                 value_map.insert(result, h);
             }
         } else if let Some(obj_store) = <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, inst_data) {
-            let dest = resolve_naga_value(*obj_store.object(), function, value_map, phi_locals, func).unwrap();
-            let val = resolve_naga_value(*obj_store.value(), function, value_map, phi_locals, func).unwrap();
+            let dest = resolve_naga_value(*obj_store.object(), function, word, value_map, phi_locals, func).unwrap();
+            let val = resolve_naga_value(*obj_store.value(), function, word, value_map, phi_locals, func).unwrap();
             target.push(naga::Statement::Store { pointer: dest, value: val }, naga::Span::UNDEFINED);
         }
     }
@@ -758,42 +860,149 @@ fn find_block_return_value(
     None
 }
 
+/// Under a u32 word, these signedness-sensitive ops have no correct signless
+/// lowering yet, so they fail closed. Returns the op's name if `inst_data` is one
+/// of them, else `None`. (Add/Sub/Mul are sign-agnostic under wrapping and stay
+/// enabled; the emitted `Lt` maps to naga `Less`, which is an unsigned compare on
+/// a `Uint` scalar, so it is not in this set.)
+#[cfg(feature = "spirv-backend")]
+fn unsupported_signed_op_under_u32(
+    is: &dyn sonatina_ir::InstSetBase,
+    inst_data: &dyn sonatina_ir::Inst,
+) -> Option<&'static str> {
+    use sonatina_ir::{
+        InstDowncast,
+        inst::{arith, cmp},
+    };
+    if <&arith::Sar as InstDowncast>::downcast(is, inst_data).is_some() {
+        return Some("sar");
+    }
+    if <&arith::Sdiv as InstDowncast>::downcast(is, inst_data).is_some() {
+        return Some("sdiv");
+    }
+    if <&arith::Smod as InstDowncast>::downcast(is, inst_data).is_some() {
+        return Some("smod");
+    }
+    if <&cmp::Slt as InstDowncast>::downcast(is, inst_data).is_some() {
+        return Some("slt");
+    }
+    if <&cmp::Sgt as InstDowncast>::downcast(is, inst_data).is_some() {
+        return Some("sgt");
+    }
+    if <&cmp::Sle as InstDowncast>::downcast(is, inst_data).is_some() {
+        return Some("sle");
+    }
+    if <&cmp::Sge as InstDowncast>::downcast(is, inst_data).is_some() {
+        return Some("sge");
+    }
+    None
+}
+
 #[cfg(feature = "spirv-backend")]
 fn translate_to_naga(
     module: &Module,
     workgroup_size: [u32; 3],
-) -> Result<naga::Module, String> {
+) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
+
+    // Content-derived word scalar: the kernel's own Sonatina return type is the
+    // word-width SSOT (no hardwire, no config knob). I32 -> u32 (browser profile,
+    // no SHADER_INT64); I64 -> i64 (the original path, bit-for-bit). Anything else,
+    // a missing return, or a mixed-width argument fails closed.
+    let funcs_peek = module.funcs();
+    let first_func = *funcs_peek
+        .first()
+        .ok_or_else(|| "spirv: module has no functions to translate".to_string())?;
+
+    let sig = module
+        .ctx
+        .get_sig(first_func)
+        .ok_or_else(|| "spirv: first function has no declared signature".to_string())?;
+
+    let word = match sig.single_ret_ty() {
+        Some(sonatina_ir::Type::I32) => WordKind::U32,
+        Some(sonatina_ir::Type::I64) => WordKind::I64,
+        Some(other) => {
+            return Err(format!(
+                "spirv: unsupported kernel return type {other:?}; only i32 (u32 word) \
+                 and i64 words are supported"
+            ));
+        }
+        None => {
+            return Err(
+                "spirv: kernel has no single return value; the word width cannot be derived"
+                    .to_string(),
+            );
+        }
+    };
+
+    // Mixed-width fail-close: every argument must share the derived word type.
+    let word_ty = match word {
+        WordKind::U32 => sonatina_ir::Type::I32,
+        WordKind::I64 => sonatina_ir::Type::I64,
+    };
+    for (i, &arg_ty) in sig.args().iter().enumerate() {
+        if arg_ty != word_ty {
+            return Err(format!(
+                "spirv: kernel arg {i} has type {arg_ty:?} but the word type is {word_ty:?}; \
+                 mixed-width kernels are unsupported"
+            ));
+        }
+    }
+
+    let word_width = word.width_bytes();
 
     let mut naga_mod = naga::Module::default();
 
-    let i64_type = naga_mod.types.insert(
+    let word_type = naga_mod.types.insert(
         naga::Type {
             name: None,
             inner: naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Sint,
-                width: 8,
+                kind: match word {
+                    WordKind::U32 => naga::ScalarKind::Uint,
+                    WordKind::I64 => naga::ScalarKind::Sint,
+                },
+                width: word_width as u8,
             }),
         },
         naga::Span::UNDEFINED,
     );
 
-    // Scan first function for ObjAlloc to determine output mode
-    let funcs_peek = module.funcs();
-    let (param_count, has_obj_alloc) = funcs_peek.first().map(|&fr| {
-        module.func_store.try_view(fr, |f| {
+    // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
+    // fail closed on any signedness-sensitive op (Sar / signed compares / signed
+    // div|mod): Sonatina integers are signless, so u32 is exact for wrapping
+    // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
+    // silently emit the signed WGSL operator.
+    let (param_count, has_obj_alloc) = module
+        .func_store
+        .try_view(first_func, |f| -> Result<(usize, bool), String> {
             let pc = f.arg_values.len();
-            let has_alloc = f.layout.iter_block().any(|bid| {
-                f.layout.iter_inst(bid).any(|iid| {
+            let is = f.inst_set();
+            let mut has_alloc = false;
+            for bid in f.layout.iter_block() {
+                for iid in f.layout.iter_inst(bid) {
                     let inst_data = f.dfg.inst(iid);
-                    <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(
-                        f.inst_set(), inst_data
-                    ).is_some()
-                })
-            });
-            (pc, has_alloc)
-        }).unwrap_or((0, false))
-    }).unwrap_or((2, false));
+                    if <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(
+                        is, inst_data,
+                    )
+                    .is_some()
+                    {
+                        has_alloc = true;
+                    }
+                    if word == WordKind::U32 {
+                        if let Some(op) = unsupported_signed_op_under_u32(is, inst_data) {
+                            return Err(format!(
+                                "spirv u32: signedness-sensitive op `{op}` is unsupported under \
+                                 a u32 word (Sonatina integers are signless; a sign mapping is \
+                                 not yet designed). Fail closed."
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok((pc, has_alloc))
+        })
+        .ok_or_else(|| "spirv: first function body is unavailable".to_string())??;
 
     // Output type: dynamic array for batch (ObjAlloc) or single-value struct for scalar
     let output_type = if has_obj_alloc {
@@ -801,9 +1010,9 @@ fn translate_to_naga(
             naga::Type {
                 name: Some("OutputArray".into()),
                 inner: naga::TypeInner::Array {
-                    base: i64_type,
+                    base: word_type,
                     size: naga::ArraySize::Dynamic,
-                    stride: 8,
+                    stride: word_width,
                 },
             },
             naga::Span::UNDEFINED,
@@ -815,11 +1024,11 @@ fn translate_to_naga(
                 inner: naga::TypeInner::Struct {
                     members: vec![naga::StructMember {
                         name: Some("result".into()),
-                        ty: i64_type,
+                        ty: word_type,
                         binding: None,
                         offset: 0,
                     }],
-                    span: 8,
+                    span: word_width,
                 },
             },
             naga::Span::UNDEFINED,
@@ -830,12 +1039,12 @@ fn translate_to_naga(
     let input_members: Vec<naga::StructMember> = (0..effective_params).map(|i| {
         naga::StructMember {
             name: Some(format!("p{i}")),
-            ty: i64_type,
+            ty: word_type,
             binding: None,
-            offset: (i * 8) as u32,
+            offset: i as u32 * word_width,
         }
     }).collect();
-    let input_span = (effective_params * 8) as u32;
+    let input_span = effective_params as u32 * word_width;
 
     let input_struct = naga_mod.types.insert(
         naga::Type {
@@ -1035,14 +1244,14 @@ fn translate_to_naga(
             if has_loops {
                 let scfg = structured.unwrap();
                 emit_naga_regions(
-                    function, inst_set, &scfg.regions, i64_type,
+                    function, inst_set, word, &scfg.regions, word_type,
                     &mut func, &mut value_map, &mut phi_locals, &mut result_expr,
                 );
             } else {
                 // Linear fallback
                 for block in function.layout.iter_block() {
                     emit_naga_block_instructions(
-                        function, inst_set, block, i64_type,
+                        function, inst_set, word, block, word_type,
                         &mut func, &mut value_map, &mut phi_locals, &mut result_expr,
                     );
                 }
@@ -1063,8 +1272,12 @@ fn translate_to_naga(
         );
 
         let final_val = result_expr.unwrap_or_else(|| {
+            let zero = match word {
+                WordKind::U32 => naga::Literal::U32(0),
+                WordKind::I64 => naga::Literal::I64(0),
+            };
             func.expressions.append(
-                naga::Expression::Literal(naga::Literal::I64(0)),
+                naga::Expression::Literal(zero),
                 naga::Span::UNDEFINED,
             )
         });
@@ -1087,5 +1300,44 @@ fn translate_to_naga(
         incoming_ray_payload: None,
     });
 
-    Ok(naga_mod)
+    // The compiler states its own ABI, populated from the SAME values used above:
+    // the two storage globals (output @0/0 LOAD|STORE, input @0/1 LOAD), the word
+    // width, and the workgroup size passed to the entry point. Nothing downstream
+    // re-derives this.
+    let layout = SpirvLayout {
+        entry_point: "main".to_string(),
+        mode: if has_obj_alloc {
+            LayoutMode::Batch
+        } else {
+            LayoutMode::Scalar
+        },
+        workgroup_size,
+        word,
+        bindings: vec![
+            SpirvBinding {
+                group: 0,
+                binding: 0,
+                name: "output".to_string(),
+                access: Access::ReadWrite,
+                role: Role::Output,
+                stride: word_width,
+            },
+            SpirvBinding {
+                group: 0,
+                binding: 1,
+                name: "input".to_string(),
+                access: Access::Read,
+                role: Role::Input,
+                stride: input_span,
+            },
+        ],
+        result: SpirvResult {
+            group: 0,
+            binding: 0,
+            offset: 0,
+            width: word_width,
+        },
+    };
+
+    Ok((naga_mod, layout))
 }
