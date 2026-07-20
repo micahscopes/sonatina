@@ -55,6 +55,13 @@ pub enum LayoutMode {
     Scalar,
     Batch,
     Grid,
+    /// Render mode: ONE SPIR-V module with two entry points, a fixed
+    /// fullscreen-triangle `@vertex` and a `@fragment` that binds args 0,1 to
+    /// `u32(position.xy)` (the analog of Grid's `global_invocation_id.xy`), runs
+    /// the mode-blind body unchanged, and returns `unpack4x8unorm(result)` as an
+    /// `@location(0) vec4<f32>` color. Driver-declared (`with_render()`), off by
+    /// default; there is no output storage buffer.
+    Render,
 }
 
 /// Storage access a binding is declared with, mirroring the emitted naga
@@ -107,9 +114,16 @@ pub struct SpirvLayout {
     pub word: WordKind,
     pub bindings: Vec<SpirvBinding>,
     /// Where the scalar result lands for readback (`Some` for Scalar and Batch
-    /// modes). `None` in Grid mode: the whole output array is the result, written
-    /// per pixel, so there is no single readback slot.
+    /// modes). `None` in Grid and Render modes: the whole output array (Grid) or
+    /// the color target (Render) is the result, so there is no single readback slot.
     pub result: Option<SpirvResult>,
+    /// Render mode: the `@vertex` entry point name (`None` for compute modes).
+    pub vertex_entry: Option<String>,
+    /// Render mode: the `@fragment` entry point name (`None` for compute modes).
+    pub fragment_entry: Option<String>,
+    /// Render mode: the color-target texture format the fragment writes
+    /// (`Some("rgba8unorm")`); `None` for compute modes.
+    pub color_target_format: Option<String>,
 }
 
 pub struct SpirvArtifact {
@@ -135,6 +149,12 @@ pub struct SpirvBackend {
     /// `output[gid.y * (num_workgroups.x * workgroup_size[0]) + gid.x]`. A
     /// driver-declared envelope fact (no content signal), off by default.
     pub grid: bool,
+    /// Render mode: emit ONE module with a fixed fullscreen-triangle `@vertex`
+    /// and a `@fragment` that binds args 0,1 to `u32(position.xy)`, runs the
+    /// mode-blind body, and returns `unpack4x8unorm(result)` as an
+    /// `@location(0) vec4<f32>` color. Driver-declared, off by default; mutually
+    /// exclusive with grid and batch.
+    pub render: bool,
 }
 
 impl SpirvBackend {
@@ -142,6 +162,7 @@ impl SpirvBackend {
         Self {
             workgroup_size: [64, 1, 1],
             grid: false,
+            render: false,
         }
     }
 
@@ -152,6 +173,11 @@ impl SpirvBackend {
 
     pub fn with_grid(mut self) -> Self {
         self.grid = true;
+        self
+    }
+
+    pub fn with_render(mut self) -> Self {
+        self.render = true;
         self
     }
 }
@@ -169,8 +195,9 @@ impl Backend for SpirvBackend {
 
     #[cfg(feature = "spirv-backend")]
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        let (naga_mod, layout) = translate_to_naga(module, self.workgroup_size, self.grid)
-            .map_err(|e| vec![SpirvError::Translation(e)])?;
+        let (naga_mod, layout) =
+            translate_to_naga(module, self.workgroup_size, self.grid, self.render)
+                .map_err(|e| vec![SpirvError::Translation(e)])?;
 
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -357,6 +384,35 @@ fn emit_single_inst(
                     value_map.insert(result, h);
                 }
             }
+            return true;
+        }
+    } else if let Some(shr) = <&sonatina_ir::inst::arith::Shr as InstDowncast>::downcast(inst_set, inst_data) {
+        // Logical (unsigned) shift right. Fe lowers unsigned `>>` to `Shr`. Under
+        // the u32 word this is the EASY case: WGSL `>>` on a `u32` IS a logical
+        // shift, so no bitcast dance (unlike `Sar`), just shift the u32 value with
+        // a u32 literal amount. The i64 word fails closed in the pre-scan (only the
+        // u32 browser word lowers `>>`), and a non-immediate amount fails closed
+        // there too, so `bits` is an immediate here.
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let val = resolve_naga_value(*shr.value(), function, word, value_map, phi_locals, func).unwrap();
+            let shift_amount = if let Some(imm) = function.dfg.value_imm(*shr.bits()) {
+                match imm {
+                    sonatina_ir::Immediate::I64(v) => v as u32,
+                    sonatina_ir::Immediate::I32(v) => v as u32,
+                    sonatina_ir::Immediate::I8(v) => v as u32,
+                    _ => 0,
+                }
+            } else { 0 };
+            let bits_u32 = func.expressions.append(
+                naga::Expression::Literal(naga::Literal::U32(shift_amount)),
+                naga::Span::UNDEFINED,
+            );
+            let h = func.expressions.append(
+                naga::Expression::Binary { op: naga::BinaryOperator::ShiftRight, left: val, right: bits_u32 },
+                naga::Span::UNDEFINED,
+            );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
             return true;
         }
     } else if let Some(lt) = <&sonatina_ir::inst::cmp::Lt as InstDowncast>::downcast(inst_set, inst_data) {
@@ -980,6 +1036,7 @@ fn translate_to_naga(
     module: &Module,
     workgroup_size: [u32; 3],
     grid: bool,
+    render: bool,
 ) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
 
@@ -1093,6 +1150,41 @@ fn translate_to_naga(
                                 );
                             }
                         }
+                        // `Shr` (logical shift) has the SAME immediate-only rule as
+                        // `Sar` under u32: the amount is materialized as a WGSL u32
+                        // literal. A non-immediate amount fails closed rather than
+                        // silently reading 0.
+                        if let Some(shr) =
+                            <&sonatina_ir::inst::arith::Shr as sonatina_ir::InstDowncast>::downcast(
+                                is, inst_data,
+                            )
+                        {
+                            if f.dfg.value_imm(*shr.bits()).is_none() {
+                                return Err(
+                                    "spirv u32: shr with a non-immediate shift amount is \
+                                     unsupported (the u32 logical shift materializes the \
+                                     amount as a WGSL u32 literal). Fail closed."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    // `Shr` (logical/unsigned shift) is only lowered for the u32
+                    // browser word, where WGSL `>>` on a `u32` IS the logical shift.
+                    // The i64 word is a `Sint` scalar whose `>>` is arithmetic; a
+                    // logical shift would need a bitcast dance no path emits, so it
+                    // fails closed rather than emitting the wrong (arithmetic) shift.
+                    if word == WordKind::I64
+                        && <&sonatina_ir::inst::arith::Shr as sonatina_ir::InstDowncast>::downcast(
+                            is, inst_data,
+                        )
+                        .is_some()
+                    {
+                        return Err(
+                            "spirv i64: logical shift `Shr` is unsupported under the i64 word \
+                             (only the u32 browser word lowers `>>`). Fail closed."
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -1123,6 +1215,349 @@ fn translate_to_naga(
         if !(workgroup_size[0] >= 1 && workgroup_size[1] >= 1 && workgroup_size[2] == 1) {
             return Err("spirv grid: grid dispatch is 2D; workgroup z must be 1".to_string());
         }
+    }
+
+    // ======================================================================
+    // Render mode (fork push #3). ONE module, two entry points: a fixed
+    // fullscreen-triangle `@vertex` and a `@fragment` that binds args 0,1 to
+    // `u32(position.xy)`, runs the SAME mode-blind body translation Grid uses,
+    // and returns `unpack4x8unorm(result)` as an `@location(0) vec4<f32>` color.
+    // There is NO output storage buffer. Every precondition is enforced here so
+    // no wrong shader is ever emitted; Scalar/Grid/Batch never reach this branch
+    // and are byte-untouched.
+    // ======================================================================
+    if render {
+        if grid {
+            return Err(
+                "spirv render: render and grid modes are mutually exclusive".to_string(),
+            );
+        }
+        if word != WordKind::U32 {
+            return Err(
+                "spirv render: render mode requires the u32 word (browser profile); got i64"
+                    .to_string(),
+            );
+        }
+        if param_count < 2 {
+            return Err(format!(
+                "spirv render: a render kernel needs at least (px, py) args; got {param_count}"
+            ));
+        }
+        if has_obj_alloc {
+            return Err(
+                "spirv render: render and batch (ObjAlloc) modes are mutually exclusive"
+                    .to_string(),
+            );
+        }
+
+        // ---- types: f32, vec4<f32> (the vertex/fragment stage I/O) ----------
+        let f32_scalar = naga::Scalar { kind: naga::ScalarKind::Float, width: 4 };
+        let vec4f = naga_mod.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Vector { size: naga::VectorSize::Quad, scalar: f32_scalar },
+            },
+            naga::Span::UNDEFINED,
+        );
+
+        // ---- broadcast input struct (args 2..), exactly the Grid shape -------
+        // Binding 0 (the compute output buffer) is simply ABSENT in render mode;
+        // the input storage buffer stays at @group(0) @binding(1), no renumbering.
+        let broadcast = param_count - 2;
+        let effective_params = broadcast.max(1);
+        let input_members: Vec<naga::StructMember> = (0..effective_params)
+            .map(|i| naga::StructMember {
+                name: Some(format!("p{i}")),
+                ty: word_type,
+                binding: None,
+                offset: i as u32 * word_width,
+            })
+            .collect();
+        let input_span = effective_params as u32 * word_width;
+        let input_struct = naga_mod.types.insert(
+            naga::Type {
+                name: Some("Input".into()),
+                inner: naga::TypeInner::Struct { members: input_members, span: input_span },
+            },
+            naga::Span::UNDEFINED,
+        );
+        let input_var = naga_mod.global_variables.append(
+            naga::GlobalVariable {
+                name: Some("input".into()),
+                space: naga::AddressSpace::Storage { access: naga::StorageAccess::LOAD },
+                binding: Some(naga::ResourceBinding { group: 0, binding: 1 }),
+                ty: input_struct,
+                init: None,
+                memory_decorations: naga::ir::MemoryDecorations::empty(),
+            },
+            naga::Span::UNDEFINED,
+        );
+
+        // ---- @vertex: fullscreen triangle from vertex_index -----------------
+        // vi=0 -> (-1,-1); vi=1 -> (3,-1); vi=2 -> (-1,3). No vertex buffer, no
+        // varyings: the fragment reads its pixel from the position builtin.
+        //   x = f32((vi & 1u) << 2u) - 1.0 ;  y = f32((vi & 2u) << 1u) - 1.0
+        let mut vs = naga::Function {
+            name: Some("vs_fullscreen".into()),
+            arguments: vec![naga::FunctionArgument {
+                name: Some("vi".into()),
+                ty: word_type, // u32 (word == U32 here)
+                binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::VertexIndex)),
+            }],
+            result: Some(naga::FunctionResult {
+                ty: vec4f,
+                binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::Position { invariant: false })),
+            }),
+            local_variables: naga::Arena::new(),
+            expressions: naga::Arena::new(),
+            named_expressions: Default::default(),
+            body: naga::Block::new(),
+            diagnostic_filter_leaf: None,
+        };
+        {
+            let mut b = naga::Block::new();
+            // Append an expression and Emit it as its own single-expression range
+            // (the house style). Literals stay un-Emitted (const expressions).
+            fn e(
+                f: &mut naga::Function,
+                body: &mut naga::Block,
+                x: naga::Expression,
+            ) -> naga::Handle<naga::Expression> {
+                let h = f.expressions.append(x, naga::Span::UNDEFINED);
+                body.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(h, h)),
+                    naga::Span::UNDEFINED,
+                );
+                h
+            }
+            let vi = vs.expressions.append(naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED);
+            let one = vs.expressions.append(naga::Expression::Literal(naga::Literal::U32(1)), naga::Span::UNDEFINED);
+            let two = vs.expressions.append(naga::Expression::Literal(naga::Literal::U32(2)), naga::Span::UNDEFINED);
+            let one_f = vs.expressions.append(naga::Expression::Literal(naga::Literal::F32(1.0)), naga::Span::UNDEFINED);
+            let zero_f = vs.expressions.append(naga::Expression::Literal(naga::Literal::F32(0.0)), naga::Span::UNDEFINED);
+
+            let xa = e(&mut vs, &mut b, naga::Expression::Binary { op: naga::BinaryOperator::And, left: vi, right: one });
+            let xs = e(&mut vs, &mut b, naga::Expression::Binary { op: naga::BinaryOperator::ShiftLeft, left: xa, right: two });
+            let xf = e(&mut vs, &mut b, naga::Expression::As { expr: xs, kind: naga::ScalarKind::Float, convert: Some(4) });
+            let x = e(&mut vs, &mut b, naga::Expression::Binary { op: naga::BinaryOperator::Subtract, left: xf, right: one_f });
+
+            let ya = e(&mut vs, &mut b, naga::Expression::Binary { op: naga::BinaryOperator::And, left: vi, right: two });
+            let ys = e(&mut vs, &mut b, naga::Expression::Binary { op: naga::BinaryOperator::ShiftLeft, left: ya, right: one });
+            let yf = e(&mut vs, &mut b, naga::Expression::As { expr: ys, kind: naga::ScalarKind::Float, convert: Some(4) });
+            let y = e(&mut vs, &mut b, naga::Expression::Binary { op: naga::BinaryOperator::Subtract, left: yf, right: one_f });
+
+            let pos = e(&mut vs, &mut b, naga::Expression::Compose { ty: vec4f, components: vec![x, y, zero_f, one_f] });
+            b.push(naga::Statement::Return { value: Some(pos) }, naga::Span::UNDEFINED);
+            vs.body = b;
+        }
+
+        // ---- @fragment: position builtin in, vec4<f32> color out ------------
+        let mut fs = naga::Function {
+            name: Some("fs_main".into()),
+            arguments: vec![naga::FunctionArgument {
+                name: Some("pos".into()),
+                ty: vec4f,
+                binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::Position { invariant: false })),
+            }],
+            result: Some(naga::FunctionResult {
+                ty: vec4f,
+                binding: Some(naga::Binding::Location {
+                    location: 0,
+                    interpolation: None,
+                    sampling: None,
+                    blend_src: None,
+                    per_primitive: false,
+                }),
+            }),
+            local_variables: naga::Arena::new(),
+            expressions: naga::Arena::new(),
+            named_expressions: Default::default(),
+            body: naga::Block::new(),
+            diagnostic_filter_leaf: None,
+        };
+
+        let funcs = module.funcs();
+        let mut result_expr = None;
+        if let Some(&func_ref) = funcs.first() {
+            module.func_store.try_view(func_ref, |function| {
+                let inst_set = function.inst_set();
+                let mut value_map: HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>> =
+                    HashMap::new();
+                let mut phi_locals: HashMap<
+                    sonatina_ir::ValueId,
+                    naga::Handle<naga::LocalVariable>,
+                > = HashMap::new();
+
+                // The broadcast input global (unused if there are no args 2..; an
+                // unused GlobalVariable is legal, as in Grid's gradient kernel).
+                let input_expr = fs.expressions.append(
+                    naga::Expression::GlobalVariable(input_var),
+                    naga::Span::UNDEFINED,
+                );
+
+                // Prologue: px = u32(pos.x), py = u32(pos.y). The fragment center
+                // (px + 0.5) truncates to the pixel index, the render-mode analog
+                // of Grid's gid.x/gid.y binding (same orientation: y=0 top row).
+                let pos = fs.expressions.append(
+                    naga::Expression::FunctionArgument(0),
+                    naga::Span::UNDEFINED,
+                );
+                let posx = fs.expressions.append(
+                    naga::Expression::AccessIndex { base: pos, index: 0 },
+                    naga::Span::UNDEFINED,
+                );
+                fs.body.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(posx, posx)),
+                    naga::Span::UNDEFINED,
+                );
+                let px = fs.expressions.append(
+                    naga::Expression::As { expr: posx, kind: naga::ScalarKind::Uint, convert: Some(4) },
+                    naga::Span::UNDEFINED,
+                );
+                fs.body.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(px, px)),
+                    naga::Span::UNDEFINED,
+                );
+                let posy = fs.expressions.append(
+                    naga::Expression::AccessIndex { base: pos, index: 1 },
+                    naga::Span::UNDEFINED,
+                );
+                fs.body.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(posy, posy)),
+                    naga::Span::UNDEFINED,
+                );
+                let py = fs.expressions.append(
+                    naga::Expression::As { expr: posy, kind: naga::ScalarKind::Uint, convert: Some(4) },
+                    naga::Span::UNDEFINED,
+                );
+                fs.body.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(py, py)),
+                    naga::Span::UNDEFINED,
+                );
+                if let Some(&a0) = function.arg_values.first() {
+                    value_map.insert(a0, px);
+                }
+                if let Some(&a1) = function.arg_values.get(1) {
+                    value_map.insert(a1, py);
+                }
+
+                // Args 2.. load from the broadcast input struct at member idx - 2,
+                // the SAME castless path Grid uses.
+                for (idx, &arg_val) in function.arg_values.iter().enumerate().skip(2) {
+                    let field = fs.expressions.append(
+                        naga::Expression::AccessIndex { base: input_expr, index: (idx - 2) as u32 },
+                        naga::Span::UNDEFINED,
+                    );
+                    let loaded = fs.expressions.append(
+                        naga::Expression::Load { pointer: field },
+                        naga::Span::UNDEFINED,
+                    );
+                    fs.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(field, field)),
+                        naga::Span::UNDEFINED,
+                    );
+                    fs.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                        naga::Span::UNDEFINED,
+                    );
+                    value_map.insert(arg_val, loaded);
+                }
+
+                // The mode-blind body: SAME structurizer + region emission Grid and
+                // Scalar use (zero changes to emit_naga_regions / emit_single_inst).
+                let structured = crate::structurize::structurize_function(function);
+                let has_loops = structured.as_ref().map_or(false, |s| {
+                    s.regions
+                        .iter()
+                        .any(|r| matches!(r, crate::structurize::Region::Loop { .. }))
+                });
+                if has_loops {
+                    let scfg = structured.unwrap();
+                    emit_naga_regions(
+                        function, inst_set, word, &scfg.regions, word_type,
+                        &mut fs, &mut value_map, &mut phi_locals, &mut result_expr,
+                    );
+                } else {
+                    for block in function.layout.iter_block() {
+                        emit_naga_block_instructions(
+                            function, inst_set, word, block, word_type,
+                            &mut fs, &mut value_map, &mut phi_locals, &mut result_expr,
+                        );
+                    }
+                }
+            });
+        }
+
+        // Epilogue: unpack4x8unorm(result) -> @location(0) vec4<f32>. A render
+        // kernel that produced no result expression is a hard error, never a
+        // silent store-0 (that fallback is scalar-only). The packed u32 is r|g<<8|
+        // b<<16|a<<24, which unpack4x8unorm maps to the exact rgba8unorm color.
+        let result_val = result_expr
+            .ok_or_else(|| "spirv render: fragment kernel produced no result expression".to_string())?;
+        let color = fs.expressions.append(
+            naga::Expression::Math {
+                fun: naga::MathFunction::Unpack4x8unorm,
+                arg: result_val,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            },
+            naga::Span::UNDEFINED,
+        );
+        fs.body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(color, color)),
+            naga::Span::UNDEFINED,
+        );
+        fs.body.push(naga::Statement::Return { value: Some(color) }, naga::Span::UNDEFINED);
+
+        // Two entry points into ONE module (spv-out with pipeline_options=None
+        // writes both). Non-compute stages carry workgroup_size = [0,0,0].
+        naga_mod.entry_points.push(naga::EntryPoint {
+            name: "vs_fullscreen".into(),
+            stage: naga::ShaderStage::Vertex,
+            early_depth_test: None,
+            workgroup_size: [0, 0, 0],
+            workgroup_size_overrides: None,
+            function: vs,
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
+        });
+        naga_mod.entry_points.push(naga::EntryPoint {
+            name: "fs_main".into(),
+            stage: naga::ShaderStage::Fragment,
+            early_depth_test: None,
+            workgroup_size: [0, 0, 0],
+            workgroup_size_overrides: None,
+            function: fs,
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
+        });
+
+        // The compiler states its own render ABI: mode Render, the two entry
+        // names, the color-target format, the single input binding (@0/1, Read),
+        // no output binding (binding 0 absent), no single-slot result.
+        let layout = SpirvLayout {
+            entry_point: "fs_main".to_string(),
+            mode: LayoutMode::Render,
+            workgroup_size: [0, 0, 0],
+            word,
+            bindings: vec![SpirvBinding {
+                group: 0,
+                binding: 1,
+                name: "input".to_string(),
+                access: Access::Read,
+                role: Role::Input,
+                stride: input_span,
+            }],
+            result: None,
+            vertex_entry: Some("vs_fullscreen".to_string()),
+            fragment_entry: Some("fs_main".to_string()),
+            color_target_format: Some("rgba8unorm".to_string()),
+        };
+
+        return Ok((naga_mod, layout));
     }
 
     // Output type: dynamic array for batch (ObjAlloc) or grid (per-pixel store),
@@ -1640,6 +2075,11 @@ fn translate_to_naga(
                 width: word_width,
             })
         },
+        // Compute modes (Scalar/Grid/Batch) have no vertex/fragment stages and no
+        // color target.
+        vertex_entry: None,
+        fragment_entry: None,
+        color_target_format: None,
     };
 
     Ok((naga_mod, layout))
