@@ -51,6 +51,10 @@ wasm = ["dep:waffle", "dep:wasm-encoder"]
 spirv-backend = ["dep:naga"]
 
 [dev-dependencies]
+# The spirv tests reparse the emitted WGSL with naga's `wgsl-in` frontend and
+# validate it under the browser capability set. `wgsl-in` is test-only, so it
+# lives here and does not widen the library's naga features.
+naga = { version = "29", features = ["wgsl-in"] }
 hex = "0.4.3"
 insta = "1.43"
 dir-test = "0.4"

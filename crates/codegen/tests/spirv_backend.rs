@@ -1,5 +1,5 @@
 use sonatina_codegen::Backend;
-use sonatina_codegen::isa::spirv::SpirvBackend;
+use sonatina_codegen::isa::spirv::{SpirvBackend, WordKind};
 use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
@@ -274,4 +274,86 @@ fn spirv_loop_sum_to_valid() {
         assert!(output.status.success(), "SPIR-V loop should validate with spirv-val");
     }
     let _ = std::fs::remove_file(&tmp);
+}
+
+/// B1 (mb2 browser-testable plan): a u32-word kernel must lower to a naga `Uint`
+/// scalar and produce BROWSER-PROFILE WGSL (no 64-bit scalar) that reparses and
+/// validates WITHOUT SHADER_INT64. This is the content-derived word gate: the
+/// kernel's `i32` return type ALONE drives the u32 lowering (no flag, no config).
+/// The kernel mirrors the `poseidon_sigma_u32` browser keystone (rounds
+/// [13, 41, 2026]); B1 only lowers/validates it, execution is B2.
+#[test]
+fn spirv_u32_kernel_lowers_to_uint_scalar() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    // poseidon_sigma_u32: acc=1, C=[13,41,2026], sigma(x)=x*x+x, 3 rounds, all
+    // Add/Mul. Return type i32 -> the backend derives a u32 word.
+    let sig = Signature::new_single("poseidon_sigma_u32", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let mut acc = fb.make_imm_value(1i32);
+    for c_val in [13i32, 41, 2026] {
+        let c = fb.make_imm_value(c_val);
+        let sum = fb.insert_inst(arith::Add::new(is, acc, c), Type::I32);
+        let sq = fb.insert_inst(arith::Mul::new(is, sum, sum), Type::I32);
+        acc = fb.insert_inst(arith::Add::new(is, sq, sum), Type::I32);
+    }
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, acc));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new().with_workgroup_size(1, 1, 1);
+    let artifact = backend
+        .compile_module(&module)
+        .expect("u32 kernel must compile to SPIR-V");
+
+    // The compiler states its own ABI: word must be u32 with a 4-byte result.
+    assert_eq!(
+        artifact.layout.word,
+        WordKind::U32,
+        "an i32 return type must derive a u32 word (content-derived, not hardwired)"
+    );
+    assert_eq!(
+        artifact.layout.result.width, 4,
+        "u32 result readback width must be 4 bytes"
+    );
+    assert_eq!(artifact.words[0], 0x07230203, "valid SPIR-V magic");
+
+    // Browser-profile WGSL: no 64-bit scalar tokens anywhere.
+    let wgsl = artifact.wgsl.as_ref().expect("WGSL side artifact");
+    for tok in ["i64", "u64"] {
+        assert!(
+            !wgsl.contains(tok),
+            "u32 WGSL must contain no `{tok}` 64-bit scalar; got:\n{wgsl}"
+        );
+    }
+    assert!(
+        wgsl.contains("u32"),
+        "u32 WGSL should declare u32 storage; got:\n{wgsl}"
+    );
+
+    // wgsl-in reparse + validate with the BROWSER capability set (no SHADER_INT64).
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse the emitted browser-profile WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect(
+        "browser-profile validation (default caps, no SHADER_INT64) must accept the u32 module",
+    );
+
+    eprintln!(
+        "B1: i32 kernel -> u32 word; WGSL validates under default caps ({} words)",
+        artifact.words.len()
+    );
 }
