@@ -750,3 +750,323 @@ fn grid_fail_closed() {
     );
     eprintln!("grid_fail_closed OK: all four preconditions err and name grid");
 }
+
+// ===========================================================================
+// M2a: fork push #2 - signed ops under the u32 word. `Slt` and `Sar` were
+// fail-closed under u32; they are now word-aware via an i32 bitcast:
+//   - `Slt`: bitcast BOTH operands to i32, then naga `Less` (a signed compare).
+//   - `Sar`: bitcast the value to i32, arithmetic `>>` with a u32 literal amount,
+//     bitcast back to u32.
+// A non-immediate `Sar` shift amount still fails closed with a named error.
+// ===========================================================================
+
+/// A scalar u32 kernel whose loop condition is a SIGNED compare (`i <s 10`),
+/// exercising the u32 `Slt` arm: `slt_count() = { let mut i = 0; while i <s 10
+/// { i += 1 } i }` (returns 10). Scalar loop, no inner branch (the proven
+/// `spirv_loop_sum_to_valid` shape, with the compare made signed).
+fn build_u32_slt_count() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("slt_count", Linkage::Public, &[], Type::I32);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let lh = fb.append_block();
+    let lb = fb.append_block();
+    let exit = fb.append_block();
+    fb.switch_to_block(entry);
+    let init = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, lh));
+    fb.switch_to_block(lh);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(init, entry)]), Type::I32);
+    let ten = fb.make_imm_value(10i32);
+    let cond = fb.insert_inst(cmp::Slt::new(is, i, ten), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, lb, exit));
+    fb.switch_to_block(lb);
+    let one = fb.make_imm_value(1i32);
+    let ni = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, ni, lb);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, lh));
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A scalar u32 kernel `sar_probe(a) = a >> 12` with an IMMEDIATE shift amount.
+fn build_u32_sar_probe() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("sar_probe", Linkage::Public, &[Type::I32], Type::I32);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let twelve = fb.make_imm_value(12i32);
+    // Sar constructor order is (bits, value), the EVM/i64 convention.
+    let s = fb.insert_inst(arith::Sar::new(is, twelve, a), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, s));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A scalar u32 kernel `sar_nonimm(a, sh) = a >> sh` whose shift amount is a
+/// runtime value (not an immediate); this must fail closed under the u32 word.
+fn build_u32_sar_nonimm() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("sar_nonimm", Linkage::Public, &[Type::I32, Type::I32], Type::I32);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let sh = fb.args()[1];
+    let s = fb.insert_inst(arith::Sar::new(is, sh, a), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, s));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A grid escape-time kernel at the u32 word: `escape_grid(px, py) -> u32`, the
+/// `mandelbrot_snapshot.rs::build_escape_time` shape ported to I32, with the
+/// escape compare made SIGNED (`Slt`) and c derived per-pixel from (px, py) so
+/// each pixel diverges. Q10 fixed point (1.0 = 1024): c_re = -2048 + px*80,
+/// c_im = -1280 + py*80, threshold 4_194_304 (4.0), shift 10, max 50.
+fn build_u32_escape_grid() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "escape_grid", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let lh = fb.append_block();
+    let lb = fb.append_block();
+    let cont = fb.append_block();
+    let esc = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let step = fb.make_imm_value(80i32);
+    let base_re = fb.make_imm_value(-2048i32);
+    let base_im = fb.make_imm_value(-1280i32);
+    let pxs = fb.insert_inst(arith::Mul::new(is, px, step), Type::I32);
+    let c_re = fb.insert_inst(arith::Add::new(is, base_re, pxs), Type::I32);
+    let pys = fb.insert_inst(arith::Mul::new(is, py, step), Type::I32);
+    let c_im = fb.insert_inst(arith::Add::new(is, base_im, pys), Type::I32);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, lh));
+
+    fb.switch_to_block(lh);
+    let zr = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let zi = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let max = fb.make_imm_value(50i32);
+    // Loop counter compare is UNSIGNED (`Lt`): i is a non-negative iteration count.
+    let c = fb.insert_inst(cmp::Lt::new(is, i, max), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, c, lb, exit));
+
+    fb.switch_to_block(lb);
+    let rr = fb.insert_inst(arith::Mul::new(is, zr, zr), Type::I32);
+    let ii = fb.insert_inst(arith::Mul::new(is, zi, zi), Type::I32);
+    let mag = fb.insert_inst(arith::Add::new(is, rr, ii), Type::I32);
+    let th = fb.make_imm_value(4_194_304i32);
+    // Escape compare is SIGNED (`Slt`): the Q10 magnitude carries a signed value.
+    let ec = fb.insert_inst(cmp::Slt::new(is, mag, th), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, ec, cont, esc));
+
+    fb.switch_to_block(cont);
+    let diff = fb.insert_inst(arith::Sub::new(is, rr, ii), Type::I32);
+    let ten = fb.make_imm_value(10i32);
+    // `diff` can be negative (ii > rr), so `>>` must be an ARITHMETIC shift (Sar).
+    let sr = fb.insert_inst(arith::Sar::new(is, ten, diff), Type::I32);
+    let nr = fb.insert_inst(arith::Add::new(is, sr, c_re), Type::I32);
+    let p = fb.insert_inst(arith::Mul::new(is, zr, zi), Type::I32);
+    let two = fb.make_imm_value(2i32);
+    let d = fb.insert_inst(arith::Mul::new(is, two, p), Type::I32);
+    let si = fb.insert_inst(arith::Sar::new(is, ten, d), Type::I32);
+    let ni = fb.insert_inst(arith::Add::new(is, si, c_im), Type::I32);
+    let one = fb.make_imm_value(1i32);
+    let ni2 = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(zr, nr, cont);
+    fb.append_phi_arg(zi, ni, cont);
+    fb.append_phi_arg(i, ni2, cont);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, lh));
+
+    fb.switch_to_block(esc);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, max));
+
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// In-test Rust escape-time reference, integer-identical to `build_u32_escape_grid`
+/// (i32 arithmetic, arithmetic `>>`, same literals). Written here, never trusted
+/// from the kernel: the two must agree pixel-for-pixel.
+fn escape_ref(px: i32, py: i32) -> u32 {
+    let c_re = -2048i32 + px * 80;
+    let c_im = -1280i32 + py * 80;
+    let mut zr = 0i32;
+    let mut zi = 0i32;
+    let mut i: u32 = 0;
+    while i < 50 {
+        let rr = zr * zr;
+        let ii = zi * zi;
+        let mag = rr + ii;
+        if mag < 4_194_304 {
+            let diff = rr - ii;
+            let nr = (diff >> 10) + c_re;
+            let p = zr * zi;
+            let d = 2 * p;
+            let ni = (d >> 10) + c_im;
+            zr = nr;
+            zi = ni;
+            i += 1;
+        } else {
+            return i;
+        }
+    }
+    50
+}
+
+/// Test 3.3.1: the u32 `Slt` arm emits a `bitcast<i32>` signed compare that
+/// validates under the browser capability set (no SHADER_INT64, no i64/u64).
+#[test]
+fn spirv_u32_slt_shape() {
+    let module = build_u32_slt_count();
+    let art = SpirvBackend::new()
+        .with_workgroup_size(1, 1, 1)
+        .compile_module(&module)
+        .expect("u32 Slt kernel must compile");
+    assert_eq!(art.layout.word, WordKind::U32, "i32 return -> u32 word");
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+    assert!(wgsl.contains("bitcast<i32>"), "u32 Slt must bitcast operands to i32:\n{wgsl}");
+    assert!(wgsl.contains("<"), "the compare emits `<`:\n{wgsl}");
+    for tok in ["i64", "u64"] {
+        assert!(!wgsl.contains(tok), "browser profile: no `{tok}`:\n{wgsl}");
+    }
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse the u32 Slt WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation (default caps) must accept the u32 Slt module");
+    eprintln!("spirv_u32_slt_shape OK: {} words", art.words.len());
+}
+
+/// Test 3.3.2: the u32 `Sar` arm emits bitcast-i32 / shift / bitcast-u32 and
+/// validates; a non-immediate shift amount fails closed with the named error.
+#[test]
+fn spirv_u32_sar_shape() {
+    let module = build_u32_sar_probe();
+    let art = SpirvBackend::new()
+        .with_workgroup_size(1, 1, 1)
+        .compile_module(&module)
+        .expect("u32 Sar kernel must compile");
+    assert_eq!(art.layout.word, WordKind::U32, "i32 return -> u32 word");
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+    assert!(wgsl.contains("bitcast<i32>"), "u32 Sar must bitcast the value to i32:\n{wgsl}");
+    assert!(wgsl.contains("bitcast<u32>"), "u32 Sar must bitcast the result back to u32:\n{wgsl}");
+    assert!(wgsl.contains(">>"), "the shift emits `>>`:\n{wgsl}");
+    for tok in ["i64", "u64"] {
+        assert!(!wgsl.contains(tok), "browser profile: no `{tok}`:\n{wgsl}");
+    }
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse the u32 Sar WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation (default caps) must accept the u32 Sar module");
+
+    // A non-immediate shift amount fails closed with the named error.
+    let bad = build_u32_sar_nonimm();
+    let err = match SpirvBackend::new().with_workgroup_size(1, 1, 1).compile_module(&bad) {
+        Ok(_) => panic!("non-immediate-bits Sar under u32 must fail closed"),
+        Err(errs) => errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
+    };
+    assert!(
+        err.contains("non-immediate shift amount"),
+        "non-imm Sar must name the fail-closed reason: {err}"
+    );
+    eprintln!("spirv_u32_sar_shape OK: bitcast-shift-bitcast + non-imm fails closed");
+}
+
+/// Test 3.3.4 (the keystone): the FIRST u32 loop EXECUTED on lavapipe. A grid
+/// escape-time kernel (signed `Slt` escape + `Sar`) runs on the GPU and every
+/// pixel equals the in-test integer reference.
+#[test]
+fn u32_escape_grid_executes_on_lavapipe() {
+    let module = build_u32_escape_grid();
+    let art = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("u32 escape grid must compile");
+    assert_eq!(art.layout.word, WordKind::U32, "u32 word");
+    assert_eq!(art.layout.mode, LayoutMode::Grid, "grid mode");
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+    // Honesty checks: the loop really emitted, and the signed ops really went
+    // through the i32 bitcast sign mapping.
+    assert!(wgsl.contains("loop"), "the escape loop must emit a `loop`:\n{wgsl}");
+    assert!(wgsl.contains("bitcast<i32>"), "signed Slt/Sar must bitcast to i32:\n{wgsl}");
+    for tok in ["i64", "u64"] {
+        assert!(!wgsl.contains(tok), "browser profile: no `{tok}`:\n{wgsl}");
+    }
+
+    let (w, h, wgx, wgy) = (32u32, 32u32, 8u32, 8u32);
+    let out = run_grid_u32(wgsl, w, h, wgx, wgy, &[]);
+    assert_eq!(out.len(), (w * h) as usize, "full grid readback");
+
+    let mut distinct = std::collections::HashSet::new();
+    let mut saw_interior = false;
+    let mut saw_early = false;
+    for y in 0..h {
+        for x in 0..w {
+            let got = out[(y * w + x) as usize];
+            let want = escape_ref(x as i32, y as i32);
+            assert_eq!(got, want, "escape[{y}*{w}+{x}] gpu={got} != ref={want}");
+            distinct.insert(got);
+            if got == 50 { saw_interior = true; }
+            if got <= 3 { saw_early = true; }
+        }
+    }
+    assert!(distinct.len() >= 5, "escape-time grid must have variety; got {} distinct", distinct.len());
+    assert!(saw_interior, "some pixel must be interior (== 50)");
+    assert!(saw_early, "some pixel must escape early (<= 3)");
+    eprintln!(
+        "u32_escape_grid_executes_on_lavapipe OK: {w}x{h}, {} distinct escape counts, all == reference",
+        distinct.len()
+    );
+}

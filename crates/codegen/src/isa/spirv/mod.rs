@@ -318,16 +318,45 @@ fn emit_single_inst(
                     _ => 0,
                 }
             } else { 0 };
+            // WGSL requires the shift amount to be u32 even when the shifted value
+            // is i32; keep the literal u32 for both words.
             let bits_u32 = func.expressions.append(
                 naga::Expression::Literal(naga::Literal::U32(shift_amount)),
                 naga::Span::UNDEFINED,
             );
-            let h = func.expressions.append(
-                naga::Expression::Binary { op: naga::BinaryOperator::ShiftRight, left: val, right: bits_u32 },
-                naga::Span::UNDEFINED,
-            );
-            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
-            value_map.insert(result, h);
+            match word {
+                WordKind::U32 => {
+                    // The u32 word carries a signed Q12 value; WGSL `>>` on a `u32`
+                    // is a LOGICAL shift, so bitcast to i32 (arithmetic `>>`), shift,
+                    // then bitcast back to u32. `convert: None` = reinterpret bits.
+                    let as_sint = func.expressions.append(
+                        naga::Expression::As { expr: val, kind: naga::ScalarKind::Sint, convert: None },
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(as_sint, as_sint)), naga::Span::UNDEFINED);
+                    let shifted = func.expressions.append(
+                        naga::Expression::Binary { op: naga::BinaryOperator::ShiftRight, left: as_sint, right: bits_u32 },
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(shifted, shifted)), naga::Span::UNDEFINED);
+                    let as_uint = func.expressions.append(
+                        naga::Expression::As { expr: shifted, kind: naga::ScalarKind::Uint, convert: None },
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(as_uint, as_uint)), naga::Span::UNDEFINED);
+                    value_map.insert(result, as_uint);
+                }
+                WordKind::I64 => {
+                    // The i64 word operand is already `Sint`; `>>` is arithmetic.
+                    // Byte-identical to the pre-word-aware emission.
+                    let h = func.expressions.append(
+                        naga::Expression::Binary { op: naga::BinaryOperator::ShiftRight, left: val, right: bits_u32 },
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+                    value_map.insert(result, h);
+                }
+            }
             return true;
         }
     } else if let Some(lt) = <&sonatina_ir::inst::cmp::Lt as InstDowncast>::downcast(inst_set, inst_data) {
@@ -336,6 +365,39 @@ fn emit_single_inst(
             let rhs = resolve_naga_value(*lt.rhs(), function, word, value_map, phi_locals, func).unwrap();
             let h = func.expressions.append(
                 naga::Expression::Binary { op: naga::BinaryOperator::Less, left: lhs, right: rhs },
+                naga::Span::UNDEFINED,
+            );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(slt) = <&sonatina_ir::inst::cmp::Slt as InstDowncast>::downcast(inst_set, inst_data) {
+        // Signed less-than. Under the u32 word the operands carry signed values in
+        // two's complement, so bitcast BOTH to i32 (`convert: None` = reinterpret)
+        // before the compare; naga `Less` on `Sint` scalars is a signed compare.
+        // Under the i64 word the operands are already `Sint`, so compare directly
+        // (byte-identical shape to the unsigned `Lt` arm on that word).
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(*slt.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*slt.rhs(), function, word, value_map, phi_locals, func).unwrap();
+            let (left, right) = match word {
+                WordKind::U32 => {
+                    let ls = func.expressions.append(
+                        naga::Expression::As { expr: lhs, kind: naga::ScalarKind::Sint, convert: None },
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(ls, ls)), naga::Span::UNDEFINED);
+                    let rs = func.expressions.append(
+                        naga::Expression::As { expr: rhs, kind: naga::ScalarKind::Sint, convert: None },
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(rs, rs)), naga::Span::UNDEFINED);
+                    (ls, rs)
+                }
+                WordKind::I64 => (lhs, rhs),
+            };
+            let h = func.expressions.append(
+                naga::Expression::Binary { op: naga::BinaryOperator::Less, left, right },
                 naga::Span::UNDEFINED,
             );
             target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
@@ -883,7 +945,9 @@ fn find_block_return_value(
 /// lowering yet, so they fail closed. Returns the op's name if `inst_data` is one
 /// of them, else `None`. (Add/Sub/Mul are sign-agnostic under wrapping and stay
 /// enabled; the emitted `Lt` maps to naga `Less`, which is an unsigned compare on
-/// a `Uint` scalar, so it is not in this set.)
+/// a `Uint` scalar, so it is not in this set. `Sar` and `Slt` are now handled
+/// word-aware via an i32 bitcast in `emit_single_inst`, so they are no longer in
+/// this set; a non-immediate-bits `Sar` still fails closed in the pre-scan.)
 #[cfg(feature = "spirv-backend")]
 fn unsupported_signed_op_under_u32(
     is: &dyn sonatina_ir::InstSetBase,
@@ -893,17 +957,11 @@ fn unsupported_signed_op_under_u32(
         InstDowncast,
         inst::{arith, cmp},
     };
-    if <&arith::Sar as InstDowncast>::downcast(is, inst_data).is_some() {
-        return Some("sar");
-    }
     if <&arith::Sdiv as InstDowncast>::downcast(is, inst_data).is_some() {
         return Some("sdiv");
     }
     if <&arith::Smod as InstDowncast>::downcast(is, inst_data).is_some() {
         return Some("smod");
-    }
-    if <&cmp::Slt as InstDowncast>::downcast(is, inst_data).is_some() {
-        return Some("slt");
     }
     if <&cmp::Sgt as InstDowncast>::downcast(is, inst_data).is_some() {
         return Some("sgt");
@@ -1016,6 +1074,24 @@ fn translate_to_naga(
                                  a u32 word (Sonatina integers are signless; a sign mapping is \
                                  not yet designed). Fail closed."
                             ));
+                        }
+                        // `Sar` is now word-aware (i32-bitcast arithmetic shift), but the
+                        // u32 arm materializes the shift amount as a `Literal::U32`, so the
+                        // `bits` operand must be an immediate. A non-immediate shift amount
+                        // fails closed here with a named error rather than silently reading 0.
+                        if let Some(sar) =
+                            <&sonatina_ir::inst::arith::Sar as sonatina_ir::InstDowncast>::downcast(
+                                is, inst_data,
+                            )
+                        {
+                            if f.dfg.value_imm(*sar.bits()).is_none() {
+                                return Err(
+                                    "spirv u32: sar with a non-immediate shift amount is \
+                                     unsupported (the u32 arithmetic shift materializes the \
+                                     amount as a WGSL u32 literal). Fail closed."
+                                        .to_string(),
+                                );
+                            }
                         }
                     }
                 }

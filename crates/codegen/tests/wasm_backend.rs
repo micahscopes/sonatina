@@ -659,3 +659,87 @@ fn wasm32_import_module_from_side_table() {
         scan_func_imports(&bytes)
     );
 }
+
+/// M2a fork push #2: i32-operand `Lt`/`Slt`/`Sar` are keyed on the operand type
+/// (were hardwired to the i64 operators). An i32 compare must use `i32.lt_u` /
+/// `i32.lt_s` and an i32 shift `i32.shr_s`, or wasmtime rejects the module at
+/// validation. This test would have failed to even validate before the fix, and
+/// signed vs unsigned disagree on a 0x80000000-class operand.
+#[test]
+fn wasm_i32_signed_ops_execute() {
+    let isa = Native::new(native_triple());
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    // fn lt_u(a: i32, b: i32) -> i32 { (a <u b) as i32 }
+    {
+        let sig = Signature::new_single("lt_u", Linkage::Public, &[Type::I32, Type::I32], Type::I32);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let e = fb.append_block();
+        fb.switch_to_block(e);
+        let a = fb.args()[0];
+        let b = fb.args()[1];
+        let c = fb.insert_inst(cmp::Lt::new(is, a, b), Type::I1);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, c));
+        fb.seal_all();
+        fb.finish();
+    }
+    // fn lt_s(a: i32, b: i32) -> i32 { (a <s b) as i32 }
+    {
+        let sig = Signature::new_single("lt_s", Linkage::Public, &[Type::I32, Type::I32], Type::I32);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let e = fb.append_block();
+        fb.switch_to_block(e);
+        let a = fb.args()[0];
+        let b = fb.args()[1];
+        let c = fb.insert_inst(cmp::Slt::new(is, a, b), Type::I1);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, c));
+        fb.seal_all();
+        fb.finish();
+    }
+    // fn sar(a: i32) -> i32 { a >> 12 }  (Sar constructor order is (bits, value))
+    {
+        let sig = Signature::new_single("sar", Linkage::Public, &[Type::I32], Type::I32);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let e = fb.append_block();
+        fb.switch_to_block(e);
+        let a = fb.args()[0];
+        let twelve = fb.make_imm_value(12i32);
+        let s = fb.insert_inst(arith::Sar::new(is, twelve, a), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, s));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let module = mb.build();
+    let artifact = WasmBackend::new().compile_module(&module).expect("wasm compile");
+    wasmparser::validate(&artifact.bytes).expect("i32 signed ops must produce valid WASM");
+
+    let engine = wasmtime::Engine::default();
+    let wm = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let inst = wasmtime::Instance::new(&mut store, &wm, &[]).unwrap();
+    let lt_u = inst.get_typed_func::<(i32, i32), i32>(&mut store, "lt_u").unwrap();
+    let lt_s = inst.get_typed_func::<(i32, i32), i32>(&mut store, "lt_s").unwrap();
+    let sar = inst.get_typed_func::<i32, i32>(&mut store, "sar").unwrap();
+
+    // Signed and unsigned disagree on a 0x80000000-class operand.
+    let big = i32::MIN; // 0x8000_0000
+    assert_eq!(lt_u.call(&mut store, (big, 1)).unwrap(), 0, "unsigned: 0x80000000 <u 1 is false");
+    assert_eq!(lt_s.call(&mut store, (big, 1)).unwrap(), 1, "signed: -2147483648 <s 1 is true");
+    // Ordinary positive operands agree.
+    assert_eq!(lt_u.call(&mut store, (3, 7)).unwrap(), 1);
+    assert_eq!(lt_s.call(&mut store, (3, 7)).unwrap(), 1);
+
+    // Arithmetic (not logical) shift: -4096 >> 12 == -1.
+    assert_eq!(sar.call(&mut store, -4096).unwrap(), -1, "arithmetic shift keeps the sign");
+    assert_eq!(sar.call(&mut store, 4096).unwrap(), 1);
+    assert_eq!(sar.call(&mut store, -1).unwrap(), -1);
+
+    eprintln!(
+        "wasm_i32_signed_ops_execute OK: i32 Lt/Slt/Sar execute; signed vs unsigned disagree on 0x80000000; -4096>>12 == -1"
+    );
+}
