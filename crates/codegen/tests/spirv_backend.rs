@@ -1,10 +1,10 @@
 use sonatina_codegen::Backend;
-use sonatina_codegen::isa::spirv::{SpirvBackend, WordKind};
+use sonatina_codegen::isa::spirv::{LayoutMode, Role, SpirvBackend, WordKind};
 use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
-    inst::{arith, cmp, control_flow},
+    inst::{arith, cmp, control_flow, data},
     isa::{Isa, native::Native},
     module::ModuleCtx,
 };
@@ -322,7 +322,12 @@ fn spirv_u32_kernel_lowers_to_uint_scalar() {
         "an i32 return type must derive a u32 word (content-derived, not hardwired)"
     );
     assert_eq!(
-        artifact.layout.result.width, 4,
+        artifact
+            .layout
+            .result
+            .expect("scalar mode must state a single-slot result")
+            .width,
+        4,
         "u32 result readback width must be 4 bytes"
     );
     assert_eq!(artifact.words[0], 0x07230203, "valid SPIR-V magic");
@@ -356,4 +361,392 @@ fn spirv_u32_kernel_lowers_to_uint_scalar() {
         "B1: i32 kernel -> u32 word; WGSL validates under default caps ({} words)",
         artifact.words.len()
     );
+}
+
+// ===========================================================================
+// M1a: Grid mode (fork push #1). One invocation per pixel; args 0,1 are the grid
+// coordinates (global_invocation_id.xy), args 2.. are broadcast inputs, the
+// return value is stored at output[gid.y * (num_workgroups.x * wgx) + gid.x].
+// Grid is driver-declared (with_grid()); scalar/batch paths stay byte-untouched.
+// ===========================================================================
+
+/// The M1 grid gradient shape: `grid_gradient(px, py) -> px + py * 1024`. All
+/// Add/Mul, i32 return (u32 word). px = gid.x, py = gid.y, so value = x + 1024*y.
+fn build_grid_gradient_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_gradient", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let k = fb.make_imm_value(1024i32);
+    let scaled = fb.insert_inst(arith::Mul::new(is, py, k), Type::I32);
+    let v = fb.insert_inst(arith::Add::new(is, px, scaled), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, v));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A 3-arg grid kernel with one broadcast param: `f(px, py, p) -> px + py*1024 + p`.
+/// arg2 is the broadcast input struct member p0; the load-bearing M3 shape.
+fn build_grid_broadcast_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_broadcast", Linkage::Public, &[Type::I32, Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let p = fb.args()[2];
+    let k = fb.make_imm_value(1024i32);
+    let scaled = fb.insert_inst(arith::Mul::new(is, py, k), Type::I32);
+    let base = fb.insert_inst(arith::Add::new(is, px, scaled), Type::I32);
+    let v = fb.insert_inst(arith::Add::new(is, base, p), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, v));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A 2-arg i64 grid kernel (fail-closed: grid requires the u32 word).
+fn build_grid_i64_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_i64", Linkage::Public, &[Type::I64, Type::I64], Type::I64,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let b = fb.args()[1];
+    let v = fb.insert_inst(arith::Add::new(is, a, b), Type::I64);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, v));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A 1-arg i32 grid kernel (fail-closed: a grid kernel needs at least px, py).
+fn build_grid_1arg_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("grid_1arg", Linkage::Public, &[Type::I32], Type::I32);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, a));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A 2-arg i32 grid kernel that also ObjAllocs (fail-closed: grid and batch are
+/// mutually exclusive).
+fn build_grid_objalloc_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let arr_ty = mb.declare_array_type(Type::I32, 16);
+    let arr_objref_ty = mb.objref_type(arr_ty);
+    let sig = Signature::new_single(
+        "grid_objalloc", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let _buf = fb.insert_inst(data::ObjAlloc::new(is, arr_ty), arr_objref_ty);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, a));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// Execute a Grid-mode WGSL compute shader under the browser profile
+/// (`Features::empty()`, no SHADER_INT64) and read back the whole output grid.
+/// Hard-fails if no adapter is available: this is an EXECUTED gate (lavapipe is
+/// present in CI), not validate-only.
+fn run_grid_u32(wgsl: &str, width: u32, height: u32, wgx: u32, wgy: u32, input: &[u8]) -> Vec<u32> {
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::LowPower,
+        force_fallback_adapter: false,
+        ..Default::default()
+    }))
+    .expect("grid execute requires a GPU adapter (lavapipe); none available");
+    eprintln!("  GPU: {}", adapter.get_info().name);
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        // Browser profile: no SHADER_INT64. The u32 grid must run here.
+        required_features: wgpu::Features::empty(),
+        ..Default::default()
+    }))
+    .expect("browser-profile device (Features::empty) must be available on lavapipe");
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("grid"),
+        source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+    });
+
+    // Explicit two-binding BGL: output @0/0 (read-write), input @0/1 (read-only).
+    // The gradient kernel never reads `input`, so an auto-derived layout would
+    // strip binding 1; declaring both explicitly binds the dummy input exactly
+    // like the scalar keystone's unused input.
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("grid_bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("grid_pl"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let output_size = width as u64 * height as u64 * 4;
+    let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: output_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let input_size = input.len().max(4) as u64;
+    let input_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: input_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !input.is_empty() {
+        queue.write_buffer(&input_buf, 0, input);
+    }
+    let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: output_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: output_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: input_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut p = enc.begin_compute_pass(&Default::default());
+        p.set_pipeline(&pipeline);
+        p.set_bind_group(0, &bg, &[]);
+        p.dispatch_workgroups(width / wgx, height / wgy, 1);
+    }
+    enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
+    queue.submit(Some(enc.finish()));
+
+    let slice = staging_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+    let _ = device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: Some(std::time::Duration::from_secs(30)),
+    });
+    rx.recv().unwrap().unwrap();
+    let data = slice.get_mapped_range();
+    let out: Vec<u32> = data
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    drop(data);
+    staging_buf.unmap();
+    out
+}
+
+fn expect_grid_err(module: &sonatina_ir::Module, backend: SpirvBackend) -> String {
+    match backend.compile_module(module) {
+        Ok(_) => panic!("expected a grid fail-closed error, got Ok"),
+        Err(errs) => {
+            let msg = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+            assert!(msg.contains("grid"), "fail-closed error must name grid: {msg}");
+            msg
+        }
+    }
+}
+
+/// Grid WGSL shape + self-describing layout, GPU-free.
+#[test]
+fn grid_wgsl_shape() {
+    let module = build_grid_gradient_module();
+    let art = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("grid gradient must compile");
+
+    let layout = &art.layout;
+    assert_eq!(layout.mode, LayoutMode::Grid, "grid mode");
+    assert_eq!(layout.word, WordKind::U32, "u32 word");
+    assert!(layout.result.is_none(), "grid states no single-slot result");
+    assert_eq!(layout.workgroup_size, [8, 8, 1], "workgroup size");
+    let out_b = layout.bindings.iter().find(|b| b.role == Role::Output).expect("output binding");
+    let in_b = layout.bindings.iter().find(|b| b.role == Role::Input).expect("input binding");
+    assert_eq!(out_b.stride, 4, "output stride = per-element word width");
+    assert_eq!(in_b.stride, 4, "input stride = broadcast span (one dummy member)");
+
+    let wgsl = art.wgsl.as_ref().expect("WGSL side artifact");
+    for tok in ["global_invocation_id", "num_workgroups", "array<u32>"] {
+        assert!(wgsl.contains(tok), "grid WGSL must contain `{tok}`; got:\n{wgsl}");
+    }
+    for tok in ["i64", "u64"] {
+        assert!(!wgsl.contains(tok), "grid WGSL must contain no `{tok}`; got:\n{wgsl}");
+    }
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse the grid WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation (default caps) must accept the grid module");
+    eprintln!("grid_wgsl_shape OK: {} words", art.words.len());
+}
+
+/// The headline: a grid kernel EXECUTES on lavapipe and every pixel equals the
+/// CPU oracle x + 1024*y.
+#[test]
+fn grid_executes_on_lavapipe() {
+    let module = build_grid_gradient_module();
+    let art = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("grid gradient must compile");
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+
+    let (w, h, wgx, wgy) = (16u32, 16u32, 8u32, 8u32);
+    let out = run_grid_u32(wgsl, w, h, wgx, wgy, &[]);
+    assert_eq!(out.len(), (w * h) as usize, "full grid readback");
+    for y in 0..h {
+        for x in 0..w {
+            let got = out[(y * w + x) as usize];
+            let want = x + 1024 * y; // oracle, written in-test, never trusted from spec
+            assert_eq!(got, want, "grid[{y}*{w}+{x}] = {got}, want {want}");
+        }
+    }
+    eprintln!("grid_executes_on_lavapipe OK: {w}x{h}, all pixels == x + 1024*y");
+}
+
+/// A grid kernel with one broadcast param executes with p0 = 7 written to the
+/// input buffer; every pixel equals x + 1024*y + 7.
+#[test]
+fn grid_broadcast_params() {
+    let module = build_grid_broadcast_module();
+    let art = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("grid broadcast must compile");
+
+    // Exactly one broadcast member (arg2): input span = 4.
+    let in_b = art.layout.bindings.iter().find(|b| b.role == Role::Input).expect("input binding");
+    assert_eq!(in_b.stride, 4, "one broadcast member p0 at offset 0, span 4");
+
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+    let (w, h, wgx, wgy) = (8u32, 8u32, 8u32, 8u32);
+    let p0: u32 = 7;
+    let out = run_grid_u32(wgsl, w, h, wgx, wgy, &p0.to_le_bytes());
+    for y in 0..h {
+        for x in 0..w {
+            let got = out[(y * w + x) as usize];
+            let want = x + 1024 * y + 7;
+            assert_eq!(got, want, "grid[{y}*{w}+{x}] = {got}, want {want}");
+        }
+    }
+    eprintln!("grid_broadcast_params OK: p0 = 7 broadcast, all pixels == x + 1024*y + 7");
+}
+
+/// Fail-closed: the four grid preconditions each err, and the error names grid.
+#[test]
+fn grid_fail_closed() {
+    let m = build_grid_i64_module();
+    let e = expect_grid_err(&m, SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 1));
+    assert!(e.contains("u32 word"), "i64 word must name the u32 requirement: {e}");
+
+    let m = build_grid_1arg_module();
+    let e = expect_grid_err(&m, SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 1));
+    assert!(e.contains("(px, py)"), "1-arg must name the px, py minimum: {e}");
+
+    let m = build_grid_objalloc_module();
+    let e = expect_grid_err(&m, SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 1));
+    assert!(e.contains("mutually exclusive"), "ObjAlloc must name the batch conflict: {e}");
+
+    let m = build_grid_gradient_module();
+    let e = expect_grid_err(&m, SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 2));
+    assert!(
+        e.contains("2D") || e.contains("workgroup z"),
+        "workgroup z != 1 must name the 2D dispatch rule: {e}"
+    );
+    eprintln!("grid_fail_closed OK: all four preconditions err and name grid");
 }

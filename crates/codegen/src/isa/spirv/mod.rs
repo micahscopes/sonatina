@@ -44,12 +44,17 @@ impl WordKind {
     }
 }
 
-/// Output-buffer shape: a single-value `Output` struct (`Scalar`) or a dynamic
-/// `OutputArray` written per-invocation via `ObjAlloc` (`Batch`).
+/// Output-buffer shape: a single-value `Output` struct (`Scalar`), a dynamic
+/// `OutputArray` written per-invocation via `ObjAlloc` (`Batch`), or a dynamic
+/// `OutputArray` written once per grid invocation at `output[gid.y * row_width +
+/// gid.x]` (`Grid`). Grid mode is driver-declared (there is no content signal),
+/// the same treatment as workgroup size: args 0,1 are the grid coordinates, args
+/// 2.. are broadcast inputs, the return value is stored per pixel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutMode {
     Scalar,
     Batch,
+    Grid,
 }
 
 /// Storage access a binding is declared with, mirroring the emitted naga
@@ -101,7 +106,10 @@ pub struct SpirvLayout {
     pub workgroup_size: [u32; 3],
     pub word: WordKind,
     pub bindings: Vec<SpirvBinding>,
-    pub result: SpirvResult,
+    /// Where the scalar result lands for readback (`Some` for Scalar and Batch
+    /// modes). `None` in Grid mode: the whole output array is the result, written
+    /// per pixel, so there is no single readback slot.
+    pub result: Option<SpirvResult>,
 }
 
 pub struct SpirvArtifact {
@@ -122,17 +130,28 @@ impl SpirvArtifact {
 
 pub struct SpirvBackend {
     pub workgroup_size: [u32; 3],
+    /// Grid mode: one invocation per pixel, args 0,1 bound to
+    /// `global_invocation_id.xy`, the return value stored at
+    /// `output[gid.y * (num_workgroups.x * workgroup_size[0]) + gid.x]`. A
+    /// driver-declared envelope fact (no content signal), off by default.
+    pub grid: bool,
 }
 
 impl SpirvBackend {
     pub fn new() -> Self {
         Self {
             workgroup_size: [64, 1, 1],
+            grid: false,
         }
     }
 
     pub fn with_workgroup_size(mut self, x: u32, y: u32, z: u32) -> Self {
         self.workgroup_size = [x, y, z];
+        self
+    }
+
+    pub fn with_grid(mut self) -> Self {
+        self.grid = true;
         self
     }
 }
@@ -150,7 +169,7 @@ impl Backend for SpirvBackend {
 
     #[cfg(feature = "spirv-backend")]
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        let (naga_mod, layout) = translate_to_naga(module, self.workgroup_size)
+        let (naga_mod, layout) = translate_to_naga(module, self.workgroup_size, self.grid)
             .map_err(|e| vec![SpirvError::Translation(e)])?;
 
         let info = naga::valid::Validator::new(
@@ -902,6 +921,7 @@ fn unsupported_signed_op_under_u32(
 fn translate_to_naga(
     module: &Module,
     workgroup_size: [u32; 3],
+    grid: bool,
 ) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
 
@@ -1004,8 +1024,34 @@ fn translate_to_naga(
         })
         .ok_or_else(|| "spirv: first function body is unavailable".to_string())??;
 
-    // Output type: dynamic array for batch (ObjAlloc) or single-value struct for scalar
-    let output_type = if has_obj_alloc {
+    // Grid mode fail-closed checks. Grid is a driver-declared envelope fact: the
+    // translator never guesses it, and when asked for it, every precondition is
+    // enforced here so no wrong shader is ever emitted.
+    if grid {
+        if word != WordKind::U32 {
+            return Err(
+                "spirv grid: grid mode requires the u32 word (browser profile); got i64"
+                    .to_string(),
+            );
+        }
+        if param_count < 2 {
+            return Err(format!(
+                "spirv grid: a grid kernel needs at least (px, py) args; got {param_count}"
+            ));
+        }
+        if has_obj_alloc {
+            return Err(
+                "spirv grid: grid and batch (ObjAlloc) modes are mutually exclusive".to_string(),
+            );
+        }
+        if !(workgroup_size[0] >= 1 && workgroup_size[1] >= 1 && workgroup_size[2] == 1) {
+            return Err("spirv grid: grid dispatch is 2D; workgroup z must be 1".to_string());
+        }
+    }
+
+    // Output type: dynamic array for batch (ObjAlloc) or grid (per-pixel store),
+    // or a single-value struct for scalar.
+    let output_type = if has_obj_alloc || grid {
         naga_mod.types.insert(
             naga::Type {
                 name: Some("OutputArray".into()),
@@ -1035,7 +1081,11 @@ fn translate_to_naga(
         )
     };
 
-    let effective_params = param_count.max(1);
+    // In grid mode the first two args are the grid coordinates (delivered as
+    // builtins, not loaded from the input buffer), so they are excluded from the
+    // broadcast input struct. Args 2.. are the shared broadcast params.
+    let broadcast = if grid { param_count - 2 } else { param_count };
+    let effective_params = broadcast.max(1);
     let input_members: Vec<naga::StructMember> = (0..effective_params).map(|i| {
         naga::StructMember {
             name: Some(format!("p{i}")),
@@ -1124,8 +1174,25 @@ fn translate_to_naga(
         naga::Span::UNDEFINED,
     );
 
-    // Build the entry point function
-    let arguments = if has_obj_alloc {
+    // Build the entry point function. Batch and grid modes both take the grid id
+    // as FunctionArgument(0). Grid additionally takes num_workgroups as
+    // FunctionArgument(1): the per-pixel store derives the row width as
+    // num_workgroups.x * workgroup_size[0] (the dispatched width), so W is never a
+    // kernel parameter.
+    let arguments = if grid {
+        vec![
+            naga::FunctionArgument {
+                name: Some("global_id".into()),
+                ty: vec3_u32_type,
+                binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::GlobalInvocationId)),
+            },
+            naga::FunctionArgument {
+                name: Some("num_workgroups".into()),
+                ty: vec3_u32_type,
+                binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::NumWorkGroups)),
+            },
+        ]
+    } else if has_obj_alloc {
         vec![naga::FunctionArgument {
             name: Some("global_id".into()),
             ty: vec3_u32_type,
@@ -1149,6 +1216,11 @@ fn translate_to_naga(
     // Translate the first Sonatina function
     let funcs = module.funcs();
     let mut result_expr = None;
+    // In grid mode, the gid.x / gid.y expressions bound to args 0,1 are emitted
+    // inside the body closure but reused by the per-pixel store that follows it,
+    // so their handles flow out here.
+    let mut grid_gid: Option<(naga::Handle<naga::Expression>, naga::Handle<naga::Expression>)> =
+        None;
 
     if let Some(&func_ref) = funcs.first() {
         module.func_store.try_view(func_ref, |function| {
@@ -1210,29 +1282,85 @@ fn translate_to_naga(
                 input_global
             };
 
-            for (idx, &arg_val) in function.arg_values.iter().enumerate() {
-                let field = func.expressions.append(
-                    naga::Expression::AccessIndex {
-                        base: input_expr,
-                        index: idx as u32,
-                    },
+            if grid {
+                // Grid mode: args 0,1 are the grid coordinates, bound castless to
+                // global_invocation_id.x / .y (both u32, the check-1 guarantee).
+                // Args 2.. load from the broadcast input struct at member idx - 2.
+                let gid = func.expressions.append(
+                    naga::Expression::FunctionArgument(0),
                     naga::Span::UNDEFINED,
                 );
-                let loaded = func.expressions.append(
-                    naga::Expression::Load { pointer: field },
-                    naga::Span::UNDEFINED,
-                );
-                // Emit AccessIndex and Load individually to avoid range
-                // overlap issues when there are 3+ parameters
-                func.body.push(
-                    naga::Statement::Emit(naga::Range::new_from_bounds(field, field)),
+                let gid_x = func.expressions.append(
+                    naga::Expression::AccessIndex { base: gid, index: 0 },
                     naga::Span::UNDEFINED,
                 );
                 func.body.push(
-                    naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                    naga::Statement::Emit(naga::Range::new_from_bounds(gid_x, gid_x)),
                     naga::Span::UNDEFINED,
                 );
-                value_map.insert(arg_val, loaded);
+                let gid_y = func.expressions.append(
+                    naga::Expression::AccessIndex { base: gid, index: 1 },
+                    naga::Span::UNDEFINED,
+                );
+                func.body.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(gid_y, gid_y)),
+                    naga::Span::UNDEFINED,
+                );
+                if let Some(&a0) = function.arg_values.first() {
+                    value_map.insert(a0, gid_x);
+                }
+                if let Some(&a1) = function.arg_values.get(1) {
+                    value_map.insert(a1, gid_y);
+                }
+                grid_gid = Some((gid_x, gid_y));
+
+                for (idx, &arg_val) in function.arg_values.iter().enumerate().skip(2) {
+                    let field = func.expressions.append(
+                        naga::Expression::AccessIndex {
+                            base: input_expr,
+                            index: (idx - 2) as u32,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    let loaded = func.expressions.append(
+                        naga::Expression::Load { pointer: field },
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(field, field)),
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                        naga::Span::UNDEFINED,
+                    );
+                    value_map.insert(arg_val, loaded);
+                }
+            } else {
+                for (idx, &arg_val) in function.arg_values.iter().enumerate() {
+                    let field = func.expressions.append(
+                        naga::Expression::AccessIndex {
+                            base: input_expr,
+                            index: idx as u32,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    let loaded = func.expressions.append(
+                        naga::Expression::Load { pointer: field },
+                        naga::Span::UNDEFINED,
+                    );
+                    // Emit AccessIndex and Load individually to avoid range
+                    // overlap issues when there are 3+ parameters
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(field, field)),
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                        naga::Span::UNDEFINED,
+                    );
+                    value_map.insert(arg_val, loaded);
+                }
             }
 
             // Check for loops via structurizer
@@ -1259,9 +1387,100 @@ fn translate_to_naga(
         });
     }
 
-    // For scalar output, store result to output buffer struct.
-    // For batch mode (ObjAlloc), ObjStore already wrote to the buffer.
-    if !has_obj_alloc {
+    // Result store, three-way by mode:
+    //  - Scalar: store the single result into the output struct (store-0 fallback).
+    //  - Batch (ObjAlloc): ObjStore already wrote to the buffer, nothing to do.
+    //  - Grid: store the result at output[gid.y * (num_workgroups.x * wgx) + gid.x].
+    if grid {
+        // A grid kernel that produced no result expression is a hard error, never
+        // a silent store-0 (that fallback is scalar-only).
+        let result_val = result_expr.ok_or_else(|| {
+            "spirv grid: kernel produced no result expression".to_string()
+        })?;
+        let (gid_x, gid_y) = grid_gid.ok_or_else(|| {
+            "spirv grid: grid coordinate expressions were not bound".to_string()
+        })?;
+
+        // row_width = num_workgroups.x * workgroup_size[0] = the dispatched width.
+        let wgx = func.expressions.append(
+            naga::Expression::Literal(naga::Literal::U32(workgroup_size[0])),
+            naga::Span::UNDEFINED,
+        );
+        let nwg = func.expressions.append(
+            naga::Expression::FunctionArgument(1),
+            naga::Span::UNDEFINED,
+        );
+        let nwg_x = func.expressions.append(
+            naga::Expression::AccessIndex { base: nwg, index: 0 },
+            naga::Span::UNDEFINED,
+        );
+        func.body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(nwg_x, nwg_x)),
+            naga::Span::UNDEFINED,
+        );
+        let row_width = func.expressions.append(
+            naga::Expression::Binary {
+                op: naga::BinaryOperator::Multiply,
+                left: nwg_x,
+                right: wgx,
+            },
+            naga::Span::UNDEFINED,
+        );
+        func.body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(row_width, row_width)),
+            naga::Span::UNDEFINED,
+        );
+        let y_off = func.expressions.append(
+            naga::Expression::Binary {
+                op: naga::BinaryOperator::Multiply,
+                left: gid_y,
+                right: row_width,
+            },
+            naga::Span::UNDEFINED,
+        );
+        func.body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(y_off, y_off)),
+            naga::Span::UNDEFINED,
+        );
+        let linear = func.expressions.append(
+            naga::Expression::Binary {
+                op: naga::BinaryOperator::Add,
+                left: y_off,
+                right: gid_x,
+            },
+            naga::Span::UNDEFINED,
+        );
+        func.body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(linear, linear)),
+            naga::Span::UNDEFINED,
+        );
+        // As Sint index cast, mirroring the proven ObjIndex convention.
+        let idx_i32 = func.expressions.append(
+            naga::Expression::As {
+                expr: linear,
+                kind: naga::ScalarKind::Sint,
+                convert: Some(4),
+            },
+            naga::Span::UNDEFINED,
+        );
+        func.body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(idx_i32, idx_i32)),
+            naga::Span::UNDEFINED,
+        );
+        let output_expr = func.expressions.append(
+            naga::Expression::GlobalVariable(output_var),
+            naga::Span::UNDEFINED,
+        );
+        // Access returns a pointer — no Emit needed.
+        let ptr = func.expressions.append(
+            naga::Expression::Access { base: output_expr, index: idx_i32 },
+            naga::Span::UNDEFINED,
+        );
+        func.body.push(
+            naga::Statement::Store { pointer: ptr, value: result_val },
+            naga::Span::UNDEFINED,
+        );
+    } else if !has_obj_alloc {
         let output_expr = func.expressions.append(
             naga::Expression::GlobalVariable(output_var),
             naga::Span::UNDEFINED,
@@ -1306,7 +1525,9 @@ fn translate_to_naga(
     // re-derives this.
     let layout = SpirvLayout {
         entry_point: "main".to_string(),
-        mode: if has_obj_alloc {
+        mode: if grid {
+            LayoutMode::Grid
+        } else if has_obj_alloc {
             LayoutMode::Batch
         } else {
             LayoutMode::Scalar
@@ -1331,11 +1552,17 @@ fn translate_to_naga(
                 stride: input_span,
             },
         ],
-        result: SpirvResult {
-            group: 0,
-            binding: 0,
-            offset: 0,
-            width: word_width,
+        // Grid mode has no single readback slot: the whole output array is the
+        // result, written per pixel.
+        result: if grid {
+            None
+        } else {
+            Some(SpirvResult {
+                group: 0,
+                binding: 0,
+                offset: 0,
+                width: word_width,
+            })
         },
     };
 
