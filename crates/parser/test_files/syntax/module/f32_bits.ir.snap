@@ -1,0 +1,11 @@
+---
+source: crates/parser/tests/syntax.rs
+assertion_line: 46
+input_file: test_files/syntax/module/f32_bits.sntn
+---
+target = "evm-ethereum-london"
+
+func public %f32_bits() -> f32 {
+    block0:
+        return 0x80000000.f32;
+}

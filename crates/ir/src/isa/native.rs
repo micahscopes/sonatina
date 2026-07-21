@@ -148,7 +148,7 @@ impl NativeTypeLayout {
             Type::Unit => (0, 1),
             Type::I1 | Type::I8 => (1, 1),
             Type::I16 => (2, 2),
-            Type::I32 => (4, 4),
+            Type::I32 | Type::F32 => (4, 4),
             Type::I64 => (8, 8),
             Type::I128 => (16, 16),
             Type::I256 => (32, 16),

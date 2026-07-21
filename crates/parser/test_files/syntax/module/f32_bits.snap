@@ -1,0 +1,40 @@
+---
+source: crates/parser/tests/syntax.rs
+assertion_line: 62
+input_file: test_files/syntax/module/f32_bits.sntn
+---
+module "target = "evm-ethereum-london"
+
+func public %f32_bits() -> f32 {
+block0:
+    return 0x80000000.f32;
+}
+"
+  target_triple "evm-ethereum-london"
+  function "func public %f32_bits() -> f32 {
+  block0:
+      return 0x80000000.f32;
+  }"
+    function_signature "func public %f32_bits() -> f32"
+      linkage "public"
+      function_identifier "%f32_bits"
+        function_name "f32_bits"
+      function_params "()"
+      function_ret_type "-> f32"
+        type_name "f32"
+          primitive_type "f32"
+    block "block0:
+        return 0x80000000.f32;"
+      block_ident "block0"
+        block_number "0"
+      stmt "return 0x80000000.f32;"
+        inst_stmt "return 0x80000000.f32"
+          inst "return 0x80000000.f32"
+            inst_name "return"
+              inst_identifier "return"
+            inst_arg "0x80000000.f32"
+              value "0x80000000.f32"
+                imm_number "0x80000000.f32"
+                  hex "0x80000000"
+                  primitive_type "f32"
+  EOI ""

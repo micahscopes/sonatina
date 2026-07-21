@@ -316,6 +316,7 @@ pub enum Type {
     I8,
     I16,
     I32,
+    F32,
     I64,
     I128,
     I256,
@@ -331,6 +332,10 @@ impl Type {
             self,
             Self::I1 | Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::I128 | Self::I256
         )
+    }
+
+    pub fn is_float(self) -> bool {
+        matches!(self, Self::F32)
     }
 
     pub fn is_compound(self) -> bool {
@@ -421,6 +426,7 @@ where
             Type::I8 => write!(w, "i8"),
             Type::I16 => write!(w, "i16"),
             Type::I32 => write!(w, "i32"),
+            Type::F32 => write!(w, "f32"),
             Type::I64 => write!(w, "i64"),
             Type::I128 => write!(w, "i128"),
             Type::I256 => write!(w, "i256"),

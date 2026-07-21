@@ -37,6 +37,7 @@ fn scalar_bit_width(ty: Type, module: &ModuleCtx) -> Option<u16> {
         Type::I8 => 8,
         Type::I16 => 16,
         Type::I32 => 32,
+        Type::F32 => return None,
         Type::I64 => 64,
         Type::I128 => 128,
         Type::I256 => 256,

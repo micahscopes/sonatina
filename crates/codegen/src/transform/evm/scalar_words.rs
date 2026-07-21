@@ -5,7 +5,7 @@ pub(super) fn evm_scalar_word_bits(imm: Immediate) -> Option<U256> {
         Type::I1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::I256 => {
             Some(imm.zext(Type::I256).as_i256().to_u256())
         }
-        Type::EnumTag(_) | Type::Compound(_) | Type::Unit => None,
+        Type::F32 | Type::EnumTag(_) | Type::Compound(_) | Type::Unit => None,
     }
 }
 
@@ -19,7 +19,7 @@ pub(super) fn legalize_evm_scalar_immediate(imm: Immediate) -> Option<Immediate>
         Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::I256 => Some(
             Immediate::from_i256(I256::from_u256(evm_scalar_word_bits(imm)?), Type::I256),
         ),
-        Type::EnumTag(_) | Type::Compound(_) | Type::Unit => None,
+        Type::F32 | Type::EnumTag(_) | Type::Compound(_) | Type::Unit => None,
     }
 }
 
