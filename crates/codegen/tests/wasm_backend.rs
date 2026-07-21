@@ -124,6 +124,71 @@ fn wasm32_isa_call_pair_wasmtime() {
     assert_eq!(f.call(&mut store, (40, 2)).unwrap(), 42);
 }
 
+#[test]
+fn wasm32_f32_ops_execute_in_wasmtime() {
+    let source = r#"
+target = "wasm32-unknown-native"
+
+func public %float_chain(v0.f32, v1.f32) -> f32 {
+    block0:
+        v2.f32 = fadd v0 v1;
+        v3.f32 = fsub v2 v1;
+        v4.f32 = fmul v3 v1;
+        v5.f32 = fdiv v4 v1;
+        v6.f32 = fsqrt v5;
+        v7.f32 = fneg v6;
+        return v7;
+}
+
+func public %float_cmp(v0.f32, v1.f32) -> (i1, i1, i1) {
+    block0:
+        v2.i1 = feq v0 v1;
+        v3.i1 = flt v0 v1;
+        v4.i1 = fle v0 v1;
+        return (v2, v3, v4);
+}
+
+func public %float_bits() -> f32 {
+    block0:
+        return 0x40490fdb.f32;
+}
+"#;
+    let module = sonatina_parser::parse_module(source)
+        .expect("float module should parse")
+        .module;
+    let artifact = WasmBackend::new()
+        .compile_module(&module)
+        .expect("WASM float compilation failed");
+    wasmparser::validate(&artifact.bytes).expect("produced invalid float WASM");
+
+    let engine = wasmtime::Engine::default();
+    let wasm_module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
+
+    let chain = instance
+        .get_typed_func::<(f32, f32), f32>(&mut store, "float_chain")
+        .expect("float_chain export");
+    assert_eq!(
+        chain.call(&mut store, (9.0, 3.0)).unwrap().to_bits(),
+        (-3.0_f32).to_bits()
+    );
+
+    let compare = instance
+        .get_typed_func::<(f32, f32), (i32, i32, i32)>(&mut store, "float_cmp")
+        .expect("float_cmp export");
+    assert_eq!(compare.call(&mut store, (3.0, 9.0)).unwrap(), (0, 1, 1));
+    assert_eq!(
+        compare.call(&mut store, (f32::NAN, f32::NAN)).unwrap(),
+        (0, 0, 0)
+    );
+
+    let bits = instance
+        .get_typed_func::<(), f32>(&mut store, "float_bits")
+        .expect("float_bits export");
+    assert_eq!(bits.call(&mut store, ()).unwrap().to_bits(), 0x4049_0fdb);
+}
+
 fn native_triple() -> TargetTriple {
     let arch = if cfg!(target_arch = "x86_64") {
         Architecture::X86_64
