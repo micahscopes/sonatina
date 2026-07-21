@@ -21,6 +21,7 @@ fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
     match ty {
         Type::Unit => None,
         Type::I1 | Type::I8 | Type::I16 | Type::I32 => Some(WType::I32),
+        Type::F32 => Some(WType::F32),
         Type::I64 => Some(WType::I64),
         // objref<T> / constref<T> — use the inner type's WASM representation
         Type::Compound(_) => Some(WType::I64),
@@ -342,6 +343,78 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    else if let Some(fneg) = <&sonatina_ir::inst::arith::Fneg as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let arg = resolve_value(function, *fneg.arg(), &value_map, &mut body, wb)
+                                .ok_or("unresolved fneg argument")?;
+                            let wval = body.add_op(wb, Operator::F32Neg, &[arg], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fsqrt) = <&sonatina_ir::inst::arith::Fsqrt as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let arg = resolve_value(function, *fsqrt.arg(), &value_map, &mut body, wb)
+                                .ok_or("unresolved fsqrt argument")?;
+                            let wval = body.add_op(wb, Operator::F32Sqrt, &[arg], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fadd) = <&sonatina_ir::inst::arith::Fadd as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fadd.lhs(), &value_map, &mut body, wb).ok_or("unresolved fadd lhs")?;
+                            let rhs = resolve_value(function, *fadd.rhs(), &value_map, &mut body, wb).ok_or("unresolved fadd rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Add, &[lhs, rhs], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fsub) = <&sonatina_ir::inst::arith::Fsub as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fsub.lhs(), &value_map, &mut body, wb).ok_or("unresolved fsub lhs")?;
+                            let rhs = resolve_value(function, *fsub.rhs(), &value_map, &mut body, wb).ok_or("unresolved fsub rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Sub, &[lhs, rhs], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fmul) = <&sonatina_ir::inst::arith::Fmul as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fmul.lhs(), &value_map, &mut body, wb).ok_or("unresolved fmul lhs")?;
+                            let rhs = resolve_value(function, *fmul.rhs(), &value_map, &mut body, wb).ok_or("unresolved fmul rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Mul, &[lhs, rhs], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fdiv) = <&sonatina_ir::inst::arith::Fdiv as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fdiv.lhs(), &value_map, &mut body, wb).ok_or("unresolved fdiv lhs")?;
+                            let rhs = resolve_value(function, *fdiv.rhs(), &value_map, &mut body, wb).ok_or("unresolved fdiv rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Div, &[lhs, rhs], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(feq) = <&sonatina_ir::inst::cmp::Feq as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *feq.lhs(), &value_map, &mut body, wb).ok_or("unresolved feq lhs")?;
+                            let rhs = resolve_value(function, *feq.rhs(), &value_map, &mut body, wb).ok_or("unresolved feq rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Eq, &[lhs, rhs], &[WType::I32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(flt) = <&sonatina_ir::inst::cmp::Flt as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *flt.lhs(), &value_map, &mut body, wb).ok_or("unresolved flt lhs")?;
+                            let rhs = resolve_value(function, *flt.rhs(), &value_map, &mut body, wb).ok_or("unresolved flt rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Lt, &[lhs, rhs], &[WType::I32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fle) = <&sonatina_ir::inst::cmp::Fle as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fle.lhs(), &value_map, &mut body, wb).ok_or("unresolved fle lhs")?;
+                            let rhs = resolve_value(function, *fle.rhs(), &value_map, &mut body, wb).ok_or("unresolved fle rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Le, &[lhs, rhs], &[WType::I32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
                     // Lt (unsigned). Key on the OPERAND type, not the result (the
                     // result is the I32 bool): an i32-operand compare must use
                     // `i32.lt_u` or wasmtime rejects the module at validation.
@@ -656,6 +729,9 @@ fn resolve_value(
                 }
                 Immediate::I64(v) => {
                     body.add_op(block, Operator::I64Const { value: *v as u64 }, &[], &[WType::I64])
+                }
+                Immediate::F32(bits) => {
+                    body.add_op(block, Operator::F32Const { value: *bits }, &[], &[WType::F32])
                 }
                 _ => return None,
             };
