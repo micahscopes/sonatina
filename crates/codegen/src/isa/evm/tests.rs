@@ -158,6 +158,35 @@ fn test_backend() -> EvmBackend {
     }))
 }
 
+#[test]
+fn f32_is_rejected_before_evm_type_legalization_without_panicking() {
+    let parsed = parse_module(
+        r#"target = "evm-ethereum-osaka"
+
+func public %f32_entry() -> f32 {
+block0:
+    return 0x7fc01234.f32;
+}
+"#,
+    )
+    .expect("f32 carrier IR should parse");
+    let funcs = parsed.module.funcs();
+    let backend = test_backend();
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        backend.prepare_section(work_module(&parsed.module, &funcs))
+    }));
+    let result = outcome.expect("unsupported f32 must return an error, not panic");
+    let error = match result {
+        Ok(_) => panic!("EVM backend must reject f32 before legalization"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains("f32 is unsupported by the EVM backend"),
+        "unexpected diagnostic: {error}"
+    );
+}
+
 fn first_memory_op(lowered: &LoweredFunction<OpCode>) -> Option<u8> {
     lowered
         .block_order

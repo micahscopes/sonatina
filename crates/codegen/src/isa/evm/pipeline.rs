@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug_span, info_span, trace_span};
 
 use crate::{
@@ -20,7 +20,11 @@ use crate::{
         evm::{ConstDataLower, legalize_evm_section},
     },
 };
-use sonatina_ir::{Module, module::FuncRef};
+use sonatina_ir::{
+    module::{FuncRef, ModuleCtx},
+    types::{CompoundType, CompoundTypeRef},
+    Module, Type,
+};
 
 use super::{
     EvmBackend, LateCleanupProfile, PtrEscapeSummary, collect_unsupported_evm_calls,
@@ -70,6 +74,8 @@ impl<'a> EvmPipeline<'a> {
             phases = if optional_cleanup { 9 } else { 5 }
         )
         .entered();
+
+        reject_f32_before_evm_legalization(ctx.module(), &ctx.funcs)?;
 
         ctx.run_phase(
             "enum_and_const_lowering",
@@ -131,6 +137,71 @@ impl<'a> EvmPipeline<'a> {
                 .ptr_escape
                 .ok_or_else(|| "missing ptr escape summaries after EVM pipeline".to_string())?,
         })
+    }
+}
+
+fn reject_f32_before_evm_legalization(module: &Module, funcs: &[FuncRef]) -> Result<(), String> {
+    for &func_ref in funcs {
+        if let Some(sig) = module.ctx.get_sig(func_ref) {
+            for &ty in sig.args().iter().chain(sig.ret_tys()) {
+                if type_contains_f32(&module.ctx, ty, &mut FxHashSet::default()) {
+                    return Err(format!(
+                        "f32 is unsupported by the EVM backend in function signature `{}`",
+                        sig.name()
+                    ));
+                }
+            }
+        }
+
+        let has_f32_value = module.func_store.view(func_ref, |function| {
+            function.dfg.value_ids().any(|value| {
+                type_contains_f32(
+                    &module.ctx,
+                    function.dfg.value_ty(value),
+                    &mut FxHashSet::default(),
+                )
+            })
+        });
+        if has_f32_value {
+            return Err(format!(
+                "f32 is unsupported by the EVM backend in function {func_ref:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn type_contains_f32(
+    ctx: &ModuleCtx,
+    ty: Type,
+    seen: &mut FxHashSet<CompoundTypeRef>,
+) -> bool {
+    let Type::Compound(compound) = ty else {
+        return ty == Type::F32;
+    };
+    if !seen.insert(compound) {
+        return false;
+    }
+
+    match ctx.with_ty_store(|store| store.resolve_compound(compound).clone()) {
+        CompoundType::Array { elem, .. }
+        | CompoundType::Ptr(elem)
+        | CompoundType::ObjRef(elem)
+        | CompoundType::ConstRef(elem) => type_contains_f32(ctx, elem, seen),
+        CompoundType::Struct(data) => data
+            .fields
+            .into_iter()
+            .any(|field| type_contains_f32(ctx, field, seen)),
+        CompoundType::Enum(data) => data.variants.into_iter().any(|variant| {
+            variant
+                .fields
+                .into_iter()
+                .any(|field| type_contains_f32(ctx, field, seen))
+        }),
+        CompoundType::Func { args, ret_tys } => args
+            .into_iter()
+            .chain(ret_tys)
+            .any(|ty| type_contains_f32(ctx, ty, seen)),
     }
 }
 
