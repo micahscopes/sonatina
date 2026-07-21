@@ -31,6 +31,12 @@ pub trait Interpret {
     // `type Members = All`
     type Members = (
         inst::arith::Neg,
+        inst::arith::Fneg,
+        inst::arith::Fadd,
+        inst::arith::Fsub,
+        inst::arith::Fmul,
+        inst::arith::Fdiv,
+        inst::arith::Fsqrt,
         inst::arith::Add,
         inst::arith::Uaddo,
         inst::arith::Uaddsat,
@@ -65,6 +71,9 @@ pub trait Interpret {
         inst::cast::PtrToInt,
         inst::cast::Bitcast,
         inst::cmp::Lt,
+        inst::cmp::Feq,
+        inst::cmp::Flt,
+        inst::cmp::Fle,
         inst::cmp::Gt,
         inst::cmp::Slt,
         inst::cmp::Sgt,

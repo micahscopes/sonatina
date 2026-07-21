@@ -1,5 +1,9 @@
 use ir::inst::cmp::*;
 
+super::impl_inst_build! {Feq, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {Flt, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {Fle, (lhs: ValueId, rhs: ValueId)}
+
 super::impl_inst_build! {Lt, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Gt, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Slt, (lhs: ValueId, rhs: ValueId)}

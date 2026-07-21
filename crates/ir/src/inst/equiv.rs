@@ -17,6 +17,8 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryInstKind {
     Neg,
+    Fneg,
+    Fsqrt,
     Snego,
     Not,
     IsZero,
@@ -26,6 +28,13 @@ pub enum UnaryInstKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryInstKind {
     Add,
+    Fadd,
+    Fsub,
+    Fmul,
+    Fdiv,
+    Feq,
+    Flt,
+    Fle,
     Uaddo,
     Uaddsat,
     Saddo,

@@ -1,6 +1,12 @@
 use ir::inst::arith::*;
 
 super::impl_inst_build! {Neg, (arg: ValueId)}
+super::impl_inst_build! {Fneg, (arg: ValueId)}
+super::impl_inst_build! {Fadd, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {Fsub, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {Fmul, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {Fdiv, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {Fsqrt, (arg: ValueId)}
 super::impl_inst_build! {Add, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Uaddo, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Uaddsat, (lhs: ValueId, rhs: ValueId)}

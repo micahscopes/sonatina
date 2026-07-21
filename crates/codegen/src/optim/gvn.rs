@@ -134,7 +134,12 @@ fn make_gvn_unary_key(
             is.has_is_zero()?;
             Some(cmp::IsZero::new(is, arg).owned_key(&[result_ty]))
         }
-        UnaryInstKind::Neg | UnaryInstKind::Not | UnaryInstKind::Snego | UnaryInstKind::EvmClz => {
+        UnaryInstKind::Neg
+        | UnaryInstKind::Not
+        | UnaryInstKind::Snego
+        | UnaryInstKind::EvmClz
+        | UnaryInstKind::Fneg
+        | UnaryInstKind::Fsqrt => {
             None
         }
     }
@@ -1051,11 +1056,19 @@ impl GvnSolver {
                 UnaryInstKind::Not => !arg,
                 UnaryInstKind::IsZero => fold_result_imm(arg.is_zero().into(), result_ty)?,
                 UnaryInstKind::EvmClz => fold_evm_clz(arg)?,
+                UnaryInstKind::Fneg | UnaryInstKind::Fsqrt => return None,
             }
         } else if let InstClassKind::Binary(kind) = insn_expr.kind() {
             let (lhs, rhs) = insn_expr.binary_args()?;
             let result_ty = *insn_expr.result_tys().get(result_idx)?;
             match kind {
+                BinaryInstKind::Fadd
+                | BinaryInstKind::Fsub
+                | BinaryInstKind::Fmul
+                | BinaryInstKind::Fdiv
+                | BinaryInstKind::Feq
+                | BinaryInstKind::Flt
+                | BinaryInstKind::Fle => return None,
                 BinaryInstKind::Add => {
                     let (lhs, rhs) = word_binary_imms(func, lhs, rhs, result_ty)?;
                     fold_result_imm(lhs + rhs, result_ty)?

@@ -83,6 +83,7 @@ func public %caller() -> unit {
         v0.i32 = call %callee 1.i32;
         return;
 }
+
 "#;
 
     let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
@@ -2286,4 +2287,49 @@ func public %bad_evm_return_result() -> unit {
     let report = verify_module(&parsed.module, &cfg);
 
     assert!(has_code(&report, "IR0601"), "expected IR0601, got {report}");
+}
+
+#[test]
+fn f32_instructions_verify_with_native_types() {
+    let src = r#"
+target = "wasm32-unknown-native"
+
+func public %float_ops(v0.f32, v1.f32) -> (f32, i1) {
+    block0:
+        v2.f32 = fadd v0 v1;
+        v3.f32 = fsqrt v2;
+        v4.i1 = fle v3 v2;
+        return (v3, v4);
+}
+"#;
+    let parsed = parse_module(src).expect("module should parse");
+    let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
+    let report = verify_module(&parsed.module, &cfg);
+    assert!(report.is_ok(), "expected valid float IR, got {report}");
+}
+
+#[test]
+fn f32_instruction_type_mismatches_are_reported() {
+    let src = r#"
+target = "wasm32-unknown-native"
+
+func public %bad_float_ops(v0.i32, v1.f32) -> i32 {
+    block0:
+        v2.i32 = fadd v0 v1;
+        v3.f32 = fneg v0;
+        v4.f32 = feq v1 v1;
+        return v2;
+}
+"#;
+    let parsed = parse_module(src).expect("module should parse");
+    let cfg = VerifierConfig::for_level(VerificationLevel::Standard);
+    let report = verify_module(&parsed.module, &cfg);
+    assert!(
+        has_code(&report, "IR0600"),
+        "expected operand mismatch, got {report}"
+    );
+    assert!(
+        has_code(&report, "IR0601"),
+        "expected result mismatch, got {report}"
+    );
 }

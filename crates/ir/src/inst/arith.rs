@@ -9,6 +9,46 @@ pub struct Neg {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(unary(Fneg)))]
+pub struct Fneg {
+    arg: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(binary(Fadd)))]
+pub struct Fadd {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(binary(Fsub)))]
+pub struct Fsub {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(binary(Fmul)))]
+pub struct Fmul {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(binary(Fdiv)))]
+pub struct Fdiv {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(unary(Fsqrt)))]
+pub struct Fsqrt {
+    arg: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(kind(binary(Add)))]
 pub struct Add {
     lhs: ValueId,

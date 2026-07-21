@@ -45,6 +45,113 @@ impl_unary_integral_same_rule!(
     logic::Not => "not",
 );
 
+fn verify_unary_f32(
+    verifier: &mut FunctionVerifier<'_>,
+    inst_id: InstId,
+    arg: ValueId,
+    opname: &str,
+) {
+    let location = verifier.inst_location(inst_id);
+    let Some(arg_ty) = verifier.value_ty(arg) else {
+        return;
+    };
+    if arg_ty != Type::F32 {
+        verifier.emit(
+            Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                format!("{opname} operand must be f32"),
+                location.clone(),
+            )
+            .with_note(format!("found operand type {arg_ty:?}")),
+        );
+    }
+    verifier.expect_result_ty(inst_id, Type::F32, location);
+}
+
+fn verify_binary_f32(
+    verifier: &mut FunctionVerifier<'_>,
+    inst_id: InstId,
+    lhs: ValueId,
+    rhs: ValueId,
+    result_ty: Type,
+    opname: &str,
+) {
+    let location = verifier.inst_location(inst_id);
+    let (Some(lhs_ty), Some(rhs_ty)) = (verifier.value_ty(lhs), verifier.value_ty(rhs)) else {
+        return;
+    };
+    if lhs_ty != Type::F32 || rhs_ty != Type::F32 {
+        verifier.emit(
+            Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                format!("{opname} operands must be f32"),
+                location.clone(),
+            )
+            .with_note(format!("lhs {lhs_ty:?}, rhs {rhs_ty:?}")),
+        );
+    }
+    verifier.expect_result_ty(inst_id, result_ty, location);
+}
+
+impl VerifyInst for arith::Fneg {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_unary_f32(verifier, inst_id, *self.arg(), "fneg");
+    }
+}
+
+impl VerifyInst for arith::Fsqrt {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_unary_f32(verifier, inst_id, *self.arg(), "fsqrt");
+    }
+}
+
+macro_rules! impl_binary_f32_rule {
+    ($($ty:ty => $opname:literal),+ $(,)?) => {
+        $(
+            impl VerifyInst for $ty {
+                fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+                    verify_binary_f32(
+                        verifier,
+                        inst_id,
+                        *self.lhs(),
+                        *self.rhs(),
+                        Type::F32,
+                        $opname,
+                    );
+                }
+            }
+        )+
+    };
+}
+
+impl_binary_f32_rule!(
+    arith::Fadd => "fadd",
+    arith::Fsub => "fsub",
+    arith::Fmul => "fmul",
+    arith::Fdiv => "fdiv",
+);
+
+macro_rules! impl_compare_f32_rule {
+    ($($ty:ty => $opname:literal),+ $(,)?) => {
+        $(
+            impl VerifyInst for $ty {
+                fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+                    verify_binary_f32(
+                        verifier,
+                        inst_id,
+                        *self.lhs(),
+                        *self.rhs(),
+                        Type::I1,
+                        $opname,
+                    );
+                }
+            }
+        )+
+    };
+}
+
+impl_compare_f32_rule!(cmp::Feq => "feq", cmp::Flt => "flt", cmp::Fle => "fle");
+
 macro_rules! impl_binary_integral_same_rule {
     ($($ty:ty => $opname:literal),+ $(,)?) => {
         $(

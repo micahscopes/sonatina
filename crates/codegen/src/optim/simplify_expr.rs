@@ -370,7 +370,11 @@ pub(crate) fn simplify_unary_with_same_inner(
         UnaryInstKind::Not | UnaryInstKind::Neg => same_inner_arg(arg, kind)
             .map(SimplifyExprResult::Copy)
             .unwrap_or(SimplifyExprResult::NoChange),
-        UnaryInstKind::Snego | UnaryInstKind::IsZero | UnaryInstKind::EvmClz => {
+        UnaryInstKind::Snego
+        | UnaryInstKind::IsZero
+        | UnaryInstKind::EvmClz
+        | UnaryInstKind::Fneg
+        | UnaryInstKind::Fsqrt => {
             SimplifyExprResult::NoChange
         }
     }
@@ -616,7 +620,14 @@ pub(crate) fn simplify_binary_with_facts(
         | BinaryInstKind::EvmUmulsat
         | BinaryInstKind::EvmSmulsat
         | BinaryInstKind::EvmExp
-        | BinaryInstKind::EvmByte => {}
+        | BinaryInstKind::EvmByte
+        | BinaryInstKind::Fadd
+        | BinaryInstKind::Fsub
+        | BinaryInstKind::Fmul
+        | BinaryInstKind::Fdiv
+        | BinaryInstKind::Feq
+        | BinaryInstKind::Flt
+        | BinaryInstKind::Fle => {}
     }
 
     SimplifyExprResult::NoChange

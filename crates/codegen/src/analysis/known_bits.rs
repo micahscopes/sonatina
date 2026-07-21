@@ -347,7 +347,11 @@ impl KnownBitsQuery {
 
                 KnownBits::normalized(ty, arg_known.known_one, arg_known.known_zero)
             }
-            UnaryInstKind::Neg | UnaryInstKind::Snego | UnaryInstKind::EvmClz => {
+            UnaryInstKind::Neg
+            | UnaryInstKind::Snego
+            | UnaryInstKind::EvmClz
+            | UnaryInstKind::Fneg
+            | UnaryInstKind::Fsqrt => {
                 KnownBits::unknown(ty)
             }
         }

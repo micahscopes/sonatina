@@ -833,7 +833,14 @@ pub(super) fn simplify_inst(
                 | BinaryInstKind::EvmUsubsat
                 | BinaryInstKind::EvmSsubsat
                 | BinaryInstKind::EvmUmulsat
-                | BinaryInstKind::EvmSmulsat => SimplifyAction::NoChange,
+                | BinaryInstKind::EvmSmulsat
+                | BinaryInstKind::Fadd
+                | BinaryInstKind::Fsub
+                | BinaryInstKind::Fmul
+                | BinaryInstKind::Fdiv
+                | BinaryInstKind::Feq
+                | BinaryInstKind::Flt
+                | BinaryInstKind::Fle => SimplifyAction::NoChange,
                 BinaryInstKind::EvmSignExtend => {
                     let simplified = from_expr_simplify_result(simplify_binary_with_facts(
                         func, kind, *lhs, *rhs, &facts,

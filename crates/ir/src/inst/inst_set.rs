@@ -16,6 +16,12 @@ define_inst_set_base! {
     /// We should fix this in the future of course.
     trait InstSetBase {
         arith::Neg,
+        arith::Fneg,
+        arith::Fadd,
+        arith::Fsub,
+        arith::Fmul,
+        arith::Fdiv,
+        arith::Fsqrt,
         arith::Add,
         arith::Uaddo,
         arith::Uaddsat,
@@ -40,6 +46,9 @@ define_inst_set_base! {
         arith::Shr,
         arith::Sar,
         cmp::Lt,
+        cmp::Feq,
+        cmp::Flt,
+        cmp::Fle,
         cmp::Gt,
         cmp::Slt,
         cmp::Sgt,
