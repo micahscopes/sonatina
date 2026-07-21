@@ -467,6 +467,7 @@ impl BuildCtx {
     fn type_(&mut self, mb: &ModuleBuilder, t: &ast::Type) -> ir::Type {
         match &t.kind {
             ast::TypeKind::Int(i) => (*i).into(),
+            ast::TypeKind::Float(f) => (*f).into(),
             ast::TypeKind::Ptr(t) => {
                 let t = self.type_(mb, t);
                 mb.ptr_type(t)

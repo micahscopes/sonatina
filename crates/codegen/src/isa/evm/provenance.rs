@@ -305,7 +305,14 @@ fn type_can_carry_pointer_provenance_inner(
 ) -> bool {
     match ty {
         Type::I256 => true,
-        Type::I1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::Unit => false,
+        Type::I1
+        | Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::F32
+        | Type::I64
+        | Type::I128
+        | Type::Unit => false,
         Type::EnumTag(_) => false,
         Type::Compound(compound) => {
             if !seen.insert(compound) {

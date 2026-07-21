@@ -160,6 +160,9 @@ fn immediate_bytes(imm: Immediate) -> SmallVec<[u8; 8]> {
         Immediate::I8(v) => SmallVec::from_slice(&v.to_be_bytes()),
         Immediate::I16(v) => shrink_bytes(&v.to_be_bytes()),
         Immediate::I32(v) => shrink_bytes(&v.to_be_bytes()),
+        Immediate::F32(_) => {
+            unreachable!("f32 immediates are not representable by the EVM backend")
+        }
         Immediate::I64(v) => shrink_bytes(&v.to_be_bytes()),
         Immediate::I128(v) => shrink_bytes(&v.to_be_bytes()),
         Immediate::I256(v) => shrink_bytes(&v.to_u256().to_big_endian()),

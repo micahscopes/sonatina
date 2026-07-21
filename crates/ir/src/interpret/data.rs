@@ -47,6 +47,7 @@ impl Interpret for Gep {
                 | Type::I16
                 | Type::I8
                 | Type::I32
+                | Type::F32
                 | Type::I64
                 | Type::I128
                 | Type::I256

@@ -58,7 +58,7 @@ pub(crate) fn integral_bit_width(ty: Type) -> Option<usize> {
         Type::I64 => Some(64),
         Type::I128 => Some(128),
         Type::I256 => Some(256),
-        Type::EnumTag(_) | Type::Compound(_) | Type::Unit => None,
+        Type::F32 | Type::EnumTag(_) | Type::Compound(_) | Type::Unit => None,
     }
 }
 
@@ -70,7 +70,7 @@ fn integral_byte_width(ty: Type) -> Option<usize> {
         Type::I64 => Some(8),
         Type::I128 => Some(16),
         Type::I256 => Some(32),
-        Type::EnumTag(_) | Type::Compound(_) | Type::Unit => None,
+        Type::F32 | Type::EnumTag(_) | Type::Compound(_) | Type::Unit => None,
     }
 }
 

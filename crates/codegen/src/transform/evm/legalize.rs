@@ -55,6 +55,7 @@ impl TypeLegalizer {
             Type::I1 => Type::I1,
             Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 => Type::I256,
             Type::I256 | Type::Unit => ty,
+            Type::F32 => panic!("f32 is unsupported by EVM type legalization"),
             Type::EnumTag(_) => {
                 panic!("enum tags must be lowered before EVM type legalization");
             }
@@ -144,7 +145,7 @@ fn scalar_width_for_type(ctx: &ModuleCtx, ty: Type) -> Option<ScalarWidth> {
         Type::I256 => Some(ScalarWidth::Full256),
         Type::EnumTag(_) => None,
         Type::Compound(_) if ty.is_pointer(ctx) => Some(ScalarWidth::Full256),
-        Type::Compound(_) | Type::Unit => None,
+        Type::F32 | Type::Compound(_) | Type::Unit => None,
     }
 }
 

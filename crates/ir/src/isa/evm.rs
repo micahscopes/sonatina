@@ -154,6 +154,7 @@ impl TypeLayout for EvmTypeLayout {
             // EVM memory is word-addressed by the MLOAD/MSTORE family. For now we model all
             // scalar/pointer values as occupying one full 32-byte slot.
             Type::I1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::I256 => 32,
+            Type::F32 => return Err(TypeLayoutError::UnrepresentableType(ty)),
             Type::EnumTag(_) => return Err(TypeLayoutError::UnrepresentableType(ty)),
 
             Type::Compound(cmpd) => {

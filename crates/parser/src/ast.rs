@@ -716,7 +716,10 @@ impl FromSyntax<Error> for Type {
     fn from_syntax(node: &mut Node<Error>) -> Self {
         node.descend();
         let kind = match node.rule {
-            Rule::primitive_type => TypeKind::Int(IntType::from_str(node.txt).unwrap()),
+            Rule::primitive_type => match IntType::from_str(node.txt) {
+                Ok(ty) => TypeKind::Int(ty),
+                Err(()) => TypeKind::Float(FloatType::from_str(node.txt).unwrap()),
+            },
             Rule::ptr_type => TypeKind::Ptr(Box::new(node.single(Rule::type_name))),
             Rule::objref_type => TypeKind::ObjRef(Box::new(node.single(Rule::type_name))),
             Rule::constref_type => TypeKind::ConstRef(Box::new(node.single(Rule::type_name))),
@@ -751,6 +754,7 @@ impl FromSyntax<Error> for Type {
 #[derive(Debug)]
 pub enum TypeKind {
     Int(IntType),
+    Float(FloatType),
     Ptr(Box<Type>),
     ObjRef(Box<Type>),
     ConstRef(Box<Type>),
@@ -773,6 +777,11 @@ pub enum IntType {
     I256,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FloatType {
+    F32,
+}
+
 impl From<IntType> for ir::Type {
     fn from(value: IntType) -> Self {
         match value {
@@ -783,6 +792,14 @@ impl From<IntType> for ir::Type {
             IntType::I64 => ir::Type::I64,
             IntType::I128 => ir::Type::I128,
             IntType::I256 => ir::Type::I256,
+        }
+    }
+}
+
+impl From<FloatType> for ir::Type {
+    fn from(value: FloatType) -> Self {
+        match value {
+            FloatType::F32 => ir::Type::F32,
         }
     }
 }
@@ -867,8 +884,11 @@ impl FromSyntax<Error> for Value {
         let kind = match node.rule {
             Rule::value_name => ValueKind::Named(ValueName::from_syntax(node)),
             Rule::imm_number => {
-                let ty = if let Some(ty) = node.parse_str_opt::<IntType>(Rule::primitive_type) {
-                    TypeKind::Int(ty)
+                let ty = if let Some(primitive) = node.get_opt(Rule::primitive_type) {
+                    match primitive.as_str().parse::<IntType>() {
+                        Ok(ty) => TypeKind::Int(ty),
+                        Err(()) => TypeKind::Float(primitive.as_str().parse().unwrap()),
+                    }
                 } else if let Some(enum_ty) = node.get_opt(Rule::enumtag_type) {
                     let mut enum_ty = Node::new(enum_ty);
                     TypeKind::EnumTag(enum_ty.single(Rule::struct_identifier))
@@ -887,6 +907,10 @@ impl FromSyntax<Error> for Value {
                 let mut txt = node.txt;
                 match node.rule {
                     Rule::decimal => match ty {
+                        TypeKind::Float(_) => {
+                            node.error(Error::NumberOutOfBounds(node.span));
+                            ValueKind::Error
+                        }
                         TypeKind::Int(IntType::I1) => imm_or_err(
                             node,
                             || {
@@ -934,6 +958,16 @@ impl FromSyntax<Error> for Value {
                     },
 
                     Rule::hex => match ty {
+                        TypeKind::Float(FloatType::F32) => {
+                            let Some(bytes) = hex_bytes::<4>(txt) else {
+                                node.error(Error::NumberOutOfBounds(node.span));
+                                return Value {
+                                    kind: ValueKind::Error,
+                                    span: node.span,
+                                };
+                            };
+                            ValueKind::Immediate(Immediate::F32(u32::from_be_bytes(bytes)))
+                        }
                         TypeKind::Int(IntType::I1) => {
                             node.error(Error::NumberOutOfBounds(node.span));
                             ValueKind::Error
@@ -1004,6 +1038,17 @@ impl FromStr for IntType {
             "i64" => Ok(Self::I64),
             "i128" => Ok(Self::I128),
             "i256" => Ok(Self::I256),
+            _ => Err(()),
+        }
+    }
+}
+
+impl FromStr for FloatType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "f32" => Ok(Self::F32),
             _ => Err(()),
         }
     }

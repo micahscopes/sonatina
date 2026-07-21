@@ -88,6 +88,9 @@ pub enum Immediate {
     I8(i8),
     I16(i16),
     I32(i32),
+    /// An IEEE-754 binary32 value, stored as raw bits for exact Eq/Hash and
+    /// textual roundtrips, including NaN payloads and signed zero.
+    F32(u32),
     I64(i64),
     I128(i128),
     I256(I256),
@@ -104,6 +107,7 @@ impl Immediate {
             Self::I8(..) => Type::I8,
             Self::I16(..) => Type::I16,
             Self::I32(..) => Type::I32,
+            Self::F32(..) => Type::F32,
             Self::I64(..) => Type::I64,
             Self::I128(..) => Type::I128,
             Self::I256(..) => Type::I256,
@@ -171,6 +175,7 @@ impl Immediate {
             Self::I8(val) => (val as u8).into(),
             Self::I16(val) => (val as u16).into(),
             Self::I32(val) => (val as u32).into(),
+            Self::F32(_) => unreachable!("f32 immediates do not support integer extension"),
             Self::I64(val) => (val as u64).into(),
             Self::I128(val) => (val as u128).into(),
             Self::I256(val) => val,
@@ -406,7 +411,7 @@ impl Immediate {
             Type::I64 => Self::I64(i64::MIN),
             Type::I128 => Self::I128(i128::MIN),
             Type::I256 => Self::from_i256(I256::from(U256::one() << 255), Type::I256),
-            Type::EnumTag(_) | Type::Compound(_) | Type::Unit => unreachable!(),
+            Type::F32 | Type::EnumTag(_) | Type::Compound(_) | Type::Unit => unreachable!(),
         }
     }
 
@@ -421,7 +426,7 @@ impl Immediate {
             Type::I256 => {
                 Self::from_i256(I256::from((U256::one() << 255) - U256::one()), Type::I256)
             }
-            Type::EnumTag(_) | Type::Compound(_) | Type::Unit => unreachable!(),
+            Type::F32 | Type::EnumTag(_) | Type::Compound(_) | Type::Unit => unreachable!(),
         }
     }
 
@@ -459,6 +464,7 @@ impl Immediate {
             Self::I8(val) => val.into(),
             Self::I16(val) => val.into(),
             Self::I32(val) => val.into(),
+            Self::F32(_) => unreachable!("f32 immediates are not integers"),
             Self::I64(val) => val.into(),
             Self::I128(val) => val.into(),
             Self::I256(val) => val,
@@ -486,6 +492,7 @@ impl Immediate {
             Type::I8 => Self::I8(val.trunc_to_i8()),
             Type::I16 => Self::I16(val.trunc_to_i16()),
             Type::I32 => Self::I32(val.trunc_to_i32()),
+            Type::F32 => unreachable!("cannot construct f32 bits from an integer"),
             Type::I64 => Self::I64(val.trunc_to_i64()),
             Type::I128 => Self::I128(val.trunc_to_i128()),
             Type::I256 => Self::I256(val),
@@ -542,6 +549,7 @@ impl Immediate {
             Type::I8 => 8,
             Type::I16 => 16,
             Type::I32 => 32,
+            Type::F32 => unreachable!("f32 immediates do not support integer bit operations"),
             Type::I64 => 64,
             Type::I128 => 128,
             Type::I256 | Type::EnumTag(_) => 256,
@@ -710,6 +718,7 @@ where
             Self::I8(v) => write!(w, "{v}"),
             Self::I16(v) => write!(w, "{v}"),
             Self::I32(v) => write!(w, "{v}"),
+            Self::F32(bits) => write!(w, "0x{bits:08x}"),
             Self::I64(v) => write!(w, "{v}"),
             Self::I128(v) => write!(w, "{v}"),
             Self::I256(v) => write!(w, "{v}"),
@@ -731,6 +740,7 @@ impl fmt::Display for Immediate {
             Self::I8(v) => write!(f, "{v}"),
             Self::I16(v) => write!(f, "{v}"),
             Self::I32(v) => write!(f, "{v}"),
+            Self::F32(bits) => write!(f, "0x{bits:08x}"),
             Self::I64(v) => write!(f, "{v}"),
             Self::I128(v) => write!(f, "{v}"),
             Self::I256(v) => write!(f, "{v}"),
@@ -765,6 +775,17 @@ imm_from_primary!(I256, I256, Immediate::I256);
 #[cfg(test)]
 mod tests {
     use super::Immediate;
+
+    #[test]
+    fn f32_immediate_preserves_exact_bits_and_type() {
+        let negative_zero = Immediate::F32(0x8000_0000);
+        let nan_payload = Immediate::F32(0x7fc0_1234);
+
+        assert_eq!(negative_zero.ty(), crate::Type::F32);
+        assert_eq!(negative_zero.to_string(), "0x80000000");
+        assert_eq!(nan_payload.to_string(), "0x7fc01234");
+        assert_ne!(negative_zero, Immediate::F32(0));
+    }
 
     #[test]
     fn lshr_is_width_aware_for_negative_immediates() {

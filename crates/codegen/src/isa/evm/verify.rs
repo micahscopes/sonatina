@@ -244,7 +244,7 @@ pub(crate) fn validate_supported_lowering_ir(
 fn type_is_legalized_evm(ctx: &ModuleCtx, ty: Type, seen: &mut FxHashSet<CompoundTypeRef>) -> bool {
     match ty {
         Type::I1 | Type::I256 | Type::Unit => true,
-        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 => false,
+        Type::I8 | Type::I16 | Type::I32 | Type::F32 | Type::I64 | Type::I128 => false,
         Type::EnumTag(_) => false,
         Type::Compound(compound) => {
             if !seen.insert(compound) {

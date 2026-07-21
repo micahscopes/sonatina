@@ -113,6 +113,7 @@ fn machine_type(module: &ModuleCtx, ty: Type) -> Result<Type, String> {
         Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::EnumTag(_) => {
             Ok(Type::I256)
         }
+        Type::F32 => Err("f32 is unsupported by the EVM machine backend".to_string()),
         Type::Compound(_) => Err(format!("unsupported machine type {ty:?}")),
     }
 }
@@ -1145,7 +1146,7 @@ fn scalar_bits(ty: Type) -> Option<u16> {
         Type::I64 => Some(64),
         Type::I128 => Some(128),
         Type::I256 | Type::EnumTag(_) => Some(256),
-        Type::Unit | Type::Compound(_) => None,
+        Type::F32 | Type::Unit | Type::Compound(_) => None,
     }
 }
 

@@ -1,0 +1,6 @@
+target = "evm-ethereum-london"
+
+func public %f32_bits() -> f32 {
+block0:
+    return 0x80000000.f32;
+}
