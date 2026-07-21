@@ -10,6 +10,8 @@
 //! an ambiguous merge, a loop with no recognizable header exit) returns a named
 //! `Err`, never a silently dropped branch.
 
+use std::collections::HashSet;
+
 use sonatina_ir::{
     BlockId, Function, InstDowncast, InstSetBase,
     cfg::ControlFlowGraph,
@@ -82,7 +84,20 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
         dom_children: &dom_children,
         loop_tree: &loop_tree,
     };
-    let regions = s.build_seq(rpo[0], None, None)?;
+    let mut active = HashSet::new();
+    let mut consumed = HashSet::new();
+    let regions = s.build_seq(rpo[0], None, None, &mut active, &mut consumed)?;
+
+    let missing = rpo
+        .iter()
+        .copied()
+        .filter(|block| !consumed.contains(block))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "spirv structurize: reachable blocks were not consumed: {missing:?}"
+        ));
+    }
 
     Ok(StructuredCfg {
         block_order: rpo,
@@ -144,6 +159,8 @@ impl Structurer<'_> {
         start: BlockId,
         stop: Option<BlockId>,
         cur_loop: Option<Loop>,
+        active: &mut HashSet<BlockId>,
+        consumed: &mut HashSet<BlockId>,
     ) -> Result<Vec<Region>, String> {
         let mut regions = Vec::new();
         let mut cur = Some(start);
@@ -164,12 +181,25 @@ impl Structurer<'_> {
                 }
             }
 
+            if active.contains(&b) || !consumed.insert(b) {
+                return Err(format!(
+                    "spirv structurize: cyclic or multiply consumed block {b:?}"
+                ));
+            }
+            active.insert(b);
+
             // Open a loop when we first reach a header we are not already in.
             if let Some(lp) = self.loop_tree.loop_of_block(b) {
                 if self.loop_tree.loop_header(lp) == b && cur_loop != Some(lp) {
-                    let body = self.build_loop_body(b, lp)?;
+                    let body = self.build_loop_body(b, lp, active, consumed)?;
                     regions.push(Region::Loop { header: b, body });
+                    if let Some(exit) = self.loop_direct_exit(b, lp) {
+                        if self.returns(exit) {
+                            consumed.insert(exit);
+                        }
+                    }
                     cur = self.loop_fallthrough(b, lp)?;
+                    active.remove(&b);
                     continue;
                 }
             }
@@ -188,12 +218,12 @@ impl Structurer<'_> {
                     let then_branch = if Some(nz) == merge {
                         Vec::new()
                     } else {
-                        self.build_seq(nz, merge, cur_loop)?
+                        self.build_seq(nz, merge, cur_loop, active, consumed)?
                     };
                     let else_branch = if Some(z) == merge {
                         Vec::new()
                     } else {
-                        self.build_seq(z, merge, cur_loop)?
+                        self.build_seq(z, merge, cur_loop, active, consumed)?
                     };
                     regions.push(Region::IfThenElse {
                         header: b,
@@ -211,6 +241,7 @@ impl Structurer<'_> {
                     ));
                 }
             }
+            active.remove(&b);
         }
 
         Ok(regions)
@@ -218,7 +249,13 @@ impl Structurer<'_> {
 
     /// Structure a loop's body: the region sequence entered at the header's
     /// in-loop successor, stopping at the header (backedge) and at loop exits.
-    fn build_loop_body(&self, header: BlockId, lp: Loop) -> Result<Vec<Region>, String> {
+    fn build_loop_body(
+        &self,
+        header: BlockId,
+        lp: Loop,
+        active: &mut HashSet<BlockId>,
+        consumed: &mut HashSet<BlockId>,
+    ) -> Result<Vec<Region>, String> {
         match self.term(header) {
             Term::Br(nz, z) => {
                 let nz_in = self.in_loop(nz, lp);
@@ -245,13 +282,21 @@ impl Structurer<'_> {
                     // separate body regions to recurse into.
                     Ok(Vec::new())
                 } else {
-                    self.build_seq(entry, None, Some(lp))
+                    self.build_seq(entry, None, Some(lp), active, consumed)
                 }
             }
-            Term::Jump(t) => self.build_seq(t, None, Some(lp)),
+            Term::Jump(t) => self.build_seq(t, None, Some(lp), active, consumed),
             _ => Err(format!(
                 "spirv structurize: loop header {header:?} must end in Jump or Br"
             )),
+        }
+    }
+
+    fn loop_direct_exit(&self, header: BlockId, lp: Loop) -> Option<BlockId> {
+        match self.term(header) {
+            Term::Br(nz, z) if self.in_loop(nz, lp) && !self.in_loop(z, lp) => Some(z),
+            Term::Br(nz, z) if !self.in_loop(nz, lp) && self.in_loop(z, lp) => Some(nz),
+            _ => None,
         }
     }
 
@@ -623,6 +668,49 @@ mod tests {
             outer_body.iter().any(|r| matches!(r, Region::Loop { .. })),
             "outer loop body should nest an inner Loop, got {:?}",
             outer_body
+        );
+    }
+
+    #[test]
+    fn irreducible_multi_entry_cycle_fails_closed() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("irreducible", Linkage::Public, &[]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let a = fb.append_block();
+        let b = fb.append_block();
+        let c = fb.append_block();
+        let d = fb.append_block();
+        let exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.make_imm_value(true);
+        fb.insert_inst_no_result(Br::new(is, cond, a, b));
+        fb.switch_to_block(a);
+        fb.insert_inst_no_result(Jump::new(is, c));
+        fb.switch_to_block(b);
+        fb.insert_inst_no_result(Jump::new(is, d));
+        fb.switch_to_block(c);
+        fb.insert_inst_no_result(Br::new(is, cond, exit, d));
+        fb.switch_to_block(d);
+        fb.insert_inst_no_result(Jump::new(is, c));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let result = module
+            .func_store
+            .view(fr, |func| structurize_function(func));
+        let err = result.expect_err("irreducible cycle must fail closed");
+        assert!(
+            err.contains("cyclic")
+                || err.contains("consumed")
+                || err.contains("reachable")
+                || err.contains("unstructured/unsupported"),
+            "expected a named fail-closed structurizer error, got: {err}"
         );
     }
 }
