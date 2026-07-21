@@ -313,3 +313,98 @@ func public %float_cmp(v0.f32, v1.f32) -> (i1, i1, i1) {
         ]
     );
 }
+
+#[test]
+fn interpreter_preserves_ieee_f32_edge_semantics() {
+    let source = r#"
+target = "wasm32-unknown-native"
+
+func public %float_cmp(v0.f32, v1.f32) -> (i1, i1, i1) {
+    block0:
+        v2.i1 = feq v0 v1;
+        v3.i1 = flt v0 v1;
+        v4.i1 = fle v0 v1;
+        return (v2, v3, v4);
+}
+
+func public %float_unary(v0.f32) -> (f32, f32) {
+    block0:
+        v1.f32 = fneg v0;
+        v2.f32 = fsqrt v0;
+        return (v1, v2);
+}
+"#;
+    let parsed = sonatina_parser::parse_module(source).expect("module should parse");
+    let float_cmp = parsed
+        .module
+        .ctx
+        .declared_funcs
+        .iter()
+        .find_map(|entry| (entry.value().name() == "float_cmp").then(|| *entry.key()))
+        .expect("float_cmp should be declared");
+    let float_unary = parsed
+        .module
+        .ctx
+        .declared_funcs
+        .iter()
+        .find_map(|entry| (entry.value().name() == "float_unary").then(|| *entry.key()))
+        .expect("float_unary should be declared");
+    let mut machine = Machine::new(parsed.module);
+
+    let compare = |machine: &mut Machine, lhs, rhs| {
+        machine.run_results(
+            float_cmp,
+            vec![
+                EvalValue::Imm(Immediate::F32(lhs)),
+                EvalValue::Imm(Immediate::F32(rhs)),
+            ],
+        )
+    };
+    let true_true = &[
+        EvalValue::Imm(Immediate::I1(true)),
+        EvalValue::Imm(Immediate::I1(false)),
+        EvalValue::Imm(Immediate::I1(true)),
+    ];
+    assert_eq!(
+        compare(&mut machine, 0x0000_0000, 0x8000_0000).as_slice(),
+        true_true
+    );
+    assert_eq!(
+        compare(&mut machine, 0x8000_0000, 0x0000_0000).as_slice(),
+        true_true
+    );
+
+    let unordered = &[
+        EvalValue::Imm(Immediate::I1(false)),
+        EvalValue::Imm(Immediate::I1(false)),
+        EvalValue::Imm(Immediate::I1(false)),
+    ];
+    let nan = 0x7fc1_2345;
+    let one = 0x3f80_0000;
+    assert_eq!(compare(&mut machine, nan, one).as_slice(), unordered);
+    assert_eq!(compare(&mut machine, one, nan).as_slice(), unordered);
+
+    let unary = |machine: &mut Machine, bits| {
+        machine.run_results(float_unary, vec![EvalValue::Imm(Immediate::F32(bits))])
+    };
+    assert_eq!(
+        unary(&mut machine, 0x0000_0000).as_slice()[0],
+        EvalValue::Imm(Immediate::F32(0x8000_0000))
+    );
+    assert_eq!(
+        unary(&mut machine, 0x8000_0000).as_slice()[0],
+        EvalValue::Imm(Immediate::F32(0x0000_0000))
+    );
+    assert_eq!(
+        unary(&mut machine, nan).as_slice()[0],
+        EvalValue::Imm(Immediate::F32(nan ^ 0x8000_0000))
+    );
+    assert_eq!(
+        unary(&mut machine, nan ^ 0x8000_0000).as_slice()[0],
+        EvalValue::Imm(Immediate::F32(nan))
+    );
+    assert_eq!(
+        unary(&mut machine, 0x8000_0000).as_slice()[1],
+        EvalValue::Imm(Immediate::F32(0x8000_0000))
+    );
+}
