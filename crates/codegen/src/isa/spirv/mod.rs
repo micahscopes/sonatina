@@ -510,9 +510,10 @@ fn emit_single_inst(
         }
     } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(&val_id) = ret.args().as_slice().first() {
+            let was_cached = value_map.contains_key(&val_id);
             let resolved = resolve_naga_value(val_id, function, word, value_map, phi_locals, func);
             if let Some(h) = resolved {
-                if matches!(func.expressions[h], naga::Expression::Load { .. }) {
+                if !was_cached && matches!(func.expressions[h], naga::Expression::Load { .. }) {
                     target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
                 }
             }
@@ -554,8 +555,35 @@ fn emit_naga_block_instructions(
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
 ) {
     let mut target = naga::Block::new();
+    emit_phi_loads_for_block(function, inst_set, block, func, &mut target, value_map, phi_locals);
     emit_block_to_target(function, inst_set, word, block, func, &mut target, value_map, phi_locals, result_expr);
     func.body.extend_block(target);
+}
+
+#[cfg(feature = "spirv-backend")]
+fn emit_phi_loads_for_block(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    block: sonatina_ir::BlockId,
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
+    phi_locals: &std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
+) {
+    use sonatina_ir::InstDowncast;
+
+    for inst_id in function.layout.iter_inst(block) {
+        let inst = function.dfg.inst(inst_id);
+        if <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst).is_none() {
+            break;
+        }
+        let Some(result) = function.dfg.inst_result(inst_id) else { continue };
+        let Some(&local) = phi_locals.get(&result) else { continue };
+        let pointer = func.expressions.append(naga::Expression::LocalVariable(local), naga::Span::UNDEFINED);
+        let loaded = func.expressions.append(naga::Expression::Load { pointer }, naga::Span::UNDEFINED);
+        target.push(naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)), naga::Span::UNDEFINED);
+        value_map.insert(result, loaded);
+    }
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -569,7 +597,7 @@ fn emit_naga_regions(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
-) {
+) -> Result<(), String> {
     let mut region_idx = 0;
     while region_idx < regions.len() {
         let region = &regions[region_idx];
@@ -582,21 +610,175 @@ fn emit_naga_regions(
                 region_idx += 1;
             }
             crate::structurize::Region::Loop { header, body } => {
+                if body.iter().any(|region| matches!(region, crate::structurize::Region::IfThenElse { .. })) {
+                    return Err(format!(
+                        "spirv structurize: loop {header:?} containing a conditional is not supported yet"
+                    ));
+                }
+                if body.iter().any(|region| matches!(region, crate::structurize::Region::Loop { .. })) {
+                    return Err(format!("spirv structurize: loop {header:?} nested inside a loop is not supported yet"));
+                }
                 region_idx += 1;
                 emit_loop_region(
                     function, inst_set, word, *header, body, &regions[region_idx..],
                     &mut region_idx, word_type, func, value_map, phi_locals, result_expr,
                 );
             }
-            crate::structurize::Region::IfThenElse { header, then_branch: _, else_branch: _, merge: _ } => {
-                emit_naga_block_instructions(
-                    function, inst_set, word, *header, word_type,
-                    func, value_map, phi_locals, result_expr,
-                );
+            crate::structurize::Region::IfThenElse { .. } => {
+                let mut target = naga::Block::new();
+                emit_if_region(
+                    function, inst_set, word, region, word_type, func, &mut target,
+                    value_map, phi_locals, result_expr,
+                )?;
+                func.body.extend_block(target);
                 region_idx += 1;
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "spirv-backend")]
+fn ensure_phi_locals(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    block: sonatina_ir::BlockId,
+    word_type: naga::Handle<naga::Type>,
+    func: &mut naga::Function,
+    phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
+) {
+    use sonatina_ir::InstDowncast;
+    for inst_id in function.layout.iter_inst(block) {
+        let inst = function.dfg.inst(inst_id);
+        if <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst).is_none() { break }
+        let Some(result) = function.dfg.inst_result(inst_id) else { continue };
+        phi_locals.entry(result).or_insert_with(|| func.local_variables.append(
+            naga::LocalVariable { name: Some(format!("phi_{}", result.0)), ty: word_type, init: None },
+            naga::Span::UNDEFINED,
+        ));
+    }
+}
+
+#[cfg(feature = "spirv-backend")]
+fn region_blocks(regions: &[crate::structurize::Region], out: &mut std::collections::HashSet<sonatina_ir::BlockId>) {
+    for region in regions {
+        match region {
+            crate::structurize::Region::Block(block) => { out.insert(*block); }
+            crate::structurize::Region::IfThenElse { header, then_branch, else_branch, .. } => {
+                out.insert(*header);
+                region_blocks(then_branch, out);
+                region_blocks(else_branch, out);
+            }
+            crate::structurize::Region::Loop { header, body } => {
+                out.insert(*header);
+                region_blocks(body, out);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "spirv-backend")]
+fn emit_phi_edge_stores(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
+    merge: sonatina_ir::BlockId,
+    predecessors: &std::collections::HashSet<sonatina_ir::BlockId>,
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
+    phi_locals: &std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
+) -> Result<(), String> {
+    use sonatina_ir::InstDowncast;
+    for inst_id in function.layout.iter_inst(merge) {
+        let inst = function.dfg.inst(inst_id);
+        let Some(phi) = <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst) else { break };
+        let result = function.dfg.inst_result(inst_id).ok_or_else(|| "spirv structurize: phi has no result".to_string())?;
+        let local = *phi_locals.get(&result).ok_or_else(|| "spirv structurize: merge phi has no local".to_string())?;
+        let matching_inputs = phi.args().iter().filter(|(_, pred)| predecessors.contains(pred)).collect::<Vec<_>>();
+        let [(value, _)] = matching_inputs.as_slice() else {
+            return Err(format!("spirv structurize: merge phi {result:?} has {} inputs for one arm", matching_inputs.len()));
+        };
+        let value = resolve_naga_value(*value, function, word, value_map, phi_locals, func)
+            .ok_or_else(|| format!("spirv structurize: unresolved phi input {value:?}"))?;
+        let pointer = func.expressions.append(naga::Expression::LocalVariable(local), naga::Span::UNDEFINED);
+        target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "spirv-backend")]
+fn emit_if_region(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
+    region: &crate::structurize::Region,
+    word_type: naga::Handle<naga::Type>,
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
+    phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
+    result_expr: &mut Option<naga::Handle<naga::Expression>>,
+) -> Result<(), String> {
+    use sonatina_ir::InstDowncast;
+    let crate::structurize::Region::IfThenElse { header, then_branch, else_branch, merge } = region else {
+        return Err("spirv structurize: expected if region".to_string());
+    };
+    let Some(merge) = merge else {
+        return Err(format!("spirv structurize: conditional {header:?} without a merge is not supported yet"));
+    };
+    ensure_phi_locals(function, inst_set, *merge, word_type, func, phi_locals);
+    emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr);
+    let branch = function.layout.iter_inst(*header).find_map(|inst_id|
+        <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(inst_id))
+    ).ok_or_else(|| format!("spirv structurize: if header {header:?} has no branch"))?;
+    let condition = resolve_naga_value(*branch.cond(), function, word, value_map, phi_locals, func)
+        .ok_or_else(|| format!("spirv structurize: unresolved condition in {header:?}"))?;
+
+    let mut accept = naga::Block::new();
+    let mut reject = naga::Block::new();
+    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, func, &mut accept, value_map, phi_locals, result_expr)?;
+    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, func, &mut reject, value_map, phi_locals, result_expr)?;
+    let mut then_preds = std::collections::HashSet::new();
+    region_blocks(then_branch, &mut then_preds);
+    if then_preds.is_empty() { then_preds.insert(*header); }
+    emit_phi_edge_stores(function, inst_set, word, *merge, &then_preds, func, &mut accept, value_map, phi_locals)?;
+    let mut else_preds = std::collections::HashSet::new();
+    region_blocks(else_branch, &mut else_preds);
+    if else_preds.is_empty() { else_preds.insert(*header); }
+    emit_phi_edge_stores(function, inst_set, word, *merge, &else_preds, func, &mut reject, value_map, phi_locals)?;
+    target.push(naga::Statement::If { condition, accept, reject }, naga::Span::UNDEFINED);
+    Ok(())
+}
+
+#[cfg(feature = "spirv-backend")]
+fn emit_non_loop_regions(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
+    regions: &[crate::structurize::Region],
+    word_type: naga::Handle<naga::Type>,
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
+    phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
+    result_expr: &mut Option<naga::Handle<naga::Expression>>,
+) -> Result<(), String> {
+    for region in regions {
+        match region {
+            crate::structurize::Region::Block(block) => {
+                emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
+                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, result_expr);
+            }
+            crate::structurize::Region::IfThenElse { .. } => emit_if_region(
+                function, inst_set, word, region, word_type, func, target, value_map, phi_locals, result_expr,
+            )?,
+            crate::structurize::Region::Loop { .. } => return Err(
+                "spirv structurize: loop nested inside conditional is not supported yet".to_string()
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Emit a Loop region, handling inner conditional branches and post-loop exit blocks.
@@ -1378,6 +1560,7 @@ fn translate_to_naga(
 
         let funcs = module.funcs();
         let mut result_expr = None;
+        let mut body_error = None;
         if let Some(&func_ref) = funcs.first() {
             module.func_store.try_view(func_ref, |function| {
                 let inst_set = function.inst_set();
@@ -1465,28 +1648,20 @@ fn translate_to_naga(
 
                 // The mode-blind body: SAME structurizer + region emission Grid and
                 // Scalar use (zero changes to emit_naga_regions / emit_single_inst).
-                let structured = crate::structurize::structurize_function(function);
-                let has_loops = structured.as_ref().map_or(false, |s| {
-                    s.regions
-                        .iter()
-                        .any(|r| matches!(r, crate::structurize::Region::Loop { .. }))
-                });
-                if has_loops {
-                    let scfg = structured.unwrap();
-                    emit_naga_regions(
-                        function, inst_set, word, &scfg.regions, word_type,
-                        &mut fs, &mut value_map, &mut phi_locals, &mut result_expr,
-                    );
-                } else {
-                    for block in function.layout.iter_block() {
-                        emit_naga_block_instructions(
-                            function, inst_set, word, block, word_type,
-                            &mut fs, &mut value_map, &mut phi_locals, &mut result_expr,
-                        );
-                    }
+                let scfg = match crate::structurize::structurize_function(function) {
+                    Ok(scfg) => scfg,
+                    Err(err) => { body_error = Some(err); return; }
+                };
+                if let Err(err) = emit_naga_regions(
+                    function, inst_set, word, &scfg.regions, word_type,
+                    &mut fs, &mut value_map, &mut phi_locals, &mut result_expr,
+                ) {
+                    body_error = Some(err);
                 }
             });
         }
+
+        if let Some(err) = body_error { return Err(err); }
 
         // Epilogue: unpack4x8unorm(result) -> @location(0) vec4<f32>. A render
         // kernel that produced no result expression is a hard error, never a
@@ -1733,6 +1908,7 @@ fn translate_to_naga(
     let mut grid_gid: Option<(naga::Handle<naga::Expression>, naga::Handle<naga::Expression>)> =
         None;
 
+    let mut body_error = None;
     if let Some(&func_ref) = funcs.first() {
         module.func_store.try_view(func_ref, |function| {
             let inst_set = function.inst_set();
@@ -1874,29 +2050,20 @@ fn translate_to_naga(
                 }
             }
 
-            // Check for loops via structurizer
-            let structured = crate::structurize::structurize_function(function);
-            let has_loops = structured.as_ref().map_or(false, |s|
-                s.regions.iter().any(|r| matches!(r, crate::structurize::Region::Loop { .. }))
-            );
-
-            if has_loops {
-                let scfg = structured.unwrap();
-                emit_naga_regions(
-                    function, inst_set, word, &scfg.regions, word_type,
-                    &mut func, &mut value_map, &mut phi_locals, &mut result_expr,
-                );
-            } else {
-                // Linear fallback
-                for block in function.layout.iter_block() {
-                    emit_naga_block_instructions(
-                        function, inst_set, word, block, word_type,
-                        &mut func, &mut value_map, &mut phi_locals, &mut result_expr,
-                    );
-                }
+            let scfg = match crate::structurize::structurize_function(function) {
+                Ok(scfg) => scfg,
+                Err(err) => { body_error = Some(err); return; }
+            };
+            if let Err(err) = emit_naga_regions(
+                function, inst_set, word, &scfg.regions, word_type,
+                &mut func, &mut value_map, &mut phi_locals, &mut result_expr,
+            ) {
+                body_error = Some(err);
             }
         });
     }
+
+    if let Some(err) = body_error { return Err(err); }
 
     // Result store, three-way by mode:
     //  - Scalar: store the single result into the output struct (store-0 fallback).

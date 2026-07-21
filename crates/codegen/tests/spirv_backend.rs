@@ -397,6 +397,157 @@ fn build_grid_gradient_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+/// A top-level diamond with a merge phi. This catches the historical SPIR-V
+/// fallback that emitted blocks linearly and silently ignored branch semantics.
+fn build_grid_diamond_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_diamond", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let then_block = fb.append_block();
+    let else_block = fb.append_block();
+    let merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let cond = fb.insert_inst(cmp::Lt::new(is, px, py), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, then_block, else_block));
+
+    fb.switch_to_block(then_block);
+    let then_bias = fb.make_imm_value(100i32);
+    let then_value = fb.insert_inst(arith::Add::new(is, px, then_bias), Type::I32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(else_block);
+    let else_bias = fb.make_imm_value(200i32);
+    let else_value = fb.insert_inst(arith::Add::new(is, py, else_bias), Type::I32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(merge);
+    let selected = fb.insert_inst(
+        control_flow::Phi::new(
+            is,
+            vec![(then_value, then_block), (else_value, else_block)],
+        ),
+        Type::I32,
+    );
+    let one = fb.make_imm_value(1i32);
+    let result = fb.insert_inst(arith::Add::new(is, selected, one), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A triangle where the false edge goes straight from the header to the merge.
+/// Its phi therefore has one arm input from the header itself.
+fn build_grid_triangle_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_triangle", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let then_block = fb.append_block();
+    let merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let cond = fb.insert_inst(cmp::Lt::new(is, px, py), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, then_block, merge));
+
+    fb.switch_to_block(then_block);
+    let bias = fb.make_imm_value(100i32);
+    let then_value = fb.insert_inst(arith::Add::new(is, px, bias), Type::I32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(merge);
+    let selected = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(then_value, then_block), (py, entry)]),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, selected));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A loop whose body branches between a backedge and an early return. The
+/// structurizer represents the body branch as an `IfThenElse` nested in a
+/// `Loop`; silently flattening only direct `Block` children drops this branch.
+fn build_grid_loop_conditional_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_loop_conditional", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let continue_block = fb.append_block();
+    let escape = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let four = fb.make_imm_value(4i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, body, exit));
+
+    fb.switch_to_block(body);
+    let continue_condition = fb.insert_inst(cmp::Lt::new(is, px, py), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(
+        is,
+        continue_condition,
+        continue_block,
+        escape,
+    ));
+
+    fb.switch_to_block(continue_block);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, continue_block);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(escape);
+    let escaped = fb.make_imm_value(777i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 /// A 3-arg grid kernel with one broadcast param: `f(px, py, p) -> px + py*1024 + p`.
 /// arg2 is the broadcast input struct member p0; the load-bearing M3 shape.
 fn build_grid_broadcast_module() -> sonatina_ir::Module {
@@ -696,6 +847,71 @@ fn grid_executes_on_lavapipe() {
         }
     }
     eprintln!("grid_executes_on_lavapipe OK: {w}x{h}, all pixels == x + 1024*y");
+}
+
+/// Execute a top-level conditional and its merge phi. Both arms are exercised
+/// across the grid and the phi feeds another instruction after the merge.
+#[test]
+fn grid_diamond_executes_on_lavapipe() {
+    let module = build_grid_diamond_module();
+    let art = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("grid diamond must compile");
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+
+    let (w, h, wgx, wgy) = (8u32, 8u32, 8u32, 8u32);
+    let out = run_grid_u32(wgsl, w, h, wgx, wgy, &[]);
+    for y in 0..h {
+        for x in 0..w {
+            let got = out[(y * w + x) as usize];
+            let want = if x < y { x + 101 } else { y + 201 };
+            assert_eq!(got, want, "grid diamond at ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn grid_triangle_executes_on_lavapipe() {
+    let module = build_grid_triangle_module();
+    let art = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("grid triangle must compile");
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+
+    let (w, h, wgx, wgy) = (8u32, 8u32, 8u32, 8u32);
+    let out = run_grid_u32(wgsl, w, h, wgx, wgy, &[]);
+    for y in 0..h {
+        for x in 0..w {
+            let got = out[(y * w + x) as usize];
+            let want = if x < y { x + 100 } else { y };
+            assert_eq!(got, want, "grid triangle at ({x}, {y})");
+        }
+    }
+}
+
+/// Until loop emission recursively consumes nested regions, this shape must
+/// fail closed. Compiling it successfully after dropping the inner branch is
+/// silent wrong-code, not partial support.
+#[test]
+fn grid_loop_with_conditional_fails_closed() {
+    let module = build_grid_loop_conditional_module();
+    let result = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module);
+    let err = match result {
+        Ok(_) => panic!("loop containing a conditional must not be silently flattened"),
+        Err(err) => err,
+    };
+    let message = format!("{err:?}");
+    assert!(
+        message.contains("loop") && message.contains("conditional"),
+        "expected a named loop-conditional diagnostic, got: {message}"
+    );
 }
 
 /// A grid kernel with one broadcast param executes with p0 = 7 written to the
