@@ -1,6 +1,60 @@
 use super::{Action, EvalValue, Interpret, State, single_result};
 use crate::inst::arith::*;
 
+fn unary_f32(value: EvalValue, op: impl FnOnce(f32) -> f32) -> EvalValue {
+    match value {
+        EvalValue::Imm(crate::Immediate::F32(bits)) => {
+            EvalValue::Imm(crate::Immediate::F32(op(f32::from_bits(bits)).to_bits()))
+        }
+        _ => EvalValue::Undef,
+    }
+}
+
+fn binary_f32(lhs: EvalValue, rhs: EvalValue, op: impl FnOnce(f32, f32) -> f32) -> EvalValue {
+    match (lhs, rhs) {
+        (EvalValue::Imm(crate::Immediate::F32(lhs)), EvalValue::Imm(crate::Immediate::F32(rhs))) => {
+            EvalValue::Imm(crate::Immediate::F32(
+                op(f32::from_bits(lhs), f32::from_bits(rhs)).to_bits(),
+            ))
+        }
+        _ => EvalValue::Undef,
+    }
+}
+
+impl Interpret for Fneg {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(unary_f32(state.lookup_val(*self.arg()), |value| -value))
+    }
+}
+
+macro_rules! impl_binary_f32 {
+    ($inst:ty, $op:expr) => {
+        impl Interpret for $inst {
+            fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+                state.set_action(Action::Continue);
+                single_result(binary_f32(
+                    state.lookup_val(*self.lhs()),
+                    state.lookup_val(*self.rhs()),
+                    $op,
+                ))
+            }
+        }
+    };
+}
+
+impl_binary_f32!(Fadd, |lhs, rhs| lhs + rhs);
+impl_binary_f32!(Fsub, |lhs, rhs| lhs - rhs);
+impl_binary_f32!(Fmul, |lhs, rhs| lhs * rhs);
+impl_binary_f32!(Fdiv, |lhs, rhs| lhs / rhs);
+
+impl Interpret for Fsqrt {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(unary_f32(state.lookup_val(*self.arg()), f32::sqrt))
+    }
+}
+
 impl Interpret for Neg {
     fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
         state.set_action(Action::Continue);

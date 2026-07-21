@@ -6,6 +6,12 @@ use crate::inst::*;
 #[inst_set(InstKind = "NativeInstKind")]
 pub struct NativeInstSet(
     arith::Neg,
+    arith::Fneg,
+    arith::Fadd,
+    arith::Fsub,
+    arith::Fmul,
+    arith::Fdiv,
+    arith::Fsqrt,
     arith::Add,
     arith::Uaddo,
     arith::Uaddsat,
@@ -36,6 +42,9 @@ pub struct NativeInstSet(
     cast::IntToPtr,
     cast::PtrToInt,
     cmp::Lt,
+    cmp::Feq,
+    cmp::Flt,
+    cmp::Fle,
     cmp::Gt,
     cmp::Slt,
     cmp::Sgt,

@@ -209,3 +209,107 @@ func public %pair() -> (i8, i1) {
     let mut machine = Machine::new(parsed.module);
     let _ = machine.run(pair, vec![]);
 }
+
+#[test]
+fn interpreter_executes_f32_arithmetic_from_raw_bits() {
+    let source = r#"
+target = "wasm32-unknown-native"
+
+func public %float_ops(v0.f32, v1.f32) -> (f32, f32, f32, f32, f32, f32) {
+    block0:
+        v2.f32 = fneg v0;
+        v3.f32 = fadd v0 v1;
+        v4.f32 = fsub v0 v1;
+        v5.f32 = fmul v0 v1;
+        v6.f32 = fdiv v0 v1;
+        v7.f32 = fsqrt v0;
+        return (v2, v3, v4, v5, v6, v7);
+}
+"#;
+    let parsed = sonatina_parser::parse_module(source).expect("module should parse");
+    let float_ops = parsed
+        .module
+        .ctx
+        .declared_funcs
+        .iter()
+        .find_map(|entry| (entry.value().name() == "float_ops").then(|| *entry.key()))
+        .expect("float_ops should be declared");
+    let mut machine = Machine::new(parsed.module);
+
+    assert_eq!(
+        machine
+            .run_results(
+                float_ops,
+                vec![
+                    EvalValue::Imm(Immediate::F32(0x4110_0000)),
+                    EvalValue::Imm(Immediate::F32(0x4040_0000)),
+                ]
+            )
+            .as_slice(),
+        &[
+            EvalValue::Imm(Immediate::F32(0xc110_0000)),
+            EvalValue::Imm(Immediate::F32(0x4140_0000)),
+            EvalValue::Imm(Immediate::F32(0x40c0_0000)),
+            EvalValue::Imm(Immediate::F32(0x41d8_0000)),
+            EvalValue::Imm(Immediate::F32(0x4040_0000)),
+            EvalValue::Imm(Immediate::F32(0x4040_0000)),
+        ]
+    );
+}
+
+#[test]
+fn interpreter_executes_ordered_f32_comparisons() {
+    let source = r#"
+target = "wasm32-unknown-native"
+
+func public %float_cmp(v0.f32, v1.f32) -> (i1, i1, i1) {
+    block0:
+        v2.i1 = feq v0 v1;
+        v3.i1 = flt v0 v1;
+        v4.i1 = fle v0 v1;
+        return (v2, v3, v4);
+}
+"#;
+    let parsed = sonatina_parser::parse_module(source).expect("module should parse");
+    let float_cmp = parsed
+        .module
+        .ctx
+        .declared_funcs
+        .iter()
+        .find_map(|entry| (entry.value().name() == "float_cmp").then(|| *entry.key()))
+        .expect("float_cmp should be declared");
+    let mut machine = Machine::new(parsed.module);
+
+    assert_eq!(
+        machine
+            .run_results(
+                float_cmp,
+                vec![
+                    EvalValue::Imm(Immediate::F32(0x4040_0000)),
+                    EvalValue::Imm(Immediate::F32(0x4110_0000)),
+                ]
+            )
+            .as_slice(),
+        &[
+            EvalValue::Imm(Immediate::I1(false)),
+            EvalValue::Imm(Immediate::I1(true)),
+            EvalValue::Imm(Immediate::I1(true)),
+        ]
+    );
+    assert_eq!(
+        machine
+            .run_results(
+                float_cmp,
+                vec![
+                    EvalValue::Imm(Immediate::F32(0x7fc0_0000)),
+                    EvalValue::Imm(Immediate::F32(0x7fc0_0000)),
+                ]
+            )
+            .as_slice(),
+        &[
+            EvalValue::Imm(Immediate::I1(false)),
+            EvalValue::Imm(Immediate::I1(false)),
+            EvalValue::Imm(Immediate::I1(false)),
+        ]
+    );
+}
