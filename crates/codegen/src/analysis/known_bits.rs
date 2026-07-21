@@ -33,6 +33,9 @@ impl KnownBits {
 
     pub fn from_imm(imm: Immediate) -> Self {
         let ty = imm.ty();
+        if !supports_known_bits(ty) {
+            return Self::default();
+        }
         let ones = imm.as_i256().to_u256() & type_mask(ty);
         Self::normalized(ty, !ones, ones)
     }
@@ -701,6 +704,8 @@ mod tests {
     };
     use sonatina_parser::parse_module;
 
+    use crate::optim::{known_bits_simplify::KnownBitsSimplify, pipeline::Pipeline};
+
     use super::*;
 
     #[derive(Clone, Copy)]
@@ -725,6 +730,54 @@ mod tests {
             bits.exact_imm(Type::I8),
             Some(Immediate::from_i256(I256::from(-1i8), Type::I8))
         );
+    }
+
+    #[test]
+    fn f32_immediates_are_conservative_and_survive_known_bits_optimization() {
+        let source = r#"
+target = "wasm32-unknown-native"
+
+func public %float_literal() -> f32 {
+block0:
+    v0.f32 = fadd 0x3f800000.f32 0x40000000.f32;
+    return v0;
+}
+"#;
+        let mut parsed = parse_module(source).expect("float literal module should parse");
+        let func_ref = parsed.module.funcs()[0];
+
+        parsed.module.func_store.view(func_ref, |func| {
+            let query = KnownBitsQuery::new(func);
+            for value in func.dfg.value_ids() {
+                if func.dfg.value_ty(value) == Type::F32 {
+                    assert_eq!(query.for_value(func, value), KnownBits::default());
+                }
+            }
+        });
+
+        parsed.module.func_store.modify(func_ref, |func| {
+            assert!(
+                !KnownBitsSimplify::new().run(func),
+                "integer known-bits optimization must not rewrite float arithmetic"
+            );
+        });
+
+        Pipeline::default_pipeline().run(&mut parsed.module);
+
+        parsed.module.func_store.view(func_ref, |func| {
+            let fadd = func
+                .layout
+                .iter_block()
+                .flat_map(|block| func.layout.iter_inst(block))
+                .find(|&inst| {
+                    func.dfg.inst(inst).kind()
+                        == InstClassKind::Binary(sonatina_ir::inst::BinaryInstKind::Fadd)
+                })
+                .expect("fadd must remain after optimization");
+            let args = func.dfg.inst(fadd).collect_values();
+            assert_eq!(func.dfg.value_imm(args[0]), Some(Immediate::F32(0x3f80_0000)));
+            assert_eq!(func.dfg.value_imm(args[1]), Some(Immediate::F32(0x4000_0000)));
+        });
     }
 
     #[test]
