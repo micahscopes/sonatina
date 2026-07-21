@@ -618,6 +618,7 @@ fn emit_naga_regions(
                 if body.iter().any(|region| matches!(region, crate::structurize::Region::Loop { .. })) {
                     return Err(format!("spirv structurize: loop {header:?} nested inside a loop is not supported yet"));
                 }
+                validate_legacy_loop_shape(function, inst_set, *header, body)?;
                 region_idx += 1;
                 emit_loop_region(
                     function, inst_set, word, *header, body, &regions[region_idx..],
@@ -633,6 +634,51 @@ fn emit_naga_regions(
                 func.body.extend_block(target);
                 region_idx += 1;
             }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "spirv-backend")]
+fn validate_legacy_loop_shape(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    header: sonatina_ir::BlockId,
+    body: &[crate::structurize::Region],
+) -> Result<(), String> {
+    use sonatina_ir::InstDowncast;
+
+    let mut loop_blocks = std::collections::HashSet::new();
+    loop_blocks.insert(header);
+    region_blocks(body, &mut loop_blocks);
+    let branch = function.layout.iter_inst(header).find_map(|inst_id| {
+        <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(
+            inst_set,
+            function.dfg.inst(inst_id),
+        )
+    }).ok_or_else(|| {
+        format!("spirv structurize: legacy loop {header:?} requires a conditional header")
+    })?;
+    if !loop_blocks.contains(branch.nz_dest()) || loop_blocks.contains(branch.z_dest()) {
+        return Err(format!(
+            "spirv structurize: loop {header:?} has unsupported branch polarity"
+        ));
+    }
+
+    for inst_id in function.layout.iter_inst(header) {
+        let inst = function.dfg.inst(inst_id);
+        let Some(phi) =
+            <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst)
+        else {
+            break;
+        };
+        let outside_count = phi.args().iter()
+            .filter(|(_, pred)| !loop_blocks.contains(pred))
+            .count();
+        if outside_count != 1 {
+            return Err(format!(
+                "spirv structurize: loop {header:?} phi requires exactly one preheader input, found {outside_count}"
+            ));
         }
     }
     Ok(())
@@ -799,6 +845,10 @@ fn emit_loop_region(
 ) {
     use sonatina_ir::InstDowncast;
 
+    let mut loop_blocks = std::collections::HashSet::new();
+    loop_blocks.insert(header);
+    region_blocks(body, &mut loop_blocks);
+
     // Create LocalVariables for phi nodes in the loop header
     for inst_id in function.layout.iter_inst(header) {
         let inst_data = function.dfg.inst(inst_id);
@@ -814,8 +864,10 @@ fn emit_loop_region(
                 );
                 phi_locals.insert(result, local);
 
-                // Initialize from entry (first) phi arg
-                if let Some(&(init_val, _)) = phi.args().first() {
+                // Initialize from the unique predecessor outside the loop.
+                if let Some(&(init_val, _)) = phi.args().iter()
+                    .find(|(_, pred)| !loop_blocks.contains(pred))
+                {
                     if let Some(init) = resolve_naga_value(init_val, function, word, value_map, phi_locals, func) {
                         let ptr = func.expressions.append(
                             naga::Expression::LocalVariable(local),

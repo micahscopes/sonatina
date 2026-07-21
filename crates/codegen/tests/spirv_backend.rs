@@ -276,6 +276,118 @@ fn spirv_loop_sum_to_valid() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// The current loop emitter supports only the canonical header shape where
+/// `nz_dest` stays in the loop and `z_dest` exits. Reversing those successors
+/// must produce a named error, not inverted loop behavior.
+#[test]
+fn spirv_loop_reversed_header_polarity_fails_closed() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("reversed_loop", Linkage::Public, &[Type::I64], Type::I64);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let limit = fb.args()[0];
+    let zero = fb.make_imm_value(0i64);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I64);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, limit), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, exit, body));
+
+    fb.switch_to_block(body);
+    let one = fb.make_imm_value(1i64);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I64);
+    fb.append_phi_arg(i, next_i, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let result = SpirvBackend::new()
+        .with_workgroup_size(1, 1, 1)
+        .compile_module(&module);
+    let errors = match result {
+        Ok(_) => panic!("reversed loop header polarity must fail closed"),
+        Err(errors) => errors,
+    };
+    let message = format!("{errors:?}");
+    assert!(
+        message.contains("branch polarity"),
+        "expected branch polarity diagnostic, got: {message}"
+    );
+}
+
+/// Phi argument order is not semantic. Put the backedge input first and verify
+/// that loop initialization still selects the true outside predecessor.
+#[test]
+fn spirv_loop_backedge_first_phi_argument_validates() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("phi_order_loop", Linkage::Public, &[Type::I64], Type::I64);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let limit = fb.args()[0];
+    let zero = fb.make_imm_value(0i64);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, Vec::new()), Type::I64);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, limit), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, body, exit));
+
+    fb.switch_to_block(body);
+    let one = fb.make_imm_value(1i64);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I64);
+    fb.append_phi_arg(i, next_i, body);
+    fb.append_phi_arg(i, zero, entry);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let artifact = SpirvBackend::new()
+        .with_workgroup_size(1, 1, 1)
+        .compile_module(&module)
+        .expect("backedge-first phi order must compile");
+    assert_eq!(artifact.words[0], 0x07230203, "valid SPIR-V magic");
+
+    let tmp = std::env::temp_dir().join("spirv_loop_phi_order.spv");
+    std::fs::write(&tmp, artifact.as_bytes()).unwrap();
+    if let Ok(output) = std::process::Command::new("spirv-val").arg(&tmp).output() {
+        assert!(
+            output.status.success(),
+            "SPIR-V loop with backedge-first phi should validate: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
 /// B1 (mb2 browser-testable plan): a u32-word kernel must lower to a naga `Uint`
 /// scalar and produce BROWSER-PROFILE WGSL (no 64-bit scalar) that reparses and
 /// validates WITHOUT SHADER_INT64. This is the content-derived word gate: the
