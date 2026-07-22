@@ -249,23 +249,19 @@ fn resolve_naga_value(
         return Some(loaded);
     }
     if let sonatina_ir::Value::Immediate { imm, .. } = function.dfg.value(vid) {
-        // Literals are retyped to the word scalar. For i64 this is unchanged. For
-        // u32, an i64 immediate cannot appear in a u32-word kernel; returning None
-        // makes the caller fail closed rather than silently narrow it.
-        let literal = match word {
-            WordKind::I64 => match imm {
-                sonatina_ir::Immediate::I64(v) => naga::Literal::I64(*v),
-                sonatina_ir::Immediate::I32(v) => naga::Literal::I64(*v as i64),
-                sonatina_ir::Immediate::I8(v) => naga::Literal::I64(*v as i64),
-                sonatina_ir::Immediate::I1(v) => naga::Literal::I64(*v as i64),
-                _ => return None,
+        let literal = match imm {
+            sonatina_ir::Immediate::I1(v) => naga::Literal::Bool(*v),
+            sonatina_ir::Immediate::I8(v) => match word {
+                WordKind::U32 => naga::Literal::U32(*v as u32),
+                WordKind::I64 => naga::Literal::I64(*v as i64),
             },
-            WordKind::U32 => match imm {
-                sonatina_ir::Immediate::I32(v) => naga::Literal::U32(*v as u32),
-                sonatina_ir::Immediate::I8(v) => naga::Literal::U32(*v as u32),
-                sonatina_ir::Immediate::I1(v) => naga::Literal::U32(*v as u32),
-                _ => return None,
+            sonatina_ir::Immediate::I32(v) => match word {
+                WordKind::U32 => naga::Literal::U32(*v as u32),
+                WordKind::I64 => naga::Literal::I64(*v as i64),
             },
+            sonatina_ir::Immediate::I64(v) => naga::Literal::I64(*v),
+            sonatina_ir::Immediate::F32(bits) => naga::Literal::F32(f32::from_bits(*bits)),
+            _ => return None,
         };
         return Some(func.expressions.append(
             naga::Expression::Literal(literal),
@@ -332,6 +328,104 @@ fn emit_single_inst(
             );
             target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
             value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Fneg as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
+            let h = func.expressions.append(naga::Expression::Unary { op: naga::UnaryOperator::Negate, expr: arg }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Fsqrt as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Sqrt, arg, arg1: None, arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some((lhs_id, rhs_id, naga_op)) =
+        <&sonatina_ir::inst::arith::Fadd as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Add))
+        .or_else(|| <&sonatina_ir::inst::arith::Fsub as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Subtract)))
+        .or_else(|| <&sonatina_ir::inst::arith::Fmul as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Multiply)))
+        .or_else(|| <&sonatina_ir::inst::arith::Fdiv as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Divide)))
+        .or_else(|| <&sonatina_ir::inst::cmp::Feq as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Equal)))
+        .or_else(|| <&sonatina_ir::inst::cmp::Flt as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Less)))
+        .or_else(|| <&sonatina_ir::inst::cmp::Fle as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::LessEqual)))
+    {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(lhs_id, function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(rhs_id, function, word, value_map, phi_locals, func).unwrap();
+            let h = func.expressions.append(naga::Expression::Binary { op: naga_op, left: lhs, right: rhs }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some((from_id, signed, to_float)) =
+        <&sonatina_ir::inst::cast::I32ToF32 as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.from(), true, true))
+        .or_else(|| <&sonatina_ir::inst::cast::U32ToF32 as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.from(), false, true)))
+        .or_else(|| <&sonatina_ir::inst::cast::F32ToI32 as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.from(), true, false)))
+        .or_else(|| <&sonatina_ir::inst::cast::F32ToU32 as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.from(), false, false)))
+    {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let from = resolve_naga_value(from_id, function, word, value_map, phi_locals, func).unwrap();
+            let converted = if to_float {
+                let numeric = if signed {
+                    let signed_bits = func.expressions.append(naga::Expression::As { expr: from, kind: naga::ScalarKind::Sint, convert: None }, naga::Span::UNDEFINED);
+                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(signed_bits, signed_bits)), naga::Span::UNDEFINED);
+                    signed_bits
+                } else { from };
+                func.expressions.append(naga::Expression::As { expr: numeric, kind: naga::ScalarKind::Float, convert: Some(4) }, naga::Span::UNDEFINED)
+            } else {
+                let kind = if signed { naga::ScalarKind::Sint } else { naga::ScalarKind::Uint };
+                let numeric = func.expressions.append(naga::Expression::As { expr: from, kind, convert: Some(4) }, naga::Span::UNDEFINED);
+                target.push(naga::Statement::Emit(naga::Range::new_from_bounds(numeric, numeric)), naga::Span::UNDEFINED);
+                let raw = if signed {
+                    let raw = func.expressions.append(naga::Expression::As { expr: numeric, kind: naga::ScalarKind::Uint, convert: None }, naga::Span::UNDEFINED);
+                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(raw, raw)), naga::Span::UNDEFINED);
+                    raw
+                } else { numeric }
+                ;
+                // Rust's float-to-int casts, which define the interpreter contract,
+                // saturate and map NaN to zero. Shader conversion outside the target
+                // range is implementation-defined, so select the boundary values
+                // explicitly after the raw conversion.
+                let zero = func.expressions.append(naga::Expression::Literal(naga::Literal::U32(0)), naga::Span::UNDEFINED);
+                let (low_f, high_f, low_u, high_u) = if signed {
+                    (
+                        naga::Literal::F32(-2_147_483_648.0),
+                        naga::Literal::F32(2_147_483_648.0),
+                        naga::Literal::U32(0x8000_0000),
+                        naga::Literal::U32(0x7fff_ffff),
+                    )
+                } else {
+                    (
+                        naga::Literal::F32(0.0),
+                        naga::Literal::F32(4_294_967_296.0),
+                        naga::Literal::U32(0),
+                        naga::Literal::U32(u32::MAX),
+                    )
+                };
+                let low_f = func.expressions.append(naga::Expression::Literal(low_f), naga::Span::UNDEFINED);
+                let high_f = func.expressions.append(naga::Expression::Literal(high_f), naga::Span::UNDEFINED);
+                let low_u = func.expressions.append(naga::Expression::Literal(low_u), naga::Span::UNDEFINED);
+                let high_u = func.expressions.append(naga::Expression::Literal(high_u), naga::Span::UNDEFINED);
+                let is_low = func.expressions.append(naga::Expression::Binary { op: naga::BinaryOperator::LessEqual, left: from, right: low_f }, naga::Span::UNDEFINED);
+                target.push(naga::Statement::Emit(naga::Range::new_from_bounds(is_low, is_low)), naga::Span::UNDEFINED);
+                let low_clamped = func.expressions.append(naga::Expression::Select { condition: is_low, accept: low_u, reject: raw }, naga::Span::UNDEFINED);
+                target.push(naga::Statement::Emit(naga::Range::new_from_bounds(low_clamped, low_clamped)), naga::Span::UNDEFINED);
+                let is_high = func.expressions.append(naga::Expression::Binary { op: naga::BinaryOperator::GreaterEqual, left: from, right: high_f }, naga::Span::UNDEFINED);
+                target.push(naga::Statement::Emit(naga::Range::new_from_bounds(is_high, is_high)), naga::Span::UNDEFINED);
+                let clamped = func.expressions.append(naga::Expression::Select { condition: is_high, accept: high_u, reject: low_clamped }, naga::Span::UNDEFINED);
+                target.push(naga::Statement::Emit(naga::Range::new_from_bounds(clamped, clamped)), naga::Span::UNDEFINED);
+                let ordered = func.expressions.append(naga::Expression::Binary { op: naga::BinaryOperator::Equal, left: from, right: from }, naga::Span::UNDEFINED);
+                target.push(naga::Statement::Emit(naga::Range::new_from_bounds(ordered, ordered)), naga::Span::UNDEFINED);
+                func.expressions.append(naga::Expression::Select { condition: ordered, accept: clamped, reject: zero }, naga::Span::UNDEFINED)
+            };
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(converted, converted)), naga::Span::UNDEFINED);
+            value_map.insert(result, converted);
             return true;
         }
     } else if let Some(sar) = <&sonatina_ir::inst::arith::Sar as InstDowncast>::downcast(inst_set, inst_data) {
@@ -593,6 +687,8 @@ fn emit_naga_regions(
     word: WordKind,
     regions: &[crate::structurize::Region],
     word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
@@ -628,7 +724,7 @@ fn emit_naga_regions(
             crate::structurize::Region::IfThenElse { .. } => {
                 let mut target = naga::Block::new();
                 emit_if_region(
-                    function, inst_set, word, region, word_type, func, &mut target,
+                    function, inst_set, word, region, word_type, f32_type, bool_type, func, &mut target,
                     value_map, phi_locals, result_expr,
                 )?;
                 func.body.extend_block(target);
@@ -690,6 +786,8 @@ fn ensure_phi_locals(
     inst_set: &dyn sonatina_ir::InstSetBase,
     block: sonatina_ir::BlockId,
     word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
 ) {
@@ -698,8 +796,13 @@ fn ensure_phi_locals(
         let inst = function.dfg.inst(inst_id);
         if <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst).is_none() { break }
         let Some(result) = function.dfg.inst_result(inst_id) else { continue };
+        let ty = match function.dfg.value_ty(result) {
+            sonatina_ir::Type::F32 => f32_type,
+            sonatina_ir::Type::I1 => bool_type,
+            _ => word_type,
+        };
         phi_locals.entry(result).or_insert_with(|| func.local_variables.append(
-            naga::LocalVariable { name: Some(format!("phi_{}", result.0)), ty: word_type, init: None },
+            naga::LocalVariable { name: Some(format!("phi_{}", result.0)), ty, init: None },
             naga::Span::UNDEFINED,
         ));
     }
@@ -760,6 +863,8 @@ fn emit_if_region(
     word: WordKind,
     region: &crate::structurize::Region,
     word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     target: &mut naga::Block,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
@@ -773,7 +878,7 @@ fn emit_if_region(
     let Some(merge) = merge else {
         return Err(format!("spirv structurize: conditional {header:?} without a merge is not supported yet"));
     };
-    ensure_phi_locals(function, inst_set, *merge, word_type, func, phi_locals);
+    ensure_phi_locals(function, inst_set, *merge, word_type, f32_type, bool_type, func, phi_locals);
     emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr);
     let branch = function.layout.iter_inst(*header).find_map(|inst_id|
         <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(inst_id))
@@ -783,8 +888,8 @@ fn emit_if_region(
 
     let mut accept = naga::Block::new();
     let mut reject = naga::Block::new();
-    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, func, &mut accept, value_map, phi_locals, result_expr)?;
-    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, func, &mut reject, value_map, phi_locals, result_expr)?;
+    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, f32_type, bool_type, func, &mut accept, value_map, phi_locals, result_expr)?;
+    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, f32_type, bool_type, func, &mut reject, value_map, phi_locals, result_expr)?;
     let mut then_preds = std::collections::HashSet::new();
     region_blocks(then_branch, &mut then_preds);
     if then_preds.is_empty() { then_preds.insert(*header); }
@@ -804,6 +909,8 @@ fn emit_non_loop_regions(
     word: WordKind,
     regions: &[crate::structurize::Region],
     word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     target: &mut naga::Block,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
@@ -817,7 +924,7 @@ fn emit_non_loop_regions(
                 emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, result_expr);
             }
             crate::structurize::Region::IfThenElse { .. } => emit_if_region(
-                function, inst_set, word, region, word_type, func, target, value_map, phi_locals, result_expr,
+                function, inst_set, word, region, word_type, f32_type, bool_type, func, target, value_map, phi_locals, result_expr,
             )?,
             crate::structurize::Region::Loop { .. } => return Err(
                 "spirv structurize: loop nested inside conditional is not supported yet".to_string()
@@ -1277,10 +1384,23 @@ fn spirv_instruction_is_lowered(
         || <&arith::Add as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Sub as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Mul as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fneg as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fadd as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fsub as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fmul as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fdiv as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fsqrt as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Sar as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shr as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Lt as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Slt as InstDowncast>::downcast(is, inst).is_some()
+        || <&cmp::Feq as InstDowncast>::downcast(is, inst).is_some()
+        || <&cmp::Flt as InstDowncast>::downcast(is, inst).is_some()
+        || <&cmp::Fle as InstDowncast>::downcast(is, inst).is_some()
+        || <&sonatina_ir::inst::cast::I32ToF32 as InstDowncast>::downcast(is, inst).is_some()
+        || <&sonatina_ir::inst::cast::U32ToF32 as InstDowncast>::downcast(is, inst).is_some()
+        || <&sonatina_ir::inst::cast::F32ToI32 as InstDowncast>::downcast(is, inst).is_some()
+        || <&sonatina_ir::inst::cast::F32ToU32 as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAlloc as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjLoad as InstDowncast>::downcast(is, inst).is_some()
@@ -1327,18 +1447,27 @@ fn translate_to_naga(
         }
     };
 
-    // Mixed-width fail-close: every argument must share the derived word type.
-    let word_ty = match word {
-        WordKind::U32 => sonatina_ir::Type::I32,
-        WordKind::I64 => sonatina_ir::Type::I64,
-    };
     for (i, &arg_ty) in sig.args().iter().enumerate() {
-        if arg_ty != word_ty {
+        if word == WordKind::I64 && arg_ty != sonatina_ir::Type::I64 {
             return Err(format!(
-                "spirv: kernel arg {i} has type {arg_ty:?} but the word type is {word_ty:?}; \
-                 mixed-width kernels are unsupported"
+                "spirv i64: kernel arg {i} has type {arg_ty:?}; i64 kernels require homogeneous i64 arguments"
             ));
         }
+        if !matches!(arg_ty, sonatina_ir::Type::I1 | sonatina_ir::Type::I32 | sonatina_ir::Type::I64 | sonatina_ir::Type::F32) {
+            return Err(format!("spirv: kernel arg {i} has unsupported type {arg_ty:?}"));
+        }
+        if matches!(word, WordKind::U32) && arg_ty == sonatina_ir::Type::I64 {
+            return Err(format!("spirv u32: kernel arg {i} is i64, which requires SHADER_INT64"));
+        }
+        let is_storage_arg = !(grid || render) || i >= 2;
+        if is_storage_arg && arg_ty == sonatina_ir::Type::I1 {
+            return Err(format!(
+                "spirv: kernel arg {i} is i1; boolean storage-buffer arguments are unsupported"
+            ));
+        }
+    }
+    if (grid || render) && sig.args().get(0..2) != Some(&[sonatina_ir::Type::I32, sonatina_ir::Type::I32]) {
+        return Err("spirv grid/render: coordinate args 0 and 1 must both be i32".to_string());
     }
 
     let word_width = word.width_bytes();
@@ -1358,6 +1487,26 @@ fn translate_to_naga(
         },
         naga::Span::UNDEFINED,
     );
+    let f32_type = naga_mod.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Float,
+                width: 4,
+            }),
+        },
+        naga::Span::UNDEFINED,
+    );
+    let bool_type = naga_mod.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Bool,
+                width: 1,
+            }),
+        },
+        naga::Span::UNDEFINED,
+    );
 
     // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
     // fail closed on any signedness-sensitive op (Sar / signed compares / signed
@@ -1370,9 +1519,70 @@ fn translate_to_naga(
             let pc = f.arg_values.len();
             let is = f.inst_set();
             let mut has_alloc = false;
+            let mut cfg = sonatina_ir::cfg::ControlFlowGraph::default();
+            cfg.compute(f);
+            let mut domtree = crate::domtree::DomTree::new();
+            domtree.compute(&cfg);
+            let mut loop_tree = crate::loop_analysis::LoopTree::new();
+            loop_tree.compute(&cfg, &domtree);
+            if word == WordKind::I64
+                && f.dfg
+                    .value_ids()
+                    .any(|value| f.dfg.value_ty(value) == sonatina_ir::Type::F32)
+            {
+                return Err(
+                    "spirv i64: f32 values and 32-bit float conversions are unsupported"
+                        .to_string(),
+                );
+            }
+            // Diagnose unsupported f32 object storage before the general lowering
+            // whitelist. Address construction such as `obj.proj` may itself be
+            // outside that whitelist, but must not mask the more specific error.
             for bid in f.layout.iter_block() {
                 for iid in f.layout.iter_inst(bid) {
                     let inst_data = f.dfg.inst(iid);
+                    if let Some(store) = <&sonatina_ir::inst::data::ObjStore as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
+                        if f.dfg.value_ty(*store.value()) == sonatina_ir::Type::F32 {
+                            return Err("spirv: f32 object storage is unsupported".to_string());
+                        }
+                    }
+                    if <&sonatina_ir::inst::data::ObjLoad as sonatina_ir::InstDowncast>::downcast(is, inst_data).is_some()
+                        && f.dfg.inst_result(iid).is_some_and(|value| f.dfg.value_ty(value) == sonatina_ir::Type::F32)
+                    {
+                        return Err("spirv: f32 object storage is unsupported".to_string());
+                    }
+                }
+            }
+            for bid in f.layout.iter_block() {
+                for iid in f.layout.iter_inst(bid) {
+                    let inst_data = f.dfg.inst(iid);
+                    if let Some(result) = f.dfg.inst_result(iid) {
+                        let result_ty = f.dfg.value_ty(result);
+                        let carrier_ty = match word {
+                            WordKind::U32 => sonatina_ir::Type::I32,
+                            WordKind::I64 => sonatina_ir::Type::I64,
+                        };
+                        if result_ty.is_integral()
+                            && result_ty != sonatina_ir::Type::I1
+                            && result_ty != carrier_ty
+                        {
+                            return Err(format!(
+                                "spirv: narrow or mixed integer instruction result {result:?} has unsupported type {result_ty:?}; expected {carrier_ty:?} carrier"
+                            ));
+                        }
+                    }
+                    if <&sonatina_ir::inst::control_flow::Phi as sonatina_ir::InstDowncast>::downcast(is, inst_data).is_some() {
+                        let phi_ty = f.dfg.inst_result(iid).map(|value| f.dfg.value_ty(value));
+                        let is_loop_header = loop_tree
+                            .loop_of_block(bid)
+                            .is_some_and(|lp| loop_tree.loop_header(lp) == bid);
+                        if is_loop_header && matches!(phi_ty, Some(sonatina_ir::Type::F32 | sonatina_ir::Type::I1)) {
+                            return Err(format!(
+                                "spirv: loop-header phi of type {:?} is unsupported until loop phi locals are per-value typed",
+                                phi_ty.unwrap()
+                            ));
+                        }
+                    }
                     if !spirv_instruction_is_lowered(is, inst_data) {
                         return Err(format!(
                             "spirv: instruction `{}` is unsupported by the SPIR-V translator",
@@ -1527,15 +1737,24 @@ fn translate_to_naga(
         // the input storage buffer stays at @group(0) @binding(1), no renumbering.
         let broadcast = param_count - 2;
         let effective_params = broadcast.max(1);
-        let input_members: Vec<naga::StructMember> = (0..effective_params)
-            .map(|i| naga::StructMember {
-                name: Some(format!("p{i}")),
-                ty: word_type,
-                binding: None,
-                offset: i as u32 * word_width,
-            })
-            .collect();
-        let input_span = effective_params as u32 * word_width;
+        let mut input_members = Vec::with_capacity(effective_params);
+        let mut input_span = 0;
+        let mut input_align = 1;
+        for (i, ty) in sig.args().iter().skip(2).copied().enumerate() {
+            let (naga_ty, width) = match ty {
+                sonatina_ir::Type::I32 => (word_type, 4),
+                sonatina_ir::Type::F32 => (f32_type, 4),
+                _ => return Err(format!("spirv render: broadcast arg {} has unsupported storage type {ty:?}", i + 2)),
+            };
+            input_members.push(naga::StructMember { name: Some(format!("p{i}")), ty: naga_ty, binding: None, offset: input_span });
+            input_span += width;
+            input_align = input_align.max(width);
+        }
+        if input_members.is_empty() {
+            input_members.push(naga::StructMember { name: Some("padding".into()), ty: word_type, binding: None, offset: 0 });
+            input_span = word_width;
+        }
+        input_span = (input_span + input_align - 1) & !(input_align - 1);
         let input_struct = naga_mod.types.insert(
             naga::Type {
                 name: Some("Input".into()),
@@ -1733,7 +1952,7 @@ fn translate_to_naga(
                     Err(err) => { body_error = Some(err); return; }
                 };
                 if let Err(err) = emit_naga_regions(
-                    function, inst_set, word, &scfg.regions, word_type,
+                    function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
                     &mut fs, &mut value_map, &mut phi_locals, &mut result_expr,
                 ) {
                     body_error = Some(err);
@@ -1852,15 +2071,26 @@ fn translate_to_naga(
     // broadcast input struct. Args 2.. are the shared broadcast params.
     let broadcast = if grid { param_count - 2 } else { param_count };
     let effective_params = broadcast.max(1);
-    let input_members: Vec<naga::StructMember> = (0..effective_params).map(|i| {
-        naga::StructMember {
-            name: Some(format!("p{i}")),
-            ty: word_type,
-            binding: None,
-            offset: i as u32 * word_width,
-        }
-    }).collect();
-    let input_span = effective_params as u32 * word_width;
+    let mut input_members = Vec::with_capacity(effective_params);
+    let mut input_span = 0;
+    let mut input_align = 1;
+    for (i, ty) in sig.args().iter().skip(if grid { 2 } else { 0 }).copied().enumerate() {
+        let (naga_ty, width) = match ty {
+            sonatina_ir::Type::I32 => (word_type, 4),
+            sonatina_ir::Type::I64 if word == WordKind::I64 => (word_type, 8),
+            sonatina_ir::Type::F32 => (f32_type, 4),
+            _ => return Err(format!("spirv: input arg {i} has unsupported storage type {ty:?}")),
+        };
+        input_span = (input_span + width - 1) & !(width - 1);
+        input_members.push(naga::StructMember { name: Some(format!("p{i}")), ty: naga_ty, binding: None, offset: input_span });
+        input_span += width;
+        input_align = input_align.max(width);
+    }
+    if input_members.is_empty() {
+        input_members.push(naga::StructMember { name: Some("padding".into()), ty: word_type, binding: None, offset: 0 });
+        input_span = word_width;
+    }
+    input_span = (input_span + input_align - 1) & !(input_align - 1);
 
     let input_struct = naga_mod.types.insert(
         naga::Type {
@@ -2135,7 +2365,7 @@ fn translate_to_naga(
                 Err(err) => { body_error = Some(err); return; }
             };
             if let Err(err) = emit_naga_regions(
-                function, inst_set, word, &scfg.regions, word_type,
+                function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
                 &mut func, &mut value_map, &mut phi_locals, &mut result_expr,
             ) {
                 body_error = Some(err);

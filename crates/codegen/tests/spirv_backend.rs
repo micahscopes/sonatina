@@ -388,6 +388,42 @@ fn spirv_loop_backedge_first_phi_argument_validates() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// Loop membership is a CFG property, not a relationship between allocated
+/// block identifiers. Here the backedge block is allocated before the header,
+/// so both phi predecessors have smaller IDs than the loop header.
+#[test]
+fn float_loop_phi_with_earlier_backedge_block_fails_closed() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %earlier_backedge(v0.i32) -> i32 {
+block0:
+    jump block2;
+block1:
+    v3.f32 = fadd v1 0x3f800000.f32;
+    jump block2;
+block2:
+    v1.f32 = phi (0x00000000.f32 block0) (v3 block1);
+    v2.i1 = flt v1 0x40800000.f32;
+    br v2 block1 block3;
+block3:
+    v4.i32 = f32_to_i32 v1;
+    return v4;
+}
+"#;
+    let module = sonatina_parser::parse_module(source)
+        .expect("earlier-backedge loop should parse")
+        .module;
+    let errors = match SpirvBackend::new().compile_module(&module) {
+        Err(errors) => errors,
+        Ok(_) => panic!("f32 loop-header phi must fail closed"),
+    };
+    let message = format!("{errors:?}");
+    assert!(
+        message.contains("loop-header phi") && message.to_lowercase().contains("f32"),
+        "expected named f32 loop-phi rejection, got: {message}"
+    );
+}
+
 /// B1 (mb2 browser-testable plan): a u32-word kernel must lower to a naga `Uint`
 /// scalar and produce BROWSER-PROFILE WGSL (no 64-bit scalar) that reparses and
 /// validates WITHOUT SHADER_INT64. This is the content-derived word gate: the
@@ -1060,11 +1096,17 @@ fn grid_broadcast_params() {
 fn grid_fail_closed() {
     let m = build_grid_i64_module();
     let e = expect_grid_err(&m, SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 1));
-    assert!(e.contains("u32 word"), "i64 word must name the u32 requirement: {e}");
+    assert!(
+        e.contains("coordinate args") && e.contains("i32"),
+        "i64 coordinate args must name the i32 coordinate requirement: {e}"
+    );
 
     let m = build_grid_1arg_module();
     let e = expect_grid_err(&m, SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 1));
-    assert!(e.contains("(px, py)"), "1-arg must name the px, py minimum: {e}");
+    assert!(
+        e.contains("coordinate args") && e.contains("i32"),
+        "1-arg kernel must name the two-coordinate requirement: {e}"
+    );
 
     let m = build_grid_objalloc_module();
     let e = expect_grid_err(&m, SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 1));
@@ -1351,51 +1393,24 @@ fn spirv_u32_sar_shape() {
     eprintln!("spirv_u32_sar_shape OK: bitcast-shift-bitcast + non-imm fails closed");
 }
 
-/// Test 3.3.4 (the keystone): the FIRST u32 loop EXECUTED on lavapipe. A grid
-/// escape-time kernel (signed `Slt` escape + `Sar`) runs on the GPU and every
-/// pixel equals the in-test integer reference.
+/// The escape-time grid contains a conditional inside its loop, which the
+/// legacy loop emitter cannot preserve. It must fail closed rather than flatten
+/// the branch and silently produce the wrong image.
 #[test]
-fn u32_escape_grid_executes_on_lavapipe() {
+fn u32_escape_grid_loop_with_conditional_fails_closed() {
     let module = build_u32_escape_grid();
-    let art = SpirvBackend::new()
+    let result = SpirvBackend::new()
         .with_grid()
         .with_workgroup_size(8, 8, 1)
-        .compile_module(&module)
-        .expect("u32 escape grid must compile");
-    assert_eq!(art.layout.word, WordKind::U32, "u32 word");
-    assert_eq!(art.layout.mode, LayoutMode::Grid, "grid mode");
-    let wgsl = art.wgsl.as_ref().expect("WGSL");
-    // Honesty checks: the loop really emitted, and the signed ops really went
-    // through the i32 bitcast sign mapping.
-    assert!(wgsl.contains("loop"), "the escape loop must emit a `loop`:\n{wgsl}");
-    assert!(wgsl.contains("bitcast<i32>"), "signed Slt/Sar must bitcast to i32:\n{wgsl}");
-    for tok in ["i64", "u64"] {
-        assert!(!wgsl.contains(tok), "browser profile: no `{tok}`:\n{wgsl}");
-    }
-
-    let (w, h, wgx, wgy) = (32u32, 32u32, 8u32, 8u32);
-    let out = run_grid_u32(wgsl, w, h, wgx, wgy, &[]);
-    assert_eq!(out.len(), (w * h) as usize, "full grid readback");
-
-    let mut distinct = std::collections::HashSet::new();
-    let mut saw_interior = false;
-    let mut saw_early = false;
-    for y in 0..h {
-        for x in 0..w {
-            let got = out[(y * w + x) as usize];
-            let want = escape_ref(x as i32, y as i32);
-            assert_eq!(got, want, "escape[{y}*{w}+{x}] gpu={got} != ref={want}");
-            distinct.insert(got);
-            if got == 50 { saw_interior = true; }
-            if got <= 3 { saw_early = true; }
-        }
-    }
-    assert!(distinct.len() >= 5, "escape-time grid must have variety; got {} distinct", distinct.len());
-    assert!(saw_interior, "some pixel must be interior (== 50)");
-    assert!(saw_early, "some pixel must escape early (<= 3)");
-    eprintln!(
-        "u32_escape_grid_executes_on_lavapipe OK: {w}x{h}, {} distinct escape counts, all == reference",
-        distinct.len()
+        .compile_module(&module);
+    let error = match result {
+        Ok(_) => panic!("u32 escape grid loop containing a conditional must fail closed"),
+        Err(error) => error,
+    };
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("loop") && message.contains("conditional"),
+        "expected a named loop-conditional diagnostic, got: {message}"
     );
 }
 
@@ -1965,12 +1980,18 @@ fn render_fail_closed() {
     // i64 word (build_grid_i64_module is a 2-arg i64 kernel).
     let m = build_grid_i64_module();
     let e = expect_render_err(&m, SpirvBackend::new().with_render());
-    assert!(e.contains("u32 word"), "i64 word must name the u32 requirement: {e}");
+    assert!(
+        e.contains("coordinate args") && e.contains("i32"),
+        "i64 coordinate args must name the i32 coordinate requirement: {e}"
+    );
 
     // < 2 args.
     let m = build_grid_1arg_module();
     let e = expect_render_err(&m, SpirvBackend::new().with_render());
-    assert!(e.contains("(px, py)"), "1-arg must name the px, py minimum: {e}");
+    assert!(
+        e.contains("coordinate args") && e.contains("i32"),
+        "1-arg kernel must name the two-coordinate requirement: {e}"
+    );
 
     // ObjAlloc (batch).
     let m = build_grid_objalloc_module();
@@ -2020,57 +2041,23 @@ fn render_ramp_executes_on_lavapipe() {
     eprintln!("render_ramp_executes_on_lavapipe OK: {w}x{h}, all {} pixels byte-exact", w * h);
 }
 
-/// The real thing: the escape-time mandelbrot AND its coloring, as ONE Fe render
-/// fragment, RENDERS on lavapipe to a 64x64 rgba8unorm offscreen target with
-/// EVERY pixel byte-exact vs the in-test Rust oracle (escape-time + the integer
-/// ramp, independently written). Fe compiled the mandelbrot and its color; the
-/// GPU rendered every pixel; JavaScript painted nothing.
+/// The Mandelbrot fragment contains a conditional inside its escape loop, which
+/// the legacy loop emitter cannot preserve. It must fail closed rather than
+/// flatten the branch and silently render the wrong image.
 #[test]
-fn render_mandelbrot_executes_on_lavapipe() {
+fn render_mandelbrot_loop_with_conditional_fails_closed() {
     let module = build_mandel_frag_module();
-    let art = SpirvBackend::new()
+    let result = SpirvBackend::new()
         .with_render()
-        .compile_module(&module)
-        .expect("mandel render fragment must compile");
-    assert_eq!(art.layout.mode, LayoutMode::Render, "render mode");
-    let wgsl = art.wgsl.as_ref().expect("WGSL");
-    // Honesty checks: the escape loop really emitted, signed ops went through the
-    // i32 bitcast, the color ramp used the direct u32 logical shift.
-    assert!(wgsl.contains("loop"), "the escape loop must emit a `loop`:\n{wgsl}");
-    assert!(wgsl.contains("bitcast<i32>"), "signed Slt/Sar must bitcast to i32:\n{wgsl}");
-    assert!(wgsl.contains("unpack4x8unorm"), "epilogue must be unpack4x8unorm:\n{wgsl}");
-    for tok in ["i64", "u64"] {
-        assert!(!wgsl.contains(tok), "browser profile: no `{tok}`:\n{wgsl}");
-    }
-
-    let (w, h) = (64u32, 64u32);
-    let bytes = run_render_rgba8(wgsl, w, h, &[]);
-    assert_eq!(bytes.len(), (w * h * 4) as usize, "full frame readback");
-
-    let mut mismatches = 0u32;
-    let mut distinct = std::collections::HashSet::new();
-    let mut saw_interior = false;
-    for y in 0..h {
-        for x in 0..w {
-            let off = ((y * w + x) * 4) as usize;
-            let got = &bytes[off..off + 4];
-            let want = mandel_ref(x as i32, y as i32);
-            if got != want {
-                if mismatches < 5 {
-                    eprintln!("  MISMATCH at ({x},{y}): got {got:?} want {want:?}");
-                }
-                mismatches += 1;
-            }
-            distinct.insert(want);
-            if want == [0, 0, 0, 255] { saw_interior = true; }
-        }
-    }
-    assert_eq!(mismatches, 0, "rendered mandelbrot must equal the oracle byte-for-byte");
-    assert!(distinct.len() >= 5, "mandelbrot must have color variety; got {} distinct", distinct.len());
-    assert!(saw_interior, "some pixel must be interior black [0,0,0,255]");
-    eprintln!(
-        "render_mandelbrot_executes_on_lavapipe OK: {w}x{h}, all {} pixels byte-exact, {} distinct colors",
-        w * h, distinct.len()
+        .compile_module(&module);
+    let error = match result {
+        Ok(_) => panic!("Mandelbrot render loop containing a conditional must fail closed"),
+        Err(error) => error,
+    };
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("loop") && message.contains("conditional"),
+        "expected a named loop-conditional diagnostic, got: {message}"
     );
 }
 
@@ -2114,4 +2101,311 @@ func public %unsupported(v0.i32, v1.i32, v2.i32) -> i32 {
             "{mode} error must explain failure: {rendered}"
         );
     }
+}
+
+#[test]
+fn mixed_i32_coordinate_f32_grid_executes_on_lavapipe() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %mixed(v0.i32, v1.i32, v2.f32, v3.f32) -> i32 {
+    block0:
+        v4.i1 = lt v0 v1;
+        br v4 block1 block2;
+    block1:
+        v5.f32 = fadd v2 v3;
+        jump block3;
+    block2:
+        v6.f32 = i32_to_f32 -1.i32;
+        jump block3;
+    block3:
+        v7.f32 = phi (v5 block1) (v6 block2);
+        v8.i32 = f32_to_i32 v7;
+        return v8;
+}
+
+"#;
+    let module = sonatina_parser::parse_module(source).expect("mixed grid should parse").module;
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(2, 2, 1)
+        .compile_module(&module).expect("mixed grid should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL should be emitted");
+    let input = artifact.layout.bindings.iter().find(|binding| matches!(binding.role, Role::Input)).unwrap();
+    assert_eq!(input.stride, 8, "two f32 broadcasts must occupy offsets 0 and 4");
+    assert!(wgsl.contains("p0_: f32") && wgsl.contains("p1_: f32"), "WGSL must reflect f32 broadcast members: {wgsl}");
+    let reparsed = naga::front::wgsl::parse_str(wgsl).expect("mixed WGSL should reparse");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default())
+        .validate(&reparsed).expect("mixed WGSL should validate without SHADER_INT64");
+    let input_bits = [3.0_f32.to_bits().to_le_bytes(), 4.0_f32.to_bits().to_le_bytes()].concat();
+    let output = run_grid_u32(wgsl, 4, 2, 2, 2, &input_bits);
+    assert_eq!(output, vec![u32::MAX, u32::MAX, u32::MAX, u32::MAX, 7, u32::MAX, u32::MAX, u32::MAX]);
+}
+
+#[test]
+fn render_reflects_two_f32_broadcast_members() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %render_broadcast(v0.i32, v1.i32, v2.f32, v3.f32) -> i32 {
+    block0:
+        v4.f32 = fadd v2 v3;
+        v5.i32 = f32_to_u32 v4;
+        return v5;
+}
+"#;
+    let module = sonatina_parser::parse_module(source).expect("render broadcasts should parse").module;
+    let artifact = SpirvBackend::new().with_render().compile_module(&module)
+        .expect("render broadcasts should compile");
+    let input = artifact.layout.bindings.iter().find(|binding| matches!(binding.role, Role::Input)).unwrap();
+    assert_eq!(input.stride, 8);
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL should be emitted");
+    assert!(wgsl.contains("p0_: f32") && wgsl.contains("p1_: f32"));
+    let reparsed = naga::front::wgsl::parse_str(wgsl).expect("render WGSL should reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("render WGSL should validate without SHADER_INT64");
+}
+
+#[test]
+fn f32_integer_conversions_saturate_on_lavapipe() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %saturating(v0.i32, v1.i32, v2.f32) -> i32 {
+    block0:
+        v3.i1 = lt v0 1.i32;
+        br v3 block1 block2;
+    block1:
+        v4.i32 = f32_to_i32 v2;
+        jump block3;
+    block2:
+        v5.i32 = f32_to_u32 v2;
+        jump block3;
+    block3:
+        v6.i32 = phi (v4 block1) (v5 block2);
+        return v6;
+}
+"#;
+    let module = sonatina_parser::parse_module(source).expect("conversion probe should parse").module;
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(2, 1, 1)
+        .compile_module(&module).expect("conversion probe should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL should be emitted");
+    let values = [
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        2_147_483_520.0,
+        2_147_483_648.0,
+        -2_147_483_648.0,
+        -2_147_483_904.0,
+        4_294_967_040.0,
+        4_294_967_296.0,
+        -1.0,
+        42.75,
+    ];
+    for value in values {
+        let output = run_grid_u32(wgsl, 2, 1, 2, 1, &value.to_bits().to_le_bytes());
+        assert_eq!(
+            output,
+            vec![(value as i32) as u32, value as u32],
+            "conversion mismatch for f32 bits {:#010x}",
+            value.to_bits(),
+        );
+    }
+}
+
+fn spirv_error(source: &str, backend: SpirvBackend) -> String {
+    let module = sonatina_parser::parse_module(source).expect("regression source should parse").module;
+    match backend.compile_module(&module) {
+        Err(errors) => errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"),
+        Ok(_) => panic!("regression must fail"),
+    }
+}
+
+#[test]
+fn i64_profile_remains_homogeneous_but_accepts_integer_literals() {
+    let mixed = r#"
+target = "wasm32-unknown-native"
+func public %mixed(v0.i32) -> i64 {
+    block0:
+        return v0;
+}
+"#;
+    let error = spirv_error(mixed, SpirvBackend::new());
+    assert!(error.contains("i64") && error.contains("homogeneous"), "{error}");
+
+    let literal = r#"
+target = "wasm32-unknown-native"
+func public %literal() -> i64 {
+    block0:
+        return 7.i32;
+}
+"#;
+    let module = sonatina_parser::parse_module(literal).expect("i32 literal in i64 profile should parse").module;
+    SpirvBackend::new().compile_module(&module).expect("i32 literal must retain i64-profile compatibility");
+}
+
+#[test]
+fn narrow_integer_intermediate_and_phi_results_fail_closed() {
+    let narrow_result = r#"
+target = "wasm32-unknown-native"
+func public %narrow_result() -> i32 {
+    block0:
+        v0.i8 = add 127.i8 1.i8;
+        return 0.i32;
+}
+"#;
+    let error = spirv_error(narrow_result, SpirvBackend::new());
+    assert!(
+        error.contains("integer instruction result") && error.contains("I8"),
+        "{error}"
+    );
+
+    let narrow_phi = r#"
+target = "wasm32-unknown-native"
+func public %narrow_phi(v0.i32) -> i32 {
+    block0:
+        v1.i1 = lt v0 1.i32;
+        br v1 block1 block2;
+    block1:
+        jump block3;
+    block2:
+        jump block3;
+    block3:
+        v2.i8 = phi (1.i8 block1) (2.i8 block2);
+        return v0;
+}
+"#;
+    let error = spirv_error(narrow_phi, SpirvBackend::new());
+    assert!(
+        error.contains("integer instruction result") && error.contains("I8"),
+        "{error}"
+    );
+}
+
+#[test]
+fn i64_profile_rejects_f32_values_and_conversions() {
+    for source in [
+        r#"
+target = "wasm32-unknown-native"
+func public %to_float() -> i64 {
+    block0:
+        v0.f32 = i32_to_f32 1.i32;
+        return 0.i64;
+}
+"#,
+        r#"
+target = "wasm32-unknown-native"
+func public %from_float() -> i64 {
+    block0:
+        v0.i32 = f32_to_i32 0x3f800000.f32;
+        return 0.i64;
+}
+"#,
+        r#"
+target = "wasm32-unknown-native"
+func public %unsigned_to_float() -> i64 {
+    block0:
+        v0.f32 = u32_to_f32 1.i32;
+        return 0.i64;
+}
+"#,
+        r#"
+target = "wasm32-unknown-native"
+func public %float_to_unsigned() -> i64 {
+    block0:
+        v0.i32 = f32_to_u32 0x3f800000.f32;
+        return 0.i64;
+}
+"#,
+    ] {
+        let error = spirv_error(source, SpirvBackend::new());
+        assert!(error.contains("spirv i64") && error.contains("f32"), "{error}");
+    }
+}
+
+#[test]
+fn storage_buffer_boolean_broadcast_fails_closed() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %boolean(v0.i32, v1.i32, v2.i1) -> i32 {
+    block0:
+        return v0;
+}
+"#;
+    let error = spirv_error(source, SpirvBackend::new().with_grid());
+    assert!(error.contains("boolean") && error.contains("storage-buffer"), "{error}");
+}
+
+#[test]
+fn float_and_boolean_loop_header_phis_fail_closed() {
+    let float_loop = r#"
+target = "wasm32-unknown-native"
+func public %float_loop(v0.i32) -> i32 {
+    block0:
+        jump block1;
+    block1:
+        v1.f32 = phi (0x00000000.f32 block0) (v4 block2);
+        v2.i1 = lt v0 4.i32;
+        br v2 block2 block3;
+    block2:
+        v4.f32 = fadd v1 0x3f800000.f32;
+        jump block1;
+    block3:
+        v5.i32 = f32_to_i32 v1;
+        return v5;
+}
+
+"#;
+    let error = spirv_error(float_loop, SpirvBackend::new());
+    assert!(error.contains("loop-header phi") && error.to_lowercase().contains("f32"), "{error}");
+
+    let bool_loop = r#"
+target = "wasm32-unknown-native"
+func public %bool_loop(v0.i32) -> i32 {
+    block0:
+        jump block1;
+    block1:
+        v1.i1 = phi (0.i1 block0) (v3 block2);
+        br v1 block2 block3;
+    block2:
+        v3.i1 = lt v0 1.i32;
+        jump block1;
+    block3:
+        return 0.i32;
+}
+"#;
+    let error = spirv_error(bool_loop, SpirvBackend::new());
+    assert!(error.contains("loop-header phi") && error.to_lowercase().contains("i1"), "{error}");
+}
+
+#[test]
+fn f32_object_load_and_store_have_named_rejections() {
+    let store = r#"
+target = "wasm32-unknown-native"
+type @box = {f32};
+func public %store(v0.i32, v1.i32, v2.f32) -> i32 {
+    block0:
+        v3.objref<@box> = obj.alloc @box;
+        v4.objref<f32> = obj.proj v3 0.i8;
+        obj.store v4 v2;
+        return v0;
+}
+"#;
+    let error = spirv_error(store, SpirvBackend::new().with_grid());
+    assert!(error.contains("f32 object storage"), "{error}");
+
+    let load = r#"
+target = "wasm32-unknown-native"
+type @box = {f32};
+func public %load(v0.i32, v1.i32) -> i32 {
+    block0:
+        v2.objref<@box> = obj.alloc @box;
+        v3.objref<f32> = obj.proj v2 0.i8;
+        v4.f32 = obj.load v3;
+        v5.i32 = f32_to_i32 v4;
+        return v5;
+}
+"#;
+    let error = spirv_error(load, SpirvBackend::new().with_grid());
+    assert!(error.contains("f32 object storage"), "{error}");
 }
