@@ -19,7 +19,7 @@ use sonatina_ir::{
 };
 
 use crate::{
-    domtree::{DomTree, DominatorTreeTraversable},
+    domtree::DomTree,
     loop_analysis::{Loop, LoopTree},
 };
 
@@ -70,9 +70,6 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
     let mut loop_tree = LoopTree::new();
     loop_tree.compute(&cfg, &domtree);
 
-    let mut dom_children = DominatorTreeTraversable::default();
-    dom_children.compute(&domtree);
-
     let rpo = domtree.rpo().to_vec();
 
     if rpo.is_empty() {
@@ -86,7 +83,6 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
         function,
         is: function.inst_set(),
         cfg: &cfg,
-        dom_children: &dom_children,
         loop_tree: &loop_tree,
     };
     let mut active = HashSet::new();
@@ -122,7 +118,6 @@ struct Structurer<'a> {
     function: &'a Function,
     is: &'a dyn InstSetBase,
     cfg: &'a ControlFlowGraph,
-    dom_children: &'a DominatorTreeTraversable,
     loop_tree: &'a LoopTree,
 }
 
@@ -237,7 +232,8 @@ impl Structurer<'_> {
 
             if active.contains(&b) || !consumed.insert(b) {
                 return Err(format!(
-                    "spirv structurize: cyclic or multiply consumed block {b:?}"
+                    "spirv structurize: cyclic or multiply consumed block {b:?} while building \
+                     sequence {start:?}..{stop:?}; active={active:?}"
                 ));
             }
             active.insert(b);
@@ -278,15 +274,11 @@ impl Structurer<'_> {
                     cur = None;
                 }
                 Term::Br(nz, z) => {
-                    // A conditional nested inside an outer arm may converge at
-                    // that arm's stop block even though the stop is not
-                    // dominated by the nested header (the outer sibling also
-                    // reaches it). Treat the enclosing stop as the nested
-                    // merge so its branches stop before consuming the block;
-                    // the enclosing sequence remains its sole block owner.
-                    let merge = self.find_merge(b, cur_loop)?.or_else(|| {
-                        stop.filter(|candidate| self.cfg.pred_num_of(*candidate) >= 2)
-                    });
+                    // Reachability-based merge discovery includes an enclosing
+                    // arm's stop whenever both successors really converge
+                    // there, without mistaking an unrelated outer join for
+                    // this conditional's merge.
+                    let merge = self.find_merge(b, cur_loop)?;
                     let then_branch = self.build_branch(
                         b, nz, merge, cur_loop, active, consumed,
                     )?;
@@ -327,6 +319,16 @@ impl Structurer<'_> {
         if Some(target) == merge {
             return Ok(Vec::new());
         }
+        if let Some(merge) = merge
+            && self.is_transparent_forwarder(target, merge)
+        {
+            // Empty source-level arms can share the same forwarding block.
+            // Duplicate that semantically empty region in each structured arm
+            // so its merge-edge phi transport is preserved without granting
+            // general multiply-owned blocks.
+            consumed.insert(target);
+            return Ok(vec![Region::Block(target)]);
+        }
         if let Some(lp) = cur_loop
             && !self.in_loop(target, lp)
             && (self.is_canonical_loop_exit(lp, target) || !self.returns(target))
@@ -355,6 +357,11 @@ impl Structurer<'_> {
     fn is_canonical_loop_exit(&self, lp: Loop, target: BlockId) -> bool {
         let header = self.loop_tree.loop_header(lp);
         self.loop_direct_exit(header, lp) == Some(target)
+    }
+
+    fn is_transparent_forwarder(&self, block: BlockId, target: BlockId) -> bool {
+        matches!(self.term(block), Term::Jump(destination) if destination == target)
+            && self.function.layout.iter_inst(block).count() == 1
     }
 
     fn validate_loop_exit_target(
@@ -457,22 +464,91 @@ impl Structurer<'_> {
         cur_loop: Option<Loop>,
     ) -> Result<Option<BlockId>, String> {
         let loop_hdr = cur_loop.map(|lp| self.loop_tree.loop_header(lp));
-        let joins: Vec<BlockId> = self
-            .dom_children
-            .children_of(header)
+        let Term::Br(_, _) = self.term(header) else {
+            return Ok(None);
+        };
+        let reachable = self.reachable_from(header);
+        let mut postdom = reachable
             .iter()
             .copied()
-            .filter(|&c| self.cfg.pred_num_of(c) >= 2 && Some(c) != loop_hdr)
-            .collect();
-        match joins.len() {
-            0 => Ok(None),
-            1 => Ok(Some(joins[0])),
+            .map(|block| {
+                let successors = self
+                    .cfg
+                    .succs_of(block)
+                    .copied()
+                    .filter(|successor| reachable.contains(successor))
+                    .collect::<Vec<_>>();
+                let initial = if successors.is_empty() {
+                    HashSet::from([block])
+                } else {
+                    reachable.clone()
+                };
+                (block, initial)
+            })
+            .collect::<HashMap<_, _>>();
+
+        loop {
+            let mut changed = false;
+            for &block in &reachable {
+                let successors = self
+                    .cfg
+                    .succs_of(block)
+                    .copied()
+                    .filter(|successor| reachable.contains(successor))
+                    .collect::<Vec<_>>();
+                if successors.is_empty() {
+                    continue;
+                }
+                let mut intersection = postdom[&successors[0]].clone();
+                for successor in &successors[1..] {
+                    intersection.retain(|candidate| postdom[successor].contains(candidate));
+                }
+                intersection.insert(block);
+                if intersection != postdom[&block] {
+                    postdom.insert(block, intersection);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let strict = postdom[&header]
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != header && Some(*candidate) != loop_hdr)
+            .collect::<HashSet<_>>();
+        let immediate = strict
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                strict
+                    .iter()
+                    .all(|other| candidate == other || postdom[candidate].contains(other))
+            })
+            .collect::<Vec<_>>();
+        match immediate.as_slice() {
+            [] => Ok(None),
+            [merge] => Ok(Some(*merge)),
             _ => Err(format!(
-                "spirv structurize: {} merge candidates dominated by block {header:?} \
-                 (unstructured/unsupported control-flow shape)",
-                joins.len()
+                "spirv structurize: {} immediate postdominator candidates for block {header:?} \
+                 (irreducible/unsupported control-flow shape)",
+                immediate.len()
             )),
         }
+    }
+
+    fn reachable_from(&self, from: BlockId) -> HashSet<BlockId> {
+        let mut seen = HashSet::new();
+        let mut pending = vec![from];
+        while let Some(block) = pending.pop() {
+            if !seen.insert(block) {
+                continue;
+            }
+            pending.extend(self.cfg.succs_of(block).copied());
+        }
+        seen
     }
 }
 
@@ -624,6 +700,100 @@ mod tests {
             other => panic!("expected IfThenElse, got {other:?}"),
         }
         assert!(matches!(s.regions[1], Region::Block(_)));
+    }
+
+    /// One outer arm contains a nested diamond while the sibling enters the
+    /// nested diamond's convergence directly. The shared block is the outer
+    /// merge; it must not be consumed inside the first arm and then visited a
+    /// second time from the sibling.
+    #[test]
+    fn sibling_start_at_nested_convergence_uses_shared_merge() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("shared_merge", Linkage::Public, &[Type::I1, Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let nested = fb.append_block();
+        let nested_then = fb.append_block();
+        let nested_else = fb.append_block();
+        let shared = fb.append_block();
+        let exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(Br::new(is, fb.args()[0], nested, shared));
+        fb.switch_to_block(nested);
+        fb.insert_inst_no_result(Br::new(
+            is,
+            fb.args()[1],
+            nested_then,
+            nested_else,
+        ));
+        fb.switch_to_block(nested_then);
+        fb.insert_inst_no_result(Jump::new(is, shared));
+        fb.switch_to_block(nested_else);
+        fb.insert_inst_no_result(Jump::new(is, shared));
+        fb.switch_to_block(shared);
+        fb.insert_inst_no_result(Jump::new(is, exit));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        match &structured.regions[0] {
+            Region::IfThenElse { merge, .. } => assert_eq!(*merge, Some(shared)),
+            other => panic!("expected outer IfThenElse, got {other:?}"),
+        }
+        assert!(matches!(structured.regions[1], Region::Block(block) if block == shared));
+    }
+
+    /// Two nested selections may share the same empty else-arm forwarding
+    /// block while their actual postdominating merge is one block later.
+    #[test]
+    fn nested_and_outer_arms_may_share_transparent_forwarder() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("shared_forwarder", Linkage::Public, &[Type::I1, Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let outer = fb.append_block();
+        let nested = fb.append_block();
+        let body = fb.append_block();
+        let shared_forwarder = fb.append_block();
+        let merge = fb.append_block();
+
+        fb.switch_to_block(outer);
+        fb.insert_inst_no_result(Br::new(is, fb.args()[0], nested, shared_forwarder));
+        fb.switch_to_block(nested);
+        fb.insert_inst_no_result(Br::new(is, fb.args()[1], body, shared_forwarder));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(shared_forwarder);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(merge);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        match &structured.regions[0] {
+            Region::IfThenElse {
+                then_branch,
+                else_branch,
+                merge: selected,
+                ..
+            } => {
+                assert_eq!(*selected, Some(merge));
+                assert!(matches!(else_branch.as_slice(), [Region::Block(block)] if *block == shared_forwarder));
+                assert!(matches!(
+                    then_branch.as_slice(),
+                    [Region::IfThenElse { merge: Some(inner_merge), .. }]
+                        if *inner_merge == merge
+                ));
+            }
+            other => panic!("expected outer IfThenElse, got {other:?}"),
+        }
     }
 
     /// An if-WITHOUT-else (triangle) structurizes with an empty arm.
@@ -838,7 +1008,8 @@ mod tests {
             err.contains("cyclic")
                 || err.contains("consumed")
                 || err.contains("reachable")
-                || err.contains("unstructured/unsupported"),
+                || err.contains("unstructured/unsupported")
+                || err.contains("irreducible/unsupported"),
             "expected a named fail-closed structurizer error, got: {err}"
         );
     }
