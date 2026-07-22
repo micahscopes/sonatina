@@ -759,11 +759,64 @@ fn emit_naga_regions(
                 if body.iter().any(|region| matches!(region, crate::structurize::Region::Loop { .. })) {
                     return Err(format!("spirv structurize: loop {header:?} nested inside a loop is not supported yet"));
                 }
-                region_idx += 1;
-                emit_recursive_loop_region(
+                let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
                     func, value_map, phi_locals, result_expr,
                 )?;
+                region_idx += 1;
+                if let Some(loop_return) = loop_return {
+                    let saved_body = std::mem::replace(&mut func.body, naga::Block::new());
+                    let mut continuation_result = None;
+                    emit_naga_regions(
+                        function, inst_set, word, &regions[region_idx..], word_type, f32_type,
+                        bool_type, func, value_map, phi_locals, &mut continuation_result,
+                    )?;
+                    let mut continuation = std::mem::replace(&mut func.body, saved_body);
+                    if let Some(value) = continuation_result {
+                        let pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(loop_return.result),
+                            naga::Span::UNDEFINED,
+                        );
+                        continuation.push(
+                            naga::Statement::Store { pointer, value },
+                            naga::Span::UNDEFINED,
+                        );
+                    }
+                    let returned_pointer = func.expressions.append(
+                        naga::Expression::LocalVariable(loop_return.did_return),
+                        naga::Span::UNDEFINED,
+                    );
+                    let returned = func.expressions.append(
+                        naga::Expression::Load { pointer: returned_pointer },
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(returned, returned)),
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::If {
+                            condition: returned,
+                            accept: naga::Block::new(),
+                            reject: continuation,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    let result_pointer = func.expressions.append(
+                        naga::Expression::LocalVariable(loop_return.result),
+                        naga::Span::UNDEFINED,
+                    );
+                    let loaded = func.expressions.append(
+                        naga::Expression::Load { pointer: result_pointer },
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                        naga::Span::UNDEFINED,
+                    );
+                    *result_expr = Some(loaded);
+                    return Ok(());
+                }
             }
             crate::structurize::Region::IfThenElse { .. } => {
                 let mut target = naga::Block::new();
@@ -905,6 +958,9 @@ fn emit_if_region(
         return Err(format!("spirv structurize: conditional {header:?} without a merge is not supported yet"));
     };
     ensure_phi_locals(function, inst_set, *merge, word_type, f32_type, bool_type, func, phi_locals);
+    emit_phi_loads_for_block(
+        function, inst_set, *header, func, target, value_map, phi_locals,
+    );
     emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr);
     let branch = function.layout.iter_inst(*header).find_map(|inst_id|
         <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(inst_id))
@@ -1003,6 +1059,12 @@ enum RegionOutcome {
 }
 
 #[cfg(feature = "spirv-backend")]
+struct LoopReturnTransport {
+    result: naga::Handle<naga::LocalVariable>,
+    did_return: naga::Handle<naga::LocalVariable>,
+}
+
+#[cfg(feature = "spirv-backend")]
 fn emit_regions_in_loop(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
@@ -1013,6 +1075,8 @@ fn emit_regions_in_loop(
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     return_local: naga::Handle<naga::LocalVariable>,
+    did_return_local: naga::Handle<naga::LocalVariable>,
+    may_return: &mut bool,
     func: &mut naga::Function,
     target: &mut naga::Block,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
@@ -1040,6 +1104,16 @@ fn emit_regions_in_loop(
                             .ok_or_else(|| format!("spirv: unresolved return in {block:?}"))?;
                         let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
                         target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+                        let returned = func.expressions.append(
+                            naga::Expression::Literal(naga::Literal::Bool(true)),
+                            naga::Span::UNDEFINED,
+                        );
+                        let pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(did_return_local),
+                            naga::Span::UNDEFINED,
+                        );
+                        target.push(naga::Statement::Store { pointer, value: returned }, naga::Span::UNDEFINED);
+                        *may_return = true;
                         target.push(naga::Statement::Break, naga::Span::UNDEFINED);
                         return Ok(RegionOutcome::Terminal);
                     }
@@ -1050,6 +1124,9 @@ fn emit_regions_in_loop(
                 if let Some(merge) = merge {
                     ensure_phi_locals(function, inst_set, *merge, word_type, f32_type, bool_type, func, phi_locals);
                 }
+                emit_phi_loads_for_block(
+                    function, inst_set, *header, func, target, value_map, phi_locals,
+                );
                 emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr);
                 let branch = function.layout.iter_inst(*header).find_map(|iid|
                     <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(iid))
@@ -1061,10 +1138,10 @@ fn emit_regions_in_loop(
                 let mut accept_values = value_map.clone();
                 let mut reject_values = value_map.clone();
                 let then_outcome = if then_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
-                    emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, word_type, f32_type, bool_type, return_local, func, &mut accept, &mut accept_values, phi_locals, result_expr)?
+                    emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut accept, &mut accept_values, phi_locals, result_expr)?
                 };
                 let else_outcome = if else_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
-                    emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, word_type, f32_type, bool_type, return_local, func, &mut reject, &mut reject_values, phi_locals, result_expr)?
+                    emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut reject, &mut reject_values, phi_locals, result_expr)?
                 };
                 if let Some(merge) = merge {
                     if let RegionOutcome::Fallthrough(from) = then_outcome {
@@ -1110,6 +1187,19 @@ fn emit_regions_in_loop(
                         naga::Statement::Store { pointer, value },
                         naga::Span::UNDEFINED,
                     );
+                    let returned = func.expressions.append(
+                        naga::Expression::Literal(naga::Literal::Bool(true)),
+                        naga::Span::UNDEFINED,
+                    );
+                    let pointer = func.expressions.append(
+                        naga::Expression::LocalVariable(did_return_local),
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(
+                        naga::Statement::Store { pointer, value: returned },
+                        naga::Span::UNDEFINED,
+                    );
+                    *may_return = true;
                 }
                 target.push(naga::Statement::Break, naga::Span::UNDEFINED);
                 return Ok(RegionOutcome::Terminal);
@@ -1132,8 +1222,8 @@ fn emit_recursive_loop_region(
     func: &mut naga::Function,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
-    result_expr: &mut Option<naga::Handle<naga::Expression>>,
-) -> Result<(), String> {
+    _result_expr: &mut Option<naga::Handle<naga::Expression>>,
+) -> Result<Option<LoopReturnTransport>, String> {
     use sonatina_ir::InstDowncast;
     let mut loop_blocks = std::collections::HashSet::new();
     loop_blocks.insert(header);
@@ -1160,6 +1250,18 @@ fn emit_recursive_loop_region(
     };
     let return_local = func.local_variables.append(
         naga::LocalVariable { name: Some("loop_result".into()), ty: return_naga_ty, init: None },
+        naga::Span::UNDEFINED,
+    );
+    let returned_false = func.expressions.append(
+        naga::Expression::Literal(naga::Literal::Bool(false)),
+        naga::Span::UNDEFINED,
+    );
+    let did_return_local = func.local_variables.append(
+        naga::LocalVariable {
+            name: Some("loop_did_return".into()),
+            ty: bool_type,
+            init: Some(returned_false),
+        },
         naga::Span::UNDEFINED,
     );
     let mut header_carry_locals = Vec::new();
@@ -1189,9 +1291,16 @@ fn emit_recursive_loop_region(
         );
         header_carry_locals.push((result, local));
     }
+    // Loop-internal Returns are transported through `return_local`; their
+    // expression handles are scoped to nested Naga blocks and must never be
+    // published to the enclosing function result sink.
+    let mut nested_result_expr = None;
     let mut loop_body = naga::Block::new();
     emit_phi_loads_for_block(function, inst_set, header, func, &mut loop_body, value_map, phi_locals);
-    emit_block_to_target(function, inst_set, word, header, func, &mut loop_body, value_map, phi_locals, result_expr);
+    emit_block_to_target(
+        function, inst_set, word, header, func, &mut loop_body, value_map,
+        phi_locals, &mut nested_result_expr,
+    );
     let branch = function.layout.iter_inst(header).find_map(|iid|
         <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(iid))
     ).ok_or_else(|| format!("spirv: loop header {header:?} has no branch"))?;
@@ -1206,9 +1315,11 @@ fn emit_recursive_loop_region(
     ensure_phi_locals(function, inst_set, exit, word_type, f32_type, bool_type, func, phi_locals);
     let mut continue_arm = naga::Block::new();
     let mut continue_values = value_map.clone();
+    let mut may_return = false;
     emit_regions_in_loop(
         function, inst_set, word, body_regions, header, word_type, f32_type, bool_type,
-        return_local, func, &mut continue_arm, &mut continue_values, phi_locals, result_expr,
+        return_local, did_return_local, &mut may_return, func, &mut continue_arm,
+        &mut continue_values, phi_locals, &mut nested_result_expr,
     )?;
     let mut exit_arm = naga::Block::new();
     let mut exit_values = value_map.clone();
@@ -1220,11 +1331,24 @@ fn emit_recursive_loop_region(
         emit_phi_loads_for_block(
             function, inst_set, exit, func, &mut exit_arm, &mut exit_values, phi_locals,
         );
-        emit_block_to_target(function, inst_set, word, exit, func, &mut exit_arm, &mut exit_values, phi_locals, result_expr);
+        emit_block_to_target(
+            function, inst_set, word, exit, func, &mut exit_arm, &mut exit_values,
+            phi_locals, &mut nested_result_expr,
+        );
         let value = resolve_naga_value(ret, function, word, &mut exit_values, phi_locals, func)
             .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
         let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
         exit_arm.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+        let returned = func.expressions.append(
+            naga::Expression::Literal(naga::Literal::Bool(true)),
+            naga::Span::UNDEFINED,
+        );
+        let pointer = func.expressions.append(
+            naga::Expression::LocalVariable(did_return_local),
+            naga::Span::UNDEFINED,
+        );
+        exit_arm.push(naga::Statement::Store { pointer, value: returned }, naga::Span::UNDEFINED);
+        may_return = true;
     }
     for &(result, local) in &header_carry_locals {
         let value = *value_map.get(&result)
@@ -1262,13 +1386,10 @@ fn emit_recursive_loop_region(
         value_map.insert(result, loaded);
     }
 
-    if exit_return.is_some() {
-        let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
-        let loaded = func.expressions.append(naga::Expression::Load { pointer }, naga::Span::UNDEFINED);
-        func.body.push(naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)), naga::Span::UNDEFINED);
-        *result_expr = Some(loaded);
-    }
-    Ok(())
+    Ok(may_return.then_some(LoopReturnTransport {
+        result: return_local,
+        did_return: did_return_local,
+    }))
 }
 
 /// Find the return value (ValueId) of a block that contains a Return instruction.
