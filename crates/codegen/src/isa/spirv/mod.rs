@@ -1266,6 +1266,28 @@ fn unsupported_signed_op_under_u32(
 }
 
 #[cfg(feature = "spirv-backend")]
+fn spirv_instruction_is_lowered(
+    is: &dyn sonatina_ir::InstSetBase,
+    inst: &dyn sonatina_ir::Inst,
+) -> bool {
+    use sonatina_ir::{InstDowncast, inst::{arith, cmp, control_flow, data}};
+
+    inst.is_terminator()
+        || <&control_flow::Phi as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Add as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Sub as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Mul as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Sar as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Shr as InstDowncast>::downcast(is, inst).is_some()
+        || <&cmp::Lt as InstDowncast>::downcast(is, inst).is_some()
+        || <&cmp::Slt as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjAlloc as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjLoad as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjIndex as InstDowncast>::downcast(is, inst).is_some()
+}
+
+#[cfg(feature = "spirv-backend")]
 fn translate_to_naga(
     module: &Module,
     workgroup_size: [u32; 3],
@@ -1351,6 +1373,12 @@ fn translate_to_naga(
             for bid in f.layout.iter_block() {
                 for iid in f.layout.iter_inst(bid) {
                     let inst_data = f.dfg.inst(iid);
+                    if !spirv_instruction_is_lowered(is, inst_data) {
+                        return Err(format!(
+                            "spirv: instruction `{}` is unsupported by the SPIR-V translator",
+                            inst_data.as_text()
+                        ));
+                    }
                     if <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(
                         is, inst_data,
                     )

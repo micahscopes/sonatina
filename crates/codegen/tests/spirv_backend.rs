@@ -2073,3 +2073,45 @@ fn render_mandelbrot_executes_on_lavapipe() {
         w * h, distinct.len()
     );
 }
+
+#[test]
+fn unsupported_instruction_fails_closed_in_all_spirv_modes() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %unsupported(v0.i32, v1.i32, v2.i32) -> i32 {
+    block0:
+        v3.i32 = neg v2;
+        return v3;
+}
+"#;
+    let module = sonatina_parser::parse_module(source)
+        .expect("unsupported-op module should parse")
+        .module;
+    for (mode, backend) in [
+        ("scalar", SpirvBackend::new()),
+        ("grid", SpirvBackend::new().with_grid()),
+        ("render", SpirvBackend::new().with_render()),
+    ] {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.compile_module(&module)
+        }));
+        let compile = result.unwrap_or_else(|_| panic!("{mode} unsupported op must not panic"));
+        let errors = match compile {
+            Err(errors) => errors,
+            Ok(_) => panic!("{mode} unsupported op must fail"),
+        };
+        let rendered = errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("`neg`"),
+            "{mode} error must name neg: {rendered}"
+        );
+        assert!(
+            rendered.contains("unsupported"),
+            "{mode} error must explain failure: {rendered}"
+        );
+    }
+}
