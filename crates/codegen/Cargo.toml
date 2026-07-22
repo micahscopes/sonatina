@@ -96,6 +96,10 @@ name = "wasm_backend"
 required-features = ["cranelift", "wasm"]
 
 [[test]]
+name = "wasm_numeric_f32"
+required-features = ["cranelift", "wasm"]
+
+[[test]]
 name = "spirv_backend"
 required-features = ["cranelift", "wasm", "spirv-backend"]
 

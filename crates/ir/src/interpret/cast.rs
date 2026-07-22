@@ -77,3 +77,42 @@ impl Interpret for PtrToInt {
         }))
     }
 }
+
+macro_rules! impl_numeric_conversion {
+    ($inst:ty, $convert:expr) => {
+        impl Interpret for $inst {
+            fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+                state.set_action(Action::Continue);
+                let value = state.lookup_val(*self.from());
+                single_result(match value {
+                    super::EvalValue::Imm(imm) => ($convert)(imm),
+                    other => other,
+                })
+            }
+        }
+    };
+}
+
+impl_numeric_conversion!(I32ToF32, |imm| match imm {
+    crate::Immediate::I32(value) =>
+        super::EvalValue::Imm(crate::Immediate::F32((value as f32).to_bits(),)),
+    other => super::EvalValue::Imm(other),
+});
+
+impl_numeric_conversion!(U32ToF32, |imm| match imm {
+    crate::Immediate::I32(value) =>
+        super::EvalValue::Imm(crate::Immediate::F32(((value as u32) as f32).to_bits(),)),
+    other => super::EvalValue::Imm(other),
+});
+
+impl_numeric_conversion!(F32ToI32, |imm| match imm {
+    crate::Immediate::F32(bits) =>
+        super::EvalValue::Imm(crate::Immediate::I32(f32::from_bits(bits) as i32,)),
+    other => super::EvalValue::Imm(other),
+});
+
+impl_numeric_conversion!(F32ToU32, |imm| match imm {
+    crate::Immediate::F32(bits) =>
+        super::EvalValue::Imm(crate::Immediate::I32((f32::from_bits(bits) as u32) as i32,)),
+    other => super::EvalValue::Imm(other),
+});

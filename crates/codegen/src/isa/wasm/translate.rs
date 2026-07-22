@@ -629,6 +629,34 @@ fn translate_function(
                         }
                     }
                     // Trunc — wrap i64 to i32 if needed
+                    else if let Some(conv) = <&sonatina_ir::inst::cast::I32ToF32 as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let from = resolve_value(function, *conv.from(), &value_map, &mut body, wb).ok_or("unresolved i32_to_f32 source")?;
+                            let wval = body.add_op(wb, Operator::F32ConvertI32S, &[from], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(conv) = <&sonatina_ir::inst::cast::U32ToF32 as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let from = resolve_value(function, *conv.from(), &value_map, &mut body, wb).ok_or("unresolved u32_to_f32 source")?;
+                            let wval = body.add_op(wb, Operator::F32ConvertI32U, &[from], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(conv) = <&sonatina_ir::inst::cast::F32ToI32 as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let from = resolve_value(function, *conv.from(), &value_map, &mut body, wb).ok_or("unresolved f32_to_i32 source")?;
+                            let wval = body.add_op(wb, Operator::I32TruncSatF32S, &[from], &[WType::I32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(conv) = <&sonatina_ir::inst::cast::F32ToU32 as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let from = resolve_value(function, *conv.from(), &value_map, &mut body, wb).ok_or("unresolved f32_to_u32 source")?;
+                            let wval = body.add_op(wb, Operator::I32TruncSatF32U, &[from], &[WType::I32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
                     else if let Some(trunc) = <&sonatina_ir::inst::cast::Trunc as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let val = resolve_value(function, *trunc.from(), &value_map, &mut body, wb).ok_or("unresolved trunc")?;
