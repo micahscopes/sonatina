@@ -33,6 +33,11 @@ pub enum Region {
     /// block itself (phis, exit condition, exit branch) is referenced by
     /// `header` and consumed by the emitter's loop preamble.
     Loop { header: BlockId, body: Vec<Region> },
+    /// An edge from a loop body to that loop's canonical fallthrough block.
+    /// The source block remains a separate `Block` region when it contains
+    /// instructions; this marker preserves the exact predecessor needed for
+    /// exit-phi transport before the structured backend emits `break`.
+    LoopExit { from: BlockId, target: BlockId },
     /// An if-then-else with a condition (header) block, then-regions,
     /// else-regions, and the join (merge) block, if any. The merge block itself
     /// stays a SIBLING in the enclosing `Vec<Region>`; the arm vectors contain
@@ -207,7 +212,16 @@ impl Structurer<'_> {
             match self.term(b) {
                 Term::Jump(t) => {
                     regions.push(Region::Block(b));
-                    cur = Some(t);
+                    if let Some(lp) = cur_loop
+                        && !self.in_loop(t, lp)
+                        && (self.is_canonical_loop_exit(lp, t) || !self.returns(t))
+                    {
+                        self.validate_loop_exit_target(lp, b, t)?;
+                        regions.push(Region::LoopExit { from: b, target: t });
+                        cur = None;
+                    } else {
+                        cur = Some(t);
+                    }
                 }
                 Term::Return => {
                     regions.push(Region::Block(b));
@@ -215,16 +229,12 @@ impl Structurer<'_> {
                 }
                 Term::Br(nz, z) => {
                     let merge = self.find_merge(b, cur_loop)?;
-                    let then_branch = if Some(nz) == merge {
-                        Vec::new()
-                    } else {
-                        self.build_seq(nz, merge, cur_loop, active, consumed)?
-                    };
-                    let else_branch = if Some(z) == merge {
-                        Vec::new()
-                    } else {
-                        self.build_seq(z, merge, cur_loop, active, consumed)?
-                    };
+                    let then_branch = self.build_branch(
+                        b, nz, merge, cur_loop, active, consumed,
+                    )?;
+                    let else_branch = self.build_branch(
+                        b, z, merge, cur_loop, active, consumed,
+                    )?;
                     regions.push(Region::IfThenElse {
                         header: b,
                         then_branch,
@@ -245,6 +255,66 @@ impl Structurer<'_> {
         }
 
         Ok(regions)
+    }
+
+    fn build_branch(
+        &self,
+        from: BlockId,
+        target: BlockId,
+        merge: Option<BlockId>,
+        cur_loop: Option<Loop>,
+        active: &mut HashSet<BlockId>,
+        consumed: &mut HashSet<BlockId>,
+    ) -> Result<Vec<Region>, String> {
+        if Some(target) == merge {
+            return Ok(Vec::new());
+        }
+        if let Some(lp) = cur_loop
+            && !self.in_loop(target, lp)
+            && (self.is_canonical_loop_exit(lp, target) || !self.returns(target))
+        {
+            if !self.is_canonical_loop_exit(lp, target)
+                && let Term::Jump(exit) = self.term(target)
+                && self.is_canonical_loop_exit(lp, exit)
+            {
+                if !consumed.insert(target) {
+                    return Err(format!(
+                        "spirv structurize: cyclic or multiply consumed block {target:?}"
+                    ));
+                }
+                return Ok(vec![
+                    Region::Block(target),
+                    Region::LoopExit { from: target, target: exit },
+                ]);
+            }
+            self.validate_loop_exit_target(lp, from, target)?;
+            return Ok(vec![Region::LoopExit { from, target }]);
+        }
+        self.build_seq(target, merge, cur_loop, active, consumed)
+    }
+
+    fn is_canonical_loop_exit(&self, lp: Loop, target: BlockId) -> bool {
+        let header = self.loop_tree.loop_header(lp);
+        self.loop_direct_exit(header, lp) == Some(target)
+    }
+
+    fn validate_loop_exit_target(
+        &self,
+        lp: Loop,
+        from: BlockId,
+        target: BlockId,
+    ) -> Result<(), String> {
+        let header = self.loop_tree.loop_header(lp);
+        let canonical = self.loop_direct_exit(header, lp).ok_or_else(|| {
+            format!("spirv structurize: loop {header:?} has no canonical header exit")
+        })?;
+        if target != canonical {
+            return Err(format!(
+                "spirv structurize: loop body edge {from:?}->{target:?} targets a \
+                 noncanonical exit; expected the header exit {canonical:?}"
+            ));
+        }
+        Ok(())
     }
 
     /// Structure a loop's body: the region sequence entered at the header's
@@ -711,6 +781,49 @@ mod tests {
                 || err.contains("reachable")
                 || err.contains("unstructured/unsupported"),
             "expected a named fail-closed structurizer error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn noncanonical_loop_exit_target_fails_closed_by_name() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("two_loop_exits", Linkage::Public, &[]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let body = fb.append_block();
+        let latch = fb.append_block();
+        let canonical_exit = fb.append_block();
+        let other_exit = fb.append_block();
+        let terminal = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.make_imm_value(true);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, cond, body, canonical_exit));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Br::new(is, cond, other_exit, latch));
+        fb.switch_to_block(latch);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(canonical_exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(other_exit);
+        fb.insert_inst_no_result(Jump::new(is, terminal));
+        fb.switch_to_block(terminal);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let result = module
+            .func_store
+            .view(fr, |func| structurize_function(func));
+        let error = result.expect_err("a second non-return loop exit must fail closed");
+        assert!(
+            error.contains("noncanonical exit") && error.contains("expected the header exit"),
+            "expected a named noncanonical-exit error, got: {error}"
         );
     }
 }

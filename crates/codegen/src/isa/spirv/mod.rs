@@ -774,6 +774,9 @@ fn emit_naga_regions(
                 func.body.extend_block(target);
                 region_idx += 1;
             }
+            crate::structurize::Region::LoopExit { from, target } => return Err(format!(
+                "spirv: loop exit edge {from:?}->{target:?} appeared outside its loop"
+            )),
         }
     }
     Ok(())
@@ -821,6 +824,7 @@ fn region_blocks(regions: &[crate::structurize::Region], out: &mut std::collecti
                 out.insert(*header);
                 region_blocks(body, out);
             }
+            crate::structurize::Region::LoopExit { .. } => {}
         }
     }
 }
@@ -952,7 +956,8 @@ fn arm_outcome(
         }
         crate::structurize::Region::IfThenElse { merge: Some(_), .. } => ArmOutcome::AlreadyAtMerge,
         crate::structurize::Region::IfThenElse { merge: None, .. }
-        | crate::structurize::Region::Loop { .. } => ArmOutcome::Terminal,
+        | crate::structurize::Region::Loop { .. }
+        | crate::structurize::Region::LoopExit { .. } => ArmOutcome::Terminal,
     }
 }
 
@@ -983,6 +988,9 @@ fn emit_non_loop_regions(
             crate::structurize::Region::Loop { .. } => return Err(
                 "spirv structurize: loop nested inside conditional is not supported yet".to_string()
             ),
+            crate::structurize::Region::LoopExit { from, target } => return Err(format!(
+                "spirv: loop exit edge {from:?}->{target:?} appeared outside its loop"
+            )),
         }
     }
     Ok(())
@@ -1075,6 +1083,37 @@ fn emit_regions_in_loop(
                 target.push(naga::Statement::If { condition, accept, reject }, naga::Span::UNDEFINED);
             }
             crate::structurize::Region::Loop { .. } => return Err("spirv: nested loop emission is not implemented yet".to_string()),
+            crate::structurize::Region::LoopExit { from, target: exit } => {
+                ensure_phi_locals(
+                    function, inst_set, *exit, word_type, f32_type, bool_type, func, phi_locals,
+                );
+                emit_exact_phi_edge(
+                    function, inst_set, word, *from, *exit, func, target, value_map, phi_locals,
+                )?;
+                if let Some(ret) = find_block_return_value(*exit, function, inst_set) {
+                    emit_phi_loads_for_block(
+                        function, inst_set, *exit, func, target, value_map, phi_locals,
+                    );
+                    emit_block_to_target(
+                        function, inst_set, word, *exit, func, target, value_map, phi_locals,
+                        result_expr,
+                    );
+                    let value = resolve_naga_value(
+                        ret, function, word, value_map, phi_locals, func,
+                    )
+                    .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
+                    let pointer = func.expressions.append(
+                        naga::Expression::LocalVariable(return_local),
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(
+                        naga::Statement::Store { pointer, value },
+                        naga::Span::UNDEFINED,
+                    );
+                }
+                target.push(naga::Statement::Break, naga::Span::UNDEFINED);
+                return Ok(RegionOutcome::Terminal);
+            }
         }
     }
     outcome.ok_or_else(|| "spirv: empty region sequence has no control outcome".to_string())

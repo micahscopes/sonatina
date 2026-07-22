@@ -983,6 +983,154 @@ fn build_grid_loop_exit_phi_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+/// One shared loop exit receives distinct f32 state from two body `break`
+/// edges and the normal header exit. Grid x selects the path: 0 -> 11,
+/// 1 -> 22, and every other column runs one iteration and exits with 33.
+fn build_grid_multi_exit_f32_phi_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_multi_exit_f32_phi", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let first_test = fb.append_block();
+    let second_test = fb.append_block();
+    let latch = fb.append_block();
+    let exit = fb.append_block();
+    let sibling = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let initial = fb.make_imm_value(Immediate::F32(3.0f32.to_bits()));
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let value = fb.insert_inst(control_flow::Phi::new(is, vec![(initial, entry)]), Type::F32);
+    let one = fb.make_imm_value(1i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, one), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, first_test, exit));
+
+    fb.switch_to_block(first_test);
+    let eleven = fb.make_imm_value(Immediate::F32(11.0f32.to_bits()));
+    let is_first = fb.insert_inst(cmp::Lt::new(is, x, one), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, is_first, exit, second_test));
+
+    fb.switch_to_block(second_test);
+    let twenty_two = fb.make_imm_value(Immediate::F32(22.0f32.to_bits()));
+    let two = fb.make_imm_value(2i32);
+    let is_second = fb.insert_inst(cmp::Lt::new(is, x, two), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, is_second, exit, latch));
+
+    fb.switch_to_block(latch);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    let thirty = fb.make_imm_value(Immediate::F32(30.0f32.to_bits()));
+    let next_value = fb.insert_inst(arith::Fadd::new(is, value, thirty), Type::F32);
+    fb.append_phi_arg(i, next_i, latch);
+    fb.append_phi_arg(value, next_value, latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    let exit_value = fb.insert_inst(
+        control_flow::Phi::new(
+            is,
+            vec![(value, header), (eleven, first_test), (twenty_two, second_test)],
+        ),
+        Type::F32,
+    );
+    fb.insert_inst_no_result(control_flow::Jump::new(is, sibling));
+
+    fb.switch_to_block(sibling);
+    let output = fb.insert_inst(cast::F32ToI32::new(is, exit_value), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, output));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A directly-returning canonical exit phi is fed by the normal header edge,
+/// a conditional body edge, and an unconditional jump block outside the loop
+/// SCC. This pins both body-exit forms without relying on a following sibling.
+fn build_grid_direct_return_multi_exit_f32_phi_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_direct_return_multi_exit_f32_phi", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let first_test = fb.append_block();
+    let second_test = fb.append_block();
+    let jump_exit = fb.append_block();
+    let latch = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let initial = fb.make_imm_value(Immediate::F32(3.0f32.to_bits()));
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let value = fb.insert_inst(control_flow::Phi::new(is, vec![(initial, entry)]), Type::F32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, x), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, first_test, exit));
+
+    fb.switch_to_block(first_test);
+    let direct_value = fb.make_imm_value(Immediate::F32(41.0f32.to_bits()));
+    let two = fb.make_imm_value(2i32);
+    let takes_direct_exit = fb.insert_inst(cmp::Lt::new(is, x, two), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, takes_direct_exit, exit, second_test));
+
+    fb.switch_to_block(second_test);
+    let three = fb.make_imm_value(3i32);
+    let takes_jump_exit = fb.insert_inst(cmp::Lt::new(is, x, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, takes_jump_exit, jump_exit, latch));
+
+    fb.switch_to_block(jump_exit);
+    let jump_value = fb.make_imm_value(Immediate::F32(52.0f32.to_bits()));
+    fb.insert_inst_no_result(control_flow::Jump::new(is, exit));
+
+    fb.switch_to_block(latch);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    let ten = fb.make_imm_value(Immediate::F32(10.0f32.to_bits()));
+    let next_value = fb.insert_inst(arith::Fadd::new(is, value, ten), Type::F32);
+    fb.append_phi_arg(i, next_i, latch);
+    fb.append_phi_arg(value, next_value, latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    let exit_value = fb.insert_inst(
+        control_flow::Phi::new(
+            is,
+            vec![(value, header), (direct_value, first_test), (jump_value, jump_exit)],
+        ),
+        Type::F32,
+    );
+    let output = fb.insert_inst(cast::F32ToI32::new(is, exit_value), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, output));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 /// A 3-arg grid kernel with one broadcast param: `f(px, py, p) -> px + py*1024 + p`.
 /// arg2 is the broadcast input struct member p0; the load-bearing M3 shape.
 fn build_grid_broadcast_module() -> sonatina_ir::Module {
@@ -1439,6 +1587,47 @@ fn grid_loop_exit_phi_executes_on_lavapipe() {
     for y in 0..8u32 {
         for x in 0..8u32 {
             assert_eq!(output[(y * 8 + x) as usize], x + 10, "exit phi at ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn grid_multi_exit_f32_phi_executes_on_lavapipe() {
+    let module = build_grid_multi_exit_f32_phi_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("all loop exits should carry their exact f32 phi input");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let expected = match x { 0 => 11, 1 => 22, _ => 33 };
+            assert_eq!(output[(y * 8 + x) as usize], expected, "multi-exit phi at ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn grid_direct_return_multi_exit_f32_phi_executes_on_lavapipe() {
+    let module = build_grid_direct_return_multi_exit_f32_phi_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("direct-return loop exit phi should preserve every exact edge");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let expected = match x {
+                0 => 3,
+                1 => 41,
+                2 => 52,
+                _ => 3 + 10 * x,
+            };
+            assert_eq!(output[(y * 8 + x) as usize], expected, "direct-return exit at ({x}, {y})");
         }
     }
 }
