@@ -10,7 +10,7 @@
 //! an ambiguous merge, a loop with no recognizable header exit) returns a named
 //! `Err`, never a silently dropped branch.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use sonatina_ir::{
     BlockId, Function, InstDowncast, InstSetBase,
@@ -150,6 +150,49 @@ impl Structurer<'_> {
         matches!(self.term(b), Term::Return)
     }
 
+    /// Whether every path from `start` stays outside `lp` and terminates in a
+    /// Return. Loop analysis deliberately excludes these blocks from the loop
+    /// SCC, but structurally they belong to the early-return arm, not to the
+    /// loop's canonical break/fallthrough exit.
+    fn is_return_corridor(&self, start: BlockId, lp: Loop) -> bool {
+        fn visit(
+            s: &Structurer<'_>,
+            block: BlockId,
+            lp: Loop,
+            visiting: &mut HashSet<BlockId>,
+            memo: &mut HashMap<BlockId, bool>,
+        ) -> bool {
+            if let Some(&result) = memo.get(&block) {
+                return result;
+            }
+            if s.in_loop(block, lp) || s.is_canonical_loop_exit(lp, block) {
+                return false;
+            }
+            if !visiting.insert(block) {
+                return false;
+            }
+            let result = match s.term(block) {
+                Term::Return => true,
+                Term::Jump(target) => visit(s, target, lp, visiting, memo),
+                Term::Br(nz, z) => {
+                    visit(s, nz, lp, visiting, memo) && visit(s, z, lp, visiting, memo)
+                }
+                Term::Other => false,
+            };
+            visiting.remove(&block);
+            memo.insert(block, result);
+            result
+        }
+
+        visit(
+            self,
+            start,
+            lp,
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+        )
+    }
+
     fn in_loop(&self, b: BlockId, lp: Loop) -> bool {
         self.loop_tree.is_in_loop(b, lp)
     }
@@ -169,6 +212,8 @@ impl Structurer<'_> {
     ) -> Result<Vec<Region>, String> {
         let mut regions = Vec::new();
         let mut cur = Some(start);
+        let allow_return_corridor = cur_loop
+            .is_some_and(|lp| !self.in_loop(start, lp) && self.is_return_corridor(start, lp));
 
         while let Some(b) = cur {
             if Some(b) == stop {
@@ -181,7 +226,11 @@ impl Structurer<'_> {
                 }
                 // A fallthrough exit (a non-return block outside the loop) is
                 // resumed by the caller, not structured inside the loop.
-                if !self.in_loop(b, lp) && b != start && !self.returns(b) {
+                if !self.in_loop(b, lp)
+                    && b != start
+                    && !self.returns(b)
+                    && !allow_return_corridor
+                {
                     break;
                 }
             }
@@ -215,6 +264,7 @@ impl Structurer<'_> {
                     if let Some(lp) = cur_loop
                         && !self.in_loop(t, lp)
                         && (self.is_canonical_loop_exit(lp, t) || !self.returns(t))
+                        && !self.is_return_corridor(t, lp)
                     {
                         self.validate_loop_exit_target(lp, b, t)?;
                         regions.push(Region::LoopExit { from: b, target: t });
@@ -228,7 +278,15 @@ impl Structurer<'_> {
                     cur = None;
                 }
                 Term::Br(nz, z) => {
-                    let merge = self.find_merge(b, cur_loop)?;
+                    // A conditional nested inside an outer arm may converge at
+                    // that arm's stop block even though the stop is not
+                    // dominated by the nested header (the outer sibling also
+                    // reaches it). Treat the enclosing stop as the nested
+                    // merge so its branches stop before consuming the block;
+                    // the enclosing sequence remains its sole block owner.
+                    let merge = self.find_merge(b, cur_loop)?.or_else(|| {
+                        stop.filter(|candidate| self.cfg.pred_num_of(*candidate) >= 2)
+                    });
                     let then_branch = self.build_branch(
                         b, nz, merge, cur_loop, active, consumed,
                     )?;
@@ -272,6 +330,7 @@ impl Structurer<'_> {
         if let Some(lp) = cur_loop
             && !self.in_loop(target, lp)
             && (self.is_canonical_loop_exit(lp, target) || !self.returns(target))
+            && !self.is_return_corridor(target, lp)
         {
             if !self.is_canonical_loop_exit(lp, target)
                 && let Term::Jump(exit) = self.term(target)
@@ -785,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn noncanonical_loop_exit_target_fails_closed_by_name() {
+    fn loop_early_return_corridor_is_not_misclassified_as_break() {
         let (mb, is) = native_builder();
         let sig = Signature::new_unit("two_loop_exits", Linkage::Public, &[]);
         let fr = mb.declare_function(sig).unwrap();
@@ -817,10 +876,67 @@ mod tests {
         fb.finish();
 
         let module = mb.build();
+        let structured = module
+            .func_store
+            .view(fr, |func| structurize_function(func))
+            .expect("a return-only corridor should remain inside the loop arm");
+        let loop_body = structured
+            .regions
+            .iter()
+            .find_map(|region| match region {
+                Region::Loop { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("expected loop region");
+        assert!(
+            loop_body.iter().any(|region| matches!(
+                region,
+                Region::IfThenElse { then_branch, else_branch, .. }
+                    if then_branch
+                        .iter()
+                        .chain(else_branch)
+                        .filter(|r| matches!(r, Region::Block(_)))
+                        .count()
+                        >= 2
+            )),
+            "expected the two-block return corridor in the loop arm, got: {loop_body:?}"
+        );
+    }
+
+    #[test]
+    fn nonreturning_noncanonical_loop_exit_fails_closed_by_name() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("noncanonical_loop_exit", Linkage::Public, &[]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let body = fb.append_block();
+        let latch = fb.append_block();
+        let canonical_exit = fb.append_block();
+        let other_exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.make_imm_value(true);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, cond, body, canonical_exit));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Br::new(is, cond, other_exit, latch));
+        fb.switch_to_block(latch);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(other_exit);
+        fb.insert_inst_no_result(Br::new(is, cond, canonical_exit, canonical_exit));
+        fb.switch_to_block(canonical_exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
         let result = module
             .func_store
             .view(fr, |func| structurize_function(func));
-        let error = result.expect_err("a second non-return loop exit must fail closed");
+        let error = result.expect_err("a noncanonical break must fail closed");
         assert!(
             error.contains("noncanonical exit") && error.contains("expected the header exit"),
             "expected a named noncanonical-exit error, got: {error}"

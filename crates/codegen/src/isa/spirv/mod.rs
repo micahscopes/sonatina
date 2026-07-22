@@ -820,12 +820,63 @@ fn emit_naga_regions(
             }
             crate::structurize::Region::IfThenElse { .. } => {
                 let mut target = naga::Block::new();
+                let transport = allocate_return_transport(
+                    function, inst_set, word_type, f32_type, bool_type, func,
+                )?;
+                let mut may_return = false;
                 emit_if_region(
                     function, inst_set, word, region, word_type, f32_type, bool_type, func, &mut target,
-                    value_map, phi_locals, result_expr,
+                    value_map, phi_locals, transport, &mut may_return,
                 )?;
                 func.body.extend_block(target);
                 region_idx += 1;
+                if may_return {
+                    let saved_body = std::mem::replace(&mut func.body, naga::Block::new());
+                    let mut continuation_result = None;
+                    emit_naga_regions(
+                        function, inst_set, word, &regions[region_idx..], word_type, f32_type,
+                        bool_type, func, value_map, phi_locals, &mut continuation_result,
+                    )?;
+                    let mut continuation = std::mem::replace(&mut func.body, saved_body);
+                    if let Some(value) = continuation_result {
+                        let pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
+                        );
+                        continuation.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+                        let pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(transport.did_return), naga::Span::UNDEFINED,
+                        );
+                        let returned = func.expressions.append(
+                            naga::Expression::Load { pointer }, naga::Span::UNDEFINED,
+                        );
+                        func.body.push(
+                            naga::Statement::Emit(naga::Range::new_from_bounds(returned, returned)),
+                            naga::Span::UNDEFINED,
+                        );
+                        func.body.push(
+                            naga::Statement::If {
+                                condition: returned,
+                                accept: naga::Block::new(),
+                                reject: continuation,
+                            },
+                            naga::Span::UNDEFINED,
+                        );
+                    } else if !continuation.is_empty() {
+                        return Err("spirv: structured return continuation has no result".to_string());
+                    }
+                    let pointer = func.expressions.append(
+                        naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
+                    );
+                    let loaded = func.expressions.append(
+                        naga::Expression::Load { pointer }, naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                        naga::Span::UNDEFINED,
+                    );
+                    *result_expr = Some(loaded);
+                    return Ok(());
+                }
             }
             crate::structurize::Region::LoopExit { from, target } => return Err(format!(
                 "spirv: loop exit edge {from:?}->{target:?} appeared outside its loop"
@@ -948,20 +999,21 @@ fn emit_if_region(
     target: &mut naga::Block,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
-    result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    transport: StructuredReturnTransport,
+    may_return: &mut bool,
 ) -> Result<(), String> {
     use sonatina_ir::InstDowncast;
     let crate::structurize::Region::IfThenElse { header, then_branch, else_branch, merge } = region else {
         return Err("spirv structurize: expected if region".to_string());
     };
-    let Some(merge) = merge else {
-        return Err(format!("spirv structurize: conditional {header:?} without a merge is not supported yet"));
-    };
-    ensure_phi_locals(function, inst_set, *merge, word_type, f32_type, bool_type, func, phi_locals);
+    if let Some(merge) = merge {
+        ensure_phi_locals(function, inst_set, *merge, word_type, f32_type, bool_type, func, phi_locals);
+    }
     emit_phi_loads_for_block(
         function, inst_set, *header, func, target, value_map, phi_locals,
     );
-    emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr);
+    let mut ignored_result = None;
+    emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, &mut ignored_result);
     let branch = function.layout.iter_inst(*header).find_map(|inst_id|
         <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(inst_id))
     ).ok_or_else(|| format!("spirv structurize: if header {header:?} has no branch"))?;
@@ -975,19 +1027,81 @@ fn emit_if_region(
     // carry values out of the branch.
     let mut then_values = value_map.clone();
     let mut else_values = value_map.clone();
-    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, f32_type, bool_type, func, &mut accept, &mut then_values, phi_locals, result_expr)?;
-    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, f32_type, bool_type, func, &mut reject, &mut else_values, phi_locals, result_expr)?;
-    if let ArmOutcome::Predecessor(from) = arm_outcome(function, inst_set, *header, then_branch) {
-        emit_exact_phi_edge(function, inst_set, word, from, *merge, func, &mut accept, &mut then_values, phi_locals)?;
-    }
-    if let ArmOutcome::Predecessor(from) = arm_outcome(function, inst_set, *header, else_branch) {
-        emit_exact_phi_edge(function, inst_set, word, from, *merge, func, &mut reject, &mut else_values, phi_locals)?;
+    let mut then_returns = false;
+    let mut else_returns = false;
+    let mut then_edge_emitted = false;
+    let mut else_edge_emitted = false;
+    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, f32_type, bool_type, func, &mut accept, &mut then_values, phi_locals, transport, *merge, &mut then_returns, &mut then_edge_emitted)?;
+    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, f32_type, bool_type, func, &mut reject, &mut else_values, phi_locals, transport, *merge, &mut else_returns, &mut else_edge_emitted)?;
+    *may_return |= then_returns || else_returns;
+    let then_outcome = arm_outcome(function, inst_set, *header, then_branch);
+    let else_outcome = arm_outcome(function, inst_set, *header, else_branch);
+    if let Some(merge) = merge {
+        if let ArmOutcome::Predecessor(from) = then_outcome && !then_edge_emitted {
+            let mut edge = naga::Block::new();
+            emit_exact_phi_edge(function, inst_set, word, from, *merge, func, &mut edge, &mut then_values, phi_locals)?;
+            if then_returns {
+                let pointer = func.expressions.append(
+                    naga::Expression::LocalVariable(transport.did_return), naga::Span::UNDEFINED,
+                );
+                let returned = func.expressions.append(
+                    naga::Expression::Load { pointer }, naga::Span::UNDEFINED,
+                );
+                accept.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(returned, returned)),
+                    naga::Span::UNDEFINED,
+                );
+                accept.push(
+                    naga::Statement::If {
+                        condition: returned,
+                        accept: naga::Block::new(),
+                        reject: edge,
+                    },
+                    naga::Span::UNDEFINED,
+                );
+            } else {
+                accept.extend_block(edge);
+            }
+        }
+        if let ArmOutcome::Predecessor(from) = else_outcome && !else_edge_emitted {
+            let mut edge = naga::Block::new();
+            emit_exact_phi_edge(function, inst_set, word, from, *merge, func, &mut edge, &mut else_values, phi_locals)?;
+            if else_returns {
+                let pointer = func.expressions.append(
+                    naga::Expression::LocalVariable(transport.did_return), naga::Span::UNDEFINED,
+                );
+                let returned = func.expressions.append(
+                    naga::Expression::Load { pointer }, naga::Span::UNDEFINED,
+                );
+                reject.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(returned, returned)),
+                    naga::Span::UNDEFINED,
+                );
+                reject.push(
+                    naga::Statement::If {
+                        condition: returned,
+                        accept: naga::Block::new(),
+                        reject: edge,
+                    },
+                    naga::Span::UNDEFINED,
+                );
+            } else {
+                reject.extend_block(edge);
+            }
+        }
+    } else if !matches!(then_outcome, ArmOutcome::Terminal)
+        || !matches!(else_outcome, ArmOutcome::Terminal)
+    {
+        return Err(format!(
+            "spirv structurize: merge-less conditional {header:?} has a fallthrough arm"
+        ));
     }
     target.push(naga::Statement::If { condition, accept, reject }, naga::Span::UNDEFINED);
     Ok(())
 }
 
 #[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy)]
 enum ArmOutcome {
     Predecessor(sonatina_ir::BlockId),
     AlreadyAtMerge,
@@ -1030,17 +1144,93 @@ fn emit_non_loop_regions(
     target: &mut naga::Block,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
-    result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    transport: StructuredReturnTransport,
+    fallthrough_merge: Option<sonatina_ir::BlockId>,
+    may_return: &mut bool,
+    edge_emitted: &mut bool,
 ) -> Result<(), String> {
-    for region in regions {
+    let mut region_idx = 0;
+    while region_idx < regions.len() {
+        let region = &regions[region_idx];
         match region {
             crate::structurize::Region::Block(block) => {
                 emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
-                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, result_expr);
+                let mut block_result = None;
+                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, &mut block_result);
+                if find_block_return_value(*block, function, inst_set).is_some() {
+                    let value = block_result.ok_or_else(|| format!("spirv: unresolved structured return in {block:?}"))?;
+                    let pointer = func.expressions.append(
+                        naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
+                    );
+                    target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+                    let returned = func.expressions.append(
+                        naga::Expression::Literal(naga::Literal::Bool(true)), naga::Span::UNDEFINED,
+                    );
+                    let pointer = func.expressions.append(
+                        naga::Expression::LocalVariable(transport.did_return), naga::Span::UNDEFINED,
+                    );
+                    target.push(naga::Statement::Store { pointer, value: returned }, naga::Span::UNDEFINED);
+                    *may_return = true;
+                }
+                region_idx += 1;
             }
-            crate::structurize::Region::IfThenElse { .. } => emit_if_region(
-                function, inst_set, word, region, word_type, f32_type, bool_type, func, target, value_map, phi_locals, result_expr,
-            )?,
+            crate::structurize::Region::IfThenElse { header, merge: nested_merge, .. } => {
+                let mut nested_returns = false;
+                emit_if_region(
+                    function, inst_set, word, region, word_type, f32_type, bool_type,
+                    func, target, value_map, phi_locals, transport, &mut nested_returns,
+                )?;
+                region_idx += 1;
+                if nested_returns {
+                    let mut continuation = naga::Block::new();
+                    let mut continuation_returns = false;
+                    let mut continuation_edge_emitted = false;
+                    emit_non_loop_regions(
+                        function, inst_set, word, &regions[region_idx..], word_type,
+                        f32_type, bool_type, func, &mut continuation, value_map,
+                        phi_locals, transport, fallthrough_merge,
+                        &mut continuation_returns, &mut continuation_edge_emitted,
+                    )?;
+                    if regions[region_idx..].is_empty()
+                        && *nested_merge == fallthrough_merge
+                    {
+                        *edge_emitted = true;
+                    } else if !continuation_edge_emitted
+                        && let Some(merge) = fallthrough_merge
+                        && let ArmOutcome::Predecessor(from) =
+                            arm_outcome(function, inst_set, *header, &regions[region_idx..])
+                    {
+                        emit_exact_phi_edge(
+                            function, inst_set, word, from, merge, func,
+                            &mut continuation, value_map, phi_locals,
+                        )?;
+                        *edge_emitted = true;
+                    } else {
+                        *edge_emitted |= continuation_edge_emitted;
+                    }
+                    let pointer = func.expressions.append(
+                        naga::Expression::LocalVariable(transport.did_return),
+                        naga::Span::UNDEFINED,
+                    );
+                    let returned = func.expressions.append(
+                        naga::Expression::Load { pointer }, naga::Span::UNDEFINED,
+                    );
+                    target.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(returned, returned)),
+                        naga::Span::UNDEFINED,
+                    );
+                    target.push(
+                        naga::Statement::If {
+                            condition: returned,
+                            accept: naga::Block::new(),
+                            reject: continuation,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    *may_return = true;
+                    return Ok(());
+                }
+            }
             crate::structurize::Region::Loop { .. } => return Err(
                 "spirv structurize: loop nested inside conditional is not supported yet".to_string()
             ),
@@ -1059,9 +1249,46 @@ enum RegionOutcome {
 }
 
 #[cfg(feature = "spirv-backend")]
-struct LoopReturnTransport {
+#[derive(Clone, Copy)]
+struct StructuredReturnTransport {
     result: naga::Handle<naga::LocalVariable>,
     did_return: naga::Handle<naga::LocalVariable>,
+}
+
+#[cfg(feature = "spirv-backend")]
+fn allocate_return_transport(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    func: &mut naga::Function,
+) -> Result<StructuredReturnTransport, String> {
+    let return_ty = function.layout.iter_block().find_map(|block| {
+        find_block_return_value(block, function, inst_set).map(|value| function.dfg.value_ty(value))
+    }).ok_or_else(|| "spirv: value kernel has no return value".to_string())?;
+    let return_naga_ty = match return_ty {
+        sonatina_ir::Type::F32 => f32_type,
+        sonatina_ir::Type::I1 => bool_type,
+        _ => word_type,
+    };
+    let result = func.local_variables.append(
+        naga::LocalVariable { name: Some("structured_result".into()), ty: return_naga_ty, init: None },
+        naga::Span::UNDEFINED,
+    );
+    let returned_false = func.expressions.append(
+        naga::Expression::Literal(naga::Literal::Bool(false)),
+        naga::Span::UNDEFINED,
+    );
+    let did_return = func.local_variables.append(
+        naga::LocalVariable {
+            name: Some("structured_did_return".into()),
+            ty: bool_type,
+            init: Some(returned_false),
+        },
+        naga::Span::UNDEFINED,
+    );
+    Ok(StructuredReturnTransport { result, did_return })
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -1223,7 +1450,7 @@ fn emit_recursive_loop_region(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     _result_expr: &mut Option<naga::Handle<naga::Expression>>,
-) -> Result<Option<LoopReturnTransport>, String> {
+) -> Result<Option<StructuredReturnTransport>, String> {
     use sonatina_ir::InstDowncast;
     let mut loop_blocks = std::collections::HashSet::new();
     loop_blocks.insert(header);
@@ -1386,7 +1613,7 @@ fn emit_recursive_loop_region(
         value_map.insert(result, loaded);
     }
 
-    Ok(may_return.then_some(LoopReturnTransport {
+    Ok(may_return.then_some(StructuredReturnTransport {
         result: return_local,
         did_return: did_return_local,
     }))
