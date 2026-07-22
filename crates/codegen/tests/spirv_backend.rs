@@ -660,6 +660,133 @@ fn build_grid_triangle_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+fn build_grid_one_arm_return_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_one_arm_return", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let early = fb.append_block();
+    let merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let condition = fb.insert_inst(cmp::Lt::new(is, px, py), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, condition, early, merge));
+
+    fb.switch_to_block(early);
+    let escaped = fb.make_imm_value(777i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
+
+    fb.switch_to_block(merge);
+    let normal = fb.make_imm_value(4i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, normal));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+fn build_grid_one_arm_return_with_fallthrough_merge_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_one_arm_return_with_fallthrough_merge", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let early = fb.append_block();
+    let passthrough = fb.append_block();
+    let merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let condition = fb.insert_inst(cmp::Lt::new(is, px, py), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, condition, early, passthrough));
+
+    fb.switch_to_block(early);
+    let escaped = fb.make_imm_value(777i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
+
+    fb.switch_to_block(passthrough);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(merge);
+    let normal = fb.make_imm_value(4i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, normal));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+fn build_grid_nested_return_outer_phi_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_nested_return_outer_phi", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let nested_header = fb.append_block();
+    let other_outer_arm = fb.append_block();
+    let early = fb.append_block();
+    let nested_fallthrough = fb.append_block();
+    let outer_merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let four = fb.make_imm_value(4i32);
+    let enter_nested = fb.insert_inst(cmp::Lt::new(is, px, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, enter_nested, nested_header, other_outer_arm));
+
+    fb.switch_to_block(nested_header);
+    let return_early = fb.insert_inst(cmp::Lt::new(is, py, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, return_early, early, nested_fallthrough));
+
+    fb.switch_to_block(early);
+    let escaped = fb.make_imm_value(777i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
+
+    fb.switch_to_block(nested_fallthrough);
+    let fallthrough_value = fb.insert_inst(arith::Add::new(is, px, py), Type::I32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_merge));
+
+    fb.switch_to_block(other_outer_arm);
+    let twenty_two = fb.make_imm_value(22i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_merge));
+
+    fb.switch_to_block(outer_merge);
+    let result = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(fallthrough_value, nested_fallthrough), (twenty_two, other_outer_arm)]),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 /// A diamond merge carrying a phi is itself the header of the next
 /// conditional. The phi Load must be emitted before that header consumes it.
 fn build_grid_phi_headed_conditional_module() -> sonatina_ir::Module {
@@ -1615,6 +1742,58 @@ fn grid_triangle_executes_on_lavapipe() {
             let got = out[(y * w + x) as usize];
             let want = if x < y { x + 100 } else { y };
             assert_eq!(got, want, "grid triangle at ({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn grid_one_arm_return_bypasses_merge_on_lavapipe() {
+    let module = build_grid_one_arm_return_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("one-arm return should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            assert_eq!(output[(y * 8 + x) as usize], if x < y { 777 } else { 4 });
+        }
+    }
+}
+
+#[test]
+fn grid_one_arm_return_guards_fallthrough_merge_on_lavapipe() {
+    let module = build_grid_one_arm_return_with_fallthrough_merge_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("one-arm return with fallthrough merge should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            assert_eq!(output[(y * 8 + x) as usize], if x < y { 777 } else { 4 });
+        }
+    }
+}
+
+#[test]
+fn grid_nested_return_guards_outer_merge_phi_edge_on_lavapipe() {
+    let module = build_grid_nested_return_outer_phi_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("nested return and outer merge phi should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let expected = if x < 4 && y < 4 { 777 } else if x < 4 { x + y } else { 22 };
+            assert_eq!(output[(y * 8 + x) as usize], expected, "({x},{y})");
         }
     }
 }
