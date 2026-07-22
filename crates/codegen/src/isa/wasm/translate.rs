@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use waffle::{
     ExportKind, Func, FuncDecl, FunctionBody, Module as WaffleModule, Operator, SignatureData,
-    Terminator, Type as WType,
+    Terminator, Type as WType, ValueDef,
 };
 
 use sonatina_ir::{
@@ -697,12 +697,40 @@ fn translate_function(
                             .filter_map(|v| resolve_value(function, *v, &value_map, &mut body, wb))
                             .collect();
                         let op = Operator::Call { function_index: wfunc };
-                        if let Some(result) = function.dfg.inst_result(inst_id) {
-                            let ty = result_waffle_type(function, result);
-                            let wval = body.add_op(wb, op, &args, &[ty]);
-                            value_map.insert(result, wval);
-                        } else {
+                        let results = function.dfg.inst_results(inst_id);
+                        if results.is_empty() {
                             body.add_op(wb, op, &args, &[]);
+                        } else {
+                            let result_tys: Vec<WType> = results
+                                .iter()
+                                .map(|result| result_waffle_type(function, *result))
+                                .collect();
+                            // WAFFLE 0.2 stores a multi-value operator's stack
+                            // results into its local vector in forward order.
+                            // Because `local.set` pops the stack, that reverses
+                            // the logical result order. Describe the physical
+                            // local order here, then pick it in reverse, so the
+                            // Sonatina result slots retain the callee signature's
+                            // order (including when adjacent result types differ).
+                            let physical_tys: Vec<WType> =
+                                result_tys.iter().copied().rev().collect();
+                            let call_value = body.add_op(wb, op, &args, &physical_tys);
+                            if results.len() == 1 {
+                                value_map.insert(results[0], call_value);
+                            } else {
+                                let result_count = results.len();
+                                for (index, (result, ty)) in
+                                    results.iter().zip(result_tys).enumerate()
+                                {
+                                    let picked = body.add_value(ValueDef::PickOutput(
+                                        call_value,
+                                        (result_count - 1 - index) as u32,
+                                        ty,
+                                    ));
+                                    body.append_to_block(wb, picked);
+                                    value_map.insert(*result, picked);
+                                }
+                            }
                         }
                     }
                     // Fail closed: an unhandled instruction must be an error, never
