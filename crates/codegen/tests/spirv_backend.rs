@@ -1,5 +1,8 @@
 use sonatina_codegen::Backend;
-use sonatina_codegen::isa::spirv::{LayoutMode, Role, SpirvBackend, WordKind};
+use sonatina_codegen::isa::spirv::{
+    LayoutMode, Role, SpirvBackend, SpirvBuiltinInput, SpirvBuiltinSource, SpirvLayout,
+    SpirvBindingMember, SpirvScalarKind, WordKind,
+};
 use sonatina_ir::{
     Immediate, Linkage, Signature, Type,
     builder::ModuleBuilder,
@@ -20,6 +23,37 @@ fn native_module_builder() -> ModuleBuilder {
     let isa = Native::new(triple);
     let ctx = ModuleCtx::new(&isa);
     ModuleBuilder::new(ctx)
+}
+
+fn assert_layout_metadata_invariants(layout: &SpirvLayout, arg_count: usize) {
+    let mut seen = vec![false; arg_count];
+    for builtin in &layout.builtin_inputs {
+        let slot = seen.get_mut(builtin.arg_index as usize).expect("builtin arg index in range");
+        assert!(!*slot, "argument {} described twice", builtin.arg_index);
+        *slot = true;
+    }
+    for binding in &layout.bindings {
+        assert!(binding.stride >= binding.span, "stride must cover span");
+        let mut end = 0;
+        for member in &binding.members {
+            assert!(member.width > 0 && member.offset % member.width == 0, "member must be naturally aligned");
+            assert!(member.offset >= end, "members must be ordered and non-overlapping");
+            end = member.offset + member.width;
+            assert!(end <= binding.span, "member must fit binding span");
+            let slot = seen.get_mut(member.arg_index as usize).expect("member arg index in range");
+            assert!(!*slot, "argument {} described twice", member.arg_index);
+            *slot = true;
+        }
+        if binding.role == Role::Output {
+            assert!(binding.members.is_empty());
+            assert_eq!(binding.span, layout.word.width_bytes());
+            assert_eq!(binding.stride, layout.word.width_bytes());
+        }
+    }
+    assert!(seen.into_iter().all(|covered| covered), "every source argument needs exactly one ABI source");
+    if matches!(layout.mode, LayoutMode::Scalar | LayoutMode::Batch) {
+        assert!(layout.builtin_inputs.is_empty());
+    }
 }
 
 #[test]
@@ -1198,6 +1232,7 @@ fn grid_wgsl_shape() {
         .expect("grid gradient must compile");
 
     let layout = &art.layout;
+    assert_layout_metadata_invariants(layout, 2);
     assert_eq!(layout.mode, LayoutMode::Grid, "grid mode");
     assert_eq!(layout.word, WordKind::U32, "u32 word");
     assert!(layout.result.is_none(), "grid states no single-slot result");
@@ -1206,6 +1241,7 @@ fn grid_wgsl_shape() {
     let in_b = layout.bindings.iter().find(|b| b.role == Role::Input).expect("input binding");
     assert_eq!(out_b.stride, 4, "output stride = per-element word width");
     assert_eq!(in_b.stride, 4, "input stride = broadcast span (one dummy member)");
+    assert!(in_b.members.is_empty(), "padding-only input must not invent a source member");
 
     let wgsl = art.wgsl.as_ref().expect("WGSL side artifact");
     for tok in ["global_invocation_id", "num_workgroups", "array<u32>"] {
@@ -1223,6 +1259,25 @@ fn grid_wgsl_shape() {
     .validate(&reparsed)
     .expect("browser-profile validation (default caps) must accept the grid module");
     eprintln!("grid_wgsl_shape OK: {} words", art.words.len());
+}
+
+#[test]
+fn scalar_i64_and_batch_layout_metadata_invariants() {
+    let scalar = SpirvBackend::new().compile_module(&build_grid_i64_module())
+        .expect("homogeneous i64 scalar module should compile");
+    assert_layout_metadata_invariants(&scalar.layout, 2);
+    let input = scalar.layout.bindings.iter().find(|b| b.role == Role::Input).unwrap();
+    assert_eq!(input.members.iter().map(|m| (m.offset, m.width, m.scalar)).collect::<Vec<_>>(), vec![
+        (0, 8, SpirvScalarKind::I64),
+        (8, 8, SpirvScalarKind::I64),
+    ]);
+    assert_eq!((input.span, input.stride), (16, 16));
+
+    let batch = SpirvBackend::new().compile_module(&build_grid_objalloc_module())
+        .expect("batch module should compile");
+    assert_eq!(batch.layout.mode, LayoutMode::Batch);
+    assert_layout_metadata_invariants(&batch.layout, 2);
+    assert!(batch.layout.builtin_inputs.is_empty());
 }
 
 /// The headline: a grid kernel EXECUTES on lavapipe and every pixel equals the
@@ -2446,9 +2501,19 @@ func public %mixed(v0.i32, v1.i32, v2.f32, v3.f32) -> i32 {
     let module = sonatina_parser::parse_module(source).expect("mixed grid should parse").module;
     let artifact = SpirvBackend::new().with_grid().with_workgroup_size(2, 2, 1)
         .compile_module(&module).expect("mixed grid should compile");
+    assert_layout_metadata_invariants(&artifact.layout, 4);
     let wgsl = artifact.wgsl.as_deref().expect("WGSL should be emitted");
     let input = artifact.layout.bindings.iter().find(|binding| matches!(binding.role, Role::Input)).unwrap();
     assert_eq!(input.stride, 8, "two f32 broadcasts must occupy offsets 0 and 4");
+    assert_eq!(input.span, 8);
+    assert_eq!(input.members, vec![
+        SpirvBindingMember { arg_index: 2, offset: 0, width: 4, scalar: SpirvScalarKind::F32 },
+        SpirvBindingMember { arg_index: 3, offset: 4, width: 4, scalar: SpirvScalarKind::F32 },
+    ]);
+    assert_eq!(artifact.layout.builtin_inputs, vec![
+        SpirvBuiltinInput { arg_index: 0, source: SpirvBuiltinSource::GlobalInvocationIdX, scalar: SpirvScalarKind::I32 },
+        SpirvBuiltinInput { arg_index: 1, source: SpirvBuiltinSource::GlobalInvocationIdY, scalar: SpirvScalarKind::I32 },
+    ]);
     assert!(wgsl.contains("p0_: f32") && wgsl.contains("p1_: f32"), "WGSL must reflect f32 broadcast members: {wgsl}");
     let reparsed = naga::front::wgsl::parse_str(wgsl).expect("mixed WGSL should reparse");
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::default())
@@ -2472,8 +2537,18 @@ func public %render_broadcast(v0.i32, v1.i32, v2.f32, v3.f32) -> i32 {
     let module = sonatina_parser::parse_module(source).expect("render broadcasts should parse").module;
     let artifact = SpirvBackend::new().with_render().compile_module(&module)
         .expect("render broadcasts should compile");
+    assert_layout_metadata_invariants(&artifact.layout, 4);
     let input = artifact.layout.bindings.iter().find(|binding| matches!(binding.role, Role::Input)).unwrap();
     assert_eq!(input.stride, 8);
+    assert_eq!(input.span, 8);
+    assert_eq!(input.members, vec![
+        SpirvBindingMember { arg_index: 2, offset: 0, width: 4, scalar: SpirvScalarKind::F32 },
+        SpirvBindingMember { arg_index: 3, offset: 4, width: 4, scalar: SpirvScalarKind::F32 },
+    ]);
+    assert_eq!(artifact.layout.builtin_inputs, vec![
+        SpirvBuiltinInput { arg_index: 0, source: SpirvBuiltinSource::FragmentPositionX, scalar: SpirvScalarKind::I32 },
+        SpirvBuiltinInput { arg_index: 1, source: SpirvBuiltinSource::FragmentPositionY, scalar: SpirvScalarKind::I32 },
+    ]);
     let wgsl = artifact.wgsl.as_deref().expect("WGSL should be emitted");
     assert!(wgsl.contains("p0_: f32") && wgsl.contains("p1_: f32"));
     let reparsed = naga::front::wgsl::parse_str(wgsl).expect("render WGSL should reparse");
