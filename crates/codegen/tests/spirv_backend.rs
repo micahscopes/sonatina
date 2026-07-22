@@ -1,10 +1,10 @@
 use sonatina_codegen::Backend;
 use sonatina_codegen::isa::spirv::{LayoutMode, Role, SpirvBackend, WordKind};
 use sonatina_ir::{
-    Linkage, Signature, Type,
+    Immediate, Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
-    inst::{arith, cmp, control_flow, data},
+    inst::{arith, cast, cmp, control_flow, data},
     isa::{Isa, native::Native},
     module::ModuleCtx,
 };
@@ -276,17 +276,19 @@ fn spirv_loop_sum_to_valid() {
     let _ = std::fs::remove_file(&tmp);
 }
 
-/// The current loop emitter supports only the canonical header shape where
-/// `nz_dest` stays in the loop and `z_dest` exits. Reversing those successors
-/// must produce a named error, not inverted loop behavior.
+/// A loop header may branch to its exit when the condition is true and remain
+/// in the loop when false. This is the reverse of the usual `keep_going`
+/// polarity and must still execute according to CFG semantics.
 #[test]
-fn spirv_loop_reversed_header_polarity_fails_closed() {
+fn grid_loop_reversed_header_polarity_executes_on_lavapipe() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
     ));
     let is = isa.inst_set();
     let mb = native_module_builder();
-    let sig = Signature::new_single("reversed_loop", Linkage::Public, &[Type::I64], Type::I64);
+    let sig = Signature::new_single(
+        "grid_reversed_loop", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
     let func_ref = mb.declare_function(sig).unwrap();
     let mut fb = mb.func_builder::<InstInserter>(func_ref);
     let entry = fb.append_block();
@@ -295,18 +297,18 @@ fn spirv_loop_reversed_header_polarity_fails_closed() {
     let exit = fb.append_block();
 
     fb.switch_to_block(entry);
-    let limit = fb.args()[0];
-    let zero = fb.make_imm_value(0i64);
+    let zero = fb.make_imm_value(0i32);
     fb.insert_inst_no_result(control_flow::Jump::new(is, header));
 
     fb.switch_to_block(header);
-    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I64);
-    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, limit), Type::I1);
-    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, exit, body));
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let three = fb.make_imm_value(3i32);
+    let done = fb.insert_inst(cmp::Lt::new(is, three, i), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, done, exit, body));
 
     fb.switch_to_block(body);
-    let one = fb.make_imm_value(1i64);
-    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I64);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
     fb.append_phi_arg(i, next_i, body);
     fb.insert_inst_no_result(control_flow::Jump::new(is, header));
 
@@ -316,18 +318,13 @@ fn spirv_loop_reversed_header_polarity_fails_closed() {
     fb.finish();
 
     let module = mb.build();
-    let result = SpirvBackend::new()
-        .with_workgroup_size(1, 1, 1)
-        .compile_module(&module);
-    let errors = match result {
-        Ok(_) => panic!("reversed loop header polarity must fail closed"),
-        Err(errors) => errors,
-    };
-    let message = format!("{errors:?}");
-    assert!(
-        message.contains("branch polarity"),
-        "expected branch polarity diagnostic, got: {message}"
-    );
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("reversed loop-header polarity should compile");
+    let output = run_grid_u32(artifact.wgsl.as_deref().expect("WGSL"), 8, 8, 8, 8, &[]);
+    assert_eq!(output, vec![4; 64], "reversed-polarity loop must count through three");
 }
 
 /// Phi argument order is not semantic. Put the backedge input first and verify
@@ -392,7 +389,7 @@ fn spirv_loop_backedge_first_phi_argument_validates() {
 /// block identifiers. Here the backedge block is allocated before the header,
 /// so both phi predecessors have smaller IDs than the loop header.
 #[test]
-fn float_loop_phi_with_earlier_backedge_block_fails_closed() {
+fn float_loop_phi_with_earlier_backedge_block_compiles() {
     let source = r#"
 target = "wasm32-unknown-native"
 func public %earlier_backedge(v0.i32) -> i32 {
@@ -413,15 +410,8 @@ block3:
     let module = sonatina_parser::parse_module(source)
         .expect("earlier-backedge loop should parse")
         .module;
-    let errors = match SpirvBackend::new().compile_module(&module) {
-        Err(errors) => errors,
-        Ok(_) => panic!("f32 loop-header phi must fail closed"),
-    };
-    let message = format!("{errors:?}");
-    assert!(
-        message.contains("loop-header phi") && message.to_lowercase().contains("f32"),
-        "expected named f32 loop-phi rejection, got: {message}"
-    );
+    SpirvBackend::new().compile_module(&module)
+        .expect("f32 loop phi must use typed recursive locals independent of block IDs");
 }
 
 /// B1 (mb2 browser-testable plan): a u32-word kernel must lower to a naga `Uint`
@@ -691,6 +681,269 @@ fn build_grid_loop_conditional_module() -> sonatina_ir::Module {
 
     fb.switch_to_block(exit);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// Three parallel loop-phi swaps: (a, b) starts at (11, 22), swaps on every
+/// backedge, and therefore exits as (22, 11). Sequential phi stores would
+/// overwrite one source before the other is read and produce the wrong result.
+fn build_grid_parallel_phi_swap_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_parallel_phi_swap", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let latch = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let zero = fb.make_imm_value(0i32);
+    let eleven = fb.make_imm_value(11i32);
+    let twenty_two = fb.make_imm_value(22i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let a = fb.insert_inst(control_flow::Phi::new(is, vec![(eleven, entry)]), Type::I32);
+    let b = fb.insert_inst(control_flow::Phi::new(is, vec![(twenty_two, entry)]), Type::I32);
+    let three = fb.make_imm_value(3i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, latch, exit));
+
+    fb.switch_to_block(latch);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, latch);
+    fb.append_phi_arg(a, b, latch);
+    fb.append_phi_arg(b, a, latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    let hundred = fb.make_imm_value(100i32);
+    let high = fb.insert_inst(arith::Mul::new(is, a, hundred), Type::I32);
+    let result = fb.insert_inst(arith::Add::new(is, high, b), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A loop containing a full diamond whose merge value is carried by the loop.
+/// For grid coordinates the condition is deliberately false, so the value
+/// selected at the in-loop merge and returned after one iteration is 22.
+fn build_grid_loop_inner_if_phi_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_loop_inner_if_phi", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let then_block = fb.append_block();
+    let else_block = fb.append_block();
+    let merge = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let result = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let one = fb.make_imm_value(1i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, one), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, body, exit));
+
+    fb.switch_to_block(body);
+    let negative = fb.insert_inst(cmp::Lt::new(is, px, zero), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, negative, then_block, else_block));
+
+    fb.switch_to_block(then_block);
+    let eleven = fb.make_imm_value(11i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(else_block);
+    let twenty_two = fb.make_imm_value(22i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(merge);
+    let selected = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(eleven, then_block), (twenty_two, else_block)]),
+        Type::I32,
+    );
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, merge);
+    fb.append_phi_arg(result, selected, merge);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// Keeps the loop-carried value as f32 and converts it only in the exit block
+/// to the grid's i32/u32 output carrier. Two exact increments turn 1.0 into 3.0.
+fn build_grid_f32_loop_return_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_f32_loop_return", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let latch = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let zero = fb.make_imm_value(0i32);
+    let initial = fb.make_imm_value(Immediate::F32(1.0f32.to_bits()));
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let value = fb.insert_inst(control_flow::Phi::new(is, vec![(initial, entry)]), Type::F32);
+    let two = fb.make_imm_value(2i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, two), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, latch, exit));
+
+    fb.switch_to_block(latch);
+    let one_i32 = fb.make_imm_value(1i32);
+    let one_f32 = fb.make_imm_value(Immediate::F32(1.0f32.to_bits()));
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one_i32), Type::I32);
+    let next_value = fb.insert_inst(arith::Fadd::new(is, value, one_f32), Type::F32);
+    fb.append_phi_arg(i, next_i, latch);
+    fb.append_phi_arg(value, next_value, latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    let output = fb.insert_inst(cast::F32ToI32::new(is, value), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, output));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// Exits a loop normally, then resumes in a sibling block outside the loop.
+/// The sibling consumes a non-phi value computed in the header from the
+/// current loop phi. At exit `i == 3`, so `i * 2 + 16 == 22`.
+fn build_grid_loop_exit_sibling_resume_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_loop_exit_sibling_resume", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let loop_exit = fb.append_block();
+    let sibling = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let two = fb.make_imm_value(2i32);
+    let header_value = fb.insert_inst(arith::Mul::new(is, i, two), Type::I32);
+    let three = fb.make_imm_value(3i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, body, loop_exit));
+
+    fb.switch_to_block(body);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(loop_exit);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, sibling));
+
+    fb.switch_to_block(sibling);
+    let sixteen = fb.make_imm_value(16i32);
+    let result = fb.insert_inst(arith::Add::new(is, header_value, sixteen), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// The normal loop exit begins with a phi fed by the header edge. Using px as
+/// the trip count covers both the zero-trip x=0 case and iterative x>0 cases.
+fn build_grid_loop_exit_phi_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_loop_exit_phi", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let limit = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let ten = fb.make_imm_value(10i32);
+    let header_value = fb.insert_inst(arith::Add::new(is, i, ten), Type::I32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, limit), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, body, exit));
+
+    fb.switch_to_block(body);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    let exit_value = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(header_value, header)]),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, exit_value));
     fb.seal_all();
     fb.finish();
     mb.build()
@@ -1041,25 +1294,98 @@ fn grid_triangle_executes_on_lavapipe() {
     }
 }
 
-/// Until loop emission recursively consumes nested regions, this shape must
-/// fail closed. Compiling it successfully after dropping the inner branch is
-/// silent wrong-code, not partial support.
 #[test]
-fn grid_loop_with_conditional_fails_closed() {
+fn grid_loop_with_conditional_executes_on_lavapipe() {
     let module = build_grid_loop_conditional_module();
-    let result = SpirvBackend::new()
+    let artifact = SpirvBackend::new()
         .with_grid()
         .with_workgroup_size(8, 8, 1)
-        .compile_module(&module);
-    let err = match result {
-        Ok(_) => panic!("loop containing a conditional must not be silently flattened"),
-        Err(err) => err,
-    };
-    let message = format!("{err:?}");
-    assert!(
-        message.contains("loop") && message.contains("conditional"),
-        "expected a named loop-conditional diagnostic, got: {message}"
-    );
+        .compile_module(&module).expect("recursive loop conditional should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            assert_eq!(output[(y * 8 + x) as usize], if x < y { 4 } else { 777 }, "({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn grid_parallel_loop_phi_swap_executes_on_lavapipe() {
+    let module = build_grid_parallel_phi_swap_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("parallel loop-phi swap should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("parallel loop-phi swap WGSL should reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("parallel loop-phi swap WGSL should validate");
+
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    assert_eq!(output, vec![2211; 64], "three parallel swaps must end at (22, 11)");
+}
+
+#[test]
+fn grid_loop_inner_if_phi_executes_on_lavapipe() {
+    let module = build_grid_loop_inner_if_phi_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("in-loop if merge phi should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    assert_eq!(output, vec![22; 64], "in-loop if merge must select 22");
+}
+
+#[test]
+fn grid_f32_loop_return_executes_on_lavapipe() {
+    let module = build_grid_f32_loop_return_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("f32 loop return should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    assert_eq!(output, vec![3; 64], "1.0 + 1.0 + 1.0 must convert to u32 3");
+}
+
+#[test]
+fn grid_loop_exit_resumes_at_sibling_on_lavapipe() {
+    let module = build_grid_loop_exit_sibling_resume_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("normal loop exit should resume at its following sibling");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    assert_eq!(output, vec![22; 64], "loop exit must resume and execute sibling");
+}
+
+#[test]
+fn grid_loop_exit_phi_executes_on_lavapipe() {
+    let module = build_grid_loop_exit_phi_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("normal loop exit phi should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            assert_eq!(output[(y * 8 + x) as usize], x + 10, "exit phi at ({x}, {y})");
+        }
+    }
 }
 
 /// A grid kernel with one broadcast param executes with p0 = 7 written to the
@@ -1393,25 +1719,21 @@ fn spirv_u32_sar_shape() {
     eprintln!("spirv_u32_sar_shape OK: bitcast-shift-bitcast + non-imm fails closed");
 }
 
-/// The escape-time grid contains a conditional inside its loop, which the
-/// legacy loop emitter cannot preserve. It must fail closed rather than flatten
-/// the branch and silently produce the wrong image.
 #[test]
-fn u32_escape_grid_loop_with_conditional_fails_closed() {
+fn u32_escape_grid_executes_on_lavapipe() {
     let module = build_u32_escape_grid();
-    let result = SpirvBackend::new()
+    let artifact = SpirvBackend::new()
         .with_grid()
         .with_workgroup_size(8, 8, 1)
-        .compile_module(&module);
-    let error = match result {
-        Ok(_) => panic!("u32 escape grid loop containing a conditional must fail closed"),
-        Err(error) => error,
-    };
-    let message = format!("{error:?}");
-    assert!(
-        message.contains("loop") && message.contains("conditional"),
-        "expected a named loop-conditional diagnostic, got: {message}"
-    );
+        .compile_module(&module).expect("escape grid should compile recursively");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let (w, h) = (32u32, 32u32);
+    let output = run_grid_u32(wgsl, w, h, 8, 8, &[]);
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(output[(y * w + x) as usize], escape_ref(x as i32, y as i32), "({x},{y})");
+        }
+    }
 }
 
 // ===========================================================================
@@ -2041,24 +2363,21 @@ fn render_ramp_executes_on_lavapipe() {
     eprintln!("render_ramp_executes_on_lavapipe OK: {w}x{h}, all {} pixels byte-exact", w * h);
 }
 
-/// The Mandelbrot fragment contains a conditional inside its escape loop, which
-/// the legacy loop emitter cannot preserve. It must fail closed rather than
-/// flatten the branch and silently render the wrong image.
 #[test]
-fn render_mandelbrot_loop_with_conditional_fails_closed() {
+fn render_mandelbrot_executes_on_lavapipe() {
     let module = build_mandel_frag_module();
-    let result = SpirvBackend::new()
+    let artifact = SpirvBackend::new()
         .with_render()
-        .compile_module(&module);
-    let error = match result {
-        Ok(_) => panic!("Mandelbrot render loop containing a conditional must fail closed"),
-        Err(error) => error,
-    };
-    let message = format!("{error:?}");
-    assert!(
-        message.contains("loop") && message.contains("conditional"),
-        "expected a named loop-conditional diagnostic, got: {message}"
-    );
+        .compile_module(&module).expect("Mandelbrot render should compile recursively");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let (w, h) = (32u32, 32u32);
+    let bytes = run_render_rgba8(wgsl, w, h, &[]);
+    for y in 0..h {
+        for x in 0..w {
+            let offset = ((y * w + x) * 4) as usize;
+            assert_eq!(&bytes[offset..offset + 4], &mandel_ref(x as i32, y as i32), "({x},{y})");
+        }
+    }
 }
 
 #[test]
@@ -2213,6 +2532,35 @@ func public %saturating(v0.i32, v1.i32, v2.f32) -> i32 {
     }
 }
 
+#[test]
+fn grid_loop_exit_phi_resumes_at_sibling_on_lavapipe() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %exit_phi(v0.i32, v1.i32) -> i32 {
+    block0:
+        jump block1;
+    block1:
+        v2.i32 = phi (0.i32 block0) (v5 block2);
+        v3.i32 = add v2 10.i32;
+        v4.i1 = lt v2 2.i32;
+        br v4 block2 block3;
+    block2:
+        v5.i32 = add v2 1.i32;
+        jump block1;
+    block3:
+        v6.i32 = phi (v3 block1);
+        jump block4;
+    block4:
+        return v6;
+}
+"#;
+    let module = sonatina_parser::parse_module(source).expect("exit phi should parse").module;
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(2, 2, 1)
+        .compile_module(&module).expect("exit phi should compile");
+    let output = run_grid_u32(artifact.wgsl.as_deref().expect("WGSL"), 2, 2, 2, 2, &[]);
+    assert_eq!(output, vec![12; 4]);
+}
+
 fn spirv_error(source: &str, backend: SpirvBackend) -> String {
     let module = sonatina_parser::parse_module(source).expect("regression source should parse").module;
     match backend.compile_module(&module) {
@@ -2337,7 +2685,7 @@ func public %boolean(v0.i32, v1.i32, v2.i1) -> i32 {
 }
 
 #[test]
-fn float_and_boolean_loop_header_phis_fail_closed() {
+fn float_and_boolean_loop_header_phis_compile_with_typed_locals() {
     let float_loop = r#"
 target = "wasm32-unknown-native"
 func public %float_loop(v0.i32) -> i32 {
@@ -2356,8 +2704,8 @@ func public %float_loop(v0.i32) -> i32 {
 }
 
 "#;
-    let error = spirv_error(float_loop, SpirvBackend::new());
-    assert!(error.contains("loop-header phi") && error.to_lowercase().contains("f32"), "{error}");
+    let module = sonatina_parser::parse_module(float_loop).expect("float loop should parse").module;
+    SpirvBackend::new().compile_module(&module).expect("f32 loop phi should compile");
 
     let bool_loop = r#"
 target = "wasm32-unknown-native"
@@ -2374,8 +2722,8 @@ func public %bool_loop(v0.i32) -> i32 {
         return 0.i32;
 }
 "#;
-    let error = spirv_error(bool_loop, SpirvBackend::new());
-    assert!(error.contains("loop-header phi") && error.to_lowercase().contains("i1"), "{error}");
+    let module = sonatina_parser::parse_module(bool_loop).expect("bool loop should parse").module;
+    SpirvBackend::new().compile_module(&module).expect("i1 loop phi should compile");
 }
 
 #[test]
