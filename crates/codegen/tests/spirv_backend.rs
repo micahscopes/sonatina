@@ -660,6 +660,69 @@ fn build_grid_triangle_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+/// A diamond merge carrying a phi is itself the header of the next
+/// conditional. The phi Load must be emitted before that header consumes it.
+fn build_grid_phi_headed_conditional_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_phi_headed_conditional", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let then_block = fb.append_block();
+    let else_block = fb.append_block();
+    let merge_header = fb.append_block();
+    let low_arm = fb.append_block();
+    let high_arm = fb.append_block();
+    let final_merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let choose_low = fb.insert_inst(cmp::Lt::new(is, px, py), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, choose_low, then_block, else_block));
+
+    fb.switch_to_block(then_block);
+    let low = fb.make_imm_value(11i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge_header));
+
+    fb.switch_to_block(else_block);
+    let high = fb.make_imm_value(22i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge_header));
+
+    fb.switch_to_block(merge_header);
+    let selected = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(low, then_block), (high, else_block)]),
+        Type::I32,
+    );
+    let twenty = fb.make_imm_value(20i32);
+    let selected_low = fb.insert_inst(cmp::Lt::new(is, selected, twenty), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, selected_low, low_arm, high_arm));
+
+    fb.switch_to_block(low_arm);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, final_merge));
+
+    fb.switch_to_block(high_arm);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, final_merge));
+
+    fb.switch_to_block(final_merge);
+    let result = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(selected, low_arm), (selected, high_arm)]),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 /// A loop whose body branches between a backedge and an early return. The
 /// structurizer represents the body branch as an `IfThenElse` nested in a
 /// `Loop`; silently flattening only direct `Block` children drops this branch.
@@ -714,6 +777,65 @@ fn build_grid_loop_conditional_module() -> sonatina_ir::Module {
     fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
 
     fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A return from inside the loop must bypass the normal post-loop sibling.
+/// Lowering the return as an ordinary loop break would overwrite 777 with 4.
+fn build_grid_loop_early_return_bypasses_sibling_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_loop_early_return_bypasses_sibling", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let early = fb.append_block();
+    let latch = fb.append_block();
+    let exit = fb.append_block();
+    let sibling = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let four = fb.make_imm_value(4i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, body, exit));
+
+    fb.switch_to_block(body);
+    let return_early = fb.insert_inst(cmp::Lt::new(is, px, py), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, return_early, early, latch));
+
+    fb.switch_to_block(early);
+    let escaped = fb.make_imm_value(777i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
+
+    fb.switch_to_block(latch);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, sibling));
+
+    fb.switch_to_block(sibling);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
     fb.seal_all();
     fb.finish();
@@ -1498,6 +1620,23 @@ fn grid_triangle_executes_on_lavapipe() {
 }
 
 #[test]
+fn grid_phi_headed_conditional_executes_on_lavapipe() {
+    let module = build_grid_phi_headed_conditional_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("phi-headed conditional should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            assert_eq!(output[(y * 8 + x) as usize], if x < y { 11 } else { 22 });
+        }
+    }
+}
+
+#[test]
 fn grid_loop_with_conditional_executes_on_lavapipe() {
     let module = build_grid_loop_conditional_module();
     let artifact = SpirvBackend::new()
@@ -1509,6 +1648,27 @@ fn grid_loop_with_conditional_executes_on_lavapipe() {
     for y in 0..8u32 {
         for x in 0..8u32 {
             assert_eq!(output[(y * 8 + x) as usize], if x < y { 4 } else { 777 }, "({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn grid_loop_early_return_bypasses_post_loop_sibling_on_lavapipe() {
+    let module = build_grid_loop_early_return_bypasses_sibling_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("loop early return and normal sibling should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            assert_eq!(
+                output[(y * 8 + x) as usize],
+                if x < y { 777 } else { 4 },
+                "({x},{y})",
+            );
         }
     }
 }
