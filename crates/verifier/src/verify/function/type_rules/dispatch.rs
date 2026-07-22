@@ -1270,6 +1270,34 @@ impl VerifyInst for cast::PtrToInt {
     }
 }
 
+macro_rules! impl_numeric_conversion_rule {
+    ($inst:ty, $source:expr, $result:expr, $name:literal) => {
+        impl VerifyInst for $inst {
+            fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+                let location = verifier.inst_location(inst_id);
+                if let Some(source_ty) = verifier.value_ty(*self.from())
+                    && source_ty != $source
+                {
+                    verifier.emit(
+                        Diagnostic::error(
+                            DiagnosticCode::InstOperandTypeMismatch,
+                            concat!($name, " source type mismatch"),
+                            location.clone(),
+                        )
+                        .with_note(format!("expected {:?}, found {source_ty:?}", $source)),
+                    );
+                }
+                verifier.expect_result_ty(inst_id, $result, location);
+            }
+        }
+    };
+}
+
+impl_numeric_conversion_rule!(cast::I32ToF32, Type::I32, Type::F32, "i32_to_f32");
+impl_numeric_conversion_rule!(cast::U32ToF32, Type::I32, Type::F32, "u32_to_f32");
+impl_numeric_conversion_rule!(cast::F32ToI32, Type::F32, Type::I32, "f32_to_i32");
+impl_numeric_conversion_rule!(cast::F32ToU32, Type::F32, Type::I32, "f32_to_u32");
+
 impl VerifyInst for data::Mload {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
         let location = verifier.inst_location(inst_id);

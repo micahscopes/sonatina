@@ -43,3 +43,23 @@ pub struct PtrToInt {
     from: ValueId,
     ty: Type,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+pub struct I32ToF32 {
+    from: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+pub struct U32ToF32 {
+    from: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+pub struct F32ToI32 {
+    from: ValueId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+pub struct F32ToU32 {
+    from: ValueId,
+}
