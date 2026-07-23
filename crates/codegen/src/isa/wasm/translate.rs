@@ -922,6 +922,87 @@ fn translate_function(
                             value_map.insert(result, narrowed);
                         }
                     }
+                    else if let Some(ext) = <&sonatina_ir::inst::cast::Zext as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let val = resolve_value(function, *ext.from(), &value_map, &mut body, wb).ok_or("unresolved zext")?;
+                            let from_ty = function.dfg.value_ty(*ext.from());
+                            let to_ty = *ext.ty();
+                            let normalized = match from_ty {
+                                Type::I1 | Type::I8 | Type::I16 => {
+                                    let mask = match from_ty {
+                                        Type::I1 => 1,
+                                        Type::I8 => 0xff,
+                                        Type::I16 => 0xffff,
+                                        _ => unreachable!(),
+                                    };
+                                    let mask = body.add_op(
+                                        wb,
+                                        Operator::I32Const { value: mask },
+                                        &[],
+                                        &[WType::I32],
+                                    );
+                                    body.add_op(wb, Operator::I32And, &[val, mask], &[WType::I32])
+                                }
+                                Type::I32 => val,
+                                _ => return Err(format!("unsupported wasm zext source `{from_ty:?}`")),
+                            };
+                            let extended = match to_ty {
+                                Type::I8 | Type::I16 | Type::I32 => normalized,
+                                Type::I64 => body.add_op(
+                                    wb,
+                                    Operator::I64ExtendI32U,
+                                    &[normalized],
+                                    &[WType::I64],
+                                ),
+                                _ => return Err(format!("unsupported wasm zext target `{to_ty:?}`")),
+                            };
+                            value_map.insert(result, extended);
+                        }
+                    }
+                    else if let Some(ext) = <&sonatina_ir::inst::cast::Sext as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let val = resolve_value(function, *ext.from(), &value_map, &mut body, wb).ok_or("unresolved sext")?;
+                            let from_ty = function.dfg.value_ty(*ext.from());
+                            let to_ty = *ext.ty();
+                            let normalized = match from_ty {
+                                Type::I1 => {
+                                    let amount = body.add_op(
+                                        wb,
+                                        Operator::I32Const { value: 31 },
+                                        &[],
+                                        &[WType::I32],
+                                    );
+                                    let shifted = body.add_op(
+                                        wb,
+                                        Operator::I32Shl,
+                                        &[val, amount],
+                                        &[WType::I32],
+                                    );
+                                    body.add_op(
+                                        wb,
+                                        Operator::I32ShrS,
+                                        &[shifted, amount],
+                                        &[WType::I32],
+                                    )
+                                }
+                                Type::I8 => body.add_op(wb, Operator::I32Extend8S, &[val], &[WType::I32]),
+                                Type::I16 => body.add_op(wb, Operator::I32Extend16S, &[val], &[WType::I32]),
+                                Type::I32 => val,
+                                _ => return Err(format!("unsupported wasm sext source `{from_ty:?}`")),
+                            };
+                            let extended = match to_ty {
+                                Type::I8 | Type::I16 | Type::I32 => normalized,
+                                Type::I64 => body.add_op(
+                                    wb,
+                                    Operator::I64ExtendI32S,
+                                    &[normalized],
+                                    &[WType::I64],
+                                ),
+                                _ => return Err(format!("unsupported wasm sext target `{to_ty:?}`")),
+                            };
+                            value_map.insert(result, extended);
+                        }
+                    }
                     // EvmRevert/EvmStop → unreachable
                     else if <&sonatina_ir::inst::evm::EvmRevert as InstDowncast>::downcast(inst_set, inst_data).is_some()
                         || <&sonatina_ir::inst::evm::EvmStop as InstDowncast>::downcast(inst_set, inst_data).is_some() {
