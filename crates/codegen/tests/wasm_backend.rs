@@ -67,6 +67,79 @@ fn wasm_bitwise_and_i32_i64_execute() {
 }
 
 #[test]
+fn wasm_exports_public_functions_but_keeps_private_callees_internal() {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+
+    let helper = mb
+        .declare_function(Signature::new_single(
+            "helper",
+            Linkage::Private,
+            &[Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(helper);
+    let block = fb.append_block();
+    fb.switch_to_block(block);
+    let one = fb.make_imm_value(1i32);
+    let incremented = fb.insert_inst(arith::Add::new(is, fb.args()[0], one), Type::I32);
+    fb.insert_return(incremented);
+    fb.seal_all();
+    fb.finish();
+
+    let entry = mb
+        .declare_function(Signature::new_single(
+            "entry",
+            Linkage::Public,
+            &[Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(entry);
+    let block = fb.append_block();
+    fb.switch_to_block(block);
+    let result = fb.insert_inst(
+        control_flow::Call::new(is, helper, [fb.args()[0]].into_iter().collect()),
+        Type::I32,
+    );
+    fb.insert_return(result);
+    fb.seal_all();
+    fb.finish();
+
+    let artifact = WasmBackend::new().compile_module(&mb.build()).unwrap();
+    let mut exports = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(&artifact.bytes) {
+        if let wasmparser::Payload::ExportSection(reader) = payload.unwrap() {
+            for export in reader {
+                let export = export.unwrap();
+                exports.push((export.name.to_owned(), export.kind));
+            }
+        }
+    }
+    exports.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        exports,
+        vec![
+            ("entry".to_owned(), wasmparser::ExternalKind::Func),
+            ("memory".to_owned(), wasmparser::ExternalKind::Memory),
+        ]
+    );
+    assert_eq!(artifact.func_names, vec!["entry"]);
+
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let entry = instance
+        .get_typed_func::<i32, i32>(&mut store, "entry")
+        .unwrap();
+    assert_eq!(entry.call(&mut store, 41).unwrap(), 42);
+    assert!(instance.get_func(&mut store, "helper").is_none());
+}
+
+#[test]
 fn wasm_integer_truncation_respects_source_and_target_carriers() {
     let isa = Wasm32::new(wasm32_triple());
     let is = isa.inst_set();
