@@ -490,6 +490,17 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    // Bitwise and
+                    else if let Some(and) = <&sonatina_ir::inst::logic::And as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *and.lhs(), &value_map, &mut body, wb).ok_or("unresolved and lhs")?;
+                            let rhs = resolve_value(function, *and.rhs(), &value_map, &mut body, wb).ok_or("unresolved and rhs")?;
+                            let ty = result_waffle_type(function, result);
+                            let op = if ty == WType::I32 { Operator::I32And } else { Operator::I64And };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[ty]);
+                            value_map.insert(result, wval);
+                        }
+                    }
                     else if let Some(fneg) = <&sonatina_ir::inst::arith::Fneg as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let arg = resolve_value(function, *fneg.arg(), &value_map, &mut body, wb)

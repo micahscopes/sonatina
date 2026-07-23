@@ -4,7 +4,7 @@ use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
-    inst::{arith, cmp, control_flow, data},
+    inst::{arith, cmp, control_flow, data, logic},
     isa::{Isa, native::Native, wasm32::Wasm32},
     module::ModuleCtx,
 };
@@ -22,6 +22,48 @@ fn wasm32_module_builder() -> ModuleBuilder {
     let isa = Wasm32::new(wasm32_triple());
     let ctx = ModuleCtx::new(&isa);
     ModuleBuilder::new(ctx)
+}
+
+#[test]
+fn wasm_bitwise_and_i32_i64_execute() {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+    for (name, ty) in [("and_i32", Type::I32), ("and_i64", Type::I64)] {
+        let func = mb
+            .declare_function(Signature::new_single(
+                name,
+                Linkage::Public,
+                &[ty, ty],
+                ty,
+            ))
+            .unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(func);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let value = fb.insert_inst(logic::And::new(is, fb.args()[0], fb.args()[1]), ty);
+        fb.insert_return(value);
+        fb.seal_all();
+        fb.finish();
+    }
+    let artifact = WasmBackend::new().compile_module(&mb.build()).unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let and_i32 = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "and_i32")
+        .unwrap();
+    let and_i64 = instance
+        .get_typed_func::<(i64, i64), i64>(&mut store, "and_i64")
+        .unwrap();
+    assert_eq!(and_i32.call(&mut store, (0x5a, 0x3c)).unwrap(), 0x18);
+    assert_eq!(
+        and_i64
+            .call(&mut store, (0x55aa_ffff_0000_1234, 0x0f0f_00ff_ffff_ffff))
+            .unwrap(),
+        0x050a_00ff_0000_1234
+    );
 }
 
 fn dynamic_alloc_module() -> sonatina_ir::Module {
