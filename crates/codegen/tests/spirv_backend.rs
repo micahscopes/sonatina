@@ -2848,6 +2848,43 @@ fn render_wgsl_shape() {
 /// `>>` on the u32 (no bitcast dance, unlike Sar) and validates browser-profile.
 /// A non-immediate u32 shift amount and an i64 `Shr` both fail closed.
 #[test]
+fn spirv_u32_shl_shape() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("shl_probe", Linkage::Public, &[Type::I32], Type::I32);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let runtime_value = fb.args()[0];
+    let four = fb.make_imm_value(4i32);
+    let shifted = fb.insert_inst(arith::Shl::new(is, four, runtime_value), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, shifted));
+    fb.seal_all();
+    fb.finish();
+
+    let art = SpirvBackend::new()
+        .with_workgroup_size(1, 1, 1)
+        .compile_module(&mb.build())
+        .expect("u32 Shl kernel must compile");
+    assert_eq!(art.layout.word, WordKind::U32, "i32 return -> u32 word");
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+    assert!(wgsl.contains("<<"), "shift-left must remain a genuine WGSL `<<`:\n{wgsl}");
+    for tok in ["i64", "u64", "bitcast<i32>"] {
+        assert!(!wgsl.contains(tok), "browser Shl needs no `{tok}`:\n{wgsl}");
+    }
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse runtime-value Shl WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation must accept scalar Shl");
+}
+
+#[test]
 fn spirv_u32_shr_shape() {
     let isa = native_isa();
     let is = isa.inst_set();
