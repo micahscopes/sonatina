@@ -4,7 +4,7 @@ use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
-    inst::{arith, cmp, control_flow, data, logic},
+    inst::{arith, cast, cmp, control_flow, data, logic},
     isa::{Isa, native::Native, wasm32::Wasm32},
     module::ModuleCtx,
 };
@@ -63,6 +63,64 @@ fn wasm_bitwise_and_i32_i64_execute() {
             .call(&mut store, (0x55aa_ffff_0000_1234, 0x0f0f_00ff_ffff_ffff))
             .unwrap(),
         0x050a_00ff_0000_1234
+    );
+}
+
+#[test]
+fn wasm_integer_truncation_respects_source_and_target_carriers() {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+    for (name, source, target) in [
+        ("trunc_i32_i8", Type::I32, Type::I8),
+        ("trunc_i64_i32", Type::I64, Type::I32),
+        ("trunc_i64_i8", Type::I64, Type::I8),
+    ] {
+        let func = mb
+            .declare_function(Signature::new_single(
+                name,
+                Linkage::Public,
+                &[source],
+                target,
+            ))
+            .unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(func);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let value = fb.insert_inst(cast::Trunc::new(is, fb.args()[0], target), target);
+        fb.insert_return(value);
+        fb.seal_all();
+        fb.finish();
+    }
+    let artifact = WasmBackend::new().compile_module(&mb.build()).unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    assert_eq!(
+        instance
+            .get_typed_func::<i32, i32>(&mut store, "trunc_i32_i8")
+            .unwrap()
+            .call(&mut store, 0x1234_56ab)
+            .unwrap(),
+        0xab
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<i64, i32>(&mut store, "trunc_i64_i32")
+            .unwrap()
+            .call(&mut store, 0x1234_5678_9abc_def0)
+            .unwrap(),
+        0x9abc_def0u32 as i32
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<i64, i32>(&mut store, "trunc_i64_i8")
+            .unwrap()
+            .call(&mut store, 0x1234_5678_9abc_def0)
+            .unwrap(),
+        0xf0
     );
 }
 
