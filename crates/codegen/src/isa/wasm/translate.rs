@@ -148,9 +148,8 @@ pub(super) fn translate_module(
     }
 
     // Imported functions must occupy the lowest Wasm function indexes.
-    if canonical_arena {
-        synthesize_canonical_arena(&mut wmod, memory, &mut func_names);
-    }
+    let canonical_alloc = canonical_arena
+        .then(|| synthesize_canonical_arena(&mut wmod, memory, &mut func_names));
 
     // Pass 1: declare every translatable defined function up front (placeholder
     // bodies), recording the Sonatina `FuncRef` -> WAFFLE `Func` mapping. Doing
@@ -204,7 +203,15 @@ pub(super) fn translate_module(
 
     // Pass 2: translate each body, now that every callee has a WAFFLE `Func`.
     for (func_ref, wfunc, wsig, name) in pending {
-        let body = translate_function(module, func_ref, &wmod, wsig, memory, &func_map)?;
+        let body = translate_function(
+            module,
+            func_ref,
+            &wmod,
+            wsig,
+            memory,
+            &func_map,
+            canonical_alloc,
+        )?;
         wmod.funcs[wfunc] = FuncDecl::Body(wsig, name, body);
     }
 
@@ -215,7 +222,7 @@ fn synthesize_canonical_arena(
     module: &mut WaffleModule<'static>,
     memory: waffle::Memory,
     func_names: &mut Vec<String>,
-) {
+) -> Func {
     const HEAP_BASE: u32 = 1024;
     const PAGE_SHIFT: u32 = 16;
     const PAGE_MASK: u32 = (1 << PAGE_SHIFT) - 1;
@@ -324,6 +331,7 @@ fn synthesize_canonical_arena(
         kind: ExportKind::Func(reset_func),
     });
     func_names.push("fe_cabi_reset".to_string());
+    alloc
 }
 
 fn translate_function(
@@ -333,6 +341,7 @@ fn translate_function(
     wsig: waffle::Signature,
     memory: waffle::Memory,
     func_map: &HashMap<FuncRef, Func>,
+    canonical_alloc: Option<Func>,
 ) -> Result<FunctionBody, String> {
     let mut body = FunctionBody::new(wmod, wsig);
     // Stack pointer for bump allocation in linear memory (starts at 1024 to leave space)
@@ -721,6 +730,43 @@ fn translate_function(
                             let addr = body.add_op(wb, Operator::I32Add, &[base, offset], &[WType::I32]);
                             value_map.insert(result, addr);
                         }
+                    }
+                    // MemAllocDynamic has one operand, byte size, and no
+                    // alignment operand in Sonatina IR. Its portable contract
+                    // therefore cannot promise more than byte alignment. Route
+                    // it through the opt-in canonical arena with align=1 so it
+                    // shares growth, overflow checks, and the one cursor.
+                    else if let Some(alloc) = <&sonatina_ir::inst::data::MemAllocDynamic as InstDowncast>::downcast(inst_set, inst_data) {
+                        let canonical_alloc = canonical_alloc.ok_or(
+                            "wasm translation: mem.alloc_dynamic requires the opt-in canonical arena",
+                        )?;
+                        let size_ty = function.dfg.value_ty(*alloc.size());
+                        if sonatina_to_waffle_type(size_ty) != Some(WType::I32) {
+                            return Err(format!(
+                                "wasm translation: mem.alloc_dynamic size `{size_ty:?}` is not representable by the canonical wasm32 allocator"
+                            ));
+                        }
+                        let size = resolve_value(function, *alloc.size(), &value_map, &mut body, wb)
+                            .ok_or("unresolved mem.alloc_dynamic size")?;
+                        let align = body.add_op(
+                            wb,
+                            Operator::I32Const { value: 1 },
+                            &[],
+                            &[WType::I32],
+                        );
+                        let result = function
+                            .dfg
+                            .inst_result(inst_id)
+                            .ok_or("mem.alloc_dynamic has no pointer result")?;
+                        let address = body.add_op(
+                            wb,
+                            Operator::Call {
+                                function_index: canonical_alloc,
+                            },
+                            &[size, align],
+                            &[WType::I32],
+                        );
+                        value_map.insert(result, address);
                     }
                     // Alloca — allocate a local
                     else if <&sonatina_ir::inst::data::Alloca as InstDowncast>::downcast(inst_set, inst_data).is_some() {

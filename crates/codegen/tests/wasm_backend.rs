@@ -24,6 +24,28 @@ fn wasm32_module_builder() -> ModuleBuilder {
     ModuleBuilder::new(ctx)
 }
 
+fn dynamic_alloc_module() -> sonatina_ir::Module {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+    let ptr_i8 = mb.ptr_type(Type::I8);
+    let func = mb
+        .declare_function(Signature::new_unit(
+            "dynamic_alloc",
+            Linkage::Public,
+            &[Type::I32],
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    fb.insert_inst(data::MemAllocDynamic::new(is, fb.args()[0]), ptr_i8);
+    fb.insert_inst_no_result(control_flow::Return::new(is, Default::default()));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 #[test]
 fn canonical_arena_is_opt_in_checked_growable_and_resettable() {
     let engine = wasmtime::Engine::default();
@@ -73,6 +95,55 @@ fn canonical_arena_is_opt_in_checked_growable_and_resettable() {
         reset.call(&mut store, ()).unwrap();
     }
     assert!(alloc.call(&mut store, (20_000_000, 1)).is_err());
+}
+
+#[test]
+fn mem_alloc_dynamic_uses_the_opt_in_canonical_arena() {
+    let error = match WasmBackend::new().compile_module(&dynamic_alloc_module()) {
+        Ok(_) => panic!("mem.alloc_dynamic compiled without the canonical arena"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .iter()
+            .any(|error| error
+                .to_string()
+                .contains("mem.alloc_dynamic requires the opt-in canonical arena")),
+        "{error:?}"
+    );
+
+    let artifact = WasmBackend::new()
+        .with_canonical_arena()
+        .compile_module(&dynamic_alloc_module())
+        .unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    let alloc = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "fe_cabi_alloc")
+        .unwrap();
+    let reset = instance
+        .get_typed_func::<(), ()>(&mut store, "fe_cabi_reset")
+        .unwrap();
+    let dynamic = instance
+        .get_typed_func::<i32, ()>(&mut store, "dynamic_alloc")
+        .unwrap();
+
+    // mem.alloc_dynamic has no alignment operand, so its specified bridge is
+    // byte alignment (align=1). The surrounding canonical allocations prove
+    // that it advances the same cursor and does not overlap either neighbor.
+    assert_eq!(alloc.call(&mut store, (3, 1)).unwrap(), 1024);
+    dynamic.call(&mut store, 5).unwrap();
+    assert_eq!(alloc.call(&mut store, (1, 8)).unwrap(), 1032);
+
+    reset.call(&mut store, ()).unwrap();
+    let pages_before = memory.size(&store);
+    dynamic.call(&mut store, 200_000).unwrap();
+    assert!(memory.size(&store) > pages_before);
+    assert_eq!(alloc.call(&mut store, (1, 16)).unwrap(), 201_024);
 }
 
 #[test]
