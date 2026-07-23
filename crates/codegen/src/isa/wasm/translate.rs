@@ -191,13 +191,17 @@ pub(super) fn translate_module(
         let placeholder = FunctionBody::new(&wmod, wsig);
         let wfunc = wmod.funcs.push(FuncDecl::Body(wsig, name.clone(), placeholder));
 
-        wmod.exports.push(waffle::Export {
-            name: name.clone(),
-            kind: ExportKind::Func(wfunc),
-        });
+        // Linkage is the compiler-owned Wasm export boundary. Private helper
+        // bodies remain callable inside the module without becoming host ABI.
+        if module.ctx.func_linkage(func_ref) == Linkage::Public {
+            wmod.exports.push(waffle::Export {
+                name: name.clone(),
+                kind: ExportKind::Func(wfunc),
+            });
+            func_names.push(name.clone());
+        }
 
         func_map.insert(func_ref, wfunc);
-        func_names.push(name.clone());
         pending.push((func_ref, wfunc, wsig, name));
     }
 
