@@ -530,6 +530,32 @@ fn emit_single_inst(
             }
             return true;
         }
+    } else if let Some(shl) = <&sonatina_ir::inst::arith::Shl as InstDowncast>::downcast(inst_set, inst_data) {
+        // Shift-left is sign-agnostic. As with the existing Shr path, materialize
+        // the immediate amount as WGSL u32 while preserving the runtime value's
+        // carrier bits exactly.
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let val = resolve_naga_value(*shl.value(), function, word, value_map, phi_locals, func).unwrap();
+            let shift_amount = if let Some(imm) = function.dfg.value_imm(*shl.bits()) {
+                match imm {
+                    sonatina_ir::Immediate::I64(v) => v as u32,
+                    sonatina_ir::Immediate::I32(v) => v as u32,
+                    sonatina_ir::Immediate::I8(v) => v as u32,
+                    _ => 0,
+                }
+            } else { 0 };
+            let bits_u32 = func.expressions.append(
+                naga::Expression::Literal(naga::Literal::U32(shift_amount)),
+                naga::Span::UNDEFINED,
+            );
+            let h = func.expressions.append(
+                naga::Expression::Binary { op: naga::BinaryOperator::ShiftLeft, left: val, right: bits_u32 },
+                naga::Span::UNDEFINED,
+            );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
     } else if let Some(shr) = <&sonatina_ir::inst::arith::Shr as InstDowncast>::downcast(inst_set, inst_data) {
         // Logical (unsigned) shift right. Fe lowers unsigned `>>` to `Shr`. Under
         // the u32 word this is the EASY case: WGSL `>>` on a `u32` IS a logical
@@ -1709,6 +1735,7 @@ fn spirv_instruction_is_lowered(
         || <&arith::Fdiv as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fsqrt as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Sar as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Shl as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shr as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Lt as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Eq as InstDowncast>::downcast(is, inst).is_some()
@@ -1937,6 +1964,20 @@ fn translate_to_naga(
                                 return Err(
                                     "spirv u32: shr with a non-immediate shift amount is \
                                      unsupported (the u32 logical shift materializes the \
+                                     amount as a WGSL u32 literal). Fail closed."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                        if let Some(shl) =
+                            <&sonatina_ir::inst::arith::Shl as sonatina_ir::InstDowncast>::downcast(
+                                is, inst_data,
+                            )
+                        {
+                            if f.dfg.value_imm(*shl.bits()).is_none() {
+                                return Err(
+                                    "spirv u32: shl with a non-immediate shift amount is \
+                                     unsupported (the u32 shift-left materializes the \
                                      amount as a WGSL u32 literal). Fail closed."
                                         .to_string(),
                                 );
