@@ -29,6 +29,23 @@ fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
     }
 }
 
+fn scalar_memory_arg(memory: waffle::Memory, ty: Type) -> Result<waffle::MemoryArg, String> {
+    // WebAssembly encodes alignment as log2(bytes). These are natural
+    // alignments, but unaligned runtime addresses remain legal in Wasm.
+    let align = match ty {
+        Type::I1 | Type::I8 => 0,
+        Type::I16 => 1,
+        Type::I32 | Type::F32 => 2,
+        Type::I64 => 3,
+        _ => return Err(format!("unsupported wasm scalar memory type `{ty:?}`")),
+    };
+    Ok(waffle::MemoryArg {
+        align,
+        offset: 0,
+        memory,
+    })
+}
+
 pub(super) fn translate_module(
     module: &Module,
     import_modules: &HashMap<String, String>,
@@ -712,21 +729,51 @@ fn translate_function(
                             value_map.insert(result, zero);
                         }
                     }
-                    // Mstore — store to local (just map the value)
+                    // Mstore — typed scalar store to linear memory.
                     else if let Some(mstore) = <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(inst_set, inst_data) {
-                        let val = resolve_value(function, *mstore.value(), &value_map, &mut body, wb);
-                        let addr = resolve_value(function, *mstore.addr(), &value_map, &mut body, wb);
-                        // In WASM, mstore updates the "local" that addr represents
-                        // For now, just track the value
+                        let value = resolve_value(function, *mstore.value(), &value_map, &mut body, wb)
+                            .ok_or("unresolved mstore value")?;
+                        let addr = resolve_value(function, *mstore.addr(), &value_map, &mut body, wb)
+                            .ok_or("unresolved mstore address")?;
+                        let memarg = scalar_memory_arg(memory, *mstore.ty())?;
+                        let op = match mstore.ty() {
+                            Type::I1 | Type::I8 => Operator::I32Store8 { memory: memarg },
+                            Type::I16 => Operator::I32Store16 { memory: memarg },
+                            Type::I32 => Operator::I32Store { memory: memarg },
+                            Type::I64 => Operator::I64Store { memory: memarg },
+                            Type::F32 => Operator::F32Store { memory: memarg },
+                            ty => return Err(format!("unsupported wasm mstore type `{ty:?}`")),
+                        };
+                        body.add_op(wb, op, &[addr, value], &[]);
                     }
-                    // Mload — load from local
+                    // Mload — typed scalar load from linear memory. Narrow
+                    // integer values are zero-extended into Wasm's i32 carrier.
                     else if let Some(mload) = <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let addr = resolve_value(function, *mload.addr(), &value_map, &mut body, wb);
-                            if let Some(v) = addr {
-                                value_map.insert(result, v);
-                            }
+                            let addr = addr.ok_or("unresolved mload address")?;
+                            let memarg = scalar_memory_arg(memory, *mload.ty())?;
+                            let (op, result_ty) = match mload.ty() {
+                                Type::I1 | Type::I8 => (Operator::I32Load8U { memory: memarg }, WType::I32),
+                                Type::I16 => (Operator::I32Load16U { memory: memarg }, WType::I32),
+                                Type::I32 => (Operator::I32Load { memory: memarg }, WType::I32),
+                                Type::I64 => (Operator::I64Load { memory: memarg }, WType::I64),
+                                Type::F32 => (Operator::F32Load { memory: memarg }, WType::F32),
+                                ty => return Err(format!("unsupported wasm mload type `{ty:?}`")),
+                            };
+                            let loaded = body.add_op(wb, op, &[addr], &[result_ty]);
+                            value_map.insert(result, loaded);
                         }
+                    }
+                    // Memzero has the exact WebAssembly memory.fill semantics:
+                    // write `len` zero bytes beginning at `dest`.
+                    else if let Some(memzero) = <&sonatina_ir::inst::data::Memzero as InstDowncast>::downcast(inst_set, inst_data) {
+                        let dest = resolve_value(function, *memzero.dest(), &value_map, &mut body, wb)
+                            .ok_or("unresolved memzero destination")?;
+                        let len = resolve_value(function, *memzero.len(), &value_map, &mut body, wb)
+                            .ok_or("unresolved memzero length")?;
+                        let zero = body.add_op(wb, Operator::I32Const { value: 0 }, &[], &[WType::I32]);
+                        body.add_op(wb, Operator::MemoryFill { mem: memory }, &[dest, zero, len], &[]);
                     }
                     // ExtractValue — load at field offset from base address
                     else if let Some(extract) = <&sonatina_ir::inst::data::ExtractValue as InstDowncast>::downcast(inst_set, inst_data) {

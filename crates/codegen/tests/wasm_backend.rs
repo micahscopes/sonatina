@@ -4,7 +4,7 @@ use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
-    inst::{arith, cmp, control_flow},
+    inst::{arith, cmp, control_flow, data},
     isa::{Isa, native::Native, wasm32::Wasm32},
     module::ModuleCtx,
 };
@@ -73,6 +73,91 @@ fn canonical_arena_is_opt_in_checked_growable_and_resettable() {
         reset.call(&mut store, ()).unwrap();
     }
     assert!(alloc.call(&mut store, (20_000_000, 1)).is_err());
+}
+
+#[test]
+fn wasm_scalar_memory_ops_and_memzero_are_byte_exact() {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+
+    for (name, ty) in [
+        ("mem_i1", Type::I1),
+        ("mem_i8", Type::I8),
+        ("mem_i16", Type::I16),
+        ("mem_i32", Type::I32),
+        ("mem_i64", Type::I64),
+        ("mem_f32", Type::F32),
+    ] {
+        let func = mb
+            .declare_function(Signature::new_single(
+                name,
+                Linkage::Public,
+                &[Type::I32, ty],
+                ty,
+            ))
+            .unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(func);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let addr = fb.args()[0];
+        let value = fb.args()[1];
+        fb.insert_inst_no_result(data::Mstore::new(is, addr, value, ty));
+        let loaded = fb.insert_inst(data::Mload::new(is, addr, ty), ty);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let zero_func = mb
+        .declare_function(Signature::new_unit(
+            "memzero",
+            Linkage::Public,
+            &[Type::I32, Type::I32],
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(zero_func);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    fb.insert_inst_no_result(data::Memzero::new(is, fb.args()[0], fb.args()[1]));
+    fb.insert_inst_no_result(control_flow::Return::new(is, Default::default()));
+    fb.seal_all();
+    fb.finish();
+
+    let artifact = WasmBackend::new().compile_module(&mb.build()).unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+    let i1 = instance.get_typed_func::<(i32, i32), i32>(&mut store, "mem_i1").unwrap();
+    let i8 = instance.get_typed_func::<(i32, i32), i32>(&mut store, "mem_i8").unwrap();
+    let i16 = instance.get_typed_func::<(i32, i32), i32>(&mut store, "mem_i16").unwrap();
+    let i32f = instance.get_typed_func::<(i32, i32), i32>(&mut store, "mem_i32").unwrap();
+    let i64f = instance.get_typed_func::<(i32, i64), i64>(&mut store, "mem_i64").unwrap();
+    let f32f = instance.get_typed_func::<(i32, f32), f32>(&mut store, "mem_f32").unwrap();
+
+    assert_eq!(i1.call(&mut store, (17, 1)).unwrap(), 1);
+    assert_eq!(i8.call(&mut store, (18, 0xab)).unwrap(), 0xab);
+    assert_eq!(i16.call(&mut store, (19, 0xcdef)).unwrap(), 0xcdef);
+    assert_eq!(i32f.call(&mut store, (21, 0x78563412)).unwrap(), 0x78563412);
+    assert_eq!(
+        i64f.call(&mut store, (25, 0x0807060504030201)).unwrap(),
+        0x0807060504030201
+    );
+    assert_eq!(f32f.call(&mut store, (33, -13.25)).unwrap(), -13.25);
+    let bytes = memory.data(&store);
+    assert_eq!(&bytes[17..21], &[1, 0xab, 0xef, 0xcd]);
+    assert_eq!(&bytes[21..25], &0x78563412_i32.to_le_bytes());
+    assert_eq!(&bytes[25..33], &0x0807060504030201_i64.to_le_bytes());
+    assert_eq!(&bytes[33..37], &(-13.25_f32).to_le_bytes());
+
+    memory.write(&mut store, 40, &[0xaa; 12]).unwrap();
+    let memzero = instance.get_typed_func::<(i32, i32), ()>(&mut store, "memzero").unwrap();
+    memzero.call(&mut store, (43, 5)).unwrap();
+    assert_eq!(&memory.data(&store)[40..52], &[0xaa, 0xaa, 0xaa, 0, 0, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa]);
 }
 
 /// The minted `Wasm32` ISA drives the same WAFFLE backend end to end:

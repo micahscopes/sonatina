@@ -67,6 +67,7 @@ pub struct NativeInstSet(
     control_flow::Unreachable,
     data::Mload,
     data::Mstore,
+    data::Memzero,
     data::Gep,
     data::GetFunctionPtr,
     data::SymAddr,
