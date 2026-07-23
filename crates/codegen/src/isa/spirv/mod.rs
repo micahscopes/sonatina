@@ -571,6 +571,26 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some((lhs_id, rhs_id, naga_op)) =
+        <&sonatina_ir::inst::cmp::Eq as InstDowncast>::downcast(inst_set, inst_data)
+            .map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Equal))
+            .or_else(|| <&sonatina_ir::inst::cmp::Ne as InstDowncast>::downcast(inst_set, inst_data)
+                .map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::NotEqual)))
+    {
+        // Equality is sign-agnostic: the u32 browser word preserves the exact
+        // bit pattern of Sonatina's signless i32 carrier, so no signed cast or
+        // numeric substitution is needed.
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(lhs_id, function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(rhs_id, function, word, value_map, phi_locals, func).unwrap();
+            let h = func.expressions.append(
+                naga::Expression::Binary { op: naga_op, left: lhs, right: rhs },
+                naga::Span::UNDEFINED,
+            );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
     } else if let Some(slt) = <&sonatina_ir::inst::cmp::Slt as InstDowncast>::downcast(inst_set, inst_data) {
         // Signed less-than. Under the u32 word the operands carry signed values in
         // two's complement, so bitcast BOTH to i32 (`convert: None` = reinterpret)
@@ -1691,6 +1711,8 @@ fn spirv_instruction_is_lowered(
         || <&arith::Sar as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shr as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Lt as InstDowncast>::downcast(is, inst).is_some()
+        || <&cmp::Eq as InstDowncast>::downcast(is, inst).is_some()
+        || <&cmp::Ne as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Slt as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Feq as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Flt as InstDowncast>::downcast(is, inst).is_some()
