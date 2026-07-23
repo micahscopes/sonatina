@@ -44,13 +44,21 @@ pub struct WasmBackend {
     /// SIDE TABLE consulted only in import emission; it touches no Sonatina IR
     /// type and no symbol interning.
     import_modules: HashMap<String, String>,
+    canonical_arena: bool,
 }
 
 impl WasmBackend {
     pub fn new() -> Self {
         Self {
             import_modules: HashMap::new(),
+            canonical_arena: false,
         }
+    }
+
+    /// Emit canonical browser-interface arena exports. Disabled by default.
+    pub fn with_canonical_arena(mut self) -> Self {
+        self.canonical_arena = true;
+        self
     }
 
     /// Attach a symbol -> import-module table. A frontend that names an
@@ -68,8 +76,9 @@ impl Backend for WasmBackend {
     type Error = WasmError;
 
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        let (wasm_module, func_names) = translate::translate_module(module, &self.import_modules)
-            .map_err(|e| vec![WasmError::Translation(e)])?;
+        let (wasm_module, func_names) =
+            translate::translate_module(module, &self.import_modules, self.canonical_arena)
+                .map_err(|e| vec![WasmError::Translation(e)])?;
 
         let bytes = wasm_module
             .to_wasm_bytes()

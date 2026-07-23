@@ -24,6 +24,57 @@ fn wasm32_module_builder() -> ModuleBuilder {
     ModuleBuilder::new(ctx)
 }
 
+#[test]
+fn canonical_arena_is_opt_in_checked_growable_and_resettable() {
+    let engine = wasmtime::Engine::default();
+    let ordinary = WasmBackend::new()
+        .compile_module(&wasm32_module_builder().build())
+        .unwrap();
+    let module = wasmtime::Module::new(&engine, &ordinary.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    assert!(instance.get_memory(&mut store, "memory").is_some());
+    assert!(instance.get_func(&mut store, "fe_cabi_alloc").is_none());
+    assert!(instance.get_func(&mut store, "fe_cabi_reset").is_none());
+
+    let artifact = WasmBackend::new()
+        .with_canonical_arena()
+        .compile_module(&wasm32_module_builder().build())
+        .unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    let alloc = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "fe_cabi_alloc")
+        .unwrap();
+    let reset = instance
+        .get_typed_func::<(), ()>(&mut store, "fe_cabi_reset")
+        .unwrap();
+
+    let first = alloc.call(&mut store, (3, 1)).unwrap();
+    let aligned = alloc.call(&mut store, (8, 8)).unwrap();
+    let next = alloc.call(&mut store, (7, 4)).unwrap();
+    assert_eq!(first, 1024);
+    assert_eq!(aligned % 8, 0);
+    assert!(aligned >= first + 3);
+    assert_eq!(next % 4, 0);
+    assert!(next >= aligned + 8);
+
+    let pages_before = memory.size(&store);
+    assert_eq!(alloc.call(&mut store, (200_000, 16)).unwrap() % 16, 0);
+    assert!(memory.size(&store) > pages_before);
+    reset.call(&mut store, ()).unwrap();
+    assert_eq!(alloc.call(&mut store, (1, 1)).unwrap(), 1024);
+
+    for invalid in [(1, 0), (1, 3), (-1, 8)] {
+        assert!(alloc.call(&mut store, invalid).is_err());
+        reset.call(&mut store, ()).unwrap();
+    }
+    assert!(alloc.call(&mut store, (20_000_000, 1)).is_err());
+}
+
 /// The minted `Wasm32` ISA drives the same WAFFLE backend end to end:
 /// build `add(a,b)=a+b` under the Wasm32 target, compile, execute under
 /// wasmtime. This is the ISA the Fe wasm lowering targets.

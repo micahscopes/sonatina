@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use waffle::{
-    ExportKind, Func, FuncDecl, FunctionBody, Module as WaffleModule, Operator, SignatureData,
-    Terminator, Type as WType, ValueDef,
+    BlockTarget, ExportKind, Func, FuncDecl, FunctionBody, GlobalData, Module as WaffleModule,
+    Operator, SignatureData, Terminator, Type as WType, ValueDef,
 };
 
 use sonatina_ir::{
@@ -32,6 +32,7 @@ fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
 pub(super) fn translate_module(
     module: &Module,
     import_modules: &HashMap<String, String>,
+    canonical_arena: bool,
 ) -> Result<(WaffleModule<'static>, Vec<String>), String> {
     let mut wmod = WaffleModule::empty();
     let mut func_names = Vec::new();
@@ -129,6 +130,11 @@ pub(super) fn translate_module(
         func_map.insert(func_ref, wfunc);
     }
 
+    // Imported functions must occupy the lowest Wasm function indexes.
+    if canonical_arena {
+        synthesize_canonical_arena(&mut wmod, memory, &mut func_names);
+    }
+
     // Pass 1: declare every translatable defined function up front (placeholder
     // bodies), recording the Sonatina `FuncRef` -> WAFFLE `Func` mapping. Doing
     // this before any body is translated is what lets `Call` resolve its
@@ -186,6 +192,121 @@ pub(super) fn translate_module(
     }
 
     Ok((wmod, func_names))
+}
+
+fn synthesize_canonical_arena(
+    module: &mut WaffleModule<'static>,
+    memory: waffle::Memory,
+    func_names: &mut Vec<String>,
+) {
+    const HEAP_BASE: u32 = 1024;
+    const PAGE_SHIFT: u32 = 16;
+    const PAGE_MASK: u32 = (1 << PAGE_SHIFT) - 1;
+
+    let cursor = module.globals.push(GlobalData {
+        ty: WType::I32,
+        value: Some(HEAP_BASE as u64),
+        mutable: true,
+    });
+    let alloc_sig = module.signatures.push(SignatureData {
+        params: vec![WType::I32, WType::I32],
+        returns: vec![WType::I32],
+    });
+    let mut body = FunctionBody::new(module, alloc_sig);
+    let entry = body.entry;
+    let valid = body.add_block();
+    let check_grow = body.add_block();
+    let grow = body.add_block();
+    let success = body.add_block();
+    let trap = body.add_block();
+    let size = body.blocks[entry].params[0].1;
+    let align = body.blocks[entry].params[1].1;
+    let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[WType::I32]);
+    let one = body.add_op(entry, Operator::I32Const { value: 1 }, &[], &[WType::I32]);
+    let align_nonzero = body.add_op(entry, Operator::I32Ne, &[align, zero], &[WType::I32]);
+    let align_minus_one = body.add_op(entry, Operator::I32Sub, &[align, one], &[WType::I32]);
+    let align_bits = body.add_op(entry, Operator::I32And, &[align, align_minus_one], &[WType::I32]);
+    let align_power_two = body.add_op(entry, Operator::I32Eq, &[align_bits, zero], &[WType::I32]);
+    let alignment_valid =
+        body.add_op(entry, Operator::I32And, &[align_nonzero, align_power_two], &[WType::I32]);
+    body.set_terminator(entry, Terminator::CondBr {
+        cond: alignment_valid,
+        if_true: BlockTarget { block: valid, args: vec![] },
+        if_false: BlockTarget { block: trap, args: vec![] },
+    });
+
+    let current =
+        body.add_op(valid, Operator::GlobalGet { global_index: cursor }, &[], &[WType::I32]);
+    let biased = body.add_op(valid, Operator::I32Add, &[current, align_minus_one], &[WType::I32]);
+    let bias_overflow = body.add_op(valid, Operator::I32LtU, &[biased, current], &[WType::I32]);
+    let negative_align = body.add_op(valid, Operator::I32Sub, &[zero, align], &[WType::I32]);
+    let aligned = body.add_op(valid, Operator::I32And, &[biased, negative_align], &[WType::I32]);
+    let end = body.add_op(valid, Operator::I32Add, &[aligned, size], &[WType::I32]);
+    let end_overflow = body.add_op(valid, Operator::I32LtU, &[end, aligned], &[WType::I32]);
+    let overflow = body.add_op(valid, Operator::I32Or, &[bias_overflow, end_overflow], &[WType::I32]);
+    body.set_terminator(valid, Terminator::CondBr {
+        cond: overflow,
+        if_true: BlockTarget { block: trap, args: vec![] },
+        if_false: BlockTarget { block: check_grow, args: vec![] },
+    });
+
+    let shift =
+        body.add_op(check_grow, Operator::I32Const { value: PAGE_SHIFT }, &[], &[WType::I32]);
+    let mask = body.add_op(check_grow, Operator::I32Const { value: PAGE_MASK }, &[], &[WType::I32]);
+    let whole_pages = body.add_op(check_grow, Operator::I32ShrU, &[end, shift], &[WType::I32]);
+    let remainder = body.add_op(check_grow, Operator::I32And, &[end, mask], &[WType::I32]);
+    let partial = body.add_op(check_grow, Operator::I32Ne, &[remainder, zero], &[WType::I32]);
+    let needed_pages =
+        body.add_op(check_grow, Operator::I32Add, &[whole_pages, partial], &[WType::I32]);
+    let current_pages =
+        body.add_op(check_grow, Operator::MemorySize { mem: memory }, &[], &[WType::I32]);
+    let needs_grow =
+        body.add_op(check_grow, Operator::I32LtU, &[current_pages, needed_pages], &[WType::I32]);
+    body.set_terminator(check_grow, Terminator::CondBr {
+        cond: needs_grow,
+        if_true: BlockTarget { block: grow, args: vec![] },
+        if_false: BlockTarget { block: success, args: vec![] },
+    });
+
+    let delta = body.add_op(grow, Operator::I32Sub, &[needed_pages, current_pages], &[WType::I32]);
+    let previous = body.add_op(grow, Operator::MemoryGrow { mem: memory }, &[delta], &[WType::I32]);
+    let failed = body.add_op(grow, Operator::I32Const { value: u32::MAX }, &[], &[WType::I32]);
+    let grew = body.add_op(grow, Operator::I32Ne, &[previous, failed], &[WType::I32]);
+    body.set_terminator(grow, Terminator::CondBr {
+        cond: grew,
+        if_true: BlockTarget { block: success, args: vec![] },
+        if_false: BlockTarget { block: trap, args: vec![] },
+    });
+
+    body.add_op(success, Operator::GlobalSet { global_index: cursor }, &[end], &[]);
+    body.set_terminator(success, Terminator::Return { values: vec![aligned] });
+    body.set_terminator(trap, Terminator::Unreachable);
+    let alloc = module.funcs.push(FuncDecl::Body(
+        alloc_sig, "fe_cabi_alloc".to_string(), body,
+    ));
+    module.exports.push(waffle::Export {
+        name: "fe_cabi_alloc".to_string(),
+        kind: ExportKind::Func(alloc),
+    });
+    func_names.push("fe_cabi_alloc".to_string());
+
+    let reset_sig = module.signatures.push(SignatureData { params: vec![], returns: vec![] });
+    let mut reset = FunctionBody::new(module, reset_sig);
+    let base = reset.add_op(
+        reset.entry, Operator::I32Const { value: HEAP_BASE }, &[], &[WType::I32],
+    );
+    reset.add_op(
+        reset.entry, Operator::GlobalSet { global_index: cursor }, &[base], &[],
+    );
+    reset.set_terminator(reset.entry, Terminator::Return { values: vec![] });
+    let reset_func = module.funcs.push(FuncDecl::Body(
+        reset_sig, "fe_cabi_reset".to_string(), reset,
+    ));
+    module.exports.push(waffle::Export {
+        name: "fe_cabi_reset".to_string(),
+        kind: ExportKind::Func(reset_func),
+    });
+    func_names.push("fe_cabi_reset".to_string());
 }
 
 fn translate_function(
