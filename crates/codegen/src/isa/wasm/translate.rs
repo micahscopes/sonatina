@@ -885,13 +885,41 @@ fn translate_function(
                     else if let Some(trunc) = <&sonatina_ir::inst::cast::Trunc as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let val = resolve_value(function, *trunc.from(), &value_map, &mut body, wb).ok_or("unresolved trunc")?;
+                            let from_ty = function.dfg.value_ty(*trunc.from());
                             let to_ty = *trunc.ty();
-                            if matches!(to_ty, Type::I32 | Type::I16 | Type::I8 | Type::I1) {
-                                let wrapped = body.add_op(wb, Operator::I32WrapI64, &[val], &[WType::I32]);
-                                value_map.insert(result, wrapped);
+                            let narrowed = if from_ty == Type::I64
+                                && matches!(to_ty, Type::I32 | Type::I16 | Type::I8 | Type::I1)
+                            {
+                                body.add_op(wb, Operator::I32WrapI64, &[val], &[WType::I32])
+                            } else if matches!(from_ty, Type::I32 | Type::I16 | Type::I8 | Type::I1)
+                                && matches!(to_ty, Type::I16 | Type::I8 | Type::I1)
+                            {
+                                val
                             } else {
-                                value_map.insert(result, val);
-                            }
+                                return Err(format!(
+                                    "unsupported wasm trunc `{from_ty:?}` -> `{to_ty:?}`"
+                                ));
+                            };
+                            let narrowed = match to_ty {
+                                Type::I16 | Type::I8 | Type::I1 => {
+                                    let mask = match to_ty {
+                                        Type::I16 => 0xffff,
+                                        Type::I8 => 0xff,
+                                        Type::I1 => 1,
+                                        _ => unreachable!(),
+                                    };
+                                    let mask = body.add_op(
+                                        wb,
+                                        Operator::I32Const { value: mask },
+                                        &[],
+                                        &[WType::I32],
+                                    );
+                                    body.add_op(wb, Operator::I32And, &[narrowed, mask], &[WType::I32])
+                                }
+                                Type::I32 => narrowed,
+                                _ => unreachable!(),
+                            };
+                            value_map.insert(result, narrowed);
                         }
                     }
                     // EvmRevert/EvmStop → unreachable
