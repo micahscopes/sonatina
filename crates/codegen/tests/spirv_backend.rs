@@ -2077,6 +2077,46 @@ fn build_u32_slt_count() -> sonatina_ir::Module {
     mb.build()
 }
 
+/// A browser-word grid kernel containing both of Sonatina's signless integer
+/// equality operations. Runtime coordinate operands ensure both comparisons
+/// survive into Naga and the emitted WGSL/SPIR-V.
+fn build_u32_eq_ne_probe() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("eq_ne_probe", Linkage::Public, &[Type::I32, Type::I32], Type::I32);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let lhs = fb.args()[0];
+    let rhs = fb.args()[1];
+    let entry = fb.append_block();
+    let equal = fb.append_block();
+    let unequal = fb.append_block();
+    let ne_true = fb.append_block();
+    let impossible = fb.append_block();
+    fb.switch_to_block(entry);
+    let is_equal = fb.insert_inst(cmp::Eq::new(is, lhs, rhs), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, is_equal, equal, unequal));
+    fb.switch_to_block(equal);
+    let eleven = fb.make_imm_value(11i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, eleven));
+    fb.switch_to_block(unequal);
+    let is_unequal = fb.insert_inst(cmp::Ne::new(is, lhs, rhs), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, is_unequal, ne_true, impossible));
+    fb.switch_to_block(ne_true);
+    let twenty_two = fb.make_imm_value(22i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, twenty_two));
+    fb.switch_to_block(impossible);
+    let thirty_three = fb.make_imm_value(33i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, thirty_three));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 /// A scalar u32 kernel `sar_probe(a) = a >> 12` with an IMMEDIATE shift amount.
 fn build_u32_sar_probe() -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
@@ -2261,6 +2301,31 @@ fn spirv_u32_slt_shape() {
     .validate(&reparsed)
     .expect("browser-profile validation (default caps) must accept the u32 Slt module");
     eprintln!("spirv_u32_slt_shape OK: {} words", art.words.len());
+}
+
+#[test]
+fn spirv_u32_eq_ne_shape() {
+    let module = build_u32_eq_ne_probe();
+    let art = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(1, 1, 1)
+        .compile_module(&module)
+        .expect("scalar Eq/Ne kernel must compile");
+    assert_eq!(art.layout.word, WordKind::U32, "i32 return -> u32 word");
+    let wgsl = art.wgsl.as_ref().expect("WGSL");
+    assert!(wgsl.contains("=="), "Eq must emit genuine WGSL equality:\n{wgsl}");
+    assert!(wgsl.contains("!="), "Ne must emit genuine WGSL inequality:\n{wgsl}");
+    for tok in ["i64", "u64"] {
+        assert!(!wgsl.contains(tok), "browser profile: no `{tok}`:\n{wgsl}");
+    }
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse Eq/Ne WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation must accept scalar Eq/Ne");
 }
 
 /// Test 3.3.2: the u32 `Sar` arm emits bitcast-i32 / shift / bitcast-u32 and
