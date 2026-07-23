@@ -124,6 +124,77 @@ fn wasm_integer_truncation_respects_source_and_target_carriers() {
     );
 }
 
+#[test]
+fn wasm_integer_extension_respects_signedness_and_carriers() {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+    for (name, signed, target) in [
+        ("sext_i8_i32", true, Type::I32),
+        ("sext_i8_i64", true, Type::I64),
+        ("zext_i8_i32", false, Type::I32),
+        ("zext_i8_i64", false, Type::I64),
+    ] {
+        let func = mb
+            .declare_function(Signature::new_single(
+                name,
+                Linkage::Public,
+                &[Type::I8],
+                target,
+            ))
+            .unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(func);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let value = if signed {
+            fb.insert_inst(cast::Sext::new(is, fb.args()[0], target), target)
+        } else {
+            fb.insert_inst(cast::Zext::new(is, fb.args()[0], target), target)
+        };
+        fb.insert_return(value);
+        fb.seal_all();
+        fb.finish();
+    }
+    let artifact = WasmBackend::new().compile_module(&mb.build()).unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    assert_eq!(
+        instance
+            .get_typed_func::<i32, i32>(&mut store, "sext_i8_i32")
+            .unwrap()
+            .call(&mut store, 0xff)
+            .unwrap(),
+        -1
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<i32, i64>(&mut store, "sext_i8_i64")
+            .unwrap()
+            .call(&mut store, 0xff)
+            .unwrap(),
+        -1
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<i32, i32>(&mut store, "zext_i8_i32")
+            .unwrap()
+            .call(&mut store, 0xff)
+            .unwrap(),
+        255
+    );
+    assert_eq!(
+        instance
+            .get_typed_func::<i32, i64>(&mut store, "zext_i8_i64")
+            .unwrap()
+            .call(&mut store, 0xff)
+            .unwrap(),
+        255
+    );
+}
+
 fn dynamic_alloc_module() -> sonatina_ir::Module {
     let isa = Wasm32::new(wasm32_triple());
     let is = isa.inst_set();
