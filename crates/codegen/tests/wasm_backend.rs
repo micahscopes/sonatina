@@ -1,7 +1,6 @@
-use sonatina_codegen::Backend;
-use sonatina_codegen::isa::wasm::WasmBackend;
+use sonatina_codegen::{Backend, isa::wasm::WasmBackend};
 use sonatina_ir::{
-    Linkage, Signature, Type,
+    Immediate, Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
     inst::{arith, cmp, control_flow},
@@ -70,12 +69,20 @@ fn wasm32_isa_call_pair_wasmtime() {
     let is = isa.inst_set();
     let mb = wasm32_module_builder();
 
-    let callee_sig =
-        Signature::new_single("callee", Linkage::Private, &[Type::I64, Type::I64], Type::I64);
+    let callee_sig = Signature::new_single(
+        "callee",
+        Linkage::Private,
+        &[Type::I64, Type::I64],
+        Type::I64,
+    );
     let callee_ref = mb.declare_function(callee_sig).unwrap();
 
-    let caller_sig =
-        Signature::new_single("caller", Linkage::Public, &[Type::I64, Type::I64], Type::I64);
+    let caller_sig = Signature::new_single(
+        "caller",
+        Linkage::Public,
+        &[Type::I64, Type::I64],
+        Type::I64,
+    );
     let caller_ref = mb.declare_function(caller_sig).unwrap();
 
     // callee(a, b) = a + b
@@ -122,6 +129,47 @@ fn wasm32_isa_call_pair_wasmtime() {
         .expect("caller export");
     assert_eq!(f.call(&mut store, (2, 3)).unwrap(), 5);
     assert_eq!(f.call(&mut store, (40, 2)).unwrap(), 42);
+}
+
+/// An internal call returning unlike Wasm value types must preserve the
+/// callee signature's result order. Using unlike types makes an accidental
+/// stack/local reversal observable to Wasm validation as well as execution.
+#[test]
+fn wasm32_internal_heterogeneous_multi_result_call_preserves_order() {
+    let source = r#"
+target = "wasm32-unknown-native"
+
+func private %pair(v0.i32, v1.i64) -> (i32, i64) {
+    block0:
+        return (v0, v1);
+}
+
+func public %forward_pair(v0.i32, v1.i64) -> (i32, i64) {
+    block0:
+        (v2.i32, v3.i64) = call %pair v0 v1;
+        return (v2, v3);
+}
+"#;
+    let module = sonatina_parser::parse_module(source)
+        .expect("heterogeneous multi-result module should parse")
+        .module;
+    let artifact = WasmBackend::new()
+        .compile_module(&module)
+        .expect("WASM multi-result call compilation failed");
+    wasmparser::validate(&artifact.bytes).expect("produced invalid multi-result WASM");
+
+    let engine = wasmtime::Engine::default();
+    let wasm_module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
+    let forward_pair = instance
+        .get_typed_func::<(i32, i64), (i32, i64)>(&mut store, "forward_pair")
+        .expect("forward_pair export");
+
+    let input = (0x1234_5678, -0x1234_5678_7654_321_i64);
+    let output = forward_pair.call(&mut store, input).unwrap();
+    assert_eq!(output.0, input.0);
+    assert_eq!(output.1, input.1);
 }
 
 #[test]
@@ -212,7 +260,12 @@ fn wasm_add_two_i64s_wasmtime() {
     let is = isa.inst_set();
     let mb = native_module_builder();
 
-    let sig = Signature::new_single("add_i64", Linkage::Public, &[Type::I64, Type::I64], Type::I64);
+    let sig = Signature::new_single(
+        "add_i64",
+        Linkage::Public,
+        &[Type::I64, Type::I64],
+        Type::I64,
+    );
     let func_ref = mb.declare_function(sig).unwrap();
 
     let mut fb = mb.func_builder::<InstInserter>(func_ref);
@@ -228,7 +281,9 @@ fn wasm_add_two_i64s_wasmtime() {
 
     let module = mb.build();
     let backend = WasmBackend::new();
-    let artifact = backend.compile_module(&module).expect("WASM compilation failed");
+    let artifact = backend
+        .compile_module(&module)
+        .expect("WASM compilation failed");
 
     // Validate WASM
     wasmparser::validate(&artifact.bytes).expect("produced invalid WASM");
@@ -245,10 +300,14 @@ fn wasm_add_two_i64s_wasmtime() {
         .get_typed_func::<(i64, i64), i64>(&mut store, "add_i64")
         .expect("add_i64 export should exist");
 
-    let result = add_fn.call(&mut store, (3, 4)).expect("call should succeed");
+    let result = add_fn
+        .call(&mut store, (3, 4))
+        .expect("call should succeed");
     assert_eq!(result, 7);
 
-    let result = add_fn.call(&mut store, (100, 200)).expect("call should succeed");
+    let result = add_fn
+        .call(&mut store, (100, 200))
+        .expect("call should succeed");
     assert_eq!(result, 300);
 }
 
@@ -277,13 +336,15 @@ fn wasm_arithmetic_chain_wasmtime() {
 
     let module = mb.build();
     let backend = WasmBackend::new();
-    let artifact = backend.compile_module(&module).expect("WASM compilation failed");
+    let artifact = backend
+        .compile_module(&module)
+        .expect("WASM compilation failed");
 
     wasmparser::validate(&artifact.bytes).expect("produced invalid WASM");
 
     let engine = wasmtime::Engine::default();
-    let wasm_module = wasmtime::Module::new(&engine, &artifact.bytes)
-        .expect("wasmtime should load the module");
+    let wasm_module =
+        wasmtime::Module::new(&engine, &artifact.bytes).expect("wasmtime should load the module");
     let mut store = wasmtime::Store::new(&engine, ());
     let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[])
         .expect("wasmtime should instantiate");
@@ -318,7 +379,9 @@ fn wasm_constant_return_wasmtime() {
 
     let module = mb.build();
     let backend = WasmBackend::new();
-    let artifact = backend.compile_module(&module).expect("WASM compilation failed");
+    let artifact = backend
+        .compile_module(&module)
+        .expect("WASM compilation failed");
 
     wasmparser::validate(&artifact.bytes).expect("invalid WASM");
 
@@ -357,7 +420,10 @@ fn wasm_loop_sum_wasmtime() {
     fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
 
     fb.switch_to_block(loop_header);
-    let acc = fb.insert_inst(control_flow::Phi::new(is, vec![(init_acc, entry)]), Type::I64);
+    let acc = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(init_acc, entry)]),
+        Type::I64,
+    );
     let i = fb.insert_inst(control_flow::Phi::new(is, vec![(init_i, entry)]), Type::I64);
     let cond = fb.insert_inst(cmp::Lt::new(is, i, n), Type::I1);
     fb.insert_inst_no_result(control_flow::Br::new(is, cond, loop_body, exit));
@@ -378,7 +444,9 @@ fn wasm_loop_sum_wasmtime() {
 
     let module = mb.build();
     let backend = WasmBackend::new();
-    let artifact = backend.compile_module(&module).expect("WASM compilation failed");
+    let artifact = backend
+        .compile_module(&module)
+        .expect("WASM compilation failed");
 
     wasmparser::validate(&artifact.bytes).expect("invalid WASM");
 
@@ -387,7 +455,9 @@ fn wasm_loop_sum_wasmtime() {
     let mut store = wasmtime::Store::new(&engine, ());
     let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).expect("instantiate");
 
-    let f = instance.get_typed_func::<i64, i64>(&mut store, "sum_to").expect("sum_to export");
+    let f = instance
+        .get_typed_func::<i64, i64>(&mut store, "sum_to")
+        .expect("sum_to export");
 
     // sum_to(5) = 0+1+2+3+4 = 10
     let r = f.call(&mut store, 5).unwrap();
@@ -395,6 +465,145 @@ fn wasm_loop_sum_wasmtime() {
     assert_eq!(r, 10);
     assert_eq!(f.call(&mut store, 10).unwrap(), 45);
     assert_eq!(f.call(&mut store, 0).unwrap(), 0);
+}
+
+#[test]
+fn wasm_nested_loops_early_return_across_two_levels() {
+    let isa = Native::new(native_triple());
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("nested_early", Linkage::Public, &[Type::I32], Type::I32);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let outer = fb.append_block();
+    let inner = fb.append_block();
+    let body = fb.append_block();
+    let early = fb.append_block();
+    let inner_latch = fb.append_block();
+    let outer_latch = fb.append_block();
+    let done = fb.append_block();
+    fb.switch_to_block(entry);
+    let flag = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer));
+    fb.switch_to_block(outer);
+    let oi = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let outer_more = fb.insert_inst(cmp::Lt::new(is, oi, one), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, outer_more, inner, done));
+    fb.switch_to_block(inner);
+    let ii = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, outer)]), Type::I32);
+    let inner_more = fb.insert_inst(cmp::Lt::new(is, ii, one), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, inner_more, body, outer_latch));
+    fb.switch_to_block(body);
+    let should_return = fb.insert_inst(cmp::Lt::new(is, zero, flag), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, should_return, early, inner_latch));
+    fb.switch_to_block(early);
+    let escaped = fb.make_imm_value(777i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
+    fb.switch_to_block(inner_latch);
+    let next_ii = fb.insert_inst(arith::Add::new(is, ii, one), Type::I32);
+    fb.append_phi_arg(ii, next_ii, inner_latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, inner));
+    fb.switch_to_block(outer_latch);
+    let next_oi = fb.insert_inst(arith::Add::new(is, oi, one), Type::I32);
+    fb.append_phi_arg(oi, next_oi, outer_latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer));
+    fb.switch_to_block(done);
+    let resumed = fb.make_imm_value(42i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, resumed));
+    fb.seal_all();
+    fb.finish();
+    let artifact = WasmBackend::new()
+        .compile_module(&mb.build())
+        .expect("nested early-return wasm");
+    wasmparser::validate(&artifact.bytes).expect("valid wasm");
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let f = instance
+        .get_typed_func::<i32, i32>(&mut store, "nested_early")
+        .unwrap();
+    assert_eq!(f.call(&mut store, 1).unwrap(), 777);
+    assert_eq!(f.call(&mut store, 0).unwrap(), 42);
+}
+
+#[test]
+fn wasm_loop_in_conditional_arm_transports_f32_and_i1_to_shared_merge() {
+    let isa = Native::new(native_triple());
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("arm_loop_phi", Linkage::Public, &[Type::I32], Type::F32);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let other = fb.append_block();
+    let merge = fb.append_block();
+    let yes = fb.append_block();
+    let no = fb.append_block();
+    fb.switch_to_block(entry);
+    let choose = fb.args()[0];
+    let zero_i = fb.make_imm_value(0i32);
+    let enter = fb.insert_inst(cmp::Lt::new(is, zero_i, choose), Type::I1);
+    let zero_f = fb.make_imm_value(Immediate::F32(0.0f32.to_bits()));
+    let false_v = fb.make_imm_value(false);
+    fb.insert_inst_no_result(control_flow::Br::new(is, enter, header, other));
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero_i, entry)]), Type::I32);
+    let value = fb.insert_inst(control_flow::Phi::new(is, vec![(zero_f, entry)]), Type::F32);
+    let truth = fb.insert_inst(control_flow::Phi::new(is, vec![(false_v, entry)]), Type::I1);
+    let two = fb.make_imm_value(2i32);
+    let more = fb.insert_inst(cmp::Lt::new(is, i, two), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, more, body, merge));
+    fb.switch_to_block(body);
+    let one_i = fb.make_imm_value(1i32);
+    let one_f = fb.make_imm_value(Immediate::F32(1.5f32.to_bits()));
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one_i), Type::I32);
+    let next_value = fb.insert_inst(arith::Fadd::new(is, value, one_f), Type::F32);
+    let next_truth = fb.insert_inst(cmp::Eq::new(is, next_i, two), Type::I1);
+    fb.append_phi_arg(i, next_i, body);
+    fb.append_phi_arg(value, next_value, body);
+    fb.append_phi_arg(truth, next_truth, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(other);
+    let nine = fb.make_imm_value(Immediate::F32(9.0f32.to_bits()));
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+    fb.switch_to_block(merge);
+    let merged = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(value, header), (nine, other)]),
+        Type::F32,
+    );
+    let merged_truth = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(truth, header), (false_v, other)]),
+        Type::I1,
+    );
+    fb.insert_inst_no_result(control_flow::Br::new(is, merged_truth, yes, no));
+    fb.switch_to_block(yes);
+    let ten = fb.make_imm_value(Immediate::F32(10.0f32.to_bits()));
+    let resumed_yes = fb.insert_inst(arith::Fadd::new(is, merged, ten), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, resumed_yes));
+    fb.switch_to_block(no);
+    let resumed_no = fb.insert_inst(arith::Fadd::new(is, merged, one_f), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, resumed_no));
+    fb.seal_all();
+    fb.finish();
+    let artifact = WasmBackend::new()
+        .compile_module(&mb.build())
+        .expect("arm loop phi wasm");
+    wasmparser::validate(&artifact.bytes).expect("valid wasm");
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let f = instance
+        .get_typed_func::<i32, f32>(&mut store, "arm_loop_phi")
+        .unwrap();
+    assert_eq!(f.call(&mut store, 1).unwrap(), 13.0);
+    assert_eq!(f.call(&mut store, 0).unwrap(), 10.5);
 }
 
 /// Poseidon-style sigma loop on WASM with known-answer verification.
@@ -447,17 +656,24 @@ fn wasm_poseidon_sigma_loop_wasmtime() {
 
     let module = mb.build();
     let backend = WasmBackend::new();
-    let artifact = backend.compile_module(&module).expect("WASM compilation failed");
+    let artifact = backend
+        .compile_module(&module)
+        .expect("WASM compilation failed");
     wasmparser::validate(&artifact.bytes).expect("invalid WASM");
 
     let engine = wasmtime::Engine::default();
     let wasm_module = wasmtime::Module::new(&engine, &artifact.bytes).expect("load");
     let mut store = wasmtime::Store::new(&engine, ());
     let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).expect("instantiate");
-    let f = instance.get_typed_func::<(), i64>(&mut store, "poseidon_sigma").expect("export");
+    let f = instance
+        .get_typed_func::<(), i64>(&mut store, "poseidon_sigma")
+        .expect("export");
 
     let result = f.call(&mut store, ()).unwrap();
-    assert_eq!(result, 186898420806, "WASM Poseidon sigma should match Cranelift known answer");
+    assert_eq!(
+        result, 186898420806,
+        "WASM Poseidon sigma should match Cranelift known answer"
+    );
 }
 
 /// Cross-target loop known-answer: same loop IR → Cranelift + WASM, compare.
@@ -486,7 +702,10 @@ fn cross_target_loop_cranelift_vs_wasm() {
     fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
 
     fb.switch_to_block(loop_header);
-    let acc = fb.insert_inst(control_flow::Phi::new(is, vec![(init_acc, entry)]), Type::I64);
+    let acc = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(init_acc, entry)]),
+        Type::I64,
+    );
     let i = fb.insert_inst(control_flow::Phi::new(is, vec![(init_i, entry)]), Type::I64);
     let cond = fb.insert_inst(cmp::Lt::new(is, i, n), Type::I1);
     fb.insert_inst_no_result(control_flow::Br::new(is, cond, loop_body, exit));
@@ -509,9 +728,8 @@ fn cross_target_loop_cranelift_vs_wasm() {
     // Cranelift
     let cl = CraneliftBackend::new();
     let cl_art = cl.compile_module(&module).expect("cranelift");
-    let cl_fn: fn(i64) -> i64 = unsafe {
-        std::mem::transmute(cl_art.get_func_ptr::<fn(i64) -> i64>("sum_to").unwrap())
-    };
+    let cl_fn: fn(i64) -> i64 =
+        unsafe { std::mem::transmute(cl_art.get_func_ptr::<fn(i64) -> i64>("sum_to").unwrap()) };
 
     // WASM
     let wasm = WasmBackend::new();
@@ -521,7 +739,9 @@ fn cross_target_loop_cranelift_vs_wasm() {
     let wm = wasmtime::Module::new(&engine, &wasm_art.bytes).unwrap();
     let mut store = wasmtime::Store::new(&engine, ());
     let inst = wasmtime::Instance::new(&mut store, &wm, &[]).unwrap();
-    let wasm_fn = inst.get_typed_func::<i64, i64>(&mut store, "sum_to").unwrap();
+    let wasm_fn = inst
+        .get_typed_func::<i64, i64>(&mut store, "sum_to")
+        .unwrap();
 
     for n in [0, 1, 5, 10, 100] {
         let cl_result = cl_fn(n);
@@ -553,8 +773,12 @@ fn build_import_demo_module() -> sonatina_ir::Module {
     let host_ref = mb.declare_function(host_sig).unwrap();
 
     // Defined function calling the import: compute(a, b) = host_add(a, b).
-    let compute_sig =
-        Signature::new_single("compute", Linkage::Public, &[Type::I64, Type::I64], Type::I64);
+    let compute_sig = Signature::new_single(
+        "compute",
+        Linkage::Public,
+        &[Type::I64, Type::I64],
+        Type::I64,
+    );
     let compute_ref = mb.declare_function(compute_sig).unwrap();
     {
         let mut fb = mb.func_builder::<InstInserter>(compute_ref);
@@ -631,8 +855,7 @@ fn wasm32_isa_import_precedes_defined_in_index_space() {
                     for entry in group {
                         let (_idx, import) = entry.expect("valid import entry");
                         if let TypeRef::Func(_) = import.ty {
-                            func_imports
-                                .push((import.module.to_string(), import.name.to_string()));
+                            func_imports.push((import.module.to_string(), import.name.to_string()));
                         }
                     }
                 }
@@ -738,7 +961,8 @@ fn wasm_i32_signed_ops_execute() {
 
     // fn lt_u(a: i32, b: i32) -> i32 { (a <u b) as i32 }
     {
-        let sig = Signature::new_single("lt_u", Linkage::Public, &[Type::I32, Type::I32], Type::I32);
+        let sig =
+            Signature::new_single("lt_u", Linkage::Public, &[Type::I32, Type::I32], Type::I32);
         let fr = mb.declare_function(sig).unwrap();
         let mut fb = mb.func_builder::<InstInserter>(fr);
         let e = fb.append_block();
@@ -752,7 +976,8 @@ fn wasm_i32_signed_ops_execute() {
     }
     // fn lt_s(a: i32, b: i32) -> i32 { (a <s b) as i32 }
     {
-        let sig = Signature::new_single("lt_s", Linkage::Public, &[Type::I32, Type::I32], Type::I32);
+        let sig =
+            Signature::new_single("lt_s", Linkage::Public, &[Type::I32, Type::I32], Type::I32);
         let fr = mb.declare_function(sig).unwrap();
         let mut fb = mb.func_builder::<InstInserter>(fr);
         let e = fb.append_block();
@@ -780,27 +1005,45 @@ fn wasm_i32_signed_ops_execute() {
     }
 
     let module = mb.build();
-    let artifact = WasmBackend::new().compile_module(&module).expect("wasm compile");
+    let artifact = WasmBackend::new()
+        .compile_module(&module)
+        .expect("wasm compile");
     wasmparser::validate(&artifact.bytes).expect("i32 signed ops must produce valid WASM");
 
     let engine = wasmtime::Engine::default();
     let wm = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
     let mut store = wasmtime::Store::new(&engine, ());
     let inst = wasmtime::Instance::new(&mut store, &wm, &[]).unwrap();
-    let lt_u = inst.get_typed_func::<(i32, i32), i32>(&mut store, "lt_u").unwrap();
-    let lt_s = inst.get_typed_func::<(i32, i32), i32>(&mut store, "lt_s").unwrap();
+    let lt_u = inst
+        .get_typed_func::<(i32, i32), i32>(&mut store, "lt_u")
+        .unwrap();
+    let lt_s = inst
+        .get_typed_func::<(i32, i32), i32>(&mut store, "lt_s")
+        .unwrap();
     let sar = inst.get_typed_func::<i32, i32>(&mut store, "sar").unwrap();
 
     // Signed and unsigned disagree on a 0x80000000-class operand.
     let big = i32::MIN; // 0x8000_0000
-    assert_eq!(lt_u.call(&mut store, (big, 1)).unwrap(), 0, "unsigned: 0x80000000 <u 1 is false");
-    assert_eq!(lt_s.call(&mut store, (big, 1)).unwrap(), 1, "signed: -2147483648 <s 1 is true");
+    assert_eq!(
+        lt_u.call(&mut store, (big, 1)).unwrap(),
+        0,
+        "unsigned: 0x80000000 <u 1 is false"
+    );
+    assert_eq!(
+        lt_s.call(&mut store, (big, 1)).unwrap(),
+        1,
+        "signed: -2147483648 <s 1 is true"
+    );
     // Ordinary positive operands agree.
     assert_eq!(lt_u.call(&mut store, (3, 7)).unwrap(), 1);
     assert_eq!(lt_s.call(&mut store, (3, 7)).unwrap(), 1);
 
     // Arithmetic (not logical) shift: -4096 >> 12 == -1.
-    assert_eq!(sar.call(&mut store, -4096).unwrap(), -1, "arithmetic shift keeps the sign");
+    assert_eq!(
+        sar.call(&mut store, -4096).unwrap(),
+        -1,
+        "arithmetic shift keeps the sign"
+    );
     assert_eq!(sar.call(&mut store, 4096).unwrap(), 1);
     assert_eq!(sar.call(&mut store, -1).unwrap(), -1);
 

@@ -179,13 +179,7 @@ impl Structurer<'_> {
             result
         }
 
-        visit(
-            self,
-            start,
-            lp,
-            &mut HashSet::new(),
-            &mut HashMap::new(),
-        )
+        visit(self, start, lp, &mut HashSet::new(), &mut HashMap::new())
     }
 
     fn in_loop(&self, b: BlockId, lp: Loop) -> bool {
@@ -221,10 +215,7 @@ impl Structurer<'_> {
                 }
                 // A fallthrough exit (a non-return block outside the loop) is
                 // resumed by the caller, not structured inside the loop.
-                if !self.in_loop(b, lp)
-                    && b != start
-                    && !self.returns(b)
-                    && !allow_return_corridor
+                if !self.in_loop(b, lp) && b != start && !self.returns(b) && !allow_return_corridor
                 {
                     break;
                 }
@@ -244,7 +235,7 @@ impl Structurer<'_> {
                     let body = self.build_loop_body(b, lp, active, consumed)?;
                     regions.push(Region::Loop { header: b, body });
                     if let Some(exit) = self.loop_direct_exit(b, lp) {
-                        if self.returns(exit) {
+                        if self.returns(exit) && Some(exit) != stop {
                             consumed.insert(exit);
                         }
                     }
@@ -279,12 +270,9 @@ impl Structurer<'_> {
                     // there, without mistaking an unrelated outer join for
                     // this conditional's merge.
                     let merge = self.find_merge(b, cur_loop)?;
-                    let then_branch = self.build_branch(
-                        b, nz, merge, cur_loop, active, consumed,
-                    )?;
-                    let else_branch = self.build_branch(
-                        b, z, merge, cur_loop, active, consumed,
-                    )?;
+                    let then_branch =
+                        self.build_branch(b, nz, merge, cur_loop, active, consumed)?;
+                    let else_branch = self.build_branch(b, z, merge, cur_loop, active, consumed)?;
                     regions.push(Region::IfThenElse {
                         header: b,
                         then_branch,
@@ -345,7 +333,10 @@ impl Structurer<'_> {
                 }
                 return Ok(vec![
                     Region::Block(target),
-                    Region::LoopExit { from: target, target: exit },
+                    Region::LoopExit {
+                        from: target,
+                        target: exit,
+                    },
                 ]);
             }
             self.validate_loop_exit_target(lp, from, target)?;
@@ -722,12 +713,7 @@ mod tests {
         fb.switch_to_block(entry);
         fb.insert_inst_no_result(Br::new(is, fb.args()[0], nested, shared));
         fb.switch_to_block(nested);
-        fb.insert_inst_no_result(Br::new(
-            is,
-            fb.args()[1],
-            nested_then,
-            nested_else,
-        ));
+        fb.insert_inst_no_result(Br::new(is, fb.args()[1], nested_then, nested_else));
         fb.switch_to_block(nested_then);
         fb.insert_inst_no_result(Jump::new(is, shared));
         fb.switch_to_block(nested_else);
@@ -785,7 +771,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*selected, Some(merge));
-                assert!(matches!(else_branch.as_slice(), [Region::Block(block)] if *block == shared_forwarder));
+                assert!(
+                    matches!(else_branch.as_slice(), [Region::Block(block)] if *block == shared_forwarder)
+                );
                 assert!(matches!(
                     then_branch.as_slice(),
                     [Region::IfThenElse { merge: Some(inner_merge), .. }]
@@ -968,6 +956,112 @@ mod tests {
             "outer loop body should nest an inner Loop, got {:?}",
             outer_body
         );
+    }
+
+    #[test]
+    fn nested_loop_early_return_remains_inside_both_loop_regions() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_single("nested_early", Linkage::Public, &[Type::I1], Type::I32);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let outer = fb.append_block();
+        let inner = fb.append_block();
+        let body = fb.append_block();
+        let early = fb.append_block();
+        let inner_latch = fb.append_block();
+        let outer_latch = fb.append_block();
+        let done = fb.append_block();
+        fb.switch_to_block(entry);
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        fb.insert_inst_no_result(Jump::new(is, outer));
+        fb.switch_to_block(outer);
+        let oi = fb.insert_inst(Phi::new(is, vec![(zero, entry)]), Type::I32);
+        let oc = fb.insert_inst(cmp::Lt::new(is, oi, one), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, oc, inner, done));
+        fb.switch_to_block(inner);
+        let ii = fb.insert_inst(Phi::new(is, vec![(zero, outer)]), Type::I32);
+        let ic = fb.insert_inst(cmp::Lt::new(is, ii, one), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, ic, body, outer_latch));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Br::new(is, fb.args()[0], early, inner_latch));
+        fb.switch_to_block(early);
+        let escaped = fb.make_imm_value(777i32);
+        fb.insert_inst_no_result(Return::new_single(is, escaped));
+        fb.switch_to_block(inner_latch);
+        let ni = fb.insert_inst(arith::Add::new(is, ii, one), Type::I32);
+        fb.append_phi_arg(ii, ni, inner_latch);
+        fb.insert_inst_no_result(Jump::new(is, inner));
+        fb.switch_to_block(outer_latch);
+        let no = fb.insert_inst(arith::Add::new(is, oi, one), Type::I32);
+        fb.append_phi_arg(oi, no, outer_latch);
+        fb.insert_inst_no_result(Jump::new(is, outer));
+        fb.switch_to_block(done);
+        fb.insert_inst_no_result(Return::new_single(is, oi));
+        fb.seal_all();
+        fb.finish();
+        let structured = structurize(&mb.build(), fr);
+        let outer_body = structured
+            .regions
+            .iter()
+            .find_map(|r| match r {
+                Region::Loop { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("outer loop");
+        let inner_body = outer_body
+            .iter()
+            .find_map(|r| match r {
+                Region::Loop { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("inner loop");
+        assert!(
+            inner_body
+                .iter()
+                .any(|r| matches!(r, Region::IfThenElse { .. })),
+            "early return must remain nested in inner loop: {inner_body:?}"
+        );
+    }
+
+    #[test]
+    fn loop_in_conditional_arm_resumes_at_shared_merge() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("arm_loop_merge", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let body = fb.append_block();
+        let other = fb.append_block();
+        let merge = fb.append_block();
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(Br::new(is, fb.args()[0], header, other));
+        fb.switch_to_block(header);
+        let cond = fb.make_imm_value(false);
+        fb.insert_inst_no_result(Br::new(is, cond, body, merge));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(other);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(merge);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+        let structured = structurize(&mb.build(), fr);
+        match &structured.regions[0] {
+            Region::IfThenElse {
+                then_branch,
+                merge: selected,
+                ..
+            } => {
+                assert_eq!(*selected, Some(merge));
+                assert!(then_branch.iter().any(|r| matches!(r, Region::Loop { .. })));
+            }
+            other => panic!("expected conditional containing loop, got {other:?}"),
+        }
+        assert!(matches!(structured.regions[1], Region::Block(block) if block == merge));
     }
 
     #[test]
