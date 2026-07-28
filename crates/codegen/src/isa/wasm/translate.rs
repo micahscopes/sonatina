@@ -14,8 +14,11 @@ use waffle::{
 use sonatina_ir::{
     BlockId, Function, Immediate, Inst, InstDowncast, InstSetBase, Linkage, Module, Signature, Type,
     Value, ValueId,
+    cfg::ControlFlowGraph,
     module::FuncRef,
 };
+
+use crate::domtree::DomTree;
 
 fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
     match ty {
@@ -402,8 +405,37 @@ fn translate_function(
                 }
             }
 
-            // Second pass: translate instructions and set terminators
-            for block in function.layout.iter_block() {
+            // Second pass: translate instructions and set terminators.
+            //
+            // Iterate blocks in reverse post-order (dominators before the blocks
+            // they dominate), NOT `layout` order. `resolve_value` is a single
+            // forward pass keyed on a `value_map` populated as instructions are
+            // translated; a value defined in a block laid out AFTER one that uses
+            // it (a non-RPO layout, which Fe's MIR block numbering can produce for
+            // e.g. loop pre-headers) would otherwise be `unresolved`. RPO makes
+            // every non-phi definition precede its uses; loop back-edge values are
+            // carried by phi results, which the first pass already pre-seeds. This
+            // mirrors the EVM machine path, which already orders by `DomTree::rpo`
+            // (isa/evm/machine/prepare.rs).
+            let block_order = {
+                let mut cfg = ControlFlowGraph::new();
+                cfg.compute(function);
+                let mut dom = DomTree::new();
+                dom.compute(&cfg);
+                let rpo = dom.rpo().to_owned();
+                let in_rpo: std::collections::HashSet<BlockId> = rpo.iter().copied().collect();
+                let mut order = rpo;
+                // Keep processing any block the RPO walk did not reach (an
+                // unreachable block still in layout), so its WAFFLE block still
+                // receives a terminator exactly as under the old layout walk.
+                for block in function.layout.iter_block() {
+                    if !in_rpo.contains(&block) {
+                        order.push(block);
+                    }
+                }
+                order
+            };
+            for block in block_order.iter().copied() {
                 let wb = block_map[&block];
 
                 for inst_id in function.layout.iter_inst(block) {
