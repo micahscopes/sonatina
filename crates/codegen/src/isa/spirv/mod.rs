@@ -617,6 +617,29 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some((lhs_id, rhs_id, naga_op)) =
+        <&sonatina_ir::inst::logic::And as InstDowncast>::downcast(inst_set, inst_data)
+            .map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::And))
+            .or_else(|| <&sonatina_ir::inst::logic::Or as InstDowncast>::downcast(inst_set, inst_data)
+                .map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::InclusiveOr)))
+            .or_else(|| <&sonatina_ir::inst::logic::Xor as InstDowncast>::downcast(inst_set, inst_data)
+                .map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::ExclusiveOr)))
+    {
+        // Bitwise and/or/xor are sign-agnostic per-bit ops: the u32 browser word
+        // and the i64 word both carry the exact bit pattern, and naga defines
+        // these operators for Uint and Sint alike, so no cast dance is needed
+        // (unlike `Sar`/`Slt`). Direct `lhs/rhs` operand order.
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(lhs_id, function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(rhs_id, function, word, value_map, phi_locals, func).unwrap();
+            let h = func.expressions.append(
+                naga::Expression::Binary { op: naga_op, left: lhs, right: rhs },
+                naga::Span::UNDEFINED,
+            );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
     } else if let Some(slt) = <&sonatina_ir::inst::cmp::Slt as InstDowncast>::downcast(inst_set, inst_data) {
         // Signed less-than. Under the u32 word the operands carry signed values in
         // two's complement, so bitcast BOTH to i32 (`convert: None` = reinterpret)
@@ -1721,7 +1744,7 @@ fn spirv_instruction_is_lowered(
     is: &dyn sonatina_ir::InstSetBase,
     inst: &dyn sonatina_ir::Inst,
 ) -> bool {
-    use sonatina_ir::{InstDowncast, inst::{arith, cmp, control_flow, data}};
+    use sonatina_ir::{InstDowncast, inst::{arith, cmp, control_flow, data, logic}};
 
     inst.is_terminator()
         || <&control_flow::Phi as InstDowncast>::downcast(is, inst).is_some()
@@ -1737,6 +1760,9 @@ fn spirv_instruction_is_lowered(
         || <&arith::Sar as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shl as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shr as InstDowncast>::downcast(is, inst).is_some()
+        || <&logic::And as InstDowncast>::downcast(is, inst).is_some()
+        || <&logic::Or as InstDowncast>::downcast(is, inst).is_some()
+        || <&logic::Xor as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Lt as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Eq as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Ne as InstDowncast>::downcast(is, inst).is_some()
