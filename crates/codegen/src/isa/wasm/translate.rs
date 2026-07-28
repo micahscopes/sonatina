@@ -505,6 +505,28 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    // Bitwise or. Sign-agnostic per-bit op, type-keyed like `And`.
+                    else if let Some(or) = <&sonatina_ir::inst::logic::Or as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *or.lhs(), &value_map, &mut body, wb).ok_or("unresolved or lhs")?;
+                            let rhs = resolve_value(function, *or.rhs(), &value_map, &mut body, wb).ok_or("unresolved or rhs")?;
+                            let ty = result_waffle_type(function, result);
+                            let op = if ty == WType::I32 { Operator::I32Or } else { Operator::I64Or };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[ty]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    // Bitwise xor. Sign-agnostic per-bit op, type-keyed like `And`.
+                    else if let Some(xor) = <&sonatina_ir::inst::logic::Xor as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *xor.lhs(), &value_map, &mut body, wb).ok_or("unresolved xor lhs")?;
+                            let rhs = resolve_value(function, *xor.rhs(), &value_map, &mut body, wb).ok_or("unresolved xor rhs")?;
+                            let ty = result_waffle_type(function, result);
+                            let op = if ty == WType::I32 { Operator::I32Xor } else { Operator::I64Xor };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[ty]);
+                            value_map.insert(result, wval);
+                        }
+                    }
                     else if let Some(fneg) = <&sonatina_ir::inst::arith::Fneg as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let arg = resolve_value(function, *fneg.arg(), &value_map, &mut body, wb)
