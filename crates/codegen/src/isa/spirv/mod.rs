@@ -849,10 +849,12 @@ fn emit_naga_regions(
                 if body.iter().any(|region| matches!(region, crate::structurize::Region::Loop { .. })) {
                     return Err(format!("spirv structurize: loop {header:?} nested inside a loop is not supported yet"));
                 }
+                let mut loop_target = naga::Block::new();
                 let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
-                    func, value_map, phi_locals, result_expr,
+                    func, value_map, phi_locals, result_expr, &mut loop_target,
                 )?;
+                func.body.extend_block(loop_target);
                 region_idx += 1;
                 if let Some(loop_return) = loop_return {
                     let saved_body = std::mem::replace(&mut func.body, naga::Block::new());
@@ -1321,9 +1323,31 @@ fn emit_non_loop_regions(
                     return Ok(());
                 }
             }
-            crate::structurize::Region::Loop { .. } => return Err(
-                "spirv structurize: loop nested inside conditional is not supported yet".to_string()
-            ),
+            crate::structurize::Region::Loop { header, body } => {
+                // A loop nested inside this conditional arm: emit it into the arm's
+                // `target` block via the parameterized loop emitter, so the whole
+                // Naga Loop statement lands inside the `if`. dec's inlined operator
+                // loops carry no loop-internal Return (the kernel's single Return is
+                // at the end), so a returning nested loop is not needed yet and
+                // fails closed below; loop-in-loop stays a separate follow-on.
+                if body.iter().any(|r| matches!(r, crate::structurize::Region::Loop { .. })) {
+                    return Err(format!(
+                        "spirv structurize: loop {header:?} nested inside a loop is not supported yet"
+                    ));
+                }
+                let mut no_result = None;
+                let loop_return = emit_recursive_loop_region(
+                    function, inst_set, word, *header, body, word_type, f32_type, bool_type,
+                    func, value_map, phi_locals, &mut no_result, target,
+                )?;
+                if loop_return.is_some() {
+                    return Err(format!(
+                        "spirv structurize: a loop nested inside a conditional with an \
+                         internal return is not supported yet (loop header {header:?})"
+                    ));
+                }
+                region_idx += 1;
+            }
             crate::structurize::Region::LoopExit { from, target } => return Err(format!(
                 "spirv: loop exit edge {from:?}->{target:?} appeared outside its loop"
             )),
@@ -1540,6 +1564,12 @@ fn emit_recursive_loop_region(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     _result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    // The Naga block this loop's statements are appended to. At top level the
+    // caller passes a fresh block and extends `func.body` with it; inside a
+    // conditional arm it is the arm's block, so a loop nested in an `if` lands in
+    // the arm rather than the function root. (`func.body` cannot be passed here
+    // directly — it would alias the `&mut func` this fn also needs.)
+    target: &mut naga::Block,
 ) -> Result<Option<StructuredReturnTransport>, String> {
     use sonatina_ir::InstDowncast;
     let mut loop_blocks = std::collections::HashSet::new();
@@ -1554,7 +1584,7 @@ fn emit_recursive_loop_region(
     if let Some(outside_pred) = outside_pred {
         let mut init = naga::Block::new();
         emit_exact_phi_edge(function, inst_set, word, outside_pred, header, func, &mut init, value_map, phi_locals)?;
-        func.body.extend_block(init);
+        target.extend_block(init);
     }
 
     let return_ty = function.layout.iter_block().find_map(|block| {
@@ -1676,7 +1706,7 @@ fn emit_recursive_loop_region(
     exit_arm.push(naga::Statement::Break, naga::Span::UNDEFINED);
     let (accept, reject) = if nz_in { (continue_arm, exit_arm) } else { (exit_arm, continue_arm) };
     loop_body.push(naga::Statement::If { condition, accept, reject }, naga::Span::UNDEFINED);
-    func.body.push(naga::Statement::Loop { body: loop_body, continuing: naga::Block::new(), break_if: None }, naga::Span::UNDEFINED);
+    target.push(naga::Statement::Loop { body: loop_body, continuing: naga::Block::new(), break_if: None }, naga::Span::UNDEFINED);
 
     // Header-phi Loads created at the top of the loop are scoped inside the
     // Naga Loop statement. A normal loop exit may resume at a sibling block
@@ -1691,12 +1721,12 @@ fn emit_recursive_loop_region(
     emit_phi_loads_for_block(
         function, inst_set, header, func, &mut outer_phi_loads, value_map, phi_locals,
     );
-    func.body.extend_block(outer_phi_loads);
+    target.extend_block(outer_phi_loads);
     for (result, local) in header_carry_locals {
         value_map.remove(&result);
         let pointer = func.expressions.append(naga::Expression::LocalVariable(local), naga::Span::UNDEFINED);
         let loaded = func.expressions.append(naga::Expression::Load { pointer }, naga::Span::UNDEFINED);
-        func.body.push(
+        target.push(
             naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
             naga::Span::UNDEFINED,
         );
