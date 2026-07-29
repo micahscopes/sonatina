@@ -846,9 +846,6 @@ fn emit_naga_regions(
                 region_idx += 1;
             }
             crate::structurize::Region::Loop { header, body } => {
-                if body.iter().any(|region| matches!(region, crate::structurize::Region::Loop { .. })) {
-                    return Err(format!("spirv structurize: loop {header:?} nested inside a loop is not supported yet"));
-                }
                 let mut loop_target = naga::Block::new();
                 let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
@@ -1329,12 +1326,7 @@ fn emit_non_loop_regions(
                 // Naga Loop statement lands inside the `if`. dec's inlined operator
                 // loops carry no loop-internal Return (the kernel's single Return is
                 // at the end), so a returning nested loop is not needed yet and
-                // fails closed below; loop-in-loop stays a separate follow-on.
-                if body.iter().any(|r| matches!(r, crate::structurize::Region::Loop { .. })) {
-                    return Err(format!(
-                        "spirv structurize: loop {header:?} nested inside a loop is not supported yet"
-                    ));
-                }
+                // fails closed below.
                 let mut no_result = None;
                 let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
@@ -1485,10 +1477,16 @@ fn emit_regions_in_loop(
                     emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut reject, &mut reject_values, phi_locals, result_expr)?
                 };
                 if let Some(merge) = merge {
-                    if let RegionOutcome::Fallthrough(from) = then_outcome {
+                    // `from == merge` means the arm already LANDED at the merge
+                    // (a trailing nested loop whose exit is the merge, or a
+                    // trailing nested if merging directly at the outer merge);
+                    // its phi transfer was emitted inside that region with the
+                    // true CFG predecessor, so a second transfer keyed on the
+                    // merge itself would be a bogus self-edge.
+                    if let RegionOutcome::Fallthrough(from) = then_outcome && from != *merge {
                         emit_exact_phi_edge(function, inst_set, word, from, *merge, func, &mut accept, &mut accept_values, phi_locals)?;
                     }
-                    if let RegionOutcome::Fallthrough(from) = else_outcome {
+                    if let RegionOutcome::Fallthrough(from) = else_outcome && from != *merge {
                         emit_exact_phi_edge(function, inst_set, word, from, *merge, func, &mut reject, &mut reject_values, phi_locals)?;
                     }
                     outcome = Some(RegionOutcome::Fallthrough(*merge));
@@ -1500,7 +1498,38 @@ fn emit_regions_in_loop(
                 }
                 target.push(naga::Statement::If { condition, accept, reject }, naga::Span::UNDEFINED);
             }
-            crate::structurize::Region::Loop { .. } => return Err("spirv: nested loop emission is not implemented yet".to_string()),
+            crate::structurize::Region::Loop { header, body } => {
+                // A loop nested inside this loop's body: emit it into `target` via
+                // the (already parameterized) loop emitter, so the inner Naga Loop
+                // lands inside the outer loop body. dec's inlined operator loops
+                // carry no loop-internal Return, so a returning inner loop is not
+                // needed yet and fails closed (the Break-cascade through the outer
+                // loop is a follow-on).
+                let mut nested_result = None;
+                let inner_return = emit_recursive_loop_region(
+                    function, inst_set, word, *header, body, word_type, f32_type, bool_type,
+                    func, value_map, phi_locals, &mut nested_result, target,
+                )?;
+                if inner_return.is_some() {
+                    return Err(format!(
+                        "spirv structurize: a loop nested inside a loop with an internal \
+                         return is not supported yet (inner loop header {header:?})"
+                    ));
+                }
+                // Control resumes at the inner loop's exit successor.
+                let mut inner_blocks = std::collections::HashSet::new();
+                inner_blocks.insert(*header);
+                region_blocks(body, &mut inner_blocks);
+                let inner_branch = function.layout.iter_inst(*header).find_map(|iid|
+                    <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(iid))
+                ).ok_or_else(|| format!("spirv: nested loop header {header:?} has no branch"))?;
+                let inner_exit = if inner_blocks.contains(inner_branch.nz_dest()) {
+                    *inner_branch.z_dest()
+                } else {
+                    *inner_branch.nz_dest()
+                };
+                outcome = Some(RegionOutcome::Fallthrough(inner_exit));
+            }
             crate::structurize::Region::LoopExit { from, target: exit } => {
                 ensure_phi_locals(
                     function, inst_set, *exit, word_type, f32_type, bool_type, func, phi_locals,
@@ -1663,11 +1692,32 @@ fn emit_recursive_loop_region(
     let mut continue_arm = naga::Block::new();
     let mut continue_values = value_map.clone();
     let mut may_return = false;
-    emit_regions_in_loop(
-        function, inst_set, word, body_regions, header, word_type, f32_type, bool_type,
-        return_local, did_return_local, &mut may_return, func, &mut continue_arm,
-        &mut continue_values, phi_locals, &mut nested_result_expr,
-    )?;
+    if body_regions.is_empty() {
+        // A header-only loop: the header is its own latch, so the continue arm
+        // is exactly the self back-edge phi transfer (each header phi has one
+        // arg whose predecessor is the header itself).
+        emit_exact_phi_edge(
+            function, inst_set, word, header, header, func, &mut continue_arm,
+            &mut continue_values, phi_locals,
+        )?;
+    } else {
+        let body_outcome = emit_regions_in_loop(
+            function, inst_set, word, body_regions, header, word_type, f32_type, bool_type,
+            return_local, did_return_local, &mut may_return, func, &mut continue_arm,
+            &mut continue_values, phi_locals, &mut nested_result_expr,
+        )?;
+        // Fallthrough(header) is a trailing nested loop whose exit IS this
+        // loop's back-edge: its exit arm already stored this header's phi
+        // locals, and falling off the Naga loop body is an implicit continue.
+        // Any other fallthrough would silently continue instead of breaking;
+        // fail closed until the break-cascade lands.
+        if let RegionOutcome::Fallthrough(resume) = body_outcome && resume != header {
+            return Err(format!(
+                "spirv structurize: loop {header:?} body falls through to {resume:?} \
+                 instead of terminating (break-cascade not supported yet)"
+            ));
+        }
+    }
     let mut exit_arm = naga::Block::new();
     let mut exit_values = value_map.clone();
     emit_exact_phi_edge(
