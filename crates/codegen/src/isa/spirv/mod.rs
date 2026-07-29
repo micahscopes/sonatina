@@ -617,6 +617,27 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some(is_zero) = <&sonatina_ir::inst::cmp::IsZero as InstDowncast>::downcast(inst_set, inst_data) {
+        // `x == 0`, lowered like the Eq arm to a naga bool consumed by branches /
+        // `select`. The zero literal matches the active word (the U32 browser word
+        // or the i64 word), the same shape as the immediate materialization above.
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(*is_zero.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let zero = func.expressions.append(
+                naga::Expression::Literal(match word {
+                    WordKind::U32 => naga::Literal::U32(0),
+                    WordKind::I64 => naga::Literal::I64(0),
+                }),
+                naga::Span::UNDEFINED,
+            );
+            let h = func.expressions.append(
+                naga::Expression::Binary { op: naga::BinaryOperator::Equal, left: lhs, right: zero },
+                naga::Span::UNDEFINED,
+            );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
     } else if let Some((lhs_id, rhs_id, naga_op)) =
         <&sonatina_ir::inst::logic::And as InstDowncast>::downcast(inst_set, inst_data)
             .map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::And))
@@ -1767,6 +1788,7 @@ fn spirv_instruction_is_lowered(
         || <&cmp::Eq as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Ne as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Slt as InstDowncast>::downcast(is, inst).is_some()
+        || <&cmp::IsZero as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Feq as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Flt as InstDowncast>::downcast(is, inst).is_some()
         || <&cmp::Fle as InstDowncast>::downcast(is, inst).is_some()
