@@ -1070,7 +1070,19 @@ fn translate_function(
                     else if let Some(is_zero) = <&sonatina_ir::inst::cmp::IsZero as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let val = resolve_value(function, *is_zero.lhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let wval = body.add_op(wb, Operator::I64Eqz, &[val], &[WType::I32]);
+                            // eqz width must match the operand's WASM type. Select it via
+                            // `sonatina_to_waffle_type` — the same mapping that declared the
+                            // value — so it is validation-consistent by construction:
+                            // I1/I8/I16/I32 -> i32; I64 and `Compound` handles -> i64. (A raw
+                            // `Type` match would mishandle `Compound(_)`, whose handle is i64,
+                            // e.g. an IsZero null-check on a ref, which the old hardcoded
+                            // I64Eqz got accidentally right.)
+                            let eqz = match sonatina_to_waffle_type(function.dfg.value_ty(*is_zero.lhs())) {
+                                Some(WType::I32) => Operator::I32Eqz,
+                                Some(WType::I64) => Operator::I64Eqz,
+                                other => return Err(format!("unsupported wasm iszero operand `{other:?}`")),
+                            };
+                            let wval = body.add_op(wb, eqz, &[val], &[WType::I32]);
                             value_map.insert(result, wval);
                         }
                     }
