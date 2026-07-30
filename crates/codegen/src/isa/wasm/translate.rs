@@ -17,6 +17,7 @@ use sonatina_ir::{
     cfg::ControlFlowGraph,
     module::FuncRef,
 };
+use super::CanonicalStackMemoryManifest;
 
 use crate::domtree::DomTree;
 
@@ -53,6 +54,7 @@ pub(super) fn translate_module(
     module: &Module,
     import_modules: &HashMap<String, String>,
     canonical_arena: bool,
+    canonical_memory: Option<&CanonicalStackMemoryManifest>,
 ) -> Result<(WaffleModule<'static>, Vec<String>), String> {
     let mut wmod = WaffleModule::empty();
     let mut func_names = Vec::new();
@@ -153,6 +155,15 @@ pub(super) fn translate_module(
     // Imported functions must occupy the lowest Wasm function indexes.
     let canonical_alloc = canonical_arena
         .then(|| synthesize_canonical_arena(&mut wmod, memory, &mut func_names));
+    let canonical_memory_alloc = canonical_memory
+        .map(|manifest| synthesize_canonical_memory(
+            &mut wmod,
+            memory,
+            &mut func_names,
+            manifest,
+        ))
+        .transpose()?;
+    let canonical_alloc = canonical_alloc.or(canonical_memory_alloc);
 
     // Pass 1: declare every translatable defined function up front (placeholder
     // bodies), recording the Sonatina `FuncRef` -> WAFFLE `Func` mapping. Doing
@@ -339,6 +350,402 @@ fn synthesize_canonical_arena(
     });
     func_names.push("fe_cabi_reset".to_string());
     alloc
+}
+
+fn synthesize_canonical_memory(
+    module: &mut WaffleModule<'static>,
+    memory: waffle::Memory,
+    func_names: &mut Vec<String>,
+    manifest: &CanonicalStackMemoryManifest,
+) -> Result<Func, String> {
+    const HEAP_BASE: u32 = 1024;
+    const HEADER_SIZE: u32 = 16;
+    const MAGIC: u32 = 0x0fec_ab1e;
+    const PAGE_SHIFT: u32 = 16;
+    const PAGE_MASK: u32 = (1 << PAGE_SHIFT) - 1;
+
+    let mut names = std::collections::HashSet::new();
+    names.insert("cabi_realloc");
+    for name in &manifest.post_return_exports {
+        if name.is_empty() || !names.insert(name.as_str()) {
+            return Err(format!("duplicate or empty canonical-memory export `{name}`"));
+        }
+        if module.exports.iter().any(|export| export.name == *name) {
+            return Err(format!("canonical-memory export `{name}` collides with module export"));
+        }
+    }
+    if module.exports.iter().any(|export| export.name == "cabi_realloc") {
+        return Err("canonical-memory export `cabi_realloc` collides with module export".into());
+    }
+
+    let cursor = module.globals.push(GlobalData {
+        ty: WType::I32,
+        value: Some(HEAP_BASE as u64),
+        mutable: true,
+    });
+    let sig = module.signatures.push(SignatureData {
+        params: vec![WType::I32, WType::I32, WType::I32, WType::I32],
+        returns: vec![WType::I32],
+    });
+    let mut body = FunctionBody::new(module, sig);
+    let entry = body.entry;
+    let allocate = body.add_block();
+    let validate_old = body.add_block();
+    let resize = body.add_block();
+    let release = body.add_block();
+    let ensure_capacity = body.add_block();
+    let grow = body.add_block();
+    let commit = body.add_block();
+    let return_zero = body.add_block();
+    let trap = body.add_block();
+    let old_ptr = body.blocks[entry].params[0].1;
+    let old_size = body.blocks[entry].params[1].1;
+    let align = body.blocks[entry].params[2].1;
+    let new_size = body.blocks[entry].params[3].1;
+    let zero = body.add_op(entry, Operator::I32Const { value: 0 }, &[], &[WType::I32]);
+    let one = body.add_op(entry, Operator::I32Const { value: 1 }, &[], &[WType::I32]);
+    let old_is_zero = body.add_op(entry, Operator::I32Eq, &[old_ptr, zero], &[WType::I32]);
+    let align_nonzero = body.add_op(entry, Operator::I32Ne, &[align, zero], &[WType::I32]);
+    let align_minus_one = body.add_op(entry, Operator::I32Sub, &[align, one], &[WType::I32]);
+    let align_bits = body.add_op(entry, Operator::I32And, &[align, align_minus_one], &[WType::I32]);
+    let align_power_two = body.add_op(entry, Operator::I32Eq, &[align_bits, zero], &[WType::I32]);
+    let alignment_valid =
+        body.add_op(entry, Operator::I32And, &[align_nonzero, align_power_two], &[WType::I32]);
+    let dispatch = body.add_block();
+    body.set_terminator(entry, Terminator::CondBr {
+        cond: alignment_valid,
+        if_true: BlockTarget { block: dispatch, args: vec![] },
+        if_false: BlockTarget { block: trap, args: vec![] },
+    });
+    body.set_terminator(dispatch, Terminator::CondBr {
+        cond: old_is_zero,
+        if_true: BlockTarget { block: allocate, args: vec![] },
+        if_false: BlockTarget { block: validate_old, args: vec![] },
+    });
+
+    let old_size_zero = body.add_op(allocate, Operator::I32Eq, &[old_size, zero], &[WType::I32]);
+    let allocate_valid = body.add_block();
+    body.set_terminator(allocate, Terminator::CondBr {
+        cond: old_size_zero,
+        if_true: BlockTarget { block: allocate_valid, args: vec![] },
+        if_false: BlockTarget { block: trap, args: vec![] },
+    });
+    let new_is_zero =
+        body.add_op(allocate_valid, Operator::I32Eq, &[new_size, zero], &[WType::I32]);
+    let allocate_nonzero = body.add_block();
+    body.set_terminator(allocate_valid, Terminator::CondBr {
+        cond: new_is_zero,
+        if_true: BlockTarget { block: return_zero, args: vec![] },
+        if_false: BlockTarget { block: allocate_nonzero, args: vec![] },
+    });
+    let current = body.add_op(
+        allocate_nonzero,
+        Operator::GlobalGet { global_index: cursor },
+        &[],
+        &[WType::I32],
+    );
+    let header = body.add_op(
+        allocate_nonzero,
+        Operator::I32Const { value: HEADER_SIZE },
+        &[],
+        &[WType::I32],
+    );
+    let after_header =
+        body.add_op(allocate_nonzero, Operator::I32Add, &[current, header], &[WType::I32]);
+    let biased =
+        body.add_op(allocate_nonzero, Operator::I32Add, &[after_header, align_minus_one], &[WType::I32]);
+    let negative_align =
+        body.add_op(allocate_nonzero, Operator::I32Sub, &[zero, align], &[WType::I32]);
+    let new_ptr =
+        body.add_op(allocate_nonzero, Operator::I32And, &[biased, negative_align], &[WType::I32]);
+    let new_end =
+        body.add_op(allocate_nonzero, Operator::I32Add, &[new_ptr, new_size], &[WType::I32]);
+    let header_overflow =
+        body.add_op(allocate_nonzero, Operator::I32LtU, &[after_header, current], &[WType::I32]);
+    let bias_overflow =
+        body.add_op(allocate_nonzero, Operator::I32LtU, &[biased, after_header], &[WType::I32]);
+    let end_overflow =
+        body.add_op(allocate_nonzero, Operator::I32LtU, &[new_end, new_ptr], &[WType::I32]);
+    let overflow =
+        body.add_op(allocate_nonzero, Operator::I32Or, &[header_overflow, bias_overflow], &[WType::I32]);
+    let overflow = body.add_op(allocate_nonzero, Operator::I32Or, &[overflow, end_overflow], &[WType::I32]);
+    let allocation_checked = body.add_block();
+    body.set_terminator(allocate_nonzero, Terminator::CondBr {
+        cond: overflow,
+        if_true: BlockTarget { block: trap, args: vec![] },
+        if_false: BlockTarget { block: allocation_checked, args: vec![] },
+    });
+
+    let min_ptr = body.add_op(
+        validate_old,
+        Operator::I32Const { value: HEAP_BASE + HEADER_SIZE },
+        &[],
+        &[WType::I32],
+    );
+    let ptr_too_low =
+        body.add_op(validate_old, Operator::I32LtU, &[old_ptr, min_ptr], &[WType::I32]);
+    let validate_header = body.add_block();
+    body.set_terminator(validate_old, Terminator::CondBr {
+        cond: ptr_too_low,
+        if_true: BlockTarget { block: trap, args: vec![] },
+        if_false: BlockTarget { block: validate_header, args: vec![] },
+    });
+    let current_live = body.add_op(
+        validate_header,
+        Operator::GlobalGet { global_index: cursor },
+        &[],
+        &[WType::I32],
+    );
+    let ptr_past_cursor =
+        body.add_op(validate_header, Operator::I32LtU, &[current_live, old_ptr], &[WType::I32]);
+    let validate_header_size = body.add_op(
+        validate_header,
+        Operator::I32Const { value: HEADER_SIZE },
+        &[],
+        &[WType::I32],
+    );
+    let header_addr = body.add_op(
+        validate_header,
+        Operator::I32Sub,
+        &[old_ptr, validate_header_size],
+        &[WType::I32],
+    );
+    let memarg = waffle::MemoryArg { align: 2, offset: 0, memory };
+    let previous = body.add_op(
+        validate_header,
+        Operator::I32Load { memory: memarg },
+        &[header_addr],
+        &[WType::I32],
+    );
+    let four = body.add_op(validate_header, Operator::I32Const { value: 4 }, &[], &[WType::I32]);
+    let eight = body.add_op(validate_header, Operator::I32Const { value: 8 }, &[], &[WType::I32]);
+    let twelve = body.add_op(validate_header, Operator::I32Const { value: 12 }, &[], &[WType::I32]);
+    let size_addr = body.add_op(validate_header, Operator::I32Add, &[header_addr, four], &[WType::I32]);
+    let align_addr = body.add_op(validate_header, Operator::I32Add, &[header_addr, eight], &[WType::I32]);
+    let magic_addr = body.add_op(validate_header, Operator::I32Add, &[header_addr, twelve], &[WType::I32]);
+    let stored_size = body.add_op(validate_header, Operator::I32Load { memory: memarg }, &[size_addr], &[WType::I32]);
+    let stored_align = body.add_op(validate_header, Operator::I32Load { memory: memarg }, &[align_addr], &[WType::I32]);
+    let stored_magic = body.add_op(validate_header, Operator::I32Load { memory: memarg }, &[magic_addr], &[WType::I32]);
+    let expected_magic =
+        body.add_op(validate_header, Operator::I32Const { value: MAGIC }, &[], &[WType::I32]);
+    let magic_ok = body.add_op(validate_header, Operator::I32Eq, &[stored_magic, expected_magic], &[WType::I32]);
+    let size_ok = body.add_op(validate_header, Operator::I32Eq, &[stored_size, old_size], &[WType::I32]);
+    let align_ok = body.add_op(validate_header, Operator::I32Eq, &[stored_align, align], &[WType::I32]);
+    let stored_end = body.add_op(validate_header, Operator::I32Add, &[old_ptr, stored_size], &[WType::I32]);
+    let is_top = body.add_op(validate_header, Operator::I32Eq, &[stored_end, current_live], &[WType::I32]);
+    let valid = body.add_op(validate_header, Operator::I32And, &[magic_ok, size_ok], &[WType::I32]);
+    let valid = body.add_op(validate_header, Operator::I32And, &[valid, align_ok], &[WType::I32]);
+    let valid = body.add_op(validate_header, Operator::I32And, &[valid, is_top], &[WType::I32]);
+    let ptr_bounds_ok = body.add_op(validate_header, Operator::I32Eq, &[ptr_past_cursor, zero], &[WType::I32]);
+    let valid = body.add_op(validate_header, Operator::I32And, &[valid, ptr_bounds_ok], &[WType::I32]);
+    let old_valid = body.add_block();
+    body.set_terminator(validate_header, Terminator::CondBr {
+        cond: valid,
+        if_true: BlockTarget { block: old_valid, args: vec![] },
+        if_false: BlockTarget { block: trap, args: vec![] },
+    });
+    let release_requested =
+        body.add_op(old_valid, Operator::I32Eq, &[new_size, zero], &[WType::I32]);
+    body.set_terminator(old_valid, Terminator::CondBr {
+        cond: release_requested,
+        if_true: BlockTarget { block: release, args: vec![] },
+        if_false: BlockTarget { block: resize, args: vec![] },
+    });
+    body.add_op(release, Operator::I32Store { memory: memarg }, &[magic_addr, zero], &[]);
+    body.add_op(release, Operator::GlobalSet { global_index: cursor }, &[previous], &[]);
+    body.set_terminator(release, Terminator::Return { values: vec![zero] });
+
+    let resize_end = body.add_op(resize, Operator::I32Add, &[old_ptr, new_size], &[WType::I32]);
+    let resize_overflow =
+        body.add_op(resize, Operator::I32LtU, &[resize_end, old_ptr], &[WType::I32]);
+    let resize_checked = body.add_block();
+    body.set_terminator(resize, Terminator::CondBr {
+        cond: resize_overflow,
+        if_true: BlockTarget { block: trap, args: vec![] },
+        if_false: BlockTarget { block: resize_checked, args: vec![] },
+    });
+
+    for index in 0..4 {
+        let value =
+            body.values.push(ValueDef::BlockParam(ensure_capacity, index, WType::I32));
+        body.blocks[ensure_capacity].params.push((WType::I32, value));
+    }
+    let target_end = body.blocks[ensure_capacity].params[0].1;
+    let target_ptr = body.blocks[ensure_capacity].params[1].1;
+    let target_previous = body.blocks[ensure_capacity].params[2].1;
+    let allocation_mode = body.blocks[ensure_capacity].params[3].1;
+    body.set_terminator(allocation_checked, Terminator::Br {
+        target: BlockTarget {
+            block: ensure_capacity,
+            args: vec![new_end, new_ptr, current, one],
+        },
+    });
+    body.set_terminator(resize_checked, Terminator::Br {
+        target: BlockTarget {
+            block: ensure_capacity,
+            args: vec![resize_end, old_ptr, zero, zero],
+        },
+    });
+    let shift = body.add_op(ensure_capacity, Operator::I32Const { value: PAGE_SHIFT }, &[], &[WType::I32]);
+    let mask = body.add_op(ensure_capacity, Operator::I32Const { value: PAGE_MASK }, &[], &[WType::I32]);
+    let whole_pages = body.add_op(ensure_capacity, Operator::I32ShrU, &[target_end, shift], &[WType::I32]);
+    let remainder = body.add_op(ensure_capacity, Operator::I32And, &[target_end, mask], &[WType::I32]);
+    let partial = body.add_op(ensure_capacity, Operator::I32Ne, &[remainder, zero], &[WType::I32]);
+    let needed_pages = body.add_op(ensure_capacity, Operator::I32Add, &[whole_pages, partial], &[WType::I32]);
+    let current_pages = body.add_op(ensure_capacity, Operator::MemorySize { mem: memory }, &[], &[WType::I32]);
+    let needs_grow = body.add_op(ensure_capacity, Operator::I32LtU, &[current_pages, needed_pages], &[WType::I32]);
+    body.set_terminator(ensure_capacity, Terminator::CondBr {
+        cond: needs_grow,
+        if_true: BlockTarget {
+            block: grow,
+            args: vec![target_end, target_ptr, target_previous, allocation_mode],
+        },
+        if_false: BlockTarget {
+            block: commit,
+            args: vec![target_end, target_ptr, target_previous, allocation_mode],
+        },
+    });
+    for index in 0..4 {
+        let value = body.values.push(ValueDef::BlockParam(grow, index, WType::I32));
+        body.blocks[grow].params.push((WType::I32, value));
+        let value = body.values.push(ValueDef::BlockParam(commit, index, WType::I32));
+        body.blocks[commit].params.push((WType::I32, value));
+    }
+    let grow_end = body.blocks[grow].params[0].1;
+    let grow_ptr = body.blocks[grow].params[1].1;
+    let grow_previous = body.blocks[grow].params[2].1;
+    let grow_mode = body.blocks[grow].params[3].1;
+    let delta = body.add_op(grow, Operator::I32Sub, &[needed_pages, current_pages], &[WType::I32]);
+    let prior_pages = body.add_op(grow, Operator::MemoryGrow { mem: memory }, &[delta], &[WType::I32]);
+    let failed = body.add_op(grow, Operator::I32Const { value: u32::MAX }, &[], &[WType::I32]);
+    let grew = body.add_op(grow, Operator::I32Ne, &[prior_pages, failed], &[WType::I32]);
+    body.set_terminator(grow, Terminator::CondBr {
+        cond: grew,
+        if_true: BlockTarget {
+            block: commit,
+            args: vec![grow_end, grow_ptr, grow_previous, grow_mode],
+        },
+        if_false: BlockTarget { block: trap, args: vec![] },
+    });
+    let committed_end = body.blocks[commit].params[0].1;
+    let committed_ptr = body.blocks[commit].params[1].1;
+    let committed_previous = body.blocks[commit].params[2].1;
+    let committed_mode = body.blocks[commit].params[3].1;
+    let allocating = body.add_op(commit, Operator::I32Ne, &[committed_mode, zero], &[WType::I32]);
+    let commit_allocate = body.add_block();
+    let commit_resize = body.add_block();
+    body.set_terminator(commit, Terminator::CondBr {
+        cond: allocating,
+        if_true: BlockTarget { block: commit_allocate, args: vec![] },
+        if_false: BlockTarget { block: commit_resize, args: vec![] },
+    });
+    let commit_header = body.add_op(
+        commit_allocate,
+        Operator::I32Const { value: HEADER_SIZE },
+        &[],
+        &[WType::I32],
+    );
+    let commit_four =
+        body.add_op(commit_allocate, Operator::I32Const { value: 4 }, &[], &[WType::I32]);
+    let commit_eight =
+        body.add_op(commit_allocate, Operator::I32Const { value: 8 }, &[], &[WType::I32]);
+    let commit_twelve =
+        body.add_op(commit_allocate, Operator::I32Const { value: 12 }, &[], &[WType::I32]);
+    let commit_magic =
+        body.add_op(commit_allocate, Operator::I32Const { value: MAGIC }, &[], &[WType::I32]);
+    let new_header_addr = body.add_op(
+        commit_allocate,
+        Operator::I32Sub,
+        &[committed_ptr, commit_header],
+        &[WType::I32],
+    );
+    let new_size_addr =
+        body.add_op(commit_allocate, Operator::I32Add, &[new_header_addr, commit_four], &[WType::I32]);
+    let new_align_addr =
+        body.add_op(commit_allocate, Operator::I32Add, &[new_header_addr, commit_eight], &[WType::I32]);
+    let new_magic_addr =
+        body.add_op(commit_allocate, Operator::I32Add, &[new_header_addr, commit_twelve], &[WType::I32]);
+    body.add_op(commit_allocate, Operator::I32Store { memory: memarg }, &[new_header_addr, committed_previous], &[]);
+    body.add_op(commit_allocate, Operator::I32Store { memory: memarg }, &[new_size_addr, new_size], &[]);
+    body.add_op(commit_allocate, Operator::I32Store { memory: memarg }, &[new_align_addr, align], &[]);
+    body.add_op(commit_allocate, Operator::I32Store { memory: memarg }, &[new_magic_addr, commit_magic], &[]);
+    body.add_op(commit_allocate, Operator::GlobalSet { global_index: cursor }, &[committed_end], &[]);
+    body.set_terminator(commit_allocate, Terminator::Return { values: vec![committed_ptr] });
+    let resize_header = body.add_op(
+        commit_resize,
+        Operator::I32Const { value: HEADER_SIZE - 4 },
+        &[],
+        &[WType::I32],
+    );
+    let resize_size_addr = body.add_op(
+        commit_resize,
+        Operator::I32Sub,
+        &[committed_ptr, resize_header],
+        &[WType::I32],
+    );
+    body.add_op(
+        commit_resize,
+        Operator::I32Store { memory: memarg },
+        &[resize_size_addr, new_size],
+        &[],
+    );
+    body.add_op(commit_resize, Operator::GlobalSet { global_index: cursor }, &[committed_end], &[]);
+    body.set_terminator(commit_resize, Terminator::Return { values: vec![committed_ptr] });
+    body.set_terminator(return_zero, Terminator::Return { values: vec![zero] });
+    body.set_terminator(trap, Terminator::Unreachable);
+
+    let realloc = module.funcs.push(FuncDecl::Body(sig, "cabi_realloc".into(), body));
+    module.exports.push(waffle::Export {
+        name: "cabi_realloc".into(),
+        kind: ExportKind::Func(realloc),
+    });
+    func_names.push("cabi_realloc".into());
+
+    let post_sig = module.signatures.push(SignatureData {
+        params: vec![WType::I32, WType::I32, WType::I32],
+        returns: vec![],
+    });
+    for name in &manifest.post_return_exports {
+        let mut post = FunctionBody::new(module, post_sig);
+        let ptr = post.blocks[post.entry].params[0].1;
+        let size = post.blocks[post.entry].params[1].1;
+        let alignment = post.blocks[post.entry].params[2].1;
+        let zero = post.add_op(post.entry, Operator::I32Const { value: 0 }, &[], &[WType::I32]);
+        post.add_op(
+            post.entry,
+            Operator::Call { function_index: realloc },
+            &[ptr, size, alignment, zero],
+            &[WType::I32],
+        );
+        post.set_terminator(post.entry, Terminator::Return { values: vec![] });
+        let function = module.funcs.push(FuncDecl::Body(post_sig, name.clone(), post));
+        module.exports.push(waffle::Export {
+            name: name.clone(),
+            kind: ExportKind::Func(function),
+        });
+        func_names.push(name.clone());
+    }
+    let internal_sig = module.signatures.push(SignatureData {
+        params: vec![WType::I32, WType::I32],
+        returns: vec![WType::I32],
+    });
+    let mut internal = FunctionBody::new(module, internal_sig);
+    let size = internal.blocks[internal.entry].params[0].1;
+    let alignment = internal.blocks[internal.entry].params[1].1;
+    let zero =
+        internal.add_op(internal.entry, Operator::I32Const { value: 0 }, &[], &[WType::I32]);
+    let result = internal.add_op(
+        internal.entry,
+        Operator::Call { function_index: realloc },
+        &[zero, zero, alignment, size],
+        &[WType::I32],
+    );
+    internal.set_terminator(internal.entry, Terminator::Return { values: vec![result] });
+    Ok(module.funcs.push(FuncDecl::Body(
+        internal_sig,
+        "__fe_cabi_alloc_internal".into(),
+        internal,
+    )))
 }
 
 fn translate_function(
