@@ -36,6 +36,27 @@ pub struct WasmArtifact {
     pub func_names: Vec<String>,
 }
 
+/// Opt-in checked LIFO canonical-memory exports synthesized by the Wasm backend.
+///
+/// Post-return names are operation identities selected by the frontend. Each
+/// export releases exactly one live result allocation and traps on stale,
+/// out-of-order, malformed, or out-of-bounds descriptors. This is intentionally
+/// a stack allocator, not a general-purpose `realloc`: only the newest live
+/// allocation may be resized or released. It is suitable for generator-owned
+/// result lowering that guarantees reverse-order post-return cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalStackMemoryManifest {
+    pub post_return_exports: Vec<String>,
+}
+
+impl CanonicalStackMemoryManifest {
+    pub fn new(post_return_exports: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        Self {
+            post_return_exports: post_return_exports.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 pub struct WasmBackend {
     /// Per-import-symbol wasm import MODULE names, keyed by the Sonatina function
     /// symbol (which becomes the import field name). An external declaration whose
@@ -45,6 +66,7 @@ pub struct WasmBackend {
     /// type and no symbol interning.
     import_modules: HashMap<String, String>,
     canonical_arena: bool,
+    canonical_memory: Option<CanonicalStackMemoryManifest>,
 }
 
 impl WasmBackend {
@@ -52,12 +74,24 @@ impl WasmBackend {
         Self {
             import_modules: HashMap::new(),
             canonical_arena: false,
+            canonical_memory: None,
         }
     }
 
     /// Emit canonical browser-interface arena exports. Disabled by default.
     pub fn with_canonical_arena(mut self) -> Self {
         self.canonical_arena = true;
+        self
+    }
+
+    /// Emit checked LIFO `cabi_realloc`/post-return exports for a
+    /// generator-controlled result stack. Disabled by default and mutually
+    /// exclusive with the legacy resettable arena.
+    pub fn with_canonical_stack_memory(
+        mut self,
+        manifest: CanonicalStackMemoryManifest,
+    ) -> Self {
+        self.canonical_memory = Some(manifest);
         self
     }
 
@@ -76,8 +110,19 @@ impl Backend for WasmBackend {
     type Error = WasmError;
 
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
+        if self.canonical_arena && self.canonical_memory.is_some() {
+            return Err(vec![WasmError::Translation(
+                "legacy canonical arena and canonical-memory manifest are mutually exclusive"
+                    .to_string(),
+            )]);
+        }
         let (wasm_module, func_names) =
-            translate::translate_module(module, &self.import_modules, self.canonical_arena)
+            translate::translate_module(
+                module,
+                &self.import_modules,
+                self.canonical_arena,
+                self.canonical_memory.as_ref(),
+            )
                 .map_err(|e| vec![WasmError::Translation(e)])?;
 
         let bytes = wasm_module

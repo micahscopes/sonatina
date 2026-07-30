@@ -342,6 +342,74 @@ fn canonical_arena_is_opt_in_checked_growable_and_resettable() {
 }
 
 #[test]
+fn canonical_stack_memory_tracks_realloc_and_reverse_post_return() {
+    use sonatina_codegen::isa::wasm::CanonicalStackMemoryManifest;
+
+    let ordinary_first = WasmBackend::new()
+        .compile_module(&wasm32_module_builder().build())
+        .unwrap();
+    let ordinary_second = WasmBackend::new()
+        .compile_module(&wasm32_module_builder().build())
+        .unwrap();
+    assert_eq!(
+        ordinary_first.bytes, ordinary_second.bytes,
+        "the opt-in API must not perturb default output"
+    );
+    let artifact = WasmBackend::new()
+        .with_canonical_stack_memory(CanonicalStackMemoryManifest::new(["cabi_post_echo"]))
+        .compile_module(&wasm32_module_builder().build())
+        .unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let engine = wasmtime::Engine::default();
+    let ordinary_module = wasmtime::Module::new(&engine, &ordinary_first.bytes).unwrap();
+    let mut ordinary_store = wasmtime::Store::new(&engine, ());
+    let ordinary =
+        wasmtime::Instance::new(&mut ordinary_store, &ordinary_module, &[]).unwrap();
+    assert!(ordinary.get_func(&mut ordinary_store, "cabi_realloc").is_none());
+    assert!(ordinary.get_func(&mut ordinary_store, "cabi_post_echo").is_none());
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    let realloc = instance
+        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "cabi_realloc")
+        .unwrap();
+    let post = instance
+        .get_typed_func::<(i32, i32, i32), ()>(&mut store, "cabi_post_echo")
+        .unwrap();
+
+    let first = realloc.call(&mut store, (0, 0, 2, 6)).unwrap();
+    let second = realloc.call(&mut store, (0, 0, 8, 11)).unwrap();
+    assert_eq!(first % 2, 0);
+    assert_eq!(second % 8, 0);
+    assert!(second >= first + 6);
+    assert!(
+        post.call(&mut store, (first, 6, 2)).is_err(),
+        "out-of-order cleanup must trap"
+    );
+    assert!(
+        realloc.call(&mut store, (first, 6, 2, 12)).is_err(),
+        "out-of-order resize must trap"
+    );
+    memory
+        .write(&mut store, second as usize, b"hello world")
+        .unwrap();
+    let resized = realloc.call(&mut store, (second, 11, 8, 32)).unwrap();
+    assert_eq!(resized, second);
+    let mut preserved = [0; 11];
+    memory
+        .read(&store, resized as usize, &mut preserved)
+        .unwrap();
+    assert_eq!(&preserved, b"hello world");
+    post.call(&mut store, (second, 32, 8)).unwrap();
+    assert!(post.call(&mut store, (second, 32, 8)).is_err(), "double free must trap");
+    assert!(post.call(&mut store, (first, 7, 2)).is_err(), "wrong size must trap");
+    post.call(&mut store, (first, 6, 2)).unwrap();
+    assert!(post.call(&mut store, (first, 6, 2)).is_err(), "stale free must trap");
+    assert!(post.call(&mut store, (i32::MAX, 1, 1)).is_err(), "OOB pointer must trap");
+}
+
+#[test]
 fn mem_alloc_dynamic_uses_the_opt_in_canonical_arena() {
     let error = match WasmBackend::new().compile_module(&dynamic_alloc_module()) {
         Ok(_) => panic!("mem.alloc_dynamic compiled without the canonical arena"),
