@@ -1606,6 +1606,12 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    else if <&sonatina_ir::inst::control_flow::CallIndirect as InstDowncast>::downcast(inst_set, inst_data).is_some() {
+                        return Err(
+                            "wasm translation: call_indirect requires function-table lowering"
+                                .to_string(),
+                        );
+                    }
                     // Call — direct call to another translated function.
                     else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(inst_set, inst_data) {
                         let callee = *call.callee();

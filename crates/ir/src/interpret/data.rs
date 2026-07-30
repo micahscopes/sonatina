@@ -129,7 +129,7 @@ impl Interpret for Gep {
 impl Interpret for GetFunctionPtr {
     fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
         state.set_action(Action::Continue);
-        single_result(EvalValue::Undef)
+        single_result(EvalValue::Func(*self.func()))
     }
 }
 
@@ -176,7 +176,7 @@ impl Interpret for InsertValue {
                 vec![EvalValue::Undef; len]
             }
 
-            EvalValue::Imm(_) => {
+            EvalValue::Imm(_) | EvalValue::Func(_) => {
                 unreachable!()
             }
         };
@@ -222,7 +222,7 @@ impl Interpret for ExtractValue {
                 return single_result(EvalValue::Undef);
             }
 
-            EvalValue::Imm(_) => {
+            EvalValue::Imm(_) | EvalValue::Func(_) => {
                 unreachable!()
             }
         };

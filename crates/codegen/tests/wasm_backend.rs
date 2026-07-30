@@ -131,6 +131,38 @@ fn wasm_scalar_global_support_does_not_perturb_default_bytes() {
 }
 
 #[test]
+fn wasm_indirect_call_fails_closed_until_table_lowering_exists() {
+    let parsed = sonatina_parser::parse_module(
+        r#"
+target = "wasm32-unknown-native"
+func private %id(v0.i32) -> i32 {
+    block0:
+        return v0;
+}
+func public %run(v0.i32) -> i32 {
+    block0:
+        v1.*(i32) -> i32 = get_function_ptr %id;
+        v2.i32 = call_indirect v1 *(i32) -> i32 v0;
+        return v2;
+}
+"#,
+    )
+    .unwrap();
+    let errors = match WasmBackend::new().compile_module(&parsed.module) {
+        Ok(_) => panic!("indirect call must fail before table lowering exists"),
+        Err(errors) => errors,
+    };
+    assert!(
+        errors.iter().any(|error| {
+            let error = error.to_string();
+            error.contains("function-table lowering")
+                || error.contains("unsupported instruction `get_function_ptr`")
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
 fn wasm_bitwise_and_i32_i64_execute() {
     let isa = Wasm32::new(wasm32_triple());
     let is = isa.inst_set();

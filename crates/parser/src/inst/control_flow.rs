@@ -8,6 +8,7 @@ super::impl_inst_build! {Br, (cond: ValueId, nz_dest: BlockId, z_dest: BlockId)}
 super::impl_inst_build_common! {BrTable, build_br_table}
 super::impl_inst_build_common! {Phi, build_phi}
 super::impl_inst_build_common! {Call, build_call}
+super::impl_inst_build_common! {CallIndirect, build_call_indirect}
 super::impl_inst_build_common! {Return, build_return}
 super::impl_inst_build! {Unreachable, ()}
 
@@ -93,6 +94,27 @@ fn build_call(
     } else {
         Ok(Call::new(fb.inst_set(), callee, args))
     }
+}
+
+fn build_call_indirect(
+    ctx: &mut BuildCtx,
+    fb: &mut FunctionBuilder<ir::func_cursor::InstInserter>,
+    args: &[ast::InstArg],
+    _has_inst: &dyn HasInst<CallIndirect>,
+) -> Result<CallIndirect, Box<Error>> {
+    let mut ast_args = args.iter().peekable();
+    let callee = super::process_arg!(ctx, fb, ast_args, ValueId);
+    let signature = super::process_arg!(ctx, fb, ast_args, Type);
+    let mut call_args = SmallVec::new();
+    while let Some(arg) = ast_args.next() {
+        call_args.push(ctx.value(fb, arg.try_into()?));
+    }
+    Ok(CallIndirect::new(
+        fb.inst_set(),
+        callee,
+        signature,
+        call_args,
+    ))
 }
 
 fn build_return(

@@ -82,6 +82,22 @@ impl Interpret for Call {
     }
 }
 
+impl Interpret for CallIndirect {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        let EvalValue::Func(func) = state.lookup_val(*self.callee()) else {
+            state.set_action(Action::Continue);
+            return single_result(EvalValue::Undef);
+        };
+        let args = self
+            .args()
+            .iter()
+            .map(|arg| state.lookup_val(*arg))
+            .collect();
+        state.set_action(Action::Continue);
+        state.call_func(func, args)
+    }
+}
+
 impl Interpret for Return {
     fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
         let ret_vals = self

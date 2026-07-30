@@ -106,6 +106,7 @@ pub trait Interpret {
         inst::control_flow::BrTable,
         inst::control_flow::Phi,
         inst::control_flow::Call,
+        inst::control_flow::CallIndirect,
         inst::control_flow::Return,
         inst::control_flow::Unreachable,
         inst::evm::EvmUdiv,
@@ -183,6 +184,7 @@ pub enum Action {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EvalValue {
     Imm(Immediate),
+    Func(FuncRef),
     Aggregate {
         fields: Vec<EvalValue>,
         ty: Type,
@@ -200,6 +202,7 @@ impl EvalValue {
         match self {
             EvalValue::Imm(value) => f(value).into(),
             EvalValue::Aggregate { .. } => panic!("Type checker needs to handle this!"),
+            EvalValue::Func(_) => panic!("function value used as an immediate"),
             EvalValue::Undef => EvalValue::Undef,
         }
     }
@@ -213,6 +216,9 @@ impl EvalValue {
             (EvalValue::Imm(l), EvalValue::Imm(r)) => f(l, r).into(),
             (EvalValue::Aggregate { .. }, _) => panic!("Type checker needs to handle this!"),
             (_, EvalValue::Aggregate { .. }) => panic!("Type checker needs to handle this!"),
+            (EvalValue::Func(_), _) | (_, EvalValue::Func(_)) => {
+                panic!("function value used as an immediate")
+            }
             _ => EvalValue::Undef,
         }
     }
@@ -244,6 +250,7 @@ impl fmt::Display for EvalValue {
                 }
                 write!(f, " }}")
             }
+            Self::Func(func) => write!(f, "%{}", func.as_u32()),
             Self::Undef => write!(f, "undef"),
         }
     }

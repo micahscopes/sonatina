@@ -906,6 +906,9 @@ fn translate_function(
                         }
                     }
                 }
+                NativeInstKind::CallIndirect(_) => {
+                    return Err("cranelift translation: call_indirect is not lowered yet".to_string());
+                }
                 NativeInstKind::Return(ret) => {
                     if let Some(sret) = sret_ptr {
                         let [val_id] = ret.args().as_slice() else {
