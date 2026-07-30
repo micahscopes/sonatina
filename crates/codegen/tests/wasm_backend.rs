@@ -1,9 +1,10 @@
 use sonatina_codegen::Backend;
 use sonatina_codegen::isa::wasm::WasmBackend;
 use sonatina_ir::{
-    Linkage, Signature, Type,
+    GlobalVariableData, Linkage, Signature, Type,
     builder::ModuleBuilder,
     func_cursor::InstInserter,
+    global_variable::GvInitializer,
     inst::{arith, cast, cmp, control_flow, data, logic},
     isa::{Isa, native::Native, wasm32::Wasm32},
     module::ModuleCtx,
@@ -22,6 +23,111 @@ fn wasm32_module_builder() -> ModuleBuilder {
     let isa = Wasm32::new(wasm32_triple());
     let ctx = ModuleCtx::new(&isa);
     ModuleBuilder::new(ctx)
+}
+
+fn mutable_i32_global_module() -> sonatina_ir::Module {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+    let counter = mb.declare_gv(GlobalVariableData::new(
+        "counter".into(),
+        Type::I32,
+        Linkage::Private,
+        false,
+        Some(GvInitializer::make_imm(-7i32)),
+    ));
+
+    let get = mb
+        .declare_function(Signature::new_single(
+            "get_counter",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(get);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let address = fb.make_global_value(counter);
+    let value = fb.insert_inst(data::Mload::new(is, address, Type::I32), Type::I32);
+    fb.insert_return(value);
+    fb.seal_all();
+    fb.finish();
+
+    let set = mb
+        .declare_function(Signature::new(
+            "set_counter",
+            Linkage::Public,
+            &[Type::I32],
+            &[],
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(set);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let address = fb.make_global_value(counter);
+    fb.insert_inst_no_result(data::Mstore::new(
+        is,
+        address,
+        fb.args()[0],
+        Type::I32,
+    ));
+    fb.insert_return_unit();
+    fb.seal_all();
+    fb.finish();
+
+    mb.build()
+}
+
+#[test]
+fn wasm_mutable_scalar_global_persists_per_instance() {
+    let artifact = WasmBackend::new()
+        .compile_module(&mutable_i32_global_module())
+        .unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let get = instance
+        .get_typed_func::<(), i32>(&mut store, "get_counter")
+        .unwrap();
+    let set = instance
+        .get_typed_func::<i32, ()>(&mut store, "set_counter")
+        .unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(get.call(&mut store, ()).unwrap(), -7);
+    set.call(&mut store, 42).unwrap();
+    assert_eq!(get.call(&mut store, ()).unwrap(), 42);
+    let mut prefix = [0; 4];
+    memory.read(&store, 0, &mut prefix).unwrap();
+    assert_eq!(
+        prefix, [0; 4],
+        "scalar global state must not consume the linear-memory prefix"
+    );
+
+    let second = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let second_get = second
+        .get_typed_func::<(), i32>(&mut store, "get_counter")
+        .unwrap();
+    assert_eq!(
+        second_get.call(&mut store, ()).unwrap(),
+        -7,
+        "each instance starts from the declared initializer"
+    );
+}
+
+#[test]
+fn wasm_scalar_global_support_does_not_perturb_default_bytes() {
+    let bytes = WasmBackend::new()
+        .compile_module(&wasm32_module_builder().build())
+        .unwrap()
+        .bytes;
+    assert_eq!(
+        hex::encode(bytes),
+        "0061736d0100000001010002010003010004010005050101018002060100070a01066d656d6f727902000901000a01000b01000008046e616d65010100"
+    );
 }
 
 #[test]
