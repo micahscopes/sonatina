@@ -107,6 +107,7 @@ define_inst_set_base! {
         data::InsertValue,
         data::ExtractValue,
         control_flow::Call,
+        control_flow::CallIndirect,
         control_flow::Jump,
         control_flow::Br,
         control_flow::BrTable,

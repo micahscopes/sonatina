@@ -4,7 +4,8 @@ use cranelift_entity::{PrimaryMap, SecondaryMap, entity_impl};
 use dashmap::{DashMap, ReadOnlyView};
 use rustc_hash::FxHashSet;
 use sonatina_ir::{
-    Linkage, Module,
+    InstDowncast, Linkage, Module,
+    inst::{control_flow::CallIndirect, data::GetFunctionPtr},
     module::{FuncRef, ModuleCtx},
 };
 
@@ -110,6 +111,7 @@ impl CallGraph {
     /// Builds a call graph from a module.
     pub fn build_graph(module: &Module) -> Self {
         let funcs = module.func_store.funcs();
+        let indirect_targets = address_taken_functions(module);
         let d_nodes = DashMap::new();
         module.func_store.par_for_each(|func_ref, func| {
             let mut callees = FxHashSet::default();
@@ -117,6 +119,14 @@ impl CallGraph {
                 for inst_id in func.layout.iter_inst(block) {
                     if let Some(call) = func.dfg.call_info(inst_id) {
                         callees.insert(call.callee());
+                    }
+                    if <&CallIndirect as InstDowncast>::downcast(
+                        func.inst_set(),
+                        func.dfg.inst(inst_id),
+                    )
+                    .is_some()
+                    {
+                        callees.extend(indirect_targets.iter().copied());
                     }
                 }
             }
@@ -142,6 +152,7 @@ impl CallGraph {
     ///
     /// Any call edges to functions outside `funcs` are ignored.
     pub fn build_graph_subset(module: &Module, funcs: &FxHashSet<FuncRef>) -> Self {
+        let indirect_targets = address_taken_functions(module);
         let mut nodes = SecondaryMap::new();
 
         let mut ordered: Vec<FuncRef> = funcs.iter().copied().collect();
@@ -157,6 +168,19 @@ impl CallGraph {
                             if funcs.contains(&callee) {
                                 callees.insert(callee);
                             }
+                        }
+                        if <&CallIndirect as InstDowncast>::downcast(
+                            func.inst_set(),
+                            func.dfg.inst(inst_id),
+                        )
+                        .is_some()
+                        {
+                            callees.extend(
+                                indirect_targets
+                                    .iter()
+                                    .copied()
+                                    .filter(|target| funcs.contains(target)),
+                            );
                         }
                     }
                 }
@@ -189,6 +213,25 @@ impl CallGraph {
     pub fn is_leaf(&self, ctx: &ModuleCtx, func_ref: FuncRef) -> bool {
         !ctx.func_linkage(func_ref).is_external() && self.nodes[func_ref].callees.is_empty()
     }
+}
+
+fn address_taken_functions(module: &Module) -> FxHashSet<FuncRef> {
+    let mut targets = FxHashSet::default();
+    for func_ref in module.func_store.funcs() {
+        module.func_store.view(func_ref, |function| {
+            for block in function.layout.iter_block() {
+                for inst_id in function.layout.iter_inst(block) {
+                    if let Some(ptr) = <&GetFunctionPtr as InstDowncast>::downcast(
+                        function.inst_set(),
+                        function.dfg.inst(inst_id),
+                    ) {
+                        targets.insert(*ptr.func());
+                    }
+                }
+            }
+        });
+    }
+    targets
 }
 
 /// Represents the strongly connected components of a call graph in a module.
@@ -556,6 +599,28 @@ func private %live() -> i32 {
 
         let funcs: Vec<_> = CallGraph::build_graph(module).funcs().collect();
         assert_eq!(funcs, vec![entry, live]);
+    }
+
+    #[test]
+    fn indirect_call_conservatively_targets_address_taken_functions() {
+        let parsed = parse_module(
+            r#"
+target = "wasm32-unknown-native"
+func private %target(v0.i32) -> i32 {
+    block0:
+        return v0;
+}
+func public %entry(v0.i32) -> i32 {
+    block0:
+        v1.*(i32) -> i32 = get_function_ptr %target;
+        v2.i32 = call_indirect v1 *(i32) -> i32 v0;
+        return v2;
+}
+"#,
+        );
+        let entry = find_func(&parsed.module, "entry");
+        let target = find_func(&parsed.module, "target");
+        assert_eq!(CallGraph::build_graph(&parsed.module).callee_of(entry), [target]);
     }
 
     #[test]

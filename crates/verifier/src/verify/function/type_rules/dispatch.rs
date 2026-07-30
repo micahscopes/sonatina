@@ -2560,6 +2560,65 @@ impl VerifyInst for control_flow::Call {
     }
 }
 
+impl VerifyInst for control_flow::CallIndirect {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        let location = verifier.inst_location(inst_id);
+        let Some(Type::Compound(signature_ref)) = verifier.pointee_ty(*self.signature()) else {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                "indirect call signature must be a pointer to function type",
+                location,
+            ));
+            return;
+        };
+        let signature = verifier.ctx.with_ty_store(|store| {
+            store.get_compound(signature_ref).cloned()
+        });
+        let Some(CompoundType::Func { args, ret_tys }) = signature else {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                "indirect call signature must be a pointer to function type",
+                verifier.inst_location(inst_id),
+            ));
+            return;
+        };
+        if let Some(callee_ty) = verifier.value_ty(*self.callee())
+            && callee_ty != *self.signature()
+        {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::CallArgTypeMismatch,
+                "indirect call callee must point to the explicit function type",
+                verifier.inst_location(inst_id),
+            ));
+        }
+        if self.args().len() != args.len() {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::CallArityMismatch,
+                "indirect call argument count does not match explicit signature",
+                verifier.inst_location(inst_id),
+            ));
+        }
+        for (index, (arg, expected_ty)) in self.args().iter().zip(&args).enumerate() {
+            if let Some(actual_ty) = verifier.value_ty(*arg)
+                && actual_ty != *expected_ty
+            {
+                verifier.emit(
+                    Diagnostic::error(
+                        DiagnosticCode::CallArgTypeMismatch,
+                        "indirect call argument type does not match explicit signature",
+                        verifier.inst_location(inst_id),
+                    )
+                    .with_note(format!(
+                        "arg {index}: expected {:?}, found {:?}",
+                        expected_ty, actual_ty
+                    )),
+                );
+            }
+        }
+        verifier.expect_result_tys(inst_id, &ret_tys, verifier.inst_location(inst_id));
+    }
+}
+
 impl VerifyInst for control_flow::Return {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
         let location = verifier.inst_location(inst_id);

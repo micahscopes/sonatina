@@ -63,6 +63,7 @@ pub struct NativeInstSet(
     control_flow::Phi,
     control_flow::BrTable,
     control_flow::Call,
+    control_flow::CallIndirect,
     control_flow::Return,
     control_flow::Unreachable,
     data::Mload,

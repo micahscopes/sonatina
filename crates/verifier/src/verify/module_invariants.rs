@@ -142,6 +142,16 @@ pub(super) fn collect_module_invariants(
                 continue;
             }
 
+            // Function signatures are type identities, not by-value data.
+            // Their pointer wrappers have a layout; the signature itself does
+            // not and must not be sent through data-layout computation.
+            if matches!(
+                ty.resolve_compound(&module.ctx),
+                Some(sonatina_ir::types::CompoundType::Func { .. })
+            ) {
+                continue;
+            }
+
             let size_res = catch_unwind(AssertUnwindSafe(|| module.ctx.size_of(ty)));
             if !matches!(
                 size_res,

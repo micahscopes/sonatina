@@ -71,6 +71,19 @@ pub struct Call {
     args: SmallVec<[ValueId; 8]>,
 }
 
+/// Invoke a function-pointer value using an explicit function type.
+///
+/// The signature is carried independently from the callee value so verification
+/// and target lowering never have to infer a callable ABI from pointer bits.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(super::SideEffect::Write))]
+#[inst(arity(at_least(2)))]
+pub struct CallIndirect {
+    callee: ValueId,
+    signature: crate::Type,
+    args: SmallVec<[ValueId; 8]>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Inst)]
 #[inst(side_effect(super::SideEffect::Control))]
 #[inst(terminator)]

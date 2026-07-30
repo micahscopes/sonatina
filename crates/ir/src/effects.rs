@@ -632,6 +632,11 @@ fn classify_inst_effects_with<S: EffectSink>(
         record_func_summary(&mut sink, &dfg.ctx.func_effects(call.callee()), spaces);
         return sink.finish();
     }
+    if <&control_flow::CallIndirect as InstDowncast>::downcast(is, inst).is_some() {
+        record_fallback_from_declared_effect_hint(&mut sink, SideEffect::Write, spaces);
+        sink.add_other(OtherEffects::CONTROL | OtherEffects::ALLOC);
+        return sink.finish();
+    }
 
     if let Some(mstore8) = <&EvmMstore8 as InstDowncast>::downcast(is, inst) {
         sink.write_exact(MEMORY, *mstore8.addr(), 1, Type::I8);

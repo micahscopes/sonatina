@@ -391,6 +391,8 @@ fn translate_function(
                         .collect();
                     builder.ins().return_(&args);
                 }
+            } else if <&sonatina_ir::inst::control_flow::CallIndirect as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
+                return Err("cranelift translation: call_indirect is not lowered yet".to_string());
             } else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let callee = *call.callee();
                 let callee_name = module.ctx.func_sig(callee, |sig| sig.name().to_string());
