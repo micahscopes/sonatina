@@ -12,9 +12,10 @@ use waffle::{
 };
 
 use sonatina_ir::{
-    BlockId, Function, Immediate, Inst, InstDowncast, InstSetBase, Linkage, Module, Signature, Type,
-    Value, ValueId,
+    BlockId, Function, GlobalVariableRef, Immediate, Inst, InstDowncast, InstSetBase, Linkage,
+    Module, Signature, Type, Value, ValueId,
     cfg::ControlFlowGraph,
+    global_variable::GvInitializer,
     module::FuncRef,
 };
 use super::CanonicalStackMemoryManifest;
@@ -75,7 +76,36 @@ pub(super) fn translate_module(
         ["addmod", "mulmod"].into_iter().collect();
 
     let mut func_map: HashMap<FuncRef, Func> = HashMap::new();
+    let mut global_map = HashMap::new();
     let mut pending: Vec<(FuncRef, Func, waffle::Signature, String)> = Vec::new();
+
+    // Sonatina scalar globals have value semantics at `mload`/`mstore` sites.
+    // Represent them as genuine Wasm globals so state persists across exported
+    // calls without consuming or aliasing linear memory.
+    module.ctx.with_gv_store(|store| -> Result<(), String> {
+        for gv in store.all_gv_refs() {
+            let data = store.gv_data(gv);
+            let Some(ty) = sonatina_to_waffle_type(data.ty) else {
+                // Aggregate globals retain their existing data-address
+                // semantics and are not silently reinterpreted as Wasm globals.
+                continue;
+            };
+            let value = wasm_global_initializer(data.ty, data.initializer.as_ref())?;
+            let wglobal = wmod.globals.push(GlobalData {
+                ty,
+                value: Some(value),
+                mutable: !data.is_const,
+            });
+            if data.linkage == Linkage::Public {
+                wmod.exports.push(waffle::Export {
+                    name: data.symbol.clone(),
+                    kind: ExportKind::Global(wglobal),
+                });
+            }
+            global_map.insert(gv, wglobal);
+        }
+        Ok(())
+    })?;
 
     // Pass 0: emit a wasm import for every external declaration (a function
     // with `Linkage::External` and no body). WAFFLE requires imported functions
@@ -228,12 +258,38 @@ pub(super) fn translate_module(
             wsig,
             memory,
             &func_map,
+            &global_map,
             canonical_alloc,
         )?;
         wmod.funcs[wfunc] = FuncDecl::Body(wsig, name, body);
     }
 
     Ok((wmod, func_names))
+}
+
+fn wasm_global_initializer(
+    ty: Type,
+    initializer: Option<&GvInitializer>,
+) -> Result<u64, String> {
+    let Some(initializer) = initializer else {
+        return Ok(0);
+    };
+    let GvInitializer::Immediate(immediate) = initializer else {
+        return Err(format!(
+            "wasm scalar global `{ty:?}` requires a scalar initializer"
+        ));
+    };
+    match (ty, immediate) {
+        (Type::I1, Immediate::I1(value)) => Ok(u64::from(*value)),
+        (Type::I8, Immediate::I8(value)) => Ok(*value as u8 as u64),
+        (Type::I16, Immediate::I16(value)) => Ok(*value as u16 as u64),
+        (Type::I32, Immediate::I32(value)) => Ok(*value as u32 as u64),
+        (Type::I64, Immediate::I64(value)) => Ok(*value as u64),
+        (Type::F32, Immediate::F32(bits)) => Ok(u64::from(*bits)),
+        _ => Err(format!(
+            "wasm global initializer `{immediate:?}` does not match `{ty:?}`"
+        )),
+    }
 }
 
 fn synthesize_canonical_arena(
@@ -755,6 +811,7 @@ fn translate_function(
     wsig: waffle::Signature,
     memory: waffle::Memory,
     func_map: &HashMap<FuncRef, Func>,
+    global_map: &HashMap<GlobalVariableRef, waffle::Global>,
     canonical_alloc: Option<Func>,
 ) -> Result<FunctionBody, String> {
     let mut body = FunctionBody::new(wmod, wsig);
@@ -1255,6 +1312,34 @@ fn translate_function(
                     else if let Some(mstore) = <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(inst_set, inst_data) {
                         let value = resolve_value(function, *mstore.value(), &value_map, &mut body, wb)
                             .ok_or("unresolved mstore value")?;
+                        if let Value::Global { gv, .. } = function.dfg.value(*mstore.addr()) {
+                            let global = global_map.get(gv).ok_or_else(|| {
+                                format!("wasm mstore global `{gv:?}` is not a scalar global")
+                            })?;
+                            let (global_ty, is_const) = module.ctx.with_gv_store(|store| {
+                                (store.ty(*gv), store.is_const(*gv))
+                            });
+                            if global_ty != *mstore.ty() {
+                                return Err(format!(
+                                    "wasm mstore type `{:?}` does not match global `{gv:?}` type `{global_ty:?}`",
+                                    mstore.ty()
+                                ));
+                            }
+                            if is_const {
+                                return Err(format!(
+                                    "wasm mstore cannot write immutable global `{gv:?}`"
+                                ));
+                            }
+                            body.add_op(
+                                wb,
+                                Operator::GlobalSet {
+                                    global_index: *global,
+                                },
+                                &[value],
+                                &[],
+                            );
+                            continue;
+                        }
                         let addr = resolve_value(function, *mstore.addr(), &value_map, &mut body, wb)
                             .ok_or("unresolved mstore address")?;
                         let memarg = scalar_memory_arg(memory, *mstore.ty())?;
@@ -1272,6 +1357,34 @@ fn translate_function(
                     // integer values are zero-extended into Wasm's i32 carrier.
                     else if let Some(mload) = <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
+                            if let Value::Global { gv, .. } = function.dfg.value(*mload.addr()) {
+                                let global = global_map.get(gv).ok_or_else(|| {
+                                    format!("wasm mload global `{gv:?}` is not a scalar global")
+                                })?;
+                                let global_ty =
+                                    module.ctx.with_gv_store(|store| store.ty(*gv));
+                                if global_ty != *mload.ty() {
+                                    return Err(format!(
+                                        "wasm mload type `{:?}` does not match global `{gv:?}` type `{global_ty:?}`",
+                                        mload.ty()
+                                    ));
+                                }
+                                let result_ty = sonatina_to_waffle_type(*mload.ty())
+                                    .ok_or_else(|| format!(
+                                        "unsupported wasm global mload type `{:?}`",
+                                        mload.ty()
+                                    ))?;
+                                let loaded = body.add_op(
+                                    wb,
+                                    Operator::GlobalGet {
+                                        global_index: *global,
+                                    },
+                                    &[],
+                                    &[result_ty],
+                                );
+                                value_map.insert(result, loaded);
+                                continue;
+                            }
                             let addr = resolve_value(function, *mload.addr(), &value_map, &mut body, wb);
                             let addr = addr.ok_or("unresolved mload address")?;
                             let memarg = scalar_memory_arg(memory, *mload.ty())?;
