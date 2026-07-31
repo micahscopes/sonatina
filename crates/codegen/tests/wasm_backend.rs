@@ -131,34 +131,100 @@ fn wasm_scalar_global_support_does_not_perturb_default_bytes() {
 }
 
 #[test]
-fn wasm_indirect_call_fails_closed_until_table_lowering_exists() {
+fn wasm_indirect_call_executes_and_preserves_multi_result_order() {
     let parsed = sonatina_parser::parse_module(
         r#"
 target = "wasm32-unknown-native"
-func private %id(v0.i32) -> i32 {
+func private %pair(v0.i32) -> (i32, i64) {
+    block0:
+        v1.i32 = add v0 1.i32;
+        return (v1, 99.i64);
+}
+func public %run(v0.i32) -> (i32, i64) {
+    block0:
+        v1.*(i32) -> (i32, i64) = get_function_ptr %pair;
+        (v2.i32, v3.i64) = call_indirect v1 *(i32) -> (i32, i64) v0;
+        return (v2, v3);
+}
+"#,
+    )
+    .unwrap();
+    let artifact = WasmBackend::new().compile_module(&parsed.module).unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let run = instance
+        .get_typed_func::<i32, (i32, i64)>(&mut store, "run")
+        .unwrap();
+    assert_eq!(run.call(&mut store, 41).unwrap(), (42, 99));
+}
+
+#[test]
+fn wasm_indirect_call_uses_stable_slots_and_native_wasm_traps() {
+    let parsed = sonatina_parser::parse_module(
+        r#"
+target = "wasm32-unknown-native"
+func private %good(v0.i32) -> i32 {
+    block0:
+        v1.i32 = add v0 1.i32;
+        return v1;
+}
+func private %wrong(v0.i64) -> i64 {
     block0:
         return v0;
 }
-func public %run(v0.i32) -> i32 {
+func public %good_slot() -> *(i32) -> i32 {
     block0:
-        v1.*(i32) -> i32 = get_function_ptr %id;
-        v2.i32 = call_indirect v1 *(i32) -> i32 v0;
+        v0.*(i32) -> i32 = get_function_ptr %good;
+        return v0;
+}
+func public %wrong_slot() -> *(i64) -> i64 {
+    block0:
+        v0.*(i64) -> i64 = get_function_ptr %wrong;
+        return v0;
+}
+func public %dispatch(v0.*(i32) -> i32, v1.i32) -> i32 {
+    block0:
+        v2.i32 = call_indirect v0 *(i32) -> i32 v1;
         return v2;
 }
 "#,
     )
     .unwrap();
-    let errors = match WasmBackend::new().compile_module(&parsed.module) {
-        Ok(_) => panic!("indirect call must fail before table lowering exists"),
-        Err(errors) => errors,
-    };
+    let first = WasmBackend::new().compile_module(&parsed.module).unwrap();
+    let second = WasmBackend::new().compile_module(&parsed.module).unwrap();
+    assert_eq!(first.bytes, second.bytes, "table slots and elements must be stable");
+    wasmparser::validate(&first.bytes).unwrap();
+
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &first.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let good_slot = instance
+        .get_typed_func::<(), i32>(&mut store, "good_slot")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    let wrong_slot = instance
+        .get_typed_func::<(), i32>(&mut store, "wrong_slot")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    let dispatch = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "dispatch")
+        .unwrap();
+
+    assert_eq!(dispatch.call(&mut store, (good_slot, 41)).unwrap(), 42);
+    assert!(dispatch.call(&mut store, (0, 41)).is_err(), "null must trap");
     assert!(
-        errors.iter().any(|error| {
-            let error = error.to_string();
-            error.contains("function-table lowering")
-                || error.contains("unsupported instruction `get_function_ptr`")
-        }),
-        "{errors:?}"
+        dispatch.call(&mut store, (i32::MAX, 41)).is_err(),
+        "out-of-bounds table index must trap"
+    );
+    assert!(
+        dispatch.call(&mut store, (wrong_slot, 41)).is_err(),
+        "signature mismatch must trap"
     );
 }
 

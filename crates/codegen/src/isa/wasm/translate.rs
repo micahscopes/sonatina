@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 use waffle::{
     BlockTarget, ExportKind, Func, FuncDecl, FunctionBody, GlobalData, Module as WaffleModule,
-    Operator, SignatureData, Terminator, Type as WType, ValueDef,
+    Operator, SignatureData, TableData, Terminator, Type as WType, ValueDef,
+    entity::EntityRef,
 };
 
 use sonatina_ir::{
@@ -16,7 +17,8 @@ use sonatina_ir::{
     Module, Signature, Type, Value, ValueId,
     cfg::ControlFlowGraph,
     global_variable::GvInitializer,
-    module::FuncRef,
+    module::{FuncRef, ModuleCtx},
+    types::CompoundType,
 };
 use super::CanonicalStackMemoryManifest;
 
@@ -32,6 +34,45 @@ fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
         Type::Compound(_) => Some(WType::I64),
         _ => None,
     }
+}
+
+fn sonatina_to_waffle_type_in_ctx(ctx: &ModuleCtx, ty: Type) -> Option<WType> {
+    if matches!(
+        ty.resolve_compound(ctx),
+        Some(CompoundType::Ptr(pointee))
+            if matches!(pointee.resolve_compound(ctx), Some(CompoundType::Func { .. }))
+    ) {
+        Some(WType::I32)
+    } else {
+        sonatina_to_waffle_type(ty)
+    }
+}
+
+fn indirect_signature(ctx: &ModuleCtx, ty: Type) -> Result<SignatureData, String> {
+    let Some(CompoundType::Ptr(pointee)) = ty.resolve_compound(ctx) else {
+        return Err(format!("wasm call_indirect signature `{ty:?}` is not a pointer"));
+    };
+    let Some(CompoundType::Func { args, ret_tys }) = pointee.resolve_compound(ctx) else {
+        return Err(format!(
+            "wasm call_indirect signature `{ty:?}` does not point to a function"
+        ));
+    };
+    let map = |types: &[Type], position: &str| -> Result<Vec<WType>, String> {
+        types
+            .iter()
+            .map(|ty| {
+                sonatina_to_waffle_type_in_ctx(ctx, *ty).ok_or_else(|| {
+                    format!(
+                        "wasm call_indirect {position} type `{ty:?}` is not representable in wasm"
+                    )
+                })
+            })
+            .collect()
+    };
+    Ok(SignatureData {
+        params: map(&args, "parameter")?,
+        returns: map(&ret_tys, "result")?,
+    })
 }
 
 fn scalar_memory_arg(memory: waffle::Memory, ty: Type) -> Result<waffle::MemoryArg, String> {
@@ -139,7 +180,7 @@ pub(super) fn translate_module(
         let sig_data = module.ctx.func_sig(func_ref, |sig| {
             let mut params = Vec::with_capacity(sig.args().len());
             for ty in sig.args() {
-                match sonatina_to_waffle_type(*ty) {
+                match sonatina_to_waffle_type_in_ctx(&module.ctx, *ty) {
                     Some(wty) => params.push(wty),
                     None => {
                         return Err(format!(
@@ -151,7 +192,7 @@ pub(super) fn translate_module(
             }
             let mut returns = Vec::with_capacity(sig.ret_tys().len());
             for ty in sig.ret_tys() {
-                match sonatina_to_waffle_type(*ty) {
+                match sonatina_to_waffle_type_in_ctx(&module.ctx, *ty) {
                     Some(wty) => returns.push(wty),
                     None => {
                         return Err(format!(
@@ -217,12 +258,12 @@ pub(super) fn translate_module(
             let params: Vec<WType> = sig
                 .args()
                 .iter()
-                .filter_map(|ty| sonatina_to_waffle_type(*ty))
+                .filter_map(|ty| sonatina_to_waffle_type_in_ctx(&module.ctx, *ty))
                 .collect();
             let results: Vec<WType> = sig
                 .ret_tys()
                 .iter()
-                .filter_map(|ty| sonatina_to_waffle_type(*ty))
+                .filter_map(|ty| sonatina_to_waffle_type_in_ctx(&module.ctx, *ty))
                 .collect();
             (params, results)
         });
@@ -249,6 +290,72 @@ pub(super) fn translate_module(
         pending.push((func_ref, wfunc, wsig, name));
     }
 
+    // Assign deterministic, non-zero table indexes to address-taken functions.
+    // Slot zero is null, preserving WebAssembly's native null-pointer trap.
+    let mut address_taken = Vec::new();
+    let mut signature_types = Vec::new();
+    for &func_ref in &funcs {
+        module.func_store.try_view(func_ref, |function| {
+            for block in function.layout.iter_block() {
+                for inst_id in function.layout.iter_inst(block) {
+                    let inst = function.dfg.inst(inst_id);
+                    if let Some(ptr) =
+                        <&sonatina_ir::inst::data::GetFunctionPtr as InstDowncast>::downcast(
+                            function.inst_set(),
+                            inst,
+                        )
+                    {
+                        address_taken.push(*ptr.func());
+                    }
+                    if let Some(call) =
+                        <&sonatina_ir::inst::control_flow::CallIndirect as InstDowncast>::downcast(
+                            function.inst_set(),
+                            inst,
+                        )
+                    {
+                        signature_types.push(*call.signature());
+                    }
+                }
+            }
+        });
+    }
+    address_taken.sort_by_key(|func| func.as_u32());
+    address_taken.dedup();
+    signature_types.sort_by_key(|ty| format!("{ty:?}"));
+    signature_types.dedup();
+
+    let mut target_slots = HashMap::new();
+    let needs_table = !address_taken.is_empty() || !signature_types.is_empty();
+    let table = if !needs_table {
+        None
+    } else {
+        let mut elements = vec![Func::invalid()];
+        for target in address_taken {
+            let wfunc = func_map.get(&target).copied().ok_or_else(|| {
+                format!(
+                    "wasm translation: address-taken function %{} has no wasm body or import",
+                    target.as_u32()
+                )
+            })?;
+            let slot = elements.len() as u32;
+            target_slots.insert(target, slot);
+            elements.push(wfunc);
+        }
+        let len = elements.len() as u64;
+        Some(wmod.tables.push(TableData {
+            ty: WType::FuncRef,
+            initial: len,
+            max: Some(len),
+            func_elements: Some(elements),
+        }))
+    };
+
+    let mut indirect_signatures = HashMap::new();
+    for ty in signature_types {
+        let signature = wmod.signatures.push(indirect_signature(&module.ctx, ty)?);
+        indirect_signatures.insert(ty, signature);
+    }
+
     // Pass 2: translate each body, now that every callee has a WAFFLE `Func`.
     for (func_ref, wfunc, wsig, name) in pending {
         let body = translate_function(
@@ -260,6 +367,9 @@ pub(super) fn translate_module(
             &func_map,
             &global_map,
             canonical_alloc,
+            table,
+            &target_slots,
+            &indirect_signatures,
         )?;
         wmod.funcs[wfunc] = FuncDecl::Body(wsig, name, body);
     }
@@ -813,6 +923,9 @@ fn translate_function(
     func_map: &HashMap<FuncRef, Func>,
     global_map: &HashMap<GlobalVariableRef, waffle::Global>,
     canonical_alloc: Option<Func>,
+    table: Option<waffle::Table>,
+    target_slots: &HashMap<FuncRef, u32>,
+    indirect_signatures: &HashMap<Type, waffle::Signature>,
 ) -> Result<FunctionBody, String> {
     let mut body = FunctionBody::new(wmod, wsig);
     // Stack pointer for bump allocation in linear memory (starts at 1024 to leave space)
@@ -859,7 +972,9 @@ fn translate_function(
                     if let Some(_phi) = <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let ty = function.dfg.value_ty(result);
-                            let wty = sonatina_to_waffle_type(ty).unwrap_or(WType::I64);
+                            let wty =
+                                sonatina_to_waffle_type_in_ctx(function.ctx(), ty)
+                                    .unwrap_or(WType::I64);
                             let param = body.add_blockparam(wb, wty);
                             value_map.insert(result, param);
                         }
@@ -1606,11 +1721,77 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
-                    else if <&sonatina_ir::inst::control_flow::CallIndirect as InstDowncast>::downcast(inst_set, inst_data).is_some() {
-                        return Err(
-                            "wasm translation: call_indirect requires function-table lowering"
-                                .to_string(),
+                    else if let Some(get_fn) = <&sonatina_ir::inst::data::GetFunctionPtr as InstDowncast>::downcast(inst_set, inst_data) {
+                        let result = function
+                            .dfg
+                            .inst_result(inst_id)
+                            .ok_or("get_function_ptr has no result")?;
+                        let slot = target_slots.get(get_fn.func()).copied().ok_or_else(|| {
+                            format!(
+                                "wasm translation: function %{} has no table slot",
+                                get_fn.func().as_u32()
+                            )
+                        })?;
+                        let value = body.add_op(
+                            wb,
+                            Operator::I32Const { value: slot },
+                            &[],
+                            &[WType::I32],
                         );
+                        value_map.insert(result, value);
+                    }
+                    else if let Some(call) = <&sonatina_ir::inst::control_flow::CallIndirect as InstDowncast>::downcast(inst_set, inst_data) {
+                        let table = table.ok_or(
+                            "wasm translation: call_indirect has no function table",
+                        )?;
+                        let sig_index = indirect_signatures
+                            .get(call.signature())
+                            .copied()
+                            .ok_or("wasm translation: call_indirect signature was not declared")?;
+                        let mut args = Vec::with_capacity(call.args().len() + 1);
+                        for arg in call.args() {
+                            args.push(
+                                resolve_value(function, *arg, &value_map, &mut body, wb)
+                                    .ok_or("wasm translation: unresolved call_indirect argument")?,
+                            );
+                        }
+                        // WAFFLE follows Wasm stack order: parameters, then table index.
+                        args.push(
+                            resolve_value(function, *call.callee(), &value_map, &mut body, wb)
+                                .ok_or("wasm translation: unresolved call_indirect callee")?,
+                        );
+                        let op = Operator::CallIndirect {
+                            sig_index,
+                            table_index: table,
+                        };
+                        let results = function.dfg.inst_results(inst_id);
+                        if results.is_empty() {
+                            body.add_op(wb, op, &args, &[]);
+                        } else {
+                            let result_tys: Vec<WType> = results
+                                .iter()
+                                .map(|result| result_waffle_type(function, *result))
+                                .collect();
+                            let physical_tys: Vec<WType> =
+                                result_tys.iter().copied().rev().collect();
+                            let call_value = body.add_op(wb, op, &args, &physical_tys);
+                            if results.len() == 1 {
+                                value_map.insert(results[0], call_value);
+                            } else {
+                                let result_count = results.len();
+                                for (index, (result, ty)) in
+                                    results.iter().zip(result_tys).enumerate()
+                                {
+                                    let picked = body.add_value(ValueDef::PickOutput(
+                                        call_value,
+                                        (result_count - 1 - index) as u32,
+                                        ty,
+                                    ));
+                                    body.append_to_block(wb, picked);
+                                    value_map.insert(*result, picked);
+                                }
+                            }
+                        }
                     }
                     // Call — direct call to another translated function.
                     else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(inst_set, inst_data) {
@@ -1729,7 +1910,7 @@ fn resolve_value(
 
 fn result_waffle_type(function: &Function, result: ValueId) -> WType {
     let ty = function.dfg.value_ty(result);
-    sonatina_to_waffle_type(ty).unwrap_or(WType::I64)
+    sonatina_to_waffle_type_in_ctx(function.ctx(), ty).unwrap_or(WType::I64)
 }
 
 fn collect_phi_args(
