@@ -137,7 +137,8 @@ impl<'a> DemandedBitsQuery<'a> {
             | UnaryInstKind::Snego
             | UnaryInstKind::EvmClz
             | UnaryInstKind::Fneg
-            | UnaryInstKind::Fsqrt => {
+            | UnaryInstKind::Fsqrt
+            | UnaryInstKind::Fabs => {
                 self.add_demand(*arg, type_mask_or_zero(self.func, *arg), worklist, queued);
             }
         }

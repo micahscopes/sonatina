@@ -374,7 +374,8 @@ pub(crate) fn simplify_unary_with_same_inner(
         | UnaryInstKind::IsZero
         | UnaryInstKind::EvmClz
         | UnaryInstKind::Fneg
-        | UnaryInstKind::Fsqrt => {
+        | UnaryInstKind::Fsqrt
+        | UnaryInstKind::Fabs => {
             SimplifyExprResult::NoChange
         }
     }
@@ -625,6 +626,8 @@ pub(crate) fn simplify_binary_with_facts(
         | BinaryInstKind::Fsub
         | BinaryInstKind::Fmul
         | BinaryInstKind::Fdiv
+        | BinaryInstKind::Fmin
+        | BinaryInstKind::Fmax
         | BinaryInstKind::Feq
         | BinaryInstKind::Flt
         | BinaryInstKind::Fle => {}

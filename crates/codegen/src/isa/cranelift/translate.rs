@@ -105,6 +105,7 @@ fn sonatina_type_to_clif(ty: Type) -> Option<clif::Type> {
         Type::I256 => Some(clif::types::I64),
         // Compound types (objref, constref, ptr) → native pointer
         Type::Compound(_) => Some(clif::types::I64),
+        Type::F32 => Some(clif::types::F32),
         _ => None,
     }
 }
@@ -214,6 +215,88 @@ fn translate_function(
             } else if let Some(neg) = <&sonatina_ir::inst::arith::Neg as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let val = resolve_value(function, *neg.arg(), &value_map, &mut builder)?;
                 let result_val = builder.ins().ineg(val);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            // Float arithmetic. `Type::F32` -> `clif::types::F32` (added above)
+            // makes these native cranelift float instructions instead of the
+            // previous "unsupported type for cranelift" translation error that
+            // silently skipped any function using `Fadd`/`Fsqrt`/etc (the
+            // `NativeInstSet` already declared them; nothing lowered them). This
+            // is the sqrt-and-friends TEMPLATE that `Fabs`/`Fmin`/`Fmax`/`Fclamp`
+            // below mirror.
+            } else if let Some(fneg) = <&sonatina_ir::inst::arith::Fneg as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let val = resolve_value(function, *fneg.arg(), &value_map, &mut builder)?;
+                let result_val = builder.ins().fneg(val);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fadd) = <&sonatina_ir::inst::arith::Fadd as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *fadd.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *fadd.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().fadd(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fsub) = <&sonatina_ir::inst::arith::Fsub as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *fsub.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *fsub.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().fsub(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fmul) = <&sonatina_ir::inst::arith::Fmul as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *fmul.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *fmul.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().fmul(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fdiv) = <&sonatina_ir::inst::arith::Fdiv as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *fdiv.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *fdiv.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().fdiv(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fsqrt) = <&sonatina_ir::inst::arith::Fsqrt as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let val = resolve_value(function, *fsqrt.arg(), &value_map, &mut builder)?;
+                let result_val = builder.ins().sqrt(val);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fabs) = <&sonatina_ir::inst::arith::Fabs as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let val = resolve_value(function, *fabs.arg(), &value_map, &mut builder)?;
+                // Pure bitwise sign-clear, per cranelift's own `fabs` doc comment.
+                let result_val = builder.ins().fabs(val);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fmin) = <&sonatina_ir::inst::arith::Fmin as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *fmin.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *fmin.rhs(), &value_map, &mut builder)?;
+                // cranelift's `fmin` doc: "propagating NaNs using the WebAssembly
+                // rules" -- exactly the semantics pinned for `Fmin` (matches
+                // wasm's `f32.min` bit-for-bit on non-NaN inputs).
+                let result_val = builder.ins().fmin(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fmax) = <&sonatina_ir::inst::arith::Fmax as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *fmax.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *fmax.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().fmax(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fclamp) = <&sonatina_ir::inst::arith::Fclamp as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let arg = resolve_value(function, *fclamp.arg(), &value_map, &mut builder)?;
+                let lo = resolve_value(function, *fclamp.lo(), &value_map, &mut builder)?;
+                let hi = resolve_value(function, *fclamp.hi(), &value_map, &mut builder)?;
+                // No native cranelift `fclamp`; compose as `min(max(arg, lo), hi)`,
+                // matching the wasm backend's composition exactly.
+                let maxed = builder.ins().fmax(arg, lo);
+                let result_val = builder.ins().fmin(maxed, hi);
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
                 }
@@ -772,7 +855,12 @@ fn resolve_value(
     let value = function.dfg.value(value_id);
     match value {
         Value::Immediate { imm, ty } => {
-            if matches!(imm, Immediate::I256(_) | Immediate::I128(_)) {
+            if let Immediate::F32(bits) = imm {
+                let val = builder
+                    .ins()
+                    .f32const(cranelift_codegen::ir::immediates::Ieee32::with_bits(*bits));
+                Ok(val)
+            } else if matches!(imm, Immediate::I256(_) | Immediate::I128(_)) {
                 match imm {
                     Immediate::I256(i256_val) => Ok(emit_i256_immediate(i256_val, builder)),
                     _ => Err(format!("unsupported large immediate: {imm:?}")),

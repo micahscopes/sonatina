@@ -105,6 +105,39 @@ impl VerifyInst for arith::Fsqrt {
     }
 }
 
+impl VerifyInst for arith::Fabs {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_unary_f32(verifier, inst_id, *self.arg(), "fabs");
+    }
+}
+
+impl VerifyInst for arith::Fclamp {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        let location = verifier.inst_location(inst_id);
+        let (arg, lo, hi) = (*self.arg(), *self.lo(), *self.hi());
+        let (Some(arg_ty), Some(lo_ty), Some(hi_ty)) = (
+            verifier.value_ty(arg),
+            verifier.value_ty(lo),
+            verifier.value_ty(hi),
+        ) else {
+            return;
+        };
+        if arg_ty != Type::F32 || lo_ty != Type::F32 || hi_ty != Type::F32 {
+            verifier.emit(
+                Diagnostic::error(
+                    DiagnosticCode::InstOperandTypeMismatch,
+                    "fclamp operands must be f32".to_string(),
+                    location.clone(),
+                )
+                .with_note(format!(
+                    "arg {arg_ty:?}, lo {lo_ty:?}, hi {hi_ty:?}"
+                )),
+            );
+        }
+        verifier.expect_result_ty(inst_id, Type::F32, location);
+    }
+}
+
 macro_rules! impl_binary_f32_rule {
     ($($ty:ty => $opname:literal),+ $(,)?) => {
         $(
@@ -129,6 +162,8 @@ impl_binary_f32_rule!(
     arith::Fsub => "fsub",
     arith::Fmul => "fmul",
     arith::Fdiv => "fdiv",
+    arith::Fmin => "fmin",
+    arith::Fmax => "fmax",
 );
 
 macro_rules! impl_compare_f32_rule {
