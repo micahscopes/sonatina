@@ -77,7 +77,7 @@ fn make_gvn_unary_key(
         | UnaryInstKind::Not
         | UnaryInstKind::Bswap
         | UnaryInstKind::Snego
-        | UnaryInstKind::EvmClz | UnaryInstKind::Fneg | UnaryInstKind::Fsqrt => None,
+        | UnaryInstKind::EvmClz | UnaryInstKind::Fneg | UnaryInstKind::Fsqrt | UnaryInstKind::Fabs => None,
     }
 }
 

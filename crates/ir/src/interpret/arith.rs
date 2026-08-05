@@ -55,6 +55,82 @@ impl Interpret for Fsqrt {
     }
 }
 
+/// Bitwise sign-clear. Deterministic for every input, including NaN (only the
+/// sign bit changes, the payload is untouched).
+fn fabs_bits(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() & 0x7fff_ffff)
+}
+
+impl Interpret for Fabs {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(unary_f32(state.lookup_val(*self.arg()), fabs_bits))
+    }
+}
+
+/// The PINNED cross-backend semantics for float min/max: the "WebAssembly
+/// rules" (IEEE 754-2019 `minimum`/`maximum`). NaN-propagating (if either
+/// operand is NaN, the result is NaN -- we return the canonical quiet NaN,
+/// which the spec permits since the choice of NaN payload/sign is
+/// unspecified), and -0.0 is treated as strictly less than +0.0 regardless of
+/// argument order. This matches wasm's `f32.min`/`f32.max` and cranelift's
+/// `fmin`/`fmax` (whose own doc comment says "propagating NaNs using the
+/// WebAssembly rules"). It does NOT match naga/SPIR-V's `MathFunction::Min`/
+/// `Max` (GLSL.std.450 `FMin`/`FMax`), whose NaN/-0 behavior is
+/// implementation-defined by spec -- see the OPEN DECISION in
+/// `docs/numeric-intrinsics-semantics.md`.
+const CANONICAL_NAN: f32 = f32::from_bits(0x7fc0_0000);
+
+fn wasm_rules_fmin(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return CANONICAL_NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() || b.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        };
+    }
+    if a < b { a } else { b }
+}
+
+fn wasm_rules_fmax(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return CANONICAL_NAN;
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() && b.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        };
+    }
+    if a > b { a } else { b }
+}
+
+impl Interpret for Fmin {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(binary_f32(
+            state.lookup_val(*self.lhs()),
+            state.lookup_val(*self.rhs()),
+            wasm_rules_fmin,
+        ))
+    }
+}
+
+impl Interpret for Fmax {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(binary_f32(
+            state.lookup_val(*self.lhs()),
+            state.lookup_val(*self.rhs()),
+            wasm_rules_fmax,
+        ))
+    }
+}
+
 impl Interpret for Neg {
     fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
         state.set_action(Action::Continue);

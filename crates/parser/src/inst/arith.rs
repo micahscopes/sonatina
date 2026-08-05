@@ -7,6 +7,10 @@ super::impl_inst_build! {Fsub, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Fmul, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Fdiv, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Fsqrt, (arg: ValueId)}
+super::impl_inst_build! {Fabs, (arg: ValueId)}
+super::impl_inst_build! {Fmin, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {Fmax, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {Fclamp, (arg: ValueId, lo: ValueId, hi: ValueId)}
 super::impl_inst_build! {Add, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Uaddo, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Uaddsat, (lhs: ValueId, rhs: ValueId)}

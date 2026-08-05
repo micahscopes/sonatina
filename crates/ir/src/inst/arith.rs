@@ -48,6 +48,53 @@ pub struct Fsqrt {
     arg: ValueId,
 }
 
+/// Floating point absolute value. A pure bitwise sign-clear: deterministic on
+/// every backend, including for NaN payloads (only the sign bit changes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(unary(Fabs)))]
+pub struct Fabs {
+    arg: ValueId,
+}
+
+/// Floating point minimum. Semantics are PINNED to the "WebAssembly rules"
+/// (IEEE 754-2019 `minimum`): NaN-propagating (either operand NaN => NaN
+/// result), and -0.0 is treated as strictly less than +0.0 regardless of
+/// argument order. This is exactly wasm's `f32.min` and (by its own docs)
+/// cranelift's `fmin`. See `docs/numeric-intrinsics-semantics.md` for the
+/// naga/SPIR-V divergence this does NOT paper over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(binary(Fmin)))]
+pub struct Fmin {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
+/// Floating point maximum. See [`Fmin`] for the pinned semantics (the
+/// maximum-side mirror of the same "WebAssembly rules").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(binary(Fmax)))]
+pub struct Fmax {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
+/// Floating point clamp: `clamp(arg, lo, hi)`. A dedicated ternary op (not
+/// composed at this layer) so the naga/SPIR-V backend can emit a single
+/// native `clamp()`/`FClamp` instruction; the wasm and cranelift backends
+/// compose it from their native min/max as `max(min(arg, hi), lo)` is NOT
+/// used -- they use `min(max(arg, lo), hi)` (the textbook clamp order),
+/// documented at each backend's lowering site. Deliberately `InstClassKind::Opaque`
+/// (no `kind(...)` attribute): a ternary op has no `UnaryInstKind`/`BinaryInstKind`
+/// home, and Opaque already gets correct, safe treatment everywhere (no constant
+/// folding/peephole simplification, but still eligible for ordinary structural GVN
+/// CSE since it is a pure op with the default `SideEffect::None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+pub struct Fclamp {
+    arg: ValueId,
+    lo: ValueId,
+    hi: ValueId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(kind(binary(Add)))]
 pub struct Add {

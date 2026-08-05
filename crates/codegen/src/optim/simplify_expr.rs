@@ -1077,7 +1077,7 @@ pub(crate) fn simplify_unary_with_same_inner(
         UnaryInstKind::Not | UnaryInstKind::Neg | UnaryInstKind::Bswap => same_inner_arg(arg, kind)
             .map(SimplifiedResult::Copy)
             .unwrap_or(SimplifiedResult::NoChange),
-        UnaryInstKind::Snego | UnaryInstKind::IsZero | UnaryInstKind::EvmClz | UnaryInstKind::Fneg | UnaryInstKind::Fsqrt => {
+        UnaryInstKind::Snego | UnaryInstKind::IsZero | UnaryInstKind::EvmClz | UnaryInstKind::Fneg | UnaryInstKind::Fsqrt | UnaryInstKind::Fabs => {
             SimplifiedResult::NoChange
         }
     }
@@ -1340,7 +1340,7 @@ pub(crate) fn simplify_binary_with_facts(
         | BinaryInstKind::EvmUmulsat
         | BinaryInstKind::EvmSmulsat
         | BinaryInstKind::Fadd | BinaryInstKind::Fsub | BinaryInstKind::Fmul | BinaryInstKind::Fdiv
-        | BinaryInstKind::Feq | BinaryInstKind::Flt | BinaryInstKind::Fle => {}
+        | BinaryInstKind::Feq | BinaryInstKind::Flt | BinaryInstKind::Fle | BinaryInstKind::Fmin | BinaryInstKind::Fmax => {}
         BinaryInstKind::EvmExp => {
             if let Some(result) =
                 simplify_evm_exp_known(known_value(facts, lhs), known_value(facts, rhs), ty)

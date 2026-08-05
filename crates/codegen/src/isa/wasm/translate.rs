@@ -1154,6 +1154,47 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    else if let Some(fabs) = <&sonatina_ir::inst::arith::Fabs as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let arg = resolve_value(function, *fabs.arg(), &value_map, &mut body, wb)
+                                .ok_or("unresolved fabs argument")?;
+                            let wval = body.add_op(wb, Operator::F32Abs, &[arg], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    // `f32.min`/`f32.max` are wasm's NaN-propagating, -0.0 < +0.0
+                    // "WebAssembly rules" -- this IS the pinned cross-backend
+                    // semantics (see arith::Fmin/Fmax doc comments), so this is a
+                    // direct, unconditional native lowering.
+                    else if let Some(fmin) = <&sonatina_ir::inst::arith::Fmin as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fmin.lhs(), &value_map, &mut body, wb).ok_or("unresolved fmin lhs")?;
+                            let rhs = resolve_value(function, *fmin.rhs(), &value_map, &mut body, wb).ok_or("unresolved fmin rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Min, &[lhs, rhs], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fmax) = <&sonatina_ir::inst::arith::Fmax as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fmax.lhs(), &value_map, &mut body, wb).ok_or("unresolved fmax lhs")?;
+                            let rhs = resolve_value(function, *fmax.rhs(), &value_map, &mut body, wb).ok_or("unresolved fmax rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Max, &[lhs, rhs], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    // wasm has no native `f32.clamp`; compose it from the two native
+                    // ops above as `min(max(arg, lo), hi)` (the textbook clamp
+                    // order), matching the cranelift lowering's composition exactly.
+                    else if let Some(fclamp) = <&sonatina_ir::inst::arith::Fclamp as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let arg = resolve_value(function, *fclamp.arg(), &value_map, &mut body, wb).ok_or("unresolved fclamp arg")?;
+                            let lo = resolve_value(function, *fclamp.lo(), &value_map, &mut body, wb).ok_or("unresolved fclamp lo")?;
+                            let hi = resolve_value(function, *fclamp.hi(), &value_map, &mut body, wb).ok_or("unresolved fclamp hi")?;
+                            let maxed = body.add_op(wb, Operator::F32Max, &[arg, lo], &[WType::F32]);
+                            let wval = body.add_op(wb, Operator::F32Min, &[maxed, hi], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
                     else if let Some(fadd) = <&sonatina_ir::inst::arith::Fadd as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let lhs = resolve_value(function, *fadd.lhs(), &value_map, &mut body, wb).ok_or("unresolved fadd lhs")?;

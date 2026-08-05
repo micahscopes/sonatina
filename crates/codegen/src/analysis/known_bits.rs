@@ -361,7 +361,7 @@ impl KnownBitsQuery {
                     bswap_bits(ty, arg_known.known_one),
                 )
             }
-            UnaryInstKind::Neg | UnaryInstKind::Snego | UnaryInstKind::EvmClz | UnaryInstKind::Fneg | UnaryInstKind::Fsqrt => {
+            UnaryInstKind::Neg | UnaryInstKind::Snego | UnaryInstKind::EvmClz | UnaryInstKind::Fneg | UnaryInstKind::Fsqrt | UnaryInstKind::Fabs => {
                 KnownBits::unknown(ty)
             }
         }

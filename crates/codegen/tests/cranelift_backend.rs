@@ -512,3 +512,314 @@ fn cross_target_three_backend_known_answer() {
         assert_eq!(cranelift_result, expected, "compute({a}, {b}) should be {expected}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Float numeric intrinsics: `Fabs`/`Fmin`/`Fmax`/`Fclamp`.
+//
+// PINNED semantics for Fmin/Fmax: the "WebAssembly rules" (IEEE 754-2019
+// `minimum`/`maximum`): NaN-propagating, and -0.0 is treated as strictly less
+// than +0.0 regardless of argument order. This is exactly wasm's `f32.min`/
+// `f32.max` and (by its own doc comment) cranelift's `fmin`/`fmax`, so those
+// two backends are expected to agree bit-for-bit on every input, including
+// NaN/-0.0 edge cases.
+//
+// naga/SPIR-V's `MathFunction::Min`/`Max` (GLSL.std.450 `FMin`/`FMax`) are NOT
+// included in the bit-for-bit differential below, and are not exercised by
+// this synthetic module at all (`SpirvBackend::compile_module`'s kernel ABI
+// only accepts an i32/i64 return, which these raw-`f32`-returning functions
+// don't fit). Even where naga/SPIR-V IS reachable (the real Fe demo pipeline,
+// which returns i32 RGBA), the GLSL.std.450 spec leaves NaN/-0.0 behavior for
+// FMin/FMax implementation-defined (unlike wasm/cranelift's pinned rules).
+// This is a deliberate, documented divergence (OPEN DECISION — see
+// NUMERIC_INTRINSICS_STAGING.md), not an oversight: no GPU adapter exists in
+// this sandbox to observe real driver behavior either way.
+
+/// Reference implementation of the PINNED "WebAssembly rules" float minimum,
+/// independent of both `sonatina_ir::interpret`'s copy and the backends under
+/// test (a from-scratch transcription of the spec, so a bug shared between
+/// the interpreter and this oracle would still be caught here).
+fn wasm_rules_fmin_oracle(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::from_bits(0x7fc0_0000);
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() || b.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        };
+    }
+    if a < b { a } else { b }
+}
+
+fn wasm_rules_fmax_oracle(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::from_bits(0x7fc0_0000);
+    }
+    if a == 0.0 && b == 0.0 {
+        return if a.is_sign_negative() && b.is_sign_negative() {
+            -0.0
+        } else {
+            0.0
+        };
+    }
+    if a > b { a } else { b }
+}
+
+/// Build a module with `abs(x)`, `min(a,b)`, `max(a,b)`, `clamp(x,lo,hi)`, all
+/// `f32 -> f32`, using the new `Fabs`/`Fmin`/`Fmax`/`Fclamp` Sonatina ops.
+fn build_f32_intrinsics_module() -> sonatina_ir::Module {
+    let mb = native_module_builder();
+    let isa = native_isa();
+    let is = isa.inst_set();
+
+    let sig = Signature::new_single("f32_abs", Linkage::Public, &[Type::F32], Type::F32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let result = fb.insert_inst(arith::Fabs::new(is, x), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let sig = Signature::new_single(
+        "f32_min",
+        Linkage::Public,
+        &[Type::F32, Type::F32],
+        Type::F32,
+    );
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let b = fb.args()[1];
+    let result = fb.insert_inst(arith::Fmin::new(is, a, b), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let sig = Signature::new_single(
+        "f32_max",
+        Linkage::Public,
+        &[Type::F32, Type::F32],
+        Type::F32,
+    );
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let b = fb.args()[1];
+    let result = fb.insert_inst(arith::Fmax::new(is, a, b), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let sig = Signature::new_single(
+        "f32_clamp",
+        Linkage::Public,
+        &[Type::F32, Type::F32, Type::F32],
+        Type::F32,
+    );
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let lo = fb.args()[1];
+    let hi = fb.args()[2];
+    let result = fb.insert_inst(arith::Fclamp::new(is, x, lo, hi), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    mb.build()
+}
+
+/// Oracle test (VERIFY item 4): native/cranelift executes `Fabs`/`Fmin`/
+/// `Fmax`/`Fclamp` correctly on ordinary values, bit-exact vs a plain Rust
+/// reference.
+#[test]
+fn cranelift_f32_abs_min_max_clamp_oracle() {
+    let module = build_f32_intrinsics_module();
+    let backend = CraneliftBackend::new();
+    let artifact = backend.compile_module(&module).expect("cranelift compile");
+
+    let abs: fn(f32) -> f32 = unsafe {
+        std::mem::transmute(artifact.get_func_ptr::<fn(f32) -> f32>("f32_abs").unwrap())
+    };
+    let min: fn(f32, f32) -> f32 = unsafe {
+        std::mem::transmute(
+            artifact
+                .get_func_ptr::<fn(f32, f32) -> f32>("f32_min")
+                .unwrap(),
+        )
+    };
+    let max: fn(f32, f32) -> f32 = unsafe {
+        std::mem::transmute(
+            artifact
+                .get_func_ptr::<fn(f32, f32) -> f32>("f32_max")
+                .unwrap(),
+        )
+    };
+    let clamp: fn(f32, f32, f32) -> f32 = unsafe {
+        std::mem::transmute(
+            artifact
+                .get_func_ptr::<fn(f32, f32, f32) -> f32>("f32_clamp")
+                .unwrap(),
+        )
+    };
+
+    for x in [-3.5f32, 3.5, 0.0, -0.0, -1.0, 1.0, 42.25] {
+        assert_eq!(abs(x), x.abs(), "abs({x})");
+    }
+    for (a, b) in [(1.0f32, 2.0), (2.0, 1.0), (-5.0, 5.0), (3.0, 3.0), (-2.5, -7.5)] {
+        assert_eq!(min(a, b), wasm_rules_fmin_oracle(a, b), "min({a}, {b})");
+        assert_eq!(max(a, b), wasm_rules_fmax_oracle(a, b), "max({a}, {b})");
+    }
+    for (x, lo, hi, expected) in [
+        (5.0f32, 0.0, 1.0, 1.0),
+        (-5.0, 0.0, 1.0, 0.0),
+        (0.5, 0.0, 1.0, 0.5),
+        (0.0, 0.0, 1.0, 0.0),
+        (1.0, 0.0, 1.0, 1.0),
+        (100.0, -10.0, 10.0, 10.0),
+    ] {
+        assert_eq!(clamp(x, lo, hi), expected, "clamp({x}, {lo}, {hi})");
+    }
+}
+
+/// THE SHARP EDGE (VERIFY item 5): cross-backend differential over NaN/-0.0/
+/// +-inf edge inputs for `Fmin`/`Fmax`. Wasm and cranelift are asserted to
+/// agree bit-for-bit with each other AND with the from-scratch oracle above,
+/// because both backends implement the same PINNED "WebAssembly rules". The
+/// naga/SPIR-V path is validated (legal SPIR-V) but NOT executed (no GPU
+/// adapter here) and NOT asserted to agree on NaN/-0.0 (GLSL.std.450 FMin/
+/// FMax leaves that implementation-defined by spec — see the module doc
+/// comment above and NUMERIC_INTRINSICS_STAGING.md's OPEN DECISION).
+#[test]
+fn cross_backend_f32_min_max_nan_zero_inf_differential() {
+    use sonatina_codegen::isa::wasm::WasmBackend;
+
+    let module = build_f32_intrinsics_module();
+
+    let cranelift_backend = CraneliftBackend::new();
+    let cranelift_artifact = cranelift_backend
+        .compile_module(&module)
+        .expect("cranelift compile");
+    let cranelift_min: fn(f32, f32) -> f32 = unsafe {
+        std::mem::transmute(
+            cranelift_artifact
+                .get_func_ptr::<fn(f32, f32) -> f32>("f32_min")
+                .unwrap(),
+        )
+    };
+    let cranelift_max: fn(f32, f32) -> f32 = unsafe {
+        std::mem::transmute(
+            cranelift_artifact
+                .get_func_ptr::<fn(f32, f32) -> f32>("f32_max")
+                .unwrap(),
+        )
+    };
+
+    let wasm_backend = WasmBackend::new();
+    let wasm_artifact = wasm_backend.compile_module(&module).expect("wasm compile");
+    wasmparser::validate(&wasm_artifact.bytes).expect("valid wasm");
+    let engine = wasmtime::Engine::default();
+    let wasm_module = wasmtime::Module::new(&engine, &wasm_artifact.bytes).expect("load wasm");
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance =
+        wasmtime::Instance::new(&mut store, &wasm_module, &[]).expect("instantiate wasm");
+    let wasm_min = instance
+        .get_typed_func::<(f32, f32), f32>(&mut store, "f32_min")
+        .expect("f32_min export");
+    let wasm_max = instance
+        .get_typed_func::<(f32, f32), f32>(&mut store, "f32_max")
+        .expect("f32_max export");
+
+    // naga/SPIR-V is NOT exercised here: `SpirvBackend::compile_module`'s
+    // "kernel" entry ABI only accepts an i32 (u32 word) or i64 return value
+    // (this synthetic module's raw `f32`-returning functions don't fit that
+    // envelope; there is no raw bitcast op wired to the SPIR-V backend to
+    // route around it). The real naga/SPIR-V validation evidence for
+    // `Fmin`/`Fmax`/`Fabs`/`Fclamp` comes from the actual Fe demo pipeline
+    // (`demos/sketches/cga3d`, `demos/sketches/desargues` via
+    // `fe-codegen`'s `demo_compile_gate.rs`), which returns i32 RGBA and so
+    // fits the kernel/render ABI, and is validated there with
+    // `naga::valid::Validator` — see NUMERIC_INTRINSICS_STAGING.md.
+
+    let nan_a = f32::from_bits(0x7fc0_1234);
+    let nan_b = f32::NAN;
+    let edge_inputs: &[(f32, f32)] = &[
+        (1.0, 2.0),
+        (2.0, 1.0),
+        (-1.0, 1.0),
+        (0.0, 0.0),
+        (0.0, -0.0),
+        (-0.0, 0.0),
+        (-0.0, -0.0),
+        (f32::INFINITY, 1.0),
+        (f32::NEG_INFINITY, 1.0),
+        (f32::INFINITY, f32::NEG_INFINITY),
+        (nan_a, 1.0),
+        (1.0, nan_a),
+        (nan_a, nan_b),
+        (nan_a, f32::INFINITY),
+    ];
+
+    for &(a, b) in edge_inputs {
+        let oracle_min = wasm_rules_fmin_oracle(a, b);
+        let oracle_max = wasm_rules_fmax_oracle(a, b);
+        let cl_min = cranelift_min(a, b);
+        let cl_max = cranelift_max(a, b);
+        let wa_min = wasm_min.call(&mut store, (a, b)).expect("wasm min call");
+        let wa_max = wasm_max.call(&mut store, (a, b)).expect("wasm max call");
+
+        if oracle_min.is_nan() {
+            // Sign/payload of a NaN result is spec-unspecified even under the
+            // pinned "WebAssembly rules"; only "is it NaN at all" is pinned.
+            assert!(cl_min.is_nan(), "cranelift min({a:?}, {b:?}) should be NaN, got {cl_min:?}");
+            assert!(wa_min.is_nan(), "wasm min({a:?}, {b:?}) should be NaN, got {wa_min:?}");
+        } else {
+            assert_eq!(
+                cl_min.to_bits(),
+                oracle_min.to_bits(),
+                "cranelift min({a:?}, {b:?}) diverges from the WebAssembly-rules oracle"
+            );
+            assert_eq!(
+                wa_min.to_bits(),
+                oracle_min.to_bits(),
+                "wasm min({a:?}, {b:?}) diverges from the WebAssembly-rules oracle"
+            );
+            assert_eq!(
+                cl_min.to_bits(),
+                wa_min.to_bits(),
+                "cranelift and wasm min({a:?}, {b:?}) disagree bit-for-bit"
+            );
+        }
+
+        if oracle_max.is_nan() {
+            assert!(cl_max.is_nan(), "cranelift max({a:?}, {b:?}) should be NaN, got {cl_max:?}");
+            assert!(wa_max.is_nan(), "wasm max({a:?}, {b:?}) should be NaN, got {wa_max:?}");
+        } else {
+            assert_eq!(
+                cl_max.to_bits(),
+                oracle_max.to_bits(),
+                "cranelift max({a:?}, {b:?}) diverges from the WebAssembly-rules oracle"
+            );
+            assert_eq!(
+                wa_max.to_bits(),
+                oracle_max.to_bits(),
+                "wasm max({a:?}, {b:?}) diverges from the WebAssembly-rules oracle"
+            );
+            assert_eq!(
+                cl_max.to_bits(),
+                wa_max.to_bits(),
+                "cranelift and wasm max({a:?}, {b:?}) disagree bit-for-bit"
+            );
+        }
+    }
+}

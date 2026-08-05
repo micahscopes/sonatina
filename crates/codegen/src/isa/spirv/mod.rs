@@ -396,6 +396,51 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Fabs as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Abs, arg, arg1: None, arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Fmin as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(*op.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*op.rhs(), function, word, value_map, phi_locals, func).unwrap();
+            // NOTE (OPEN DECISION): naga's MathFunction::Min lowers to SPIR-V's
+            // GLSL.std.450 `FMin`, whose NaN/-0.0 behavior is implementation-defined
+            // by spec -- unlike wasm/cranelift's pinned "WebAssembly rules". See the
+            // cross-backend semantics doc; this is a documented, deliberate
+            // divergence, not an oversight.
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Min, arg: lhs, arg1: Some(rhs), arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Fmax as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(*op.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*op.rhs(), function, word, value_map, phi_locals, func).unwrap();
+            // NOTE (OPEN DECISION): see Fmin above -- GLSL.std.450 `FMax`'s NaN/-0.0
+            // behavior is implementation-defined by spec.
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Max, arg: lhs, arg1: Some(rhs), arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Fclamp as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
+            let lo = resolve_naga_value(*op.lo(), function, word, value_map, phi_locals, func).unwrap();
+            let hi = resolve_naga_value(*op.hi(), function, word, value_map, phi_locals, func).unwrap();
+            // This is the ONE hardware-native win this feature is chasing: a single
+            // `OpExtInst FClamp` / WGSL `clamp()` call, no branches.
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Clamp, arg, arg1: Some(lo), arg2: Some(hi), arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
     } else if let Some((lhs_id, rhs_id, naga_op)) =
         <&sonatina_ir::inst::arith::Fadd as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Add))
         .or_else(|| <&sonatina_ir::inst::arith::Fsub as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Subtract)))
@@ -1858,6 +1903,10 @@ fn spirv_instruction_is_lowered(
         || <&arith::Fmul as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fdiv as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fsqrt as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fabs as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fmin as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fmax as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fclamp as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Sar as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shl as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shr as InstDowncast>::downcast(is, inst).is_some()
