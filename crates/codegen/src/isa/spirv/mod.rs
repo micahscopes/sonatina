@@ -321,6 +321,102 @@ fn resolve_naga_value(
     None
 }
 
+/// Append a naga expression and immediately `Statement::Emit` it as its own
+/// single-expression range (house style; mirrors the `F32ToU32` cast
+/// lowering below).
+#[cfg(feature = "spirv-backend")]
+fn emit_expr(
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    expr: naga::Expression,
+) -> naga::Handle<naga::Expression> {
+    let h = func.expressions.append(expr, naga::Span::UNDEFINED);
+    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+    h
+}
+
+/// Append a `u32` literal constant expression (NOT `Emit`-ted: literals are
+/// naga constant expressions, same convention as the `zero`/`low_f`/`high_f`/
+/// etc. literals in the `F32ToU32` cast lowering below).
+#[cfg(feature = "spirv-backend")]
+fn lit_u32(func: &mut naga::Function, v: u32) -> naga::Handle<naga::Expression> {
+    func.expressions.append(naga::Expression::Literal(naga::Literal::U32(v)), naga::Span::UNDEFINED)
+}
+
+/// Exact, branch-free "WebAssembly rules" (IEEE 754-2019 `minimum`/`maximum`)
+/// f32 min/max for the naga/SPIR-V and WGSL backends. Bitcasts both operands
+/// to `u32` and does everything else in integer space -- no float compare, no
+/// fast-math latitude, no control flow -- so it is a conforming pinned-exact
+/// implementation on every naga target, matching wasm's `f32.min`/`f32.max`
+/// and cranelift's `fmin`/`fmax` bit-for-bit (see
+/// `docs/numeric-intrinsics-semantics.md`).
+///
+/// Algorithm: build a monotone total integer order over the u32 bit pattern
+/// of an f32 (`key(x) = xu ^ (0x80000000 | (0xffffffff * signbit(xu)))`,
+/// i.e. flip all bits of negative values and just the sign bit of
+/// non-negative values). Under that key, unsigned integer comparison agrees
+/// with IEEE float ordering, including `-0.0` sorting strictly below `+0.0`
+/// regardless of argument order. `OpSelect`/`select()` on the key comparison
+/// picks the min/max operand; a second select forces the canonical quiet NaN
+/// `0x7fc0_0000` if either operand's biased exponent+mantissa exceeds
+/// `0x7f80_0000` (i.e. either operand is NaN). `want_max` flips the key
+/// comparison from `Less` to `Greater`; everything else is shared.
+///
+/// Same toolkit as the proven `F32ToU32` saturating-cast lowering (bitcast
+/// `As { convert: None }`, integer binaries, literals, chained
+/// `Expression::Select`, `Statement::Emit`-only) -- see that arm below.
+#[cfg(feature = "spirv-backend")]
+fn emit_exact_fminmax(
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    lhs: naga::Handle<naga::Expression>,
+    rhs: naga::Handle<naga::Expression>,
+    want_max: bool,
+) -> naga::Handle<naga::Expression> {
+    // Bitcast both operands to u32. NO float ops after this point.
+    let au = emit_expr(func, target, naga::Expression::As { expr: lhs, kind: naga::ScalarKind::Uint, convert: None });
+    let bu = emit_expr(func, target, naga::Expression::As { expr: rhs, kind: naga::ScalarKind::Uint, convert: None });
+
+    let thirty_one = lit_u32(func, 31);
+    let zero_u = lit_u32(func, 0);
+    let sign_mask = lit_u32(func, 0x8000_0000);
+    let abs_mask = lit_u32(func, 0x7fff_ffff);
+    let exp_mask = lit_u32(func, 0x7f80_0000);
+    let qnan = lit_u32(func, 0x7fc0_0000);
+
+    // key(x) = xu ^ (0x80000000 | (0xffffffff * signbit(xu)))
+    let sa_shift = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::ShiftRight, left: au, right: thirty_one });
+    let sa = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Subtract, left: zero_u, right: sa_shift });
+    let sa_or = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::InclusiveOr, left: sa, right: sign_mask });
+    let ka = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::ExclusiveOr, left: au, right: sa_or });
+
+    let sb_shift = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::ShiftRight, left: bu, right: thirty_one });
+    let sb = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Subtract, left: zero_u, right: sb_shift });
+    let sb_or = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::InclusiveOr, left: sb, right: sign_mask });
+    let kb = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::ExclusiveOr, left: bu, right: sb_or });
+
+    // pick = Select(Less(ka, kb), au, bu) for min; Greater for max. naga's
+    // `Expression::Select { condition, accept, reject }` (confirmed against
+    // both call sites below and `back/spv/block.rs`'s `Instruction::select`,
+    // which emits SPIR-V `OpSelect(result, condition, object1=accept,
+    // object2=reject)`: "Result is object1 if condition is true") takes
+    // `accept` when `condition` is true, `reject` otherwise.
+    let key_cmp = if want_max { naga::BinaryOperator::Greater } else { naga::BinaryOperator::Less };
+    let cmp = emit_expr(func, target, naga::Expression::Binary { op: key_cmp, left: ka, right: kb });
+    let pick = emit_expr(func, target, naga::Expression::Select { condition: cmp, accept: au, reject: bu });
+
+    // nan = (au & 0x7fffffff) > 0x7f800000 || (bu & 0x7fffffff) > 0x7f800000
+    let a_abs = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::And, left: au, right: abs_mask });
+    let a_is_nan = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Greater, left: a_abs, right: exp_mask });
+    let b_abs = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::And, left: bu, right: abs_mask });
+    let b_is_nan = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Greater, left: b_abs, right: exp_mask });
+    let nan = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::LogicalOr, left: a_is_nan, right: b_is_nan });
+
+    // out = As{ Select(nan, 0x7fc00000, pick), Float, convert: None }
+    let result_u = emit_expr(func, target, naga::Expression::Select { condition: nan, accept: qnan, reject: pick });
+    emit_expr(func, target, naga::Expression::As { expr: result_u, kind: naga::ScalarKind::Float, convert: None })
+}
+
 /// Emit a single arithmetic/cmp instruction into the given target block.
 /// Returns the expression handle if an instruction was emitted, None otherwise.
 /// Skips Phi, Jump, Br, and Return instructions.
@@ -399,8 +495,17 @@ fn emit_single_inst(
     } else if let Some(op) = <&sonatina_ir::inst::arith::Fabs as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
-            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Abs, arg, arg1: None, arg2: None, arg3: None }, naga::Span::UNDEFINED);
-            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            // Exact, branch-free: bitcast to u32, clear the sign bit, bitcast
+            // back. A pure bitwise op on every backend (matches wasm's
+            // `f32.abs` and cranelift's `fabs`), so this is not a relaxation
+            // -- MathFunction::Abs (GLSL.std.450 `FAbs`) is ALSO exactly the
+            // bitwise sign-clear, but the explicit bitcast form here matches
+            // the same integer toolkit as Fmin/Fmax/Fclamp below and avoids
+            // depending on the extended-instruction set's semantics.
+            let au = emit_expr(func, target, naga::Expression::As { expr: arg, kind: naga::ScalarKind::Uint, convert: None });
+            let abs_mask = lit_u32(func, 0x7fff_ffff);
+            let cleared = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::And, left: au, right: abs_mask });
+            let h = emit_expr(func, target, naga::Expression::As { expr: cleared, kind: naga::ScalarKind::Float, convert: None });
             value_map.insert(result, h);
             return true;
         }
@@ -408,13 +513,13 @@ fn emit_single_inst(
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let lhs = resolve_naga_value(*op.lhs(), function, word, value_map, phi_locals, func).unwrap();
             let rhs = resolve_naga_value(*op.rhs(), function, word, value_map, phi_locals, func).unwrap();
-            // NOTE (OPEN DECISION): naga's MathFunction::Min lowers to SPIR-V's
-            // GLSL.std.450 `FMin`, whose NaN/-0.0 behavior is implementation-defined
-            // by spec -- unlike wasm/cranelift's pinned "WebAssembly rules". See the
-            // cross-backend semantics doc; this is a documented, deliberate
-            // divergence, not an oversight.
-            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Min, arg: lhs, arg1: Some(rhs), arg2: None, arg3: None }, naga::Span::UNDEFINED);
-            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            // PINNED-EXACT: branch-free integer key compare + OpSelect (see
+            // `emit_exact_fminmax`). Matches wasm's `f32.min`/cranelift's
+            // `fmin` ("WebAssembly rules") bit-for-bit, including NaN and
+            // -0.0/+0.0. Formerly `MathFunction::Min` (GLSL.std.450 `FMin`,
+            // implementation-defined on NaN/-0.0) -- that was the resolved
+            // OPEN DECISION; see docs/numeric-intrinsics-semantics.md.
+            let h = emit_exact_fminmax(func, target, lhs, rhs, false);
             value_map.insert(result, h);
             return true;
         }
@@ -422,10 +527,9 @@ fn emit_single_inst(
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let lhs = resolve_naga_value(*op.lhs(), function, word, value_map, phi_locals, func).unwrap();
             let rhs = resolve_naga_value(*op.rhs(), function, word, value_map, phi_locals, func).unwrap();
-            // NOTE (OPEN DECISION): see Fmin above -- GLSL.std.450 `FMax`'s NaN/-0.0
-            // behavior is implementation-defined by spec.
-            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Max, arg: lhs, arg1: Some(rhs), arg2: None, arg3: None }, naga::Span::UNDEFINED);
-            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            // PINNED-EXACT: see Fmin above (want_max = true selects the
+            // larger integer key instead of the smaller).
+            let h = emit_exact_fminmax(func, target, lhs, rhs, true);
             value_map.insert(result, h);
             return true;
         }
@@ -434,17 +538,15 @@ fn emit_single_inst(
             let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
             let lo = resolve_naga_value(*op.lo(), function, word, value_map, phi_locals, func).unwrap();
             let hi = resolve_naga_value(*op.hi(), function, word, value_map, phi_locals, func).unwrap();
-            // Compose as min(max(arg, lo), hi) rather than a single GLSL.std.450 `FClamp`.
-            // GLSL.std.450 `FClamp` is spec-undefined (poison) when lo > hi, whereas the
-            // pinned wasm/cranelift semantics (min(max(x, lo), hi)) are defined for ALL
-            // finite inputs. Composing from Max then Min keeps GPU bit-agreement with
-            // wasm/cranelift on every finite input and stays branch-free (two OpExtInst,
-            // no control flow). The residual NaN/-0.0 divergence of Min/Max (the OPEN
-            // DECISION, see the Fmin/Fmax notes above) is inherited unchanged, not widened.
-            let max_h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Max, arg, arg1: Some(lo), arg2: None, arg3: None }, naga::Span::UNDEFINED);
-            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(max_h, max_h)), naga::Span::UNDEFINED);
-            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Min, arg: max_h, arg1: Some(hi), arg2: None, arg3: None }, naga::Span::UNDEFINED);
-            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            // PINNED-EXACT: compose as min(max(arg, lo), hi) from the exact
+            // Fmin/Fmax expansions above (not a single GLSL.std.450
+            // `FClamp`, which is spec-undefined/poison when lo > hi). This
+            // keeps `lo > hi` DEFINED as `hi` (matching wasm/cranelift's
+            // composed clamp) on every input, not just finite ones, and
+            // stays branch-free throughout (every op is integer
+            // compare-and-select, no control flow).
+            let max_h = emit_exact_fminmax(func, target, arg, lo, true);
+            let h = emit_exact_fminmax(func, target, max_h, hi, false);
             value_map.insert(result, h);
             return true;
         }

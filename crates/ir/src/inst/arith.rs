@@ -59,9 +59,10 @@ pub struct Fabs {
 /// Floating point minimum. Semantics are PINNED to the "WebAssembly rules"
 /// (IEEE 754-2019 `minimum`): NaN-propagating (either operand NaN => NaN
 /// result), and -0.0 is treated as strictly less than +0.0 regardless of
-/// argument order. This is exactly wasm's `f32.min` and (by its own docs)
-/// cranelift's `fmin`. See `docs/numeric-intrinsics-semantics.md` for the
-/// naga/SPIR-V divergence this does NOT paper over.
+/// argument order. This is exactly wasm's `f32.min`, (by its own docs)
+/// cranelift's `fmin`, AND (via a branch-free integer key-compare-and-select
+/// expansion; GLSL.std.450 `FMin` alone is not exact) naga/SPIR-V's lowering.
+/// See `docs/numeric-intrinsics-semantics.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(kind(binary(Fmin)))]
 pub struct Fmin {
@@ -79,11 +80,13 @@ pub struct Fmax {
 }
 
 /// Floating point clamp: `clamp(arg, lo, hi)`. A dedicated ternary op (not
-/// composed at this layer) so the naga/SPIR-V backend can emit a single
-/// native `clamp()`/`FClamp` instruction; the wasm and cranelift backends
-/// compose it from their native min/max as `max(min(arg, hi), lo)` is NOT
-/// used -- they use `min(max(arg, lo), hi)` (the textbook clamp order),
-/// documented at each backend's lowering site. Deliberately `InstClassKind::Opaque`
+/// composed at this layer) so the IR carries clamp semantics as a unit and
+/// each backend lowers it as it sees fit. All three backends currently
+/// compose it as `min(max(arg, lo), hi)` (the textbook clamp order,
+/// deliberately NOT `max(min(arg, hi), lo)`): wasm and cranelift from their
+/// native min/max, and naga/SPIR-V from the exact branch-free min/max
+/// expansion (NOT a single GLSL.std.450 `FClamp`, which is poison when
+/// `lo > hi`) -- documented at each backend's lowering site. Deliberately `InstClassKind::Opaque`
 /// (no `kind(...)` attribute): a ternary op has no `UnaryInstKind`/`BinaryInstKind`
 /// home, and Opaque already gets correct, safe treatment everywhere (no constant
 /// folding/peephole simplification, but still eligible for ordinary structural GVN

@@ -75,10 +75,11 @@ impl Interpret for Fabs {
 /// unspecified), and -0.0 is treated as strictly less than +0.0 regardless of
 /// argument order. This matches wasm's `f32.min`/`f32.max` and cranelift's
 /// `fmin`/`fmax` (whose own doc comment says "propagating NaNs using the
-/// WebAssembly rules"). It does NOT match naga/SPIR-V's `MathFunction::Min`/
-/// `Max` (GLSL.std.450 `FMin`/`FMax`), whose NaN/-0 behavior is
-/// implementation-defined by spec -- see the OPEN DECISION in
-/// `docs/numeric-intrinsics-semantics.md`.
+/// WebAssembly rules"), AND naga/SPIR-V's lowering (`emit_exact_fminmax` in
+/// `isa/spirv/mod.rs`, a branch-free integer key-compare-and-select
+/// expansion -- NOT `MathFunction::Min`/`Max`/GLSL.std.450 `FMin`/`FMax`,
+/// whose NaN/-0 behavior is implementation-defined by spec and are no longer
+/// used for these ops). See `docs/numeric-intrinsics-semantics.md`.
 const CANONICAL_NAN: f32 = f32::from_bits(0x7fc0_0000);
 
 fn wasm_rules_fmin(a: f32, b: f32) -> f32 {

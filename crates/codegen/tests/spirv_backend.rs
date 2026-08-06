@@ -3462,3 +3462,90 @@ func public %load(v0.i32, v1.i32) -> i32 {
     let error = spirv_error(load, SpirvBackend::new().with_grid());
     assert!(error.contains("f32 object storage"), "{error}");
 }
+
+/// Slice 0 of the float-semantics design (float-semantics NO-GO fix): naga's
+/// `Fmin`/`Fmax`/`Fabs`/`Fclamp` lowering must be the pinned-exact,
+/// branch-free integer key-compare-and-select expansion (`emit_exact_fminmax`
+/// in `crates/codegen/src/isa/spirv/mod.rs`), NOT `MathFunction::Min`/`Max`/
+/// `Abs` or a single `FClamp`. This is a structural regression test: the
+/// emitted WGSL must reparse/validate AND contain zero branch/phi
+/// (`if `/`loop {`) for these ops, only `select(`. Kernel ABI needs an i32
+/// return, so args/result are converted through `I32ToF32`/`F32ToI32` (same
+/// trick as `build_grid_f32_loop_return_module` above); the four ops are
+/// combined into one f32 accumulator so a single WGSL dump covers all of
+/// them.
+#[test]
+fn spirv_f32_minmaxabsclamp_lowering_is_exact_and_branch_free() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    let sig = Signature::new_single(
+        "f32_minmaxabsclamp", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let a = fb.args()[0];
+    let b = fb.args()[1];
+    let af = fb.insert_inst(cast::I32ToF32::new(is, a), Type::F32);
+    let bf = fb.insert_inst(cast::I32ToF32::new(is, b), Type::F32);
+
+    let min = fb.insert_inst(arith::Fmin::new(is, af, bf), Type::F32);
+    let max = fb.insert_inst(arith::Fmax::new(is, af, bf), Type::F32);
+    let abs = fb.insert_inst(arith::Fabs::new(is, af), Type::F32);
+    let clamp = fb.insert_inst(arith::Fclamp::new(is, af, min, max), Type::F32);
+
+    let s1 = fb.insert_inst(arith::Fadd::new(is, min, max), Type::F32);
+    let s2 = fb.insert_inst(arith::Fadd::new(is, s1, abs), Type::F32);
+    let s3 = fb.insert_inst(arith::Fadd::new(is, s2, clamp), Type::F32);
+    let out = fb.insert_inst(cast::F32ToI32::new(is, s3), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, out));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new().with_workgroup_size(1, 1, 1);
+    let artifact = backend
+        .compile_module(&module)
+        .expect("min/max/abs/clamp kernel must compile to SPIR-V");
+    assert_eq!(artifact.words[0], 0x07230203, "valid SPIR-V magic");
+
+    let wgsl = artifact.wgsl.as_ref().expect("WGSL side artifact");
+
+    // Structural evidence of branch-freedom: naga's WGSL writer emits
+    // `if `/`else `/`loop {` for `Statement::If`/`Loop` and `select(` for
+    // `Expression::Select`
+    // (~/.cargo/registry/.../naga-29.0.3/src/back/wgsl/writer.rs). None of
+    // our new IR ops (min/max/abs/clamp, all Opaque/Binary/Unary, zero
+    // control-flow instructions in the source function) should produce any
+    // `Statement`, so this also incidentally covers "no phi" (naga has no
+    // phi node concept in its IR at all; sonatina phi only ever lowers to a
+    // `LocalVariable` load/store, and this function has none).
+    assert!(
+        !wgsl.contains("if ") && !wgsl.contains("else") && !wgsl.contains("loop {"),
+        "min/max/abs/clamp WGSL must be branch-free (no if/else/loop); got:\n{wgsl}"
+    );
+    let select_count = wgsl.matches("select(").count();
+    assert!(
+        select_count >= 6,
+        "expected >= 6 `select(` calls (min: 2, max: 2, clamp composes two more \
+         min/max calls with 4 more selects, minus shared literals) in the exact \
+         expansion, got {select_count}; WGSL:\n{wgsl}"
+    );
+
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse the min/max/abs/clamp WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation must accept the min/max/abs/clamp module");
+
+    eprintln!("spirv_f32_minmaxabsclamp_lowering_is_exact_and_branch_free OK: {select_count} selects, 0 branches");
+}

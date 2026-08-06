@@ -523,16 +523,22 @@ fn cross_target_three_backend_known_answer() {
 // two backends are expected to agree bit-for-bit on every input, including
 // NaN/-0.0 edge cases.
 //
-// naga/SPIR-V's `MathFunction::Min`/`Max` (GLSL.std.450 `FMin`/`FMax`) are NOT
-// included in the bit-for-bit differential below, and are not exercised by
-// this synthetic module at all (`SpirvBackend::compile_module`'s kernel ABI
-// only accepts an i32/i64 return, which these raw-`f32`-returning functions
-// don't fit). Even where naga/SPIR-V IS reachable (the real Fe demo pipeline,
-// which returns i32 RGBA), the GLSL.std.450 spec leaves NaN/-0.0 behavior for
-// FMin/FMax implementation-defined (unlike wasm/cranelift's pinned rules).
-// This is a deliberate, documented divergence (OPEN DECISION — see
-// NUMERIC_INTRINSICS_STAGING.md), not an oversight: no GPU adapter exists in
-// this sandbox to observe real driver behavior either way.
+// naga/SPIR-V is NOT included in the bit-for-bit differential below, and is
+// not exercised by this synthetic module at all (`SpirvBackend::compile_module`'s
+// kernel ABI only accepts an i32/i64 return, which these raw-`f32`-returning
+// functions don't fit). This is now a pure reachability gap, not a semantics
+// one: naga/SPIR-V's `Fmin`/`Fmax`/`Fabs`/`Fclamp` lowering (`emit_exact_fminmax`,
+// `crates/codegen/src/isa/spirv/mod.rs`) is a branch-free integer
+// key-compare-and-select expansion that is pinned-exact ("WebAssembly rules"),
+// matching wasm/cranelift bit-for-bit including NaN/-0.0 — it no longer uses
+// GLSL.std.450 `FMin`/`FMax`, whose NaN/-0.0 behavior is implementation-defined
+// by spec (that WAS the OPEN DECISION; see docs/numeric-intrinsics-semantics.md,
+// now resolved). The exact GPU expansion is validated structurally (legal
+// SPIR-V/WGSL, no branch/phi, only `select`/`OpSelect`) via the real Fe demo
+// pipeline (`demos/sketches/cga3d` etc. via `fe-codegen`'s `demo_compile_gate.rs`),
+// which returns i32 RGBA and so fits the kernel/render ABI; no GPU adapter
+// exists in this sandbox to execute the shader and observe real driver
+// behavior either way.
 
 /// Reference implementation of the PINNED "WebAssembly rules" float minimum,
 /// independent of both `sonatina_ir::interpret`'s copy and the backends under
@@ -673,33 +679,42 @@ fn cranelift_f32_abs_min_max_clamp_oracle() {
         )
     };
 
+    // `.to_bits()`, not float `==`: IEEE equality treats `-0.0 == +0.0`, which
+    // would silently hide a sign-of-zero divergence (the review's gap).
     for x in [-3.5f32, 3.5, 0.0, -0.0, -1.0, 1.0, 42.25] {
-        assert_eq!(abs(x), x.abs(), "abs({x})");
+        assert_eq!(abs(x).to_bits(), x.abs().to_bits(), "abs({x})");
     }
     for (a, b) in [(1.0f32, 2.0), (2.0, 1.0), (-5.0, 5.0), (3.0, 3.0), (-2.5, -7.5)] {
-        assert_eq!(min(a, b), wasm_rules_fmin_oracle(a, b), "min({a}, {b})");
-        assert_eq!(max(a, b), wasm_rules_fmax_oracle(a, b), "max({a}, {b})");
+        assert_eq!(min(a, b).to_bits(), wasm_rules_fmin_oracle(a, b).to_bits(), "min({a}, {b})");
+        assert_eq!(max(a, b).to_bits(), wasm_rules_fmax_oracle(a, b).to_bits(), "max({a}, {b})");
     }
-    for (x, lo, hi, expected) in [
-        (5.0f32, 0.0, 1.0, 1.0),
+    let clamp_cases: &[(f32, f32, f32, f32)] = &[
+        (5.0, 0.0, 1.0, 1.0),
         (-5.0, 0.0, 1.0, 0.0),
         (0.5, 0.0, 1.0, 0.5),
         (0.0, 0.0, 1.0, 0.0),
         (1.0, 0.0, 1.0, 1.0),
         (100.0, -10.0, 10.0, 10.0),
-    ] {
-        assert_eq!(clamp(x, lo, hi), expected, "clamp({x}, {lo}, {hi})");
+        // lo > hi (the review's test gap): composed min(max(x,lo),hi) is
+        // deterministically `hi`, never GLSL.std.450 `FClamp` poison.
+        (5.0, 10.0, -10.0, -10.0),
+        (-100.0, 10.0, -10.0, -10.0),
+    ];
+    for &(x, lo, hi, expected) in clamp_cases {
+        assert_eq!(clamp(x, lo, hi).to_bits(), expected.to_bits(), "clamp({x}, {lo}, {hi})");
     }
 }
 
 /// THE SHARP EDGE (VERIFY item 5): cross-backend differential over NaN/-0.0/
-/// +-inf edge inputs for `Fmin`/`Fmax`. Wasm and cranelift are asserted to
-/// agree bit-for-bit with each other AND with the from-scratch oracle above,
-/// because both backends implement the same PINNED "WebAssembly rules". The
-/// naga/SPIR-V path is validated (legal SPIR-V) but NOT executed (no GPU
-/// adapter here) and NOT asserted to agree on NaN/-0.0 (GLSL.std.450 FMin/
-/// FMax leaves that implementation-defined by spec — see the module doc
-/// comment above and NUMERIC_INTRINSICS_STAGING.md's OPEN DECISION).
+/// +-inf edge inputs for `Fmin`/`Fmax`, plus a `Fclamp` `lo > hi` case. Wasm
+/// and cranelift are asserted to agree bit-for-bit with each other AND with
+/// the from-scratch oracle above, because both backends implement the same
+/// PINNED "WebAssembly rules". The naga/SPIR-V path is not reachable from
+/// this synthetic module at all (see the comment below) so it is not part of
+/// this differential; its exactness is now a structural property of its
+/// lowering (branch-free integer expansion, no GLSL.std.450 FMin/FMax
+/// dependency) validated elsewhere — see the module doc comment above and
+/// docs/numeric-intrinsics-semantics.md (OPEN DECISION, now RESOLVED).
 #[test]
 fn cross_backend_f32_min_max_nan_zero_inf_differential() {
     use sonatina_codegen::isa::wasm::WasmBackend;
@@ -739,6 +754,16 @@ fn cross_backend_f32_min_max_nan_zero_inf_differential() {
     let wasm_max = instance
         .get_typed_func::<(f32, f32), f32>(&mut store, "f32_max")
         .expect("f32_max export");
+    let cranelift_clamp: fn(f32, f32, f32) -> f32 = unsafe {
+        std::mem::transmute(
+            cranelift_artifact
+                .get_func_ptr::<fn(f32, f32, f32) -> f32>("f32_clamp")
+                .unwrap(),
+        )
+    };
+    let wasm_clamp = instance
+        .get_typed_func::<(f32, f32, f32), f32>(&mut store, "f32_clamp")
+        .expect("f32_clamp export");
 
     // naga/SPIR-V is NOT exercised here: `SpirvBackend::compile_module`'s
     // "kernel" entry ABI only accepts an i32 (u32 word) or i64 return value
@@ -749,7 +774,7 @@ fn cross_backend_f32_min_max_nan_zero_inf_differential() {
     // (`demos/sketches/cga3d`, `demos/sketches/desargues` via
     // `fe-codegen`'s `demo_compile_gate.rs`), which returns i32 RGBA and so
     // fits the kernel/render ABI, and is validated there with
-    // `naga::valid::Validator` — see NUMERIC_INTRINSICS_STAGING.md.
+    // `naga::valid::Validator` — see docs/numeric-intrinsics-semantics.md.
 
     let nan_a = f32::from_bits(0x7fc0_1234);
     let nan_b = f32::NAN;
@@ -821,5 +846,46 @@ fn cross_backend_f32_min_max_nan_zero_inf_differential() {
                 "cranelift and wasm max({a:?}, {b:?}) disagree bit-for-bit"
             );
         }
+    }
+
+    // `Fclamp`'s `lo > hi` case (the review's test gap): the composed
+    // `min(max(x, lo), hi)` definition makes this deterministically `hi` on
+    // every backend and every `x` (`max(x, lo) >= lo > hi`, so the outer
+    // `min` always picks `hi`) -- never the GLSL.std.450 `FClamp` poison this
+    // feature exists to avoid. Checked via `.to_bits()` (not `==`) so a
+    // `-0.0`-vs-`+0.0` divergence in the "always hi" answer cannot hide
+    // behind IEEE equality.
+    let clamp_lo_gt_hi_inputs: &[(f32, f32, f32)] = &[
+        (5.0, 10.0, -10.0),
+        (-5.0, 10.0, -10.0),
+        (0.0, 1.0, -1.0),
+        (-0.0, 1.0, -1.0),
+        (f32::INFINITY, 1.0, -1.0),
+        (f32::NEG_INFINITY, 1.0, -1.0),
+    ];
+    for &(x, lo, hi) in clamp_lo_gt_hi_inputs {
+        let oracle = wasm_rules_fmin_oracle(wasm_rules_fmax_oracle(x, lo), hi);
+        assert_eq!(
+            oracle.to_bits(),
+            hi.to_bits(),
+            "sanity: lo > hi composed clamp oracle must equal hi for clamp({x}, {lo}, {hi})"
+        );
+        let cl = cranelift_clamp(x, lo, hi);
+        let wa = wasm_clamp.call(&mut store, (x, lo, hi)).expect("wasm clamp call");
+        assert_eq!(
+            cl.to_bits(),
+            oracle.to_bits(),
+            "cranelift clamp({x}, {lo}, {hi}) [lo > hi] diverges from the composed oracle"
+        );
+        assert_eq!(
+            wa.to_bits(),
+            oracle.to_bits(),
+            "wasm clamp({x}, {lo}, {hi}) [lo > hi] diverges from the composed oracle"
+        );
+        assert_eq!(
+            cl.to_bits(),
+            wa.to_bits(),
+            "cranelift and wasm clamp({x}, {lo}, {hi}) [lo > hi] disagree bit-for-bit"
+        );
     }
 }
