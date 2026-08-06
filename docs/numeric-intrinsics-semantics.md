@@ -3,6 +3,11 @@
 Added on branch `backend-numeric-intrinsics` (off `04d3ec91`): `Fabs`, `Fmin`,
 `Fmax`, `Fclamp` (f32 only, mirroring `Fsqrt`).
 
+**UPDATE (rounding family, on top of `584a1b15`)**: `Ffloor`, `Fceil`,
+`Ftrunc`, `Fround` added, mirroring `Fabs` exactly (all four are unary, one
+native instruction on every backend, no bit-twiddling). See "The rounding
+family" section below.
+
 ## The template: `Fsqrt`
 
 Traced end-to-end before writing anything:
@@ -68,6 +73,68 @@ hard `LowerError`, per its own comment), not scope creep.
   trait's (`crates/ir/src/interpret/mod.rs`) explicit `Members` list — that
   list has no established ternary pattern either, and nothing in this task
   requires a const-eval path for it.
+
+## The rounding family: Ffloor, Fceil, Ftrunc, Fround
+
+Unlike `Fmin`/`Fmax`/`Fabs`/`Fclamp`, this family needed no NaN/-0.0
+resolution pass: every op is a **single native instruction on all three
+backends**, and (with one exception, `Fround`'s ties-to-even rule, checked
+explicitly below) every backend already agrees on the answer.
+
+- `Ffloor` -> naga `MathFunction::Floor` (WGSL `floor()`, SPIR-V
+  `GLSL.std.450 Floor`), wasm `f32.floor`, cranelift `floor`.
+- `Fceil` -> naga `MathFunction::Ceil` (`ceil()`/`Ceil`), wasm `f32.ceil`,
+  cranelift `ceil`.
+- `Ftrunc` -> naga `MathFunction::Trunc` (`trunc()`/`Trunc`), wasm
+  `f32.trunc`, cranelift `trunc`.
+- `Fround` -> naga `MathFunction::Round` (`round()`/`RoundEven`), wasm
+  `f32.nearest`, cranelift `nearest`.
+
+All four are `UnaryInstKind` variants (mirroring `Fabs`, not `Fclamp`'s
+`Opaque`/ternary special-casing), registered the same way as `Fabs` in every
+exhaustive `UnaryInstKind` match across `analysis`/`optim`
+(`demanded_bits.rs`, `known_bits.rs`, `gvn.rs` x2, `simplify_expr.rs`): no
+constant-folding/algebraic-simplification/GVN-key special case, same
+"unknown but pure, CSE via `OwnedInstKey`" treatment `Fabs` gets.
+
+### THE ONE SEMANTIC CHECK: `Fround` ties-to-even
+
+`round(x)` must be `roundTiesToEven` (IEEE 754): `round(0.5) == 0`,
+`round(1.5) == 2`, `round(2.5) == 2`, `round(-0.5) == -0`. This was flagged
+as the one place this family could silently diverge cross-backend (the way
+`Fmin`/`Fmax` diverged on NaN/-0.0), because Rust's own `f32::round()` is
+**ties-away-from-zero**, a different rounding rule -- a tempting, wrong,
+oracle.
+
+**Verified, all three backends agree exactly, no divergence to pin around:**
+
+- **wasm**: the WebAssembly spec's `f32.nearest` is `roundTiesToEven` by
+  definition; `waffle`'s own reference interpreter
+  (`waffle-0.2.0/src/interp.rs`) implements `Operator::F32Nearest` as
+  `f32::round_ties_even()`, not `.round()`.
+- **cranelift**: `nearest`'s own generated doc comment (from
+  `cranelift-codegen-meta`) reads *"Round floating point round to integral,
+  towards nearest with ties to even."*
+- **naga/SPIR-V**: `MathFunction::Round` lowers to SPIR-V's `GLSL.std.450`
+  extended instruction **`RoundEven`**, NOT the ties-away-from-zero `Round`
+  ext inst (verified by reading naga 29.0.4's SPIR-V backend source,
+  `src/back/spv/block.rs`: `Mf::Round => MathOp::Ext(GlslStd450Op::RoundEven)`).
+  WGSL's `round()` builtin is defined the same way per the WGSL spec ("k is
+  rounded to even if e is exactly halfway between two integers"), so the
+  WGSL-text and SPIR-V-binary paths agree too.
+
+So `Ffloor`/`Fceil`/`Ftrunc`/`Fround` needed **no** NaN/-0.0/ties resolution
+work analogous to `Fmin`/`Fmax`'s `emit_exact_fminmax` expansion: each op
+lowers to exactly one native instruction/`OpExtInst`, branch-free, on every
+backend, and all three backends were already exact. `Fround`'s Rust
+interpreter/CTFE implementation uses `f32::round_ties_even()`
+(`crates/ir/src/interpret/arith.rs`, and Fe's `crates/hir/src/analysis/
+semantic/ctfe/machine.rs`), never `f32::round()`, to avoid silently
+reintroducing the divergence at the reference-implementation layer.
+
+`floor`/`ceil`/`trunc` have no ties/rounding-mode ambiguity at all (they are
+each defined pointwise, no "nearest" choice to make), so there is nothing to
+check beyond "is it the right native instruction" for those three.
 
 ## The sharp edge: Fmin/Fmax NaN and signed-zero semantics
 
@@ -173,3 +240,34 @@ unchanged (they were already exact and native).
   `naga::front::wgsl::parse_str` + `naga::valid::Validator`, and the emitted
   WGSL/SPIR-V contains no branch/phi for `Fmin`/`Fmax`/`Fclamp` — only
   `select`/`OpSelect`), not executed end-to-end against real driver behavior.
+
+### Rounding family (`Ffloor`/`Fceil`/`Ftrunc`/`Fround`)
+
+- `crates/codegen/tests/cranelift_backend.rs`: `cranelift_f32_rounding_oracle`
+  (native oracle vs Rust's `f32::floor`/`ceil`/`trunc`/`round_ties_even`,
+  bit-exact via `.to_bits()`, covering ties, negatives, `-0.0`, `+-inf`, and
+  NaN-passthrough, plus the four `roundTiesToEven` answers spelled out:
+  `round(0.5)==0`, `round(1.5)==2`, `round(2.5)==2`, `round(-0.5)==-0`) and
+  `cross_backend_f32_rounding_differential` (wasm vs cranelift, bit-for-bit,
+  same edge-input set, both checked against the Rust oracle).
+- `crates/codegen/tests/spirv_backend.rs`:
+  `spirv_f32_rounding_lowering_is_exact_and_branch_free` (structural: each op
+  emits exactly one native WGSL call -- `floor(`/`ceil(`/`trunc(`/`round(` --
+  no `if`/`else`/`loop {`, legal SPIR-V magic, reparses and validates via
+  `naga::valid::Validator`; mirrors
+  `spirv_f32_minmaxabsclamp_lowering_is_exact_and_branch_free`'s shape but
+  does NOT assert a global "zero `select(`" count, since the kernel's
+  trailing `F32ToI32` return-ABI conversion legitimately emits its own
+  `select(`s for saturation, unrelated to this family).
+- `crates/codegen/tests/wasm_backend.rs` / the Fe-side
+  `crates/codegen/tests/wasm_e2e.rs::f32_rounding_intrinsics_execute_on_wasm`
+  (Fe source -> wasm -> wasmtime, full pipeline, same value set as the
+  cranelift oracle, plus the wasm opcode-presence and branch-freedom checks).
+- Fe demo pipeline: `demos/sketches/fmath`'s `floor` (and `ceil`/`round`, now
+  newly exposed) call the intrinsics directly; `fract`/`wrap_pi`/`sin` build
+  on `floor` and go branch-free for free. Regenerating `demos/sketches/cga3d`
+  and `demos/sketches/desargues`'s WGSL and diffing against the pre-change
+  output confirms the hand-rolled `if (t > x) { t - 1.0 } else { t }` floor
+  pattern is gone, replaced by a single `floor(...)` call, with the
+  corresponding `phi_`/branch count dropping. See the top-level agent report
+  for this task for the before/after WGSL snippet.

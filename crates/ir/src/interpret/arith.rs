@@ -68,6 +68,39 @@ impl Interpret for Fabs {
     }
 }
 
+impl Interpret for Ffloor {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(unary_f32(state.lookup_val(*self.arg()), f32::floor))
+    }
+}
+
+impl Interpret for Fceil {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(unary_f32(state.lookup_val(*self.arg()), f32::ceil))
+    }
+}
+
+impl Interpret for Ftrunc {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(unary_f32(state.lookup_val(*self.arg()), f32::trunc))
+    }
+}
+
+/// `roundTiesToEven` (IEEE 754), NOT Rust's `f32::round()` (which is
+/// ties-away-from-zero). This matches wasm's `f32.nearest`, cranelift's
+/// `nearest`, and naga/SPIR-V's `MathFunction::Round` (-> GLSL.std.450
+/// `RoundEven`) -- all three backends agree exactly, so there is nothing to
+/// pin/approximate here, unlike `Fmin`/`Fmax`.
+impl Interpret for Fround {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(unary_f32(state.lookup_val(*self.arg()), f32::round_ties_even))
+    }
+}
+
 /// The PINNED cross-backend semantics for float min/max: the "WebAssembly
 /// rules" (IEEE 754-2019 `minimum`/`maximum`). NaN-propagating (if either
 /// operand is NaN, the result is NaN -- we return the canonical quiet NaN,

@@ -98,6 +98,48 @@ pub struct Fclamp {
     hi: ValueId,
 }
 
+/// Floating point floor: round to integral, towards negative infinity.
+/// Mirrors `Fsqrt`/`Fabs` exactly -- a single native instruction on every
+/// backend (naga `MathFunction::Floor`, wasm `f32.floor`, cranelift
+/// `floor`), no bit-twiddling, no NaN/-0 subtlety (floor is monotone and
+/// sign-preserving at the boundary: `floor(-0.0) == -0.0`). See
+/// `docs/numeric-intrinsics-semantics.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(unary(Ffloor)))]
+pub struct Ffloor {
+    arg: ValueId,
+}
+
+/// Floating point ceiling: round to integral, towards positive infinity.
+/// Mirrors `Ffloor` (see above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(unary(Fceil)))]
+pub struct Fceil {
+    arg: ValueId,
+}
+
+/// Floating point truncation: round to integral, towards zero. Mirrors
+/// `Ffloor` (see above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(unary(Ftrunc)))]
+pub struct Ftrunc {
+    arg: ValueId,
+}
+
+/// Floating point round: round to integral, towards the nearest value, with
+/// ties rounded to even (`roundTiesToEven`, IEEE 754). PINNED: this matches
+/// wasm's `f32.nearest` and cranelift's `nearest` (both ties-to-even by
+/// their own spec/doc comment) AND naga/SPIR-V, whose `MathFunction::Round`
+/// lowers to GLSL.std.450 `RoundEven` (verified against naga 29.0.4's SPIR-V
+/// backend source), not the ties-away-from-zero `Round` ext inst. All three
+/// backends agree exactly; no divergence to pin around, unlike `Fmin`/
+/// `Fmax`. See `docs/numeric-intrinsics-semantics.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(unary(Fround)))]
+pub struct Fround {
+    arg: ValueId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(kind(binary(Add)))]
 pub struct Add {

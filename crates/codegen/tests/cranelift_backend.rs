@@ -889,3 +889,258 @@ fn cross_backend_f32_min_max_nan_zero_inf_differential() {
         );
     }
 }
+
+/// Build a module with `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, all
+/// `f32 -> f32`, using the new `Ffloor`/`Fceil`/`Ftrunc`/`Fround` Sonatina
+/// ops. Mirrors `build_f32_intrinsics_module` above.
+fn build_f32_rounding_module() -> sonatina_ir::Module {
+    let mb = native_module_builder();
+    let isa = native_isa();
+    let is = isa.inst_set();
+
+    let sig = Signature::new_single("f32_floor", Linkage::Public, &[Type::F32], Type::F32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let result = fb.insert_inst(arith::Ffloor::new(is, x), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let sig = Signature::new_single("f32_ceil", Linkage::Public, &[Type::F32], Type::F32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let result = fb.insert_inst(arith::Fceil::new(is, x), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let sig = Signature::new_single("f32_trunc", Linkage::Public, &[Type::F32], Type::F32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let result = fb.insert_inst(arith::Ftrunc::new(is, x), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let sig = Signature::new_single("f32_round", Linkage::Public, &[Type::F32], Type::F32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let result = fb.insert_inst(arith::Fround::new(is, x), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    mb.build()
+}
+
+/// Oracle test (VERIFY item 1): native/cranelift executes `Ffloor`/`Fceil`/
+/// `Ftrunc`/`Fround` correctly, bit-exact vs Rust's own `f32::floor`/`ceil`/
+/// `trunc`/`round_ties_even` (NOT `f32::round`, which is ties-away-from-zero
+/// -- the wrong oracle for `Fround`'s pinned `roundTiesToEven` semantics).
+/// Covers ties, negatives, -0.0, +-inf, and NaN-passthrough.
+#[test]
+fn cranelift_f32_rounding_oracle() {
+    let module = build_f32_rounding_module();
+    let backend = CraneliftBackend::new();
+    let artifact = backend.compile_module(&module).expect("cranelift compile");
+
+    let floor: fn(f32) -> f32 = unsafe {
+        std::mem::transmute(
+            artifact
+                .get_func_ptr::<fn(f32) -> f32>("f32_floor")
+                .unwrap(),
+        )
+    };
+    let ceil: fn(f32) -> f32 = unsafe {
+        std::mem::transmute(artifact.get_func_ptr::<fn(f32) -> f32>("f32_ceil").unwrap())
+    };
+    let trunc: fn(f32) -> f32 = unsafe {
+        std::mem::transmute(
+            artifact
+                .get_func_ptr::<fn(f32) -> f32>("f32_trunc")
+                .unwrap(),
+        )
+    };
+    let round: fn(f32) -> f32 = unsafe {
+        std::mem::transmute(
+            artifact
+                .get_func_ptr::<fn(f32) -> f32>("f32_round")
+                .unwrap(),
+        )
+    };
+
+    // Ties, negatives, -0.0, ordinary values: bit-exact vs the Rust oracle.
+    let cases: &[f32] = &[
+        0.0, -0.0, 1.0, -1.0, 0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, -3.5, 0.25, 0.75, -0.25,
+        -0.75, 3.14159, -3.14159, 42.0, -42.0, 1e10, -1e10, f32::MIN_POSITIVE, -f32::MIN_POSITIVE,
+    ];
+    for &x in cases {
+        assert_eq!(floor(x).to_bits(), x.floor().to_bits(), "floor({x})");
+        assert_eq!(ceil(x).to_bits(), x.ceil().to_bits(), "ceil({x})");
+        assert_eq!(trunc(x).to_bits(), x.trunc().to_bits(), "trunc({x})");
+        assert_eq!(
+            round(x).to_bits(),
+            x.round_ties_even().to_bits(),
+            "round({x}) [ties-to-even]"
+        );
+    }
+
+    // +-inf: already integral, all four ops are identity.
+    for &x in &[f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(floor(x).to_bits(), x.to_bits(), "floor({x})");
+        assert_eq!(ceil(x).to_bits(), x.to_bits(), "ceil({x})");
+        assert_eq!(trunc(x).to_bits(), x.to_bits(), "trunc({x})");
+        assert_eq!(round(x).to_bits(), x.to_bits(), "round({x})");
+    }
+
+    // NaN passthrough: result must be NaN. Payload/sign are not pinned (some
+    // backends canonicalize), so this checks `.is_nan()`, not bit-exactness.
+    for &x in &[f32::NAN, f32::from_bits(0x7fc0_1234), -f32::NAN] {
+        assert!(floor(x).is_nan(), "floor({x:?}) must be NaN");
+        assert!(ceil(x).is_nan(), "ceil({x:?}) must be NaN");
+        assert!(trunc(x).is_nan(), "trunc({x:?}) must be NaN");
+        assert!(round(x).is_nan(), "round({x:?}) must be NaN");
+    }
+
+    // The exact roundTiesToEven answers, spelled out (not just delegated to
+    // the Rust oracle above): this is THE semantic check for this family.
+    assert_eq!(
+        round(0.5).to_bits(),
+        0.0f32.to_bits(),
+        "round(0.5) == 0 (ties to even)"
+    );
+    assert_eq!(
+        round(1.5).to_bits(),
+        2.0f32.to_bits(),
+        "round(1.5) == 2 (ties to even)"
+    );
+    assert_eq!(
+        round(2.5).to_bits(),
+        2.0f32.to_bits(),
+        "round(2.5) == 2 (ties to even)"
+    );
+    assert_eq!(
+        round(-0.5).to_bits(),
+        (-0.0f32).to_bits(),
+        "round(-0.5) == -0 (ties to even)"
+    );
+}
+
+/// Cross-backend differential (wasm vs cranelift) for the rounding family,
+/// mirroring `cross_backend_f32_min_max_nan_zero_inf_differential`. Unlike
+/// `Fmin`/`Fmax`, there is no NaN/-0.0 divergence to pin around here: floor/
+/// ceil/trunc are monotone bit-exact IEEE ops on every backend, and `round`
+/// is ties-to-even on both wasm's `f32.nearest` and cranelift's `nearest` by
+/// their own spec/doc comment (see `arith::Fround`'s doc comment for the
+/// naga/SPIR-V side, not exercised here for the same ABI reason as the
+/// `Fmin`/`Fmax` differential above).
+#[test]
+fn cross_backend_f32_rounding_differential() {
+    use sonatina_codegen::isa::wasm::WasmBackend;
+
+    let module = build_f32_rounding_module();
+
+    let cranelift_backend = CraneliftBackend::new();
+    let cranelift_artifact = cranelift_backend
+        .compile_module(&module)
+        .expect("cranelift compile");
+    let cranelift_fn = |name: &str| -> fn(f32) -> f32 {
+        unsafe { std::mem::transmute(cranelift_artifact.get_func_ptr::<fn(f32) -> f32>(name).unwrap()) }
+    };
+    let cl_floor = cranelift_fn("f32_floor");
+    let cl_ceil = cranelift_fn("f32_ceil");
+    let cl_trunc = cranelift_fn("f32_trunc");
+    let cl_round = cranelift_fn("f32_round");
+
+    let wasm_backend = WasmBackend::new();
+    let wasm_artifact = wasm_backend.compile_module(&module).expect("wasm compile");
+    wasmparser::validate(&wasm_artifact.bytes).expect("valid wasm");
+    let engine = wasmtime::Engine::default();
+    let wasm_module = wasmtime::Module::new(&engine, &wasm_artifact.bytes).expect("load wasm");
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance =
+        wasmtime::Instance::new(&mut store, &wasm_module, &[]).expect("instantiate wasm");
+    let wasm_floor = instance
+        .get_typed_func::<f32, f32>(&mut store, "f32_floor")
+        .expect("f32_floor export");
+    let wasm_ceil = instance
+        .get_typed_func::<f32, f32>(&mut store, "f32_ceil")
+        .expect("f32_ceil export");
+    let wasm_trunc = instance
+        .get_typed_func::<f32, f32>(&mut store, "f32_trunc")
+        .expect("f32_trunc export");
+    let wasm_round = instance
+        .get_typed_func::<f32, f32>(&mut store, "f32_round")
+        .expect("f32_round export");
+
+    let edge_inputs: &[f32] = &[
+        0.0,
+        -0.0,
+        0.5,
+        1.5,
+        2.5,
+        3.5,
+        -0.5,
+        -1.5,
+        -2.5,
+        -3.5,
+        1.0,
+        -1.0,
+        42.75,
+        -42.75,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        f32::from_bits(0x7fc0_1234),
+    ];
+
+    for &x in edge_inputs {
+        let oracle_floor = x.floor();
+        let oracle_ceil = x.ceil();
+        let oracle_trunc = x.trunc();
+        let oracle_round = x.round_ties_even();
+
+        let cl = (cl_floor(x), cl_ceil(x), cl_trunc(x), cl_round(x));
+        let wa = (
+            wasm_floor.call(&mut store, x).expect("wasm floor call"),
+            wasm_ceil.call(&mut store, x).expect("wasm ceil call"),
+            wasm_trunc.call(&mut store, x).expect("wasm trunc call"),
+            wasm_round.call(&mut store, x).expect("wasm round call"),
+        );
+
+        if x.is_nan() {
+            assert!(cl.0.is_nan() && cl.1.is_nan() && cl.2.is_nan() && cl.3.is_nan(),
+                "cranelift rounding family should be NaN for {x:?}, got {cl:?}");
+            assert!(wa.0.is_nan() && wa.1.is_nan() && wa.2.is_nan() && wa.3.is_nan(),
+                "wasm rounding family should be NaN for {x:?}, got {wa:?}");
+            continue;
+        }
+
+        assert_eq!(cl.0.to_bits(), oracle_floor.to_bits(), "cranelift floor({x}) diverges from oracle");
+        assert_eq!(cl.1.to_bits(), oracle_ceil.to_bits(), "cranelift ceil({x}) diverges from oracle");
+        assert_eq!(cl.2.to_bits(), oracle_trunc.to_bits(), "cranelift trunc({x}) diverges from oracle");
+        assert_eq!(cl.3.to_bits(), oracle_round.to_bits(), "cranelift round({x}) diverges from oracle [ties-to-even]");
+
+        assert_eq!(wa.0.to_bits(), oracle_floor.to_bits(), "wasm floor({x}) diverges from oracle");
+        assert_eq!(wa.1.to_bits(), oracle_ceil.to_bits(), "wasm ceil({x}) diverges from oracle");
+        assert_eq!(wa.2.to_bits(), oracle_trunc.to_bits(), "wasm trunc({x}) diverges from oracle");
+        assert_eq!(wa.3.to_bits(), oracle_round.to_bits(), "wasm round({x}) diverges from oracle [ties-to-even]");
+
+        assert_eq!(cl.0.to_bits(), wa.0.to_bits(), "cranelift and wasm floor({x}) disagree bit-for-bit");
+        assert_eq!(cl.1.to_bits(), wa.1.to_bits(), "cranelift and wasm ceil({x}) disagree bit-for-bit");
+        assert_eq!(cl.2.to_bits(), wa.2.to_bits(), "cranelift and wasm trunc({x}) disagree bit-for-bit");
+        assert_eq!(cl.3.to_bits(), wa.3.to_bits(), "cranelift and wasm round({x}) disagree bit-for-bit [ties-to-even]");
+    }
+}

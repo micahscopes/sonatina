@@ -1077,7 +1077,7 @@ pub(crate) fn simplify_unary_with_same_inner(
         UnaryInstKind::Not | UnaryInstKind::Neg | UnaryInstKind::Bswap => same_inner_arg(arg, kind)
             .map(SimplifiedResult::Copy)
             .unwrap_or(SimplifiedResult::NoChange),
-        UnaryInstKind::Snego | UnaryInstKind::IsZero | UnaryInstKind::EvmClz | UnaryInstKind::Fneg | UnaryInstKind::Fsqrt | UnaryInstKind::Fabs => {
+        UnaryInstKind::Snego | UnaryInstKind::IsZero | UnaryInstKind::EvmClz | UnaryInstKind::Fneg | UnaryInstKind::Fsqrt | UnaryInstKind::Fabs | UnaryInstKind::Ffloor | UnaryInstKind::Fceil | UnaryInstKind::Ftrunc | UnaryInstKind::Fround => {
             SimplifiedResult::NoChange
         }
     }

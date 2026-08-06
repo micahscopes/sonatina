@@ -1182,6 +1182,43 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    // Rounding family: single native instruction each, no
+                    // bit-twiddling, no NaN/-0 subtlety.
+                    else if let Some(ffloor) = <&sonatina_ir::inst::arith::Ffloor as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let arg = resolve_value(function, *ffloor.arg(), &value_map, &mut body, wb)
+                                .ok_or("unresolved ffloor argument")?;
+                            let wval = body.add_op(wb, Operator::F32Floor, &[arg], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fceil) = <&sonatina_ir::inst::arith::Fceil as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let arg = resolve_value(function, *fceil.arg(), &value_map, &mut body, wb)
+                                .ok_or("unresolved fceil argument")?;
+                            let wval = body.add_op(wb, Operator::F32Ceil, &[arg], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(ftrunc) = <&sonatina_ir::inst::arith::Ftrunc as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let arg = resolve_value(function, *ftrunc.arg(), &value_map, &mut body, wb)
+                                .ok_or("unresolved ftrunc argument")?;
+                            let wval = body.add_op(wb, Operator::F32Trunc, &[arg], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    // `f32.nearest` is wasm's ties-to-even rounding (per the wasm
+                    // spec), matching `Fround`'s pinned `roundTiesToEven` semantics
+                    // exactly -- a direct, unconditional native lowering.
+                    else if let Some(fround) = <&sonatina_ir::inst::arith::Fround as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let arg = resolve_value(function, *fround.arg(), &value_map, &mut body, wb)
+                                .ok_or("unresolved fround argument")?;
+                            let wval = body.add_op(wb, Operator::F32Nearest, &[arg], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
                     // wasm has no native `f32.clamp`; compose it from the two native
                     // ops above as `min(max(arg, lo), hi)` (the textbook clamp
                     // order), matching the cranelift lowering's composition exactly.

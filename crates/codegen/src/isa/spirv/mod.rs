@@ -509,6 +509,46 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Ffloor as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
+            // Single native instruction, no bit-twiddling, no NaN/-0
+            // subtlety: floor is monotone and sign-preserving at the
+            // boundary. Matches wasm's `f32.floor`/cranelift's `floor`.
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Floor, arg, arg1: None, arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Fceil as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Ceil, arg, arg1: None, arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Ftrunc as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Trunc, arg, arg1: None, arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::Fround as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
+            // `MathFunction::Round` lowers to GLSL.std.450 `RoundEven`
+            // (verified against naga 29.0.4's SPIR-V backend source, NOT
+            // the ties-away-from-zero `Round` ext inst), matching wasm's
+            // `f32.nearest`/cranelift's `nearest` exactly. No divergence to
+            // pin around, unlike `Fmin`/`Fmax`.
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Round, arg, arg1: None, arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
     } else if let Some(op) = <&sonatina_ir::inst::arith::Fmin as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let lhs = resolve_naga_value(*op.lhs(), function, word, value_map, phi_locals, func).unwrap();
@@ -2016,6 +2056,10 @@ fn spirv_instruction_is_lowered(
         || <&arith::Fmin as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fmax as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fclamp as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Ffloor as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fceil as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Ftrunc as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Fround as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Sar as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shl as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Shr as InstDowncast>::downcast(is, inst).is_some()
