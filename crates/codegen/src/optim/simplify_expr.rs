@@ -632,6 +632,8 @@ pub(crate) fn simplify_binary_with_facts(
         | BinaryInstKind::Fdiv
         | BinaryInstKind::Fmin
         | BinaryInstKind::Fmax
+        | BinaryInstKind::FminRelaxed
+        | BinaryInstKind::FmaxRelaxed
         | BinaryInstKind::Feq
         | BinaryInstKind::Flt
         | BinaryInstKind::Fle => {}

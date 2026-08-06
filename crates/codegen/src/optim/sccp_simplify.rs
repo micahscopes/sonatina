@@ -840,6 +840,8 @@ pub(super) fn simplify_inst(
                 | BinaryInstKind::Fdiv
                 | BinaryInstKind::Fmin
                 | BinaryInstKind::Fmax
+                | BinaryInstKind::FminRelaxed
+                | BinaryInstKind::FmaxRelaxed
                 | BinaryInstKind::Feq
                 | BinaryInstKind::Flt
                 | BinaryInstKind::Fle => SimplifyAction::NoChange,

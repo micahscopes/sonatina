@@ -573,6 +573,40 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::FminRelaxed as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(*op.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*op.rhs(), function, word, value_map, phi_locals, func).unwrap();
+            // RELAXED: the single GLSL.std.450 `FMin` op via naga
+            // `MathFunction::Min` -- implementation-defined on NaN operands
+            // and signed-zero ties, which is exactly the latitude
+            // `FminRelaxed`'s contract grants (unlike `Fmin` above, which
+            // must use the ~15-20-op exact integer expansion). This is the
+            // pre-slice-0 `Fmin`/`Fmax` lowering relocated here: the whole
+            // point of the relaxed op is to keep this cheap 1-op path
+            // reachable on GPU for code that opts in via `Regular`.
+            let h = func.expressions.append(
+                naga::Expression::Math { fun: naga::MathFunction::Min, arg: lhs, arg1: Some(rhs), arg2: None, arg3: None },
+                naga::Span::UNDEFINED,
+            );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(op) = <&sonatina_ir::inst::arith::FmaxRelaxed as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let lhs = resolve_naga_value(*op.lhs(), function, word, value_map, phi_locals, func).unwrap();
+            let rhs = resolve_naga_value(*op.rhs(), function, word, value_map, phi_locals, func).unwrap();
+            // RELAXED: see FminRelaxed above (single GLSL.std.450 `FMax` via
+            // `MathFunction::Max`).
+            let h = func.expressions.append(
+                naga::Expression::Math { fun: naga::MathFunction::Max, arg: lhs, arg1: Some(rhs), arg2: None, arg3: None },
+                naga::Span::UNDEFINED,
+            );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
+            value_map.insert(result, h);
+            return true;
+        }
     } else if let Some(op) = <&sonatina_ir::inst::arith::Fclamp as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
@@ -2055,6 +2089,8 @@ fn spirv_instruction_is_lowered(
         || <&arith::Fabs as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fmin as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fmax as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::FminRelaxed as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::FmaxRelaxed as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fclamp as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Ffloor as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fceil as InstDowncast>::downcast(is, inst).is_some()

@@ -188,6 +188,8 @@ impl_binary_f32_rule!(
     arith::Fdiv => "fdiv",
     arith::Fmin => "fmin",
     arith::Fmax => "fmax",
+    arith::FminRelaxed => "fmin_relaxed",
+    arith::FmaxRelaxed => "fmax_relaxed",
 );
 
 macro_rules! impl_compare_f32_rule {

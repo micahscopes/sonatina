@@ -79,6 +79,41 @@ pub struct Fmax {
     rhs: ValueId,
 }
 
+/// Floating point minimum, RELAXED contract: "any behavior within IEEE
+/// 754-2019 `minNum`/`maxNum`-family latitude on NaN operands and
+/// signed-zero ties; exact otherwise". This is a DIFFERENT, honestly weaker
+/// contract than [`Fmin`] (never merged with it in GVN/equivalence
+/// analysis): a backend is free to implement `FminRelaxed` as its single
+/// native min instruction (wasm `f32.min`, cranelift `fmin`, GLSL.std.450
+/// `FMin` via naga `MathFunction::Min`) even though that instruction's
+/// NaN/-0.0 behavior is implementation-defined, because that behavior is
+/// inside the latitude this op's contract grants. A backend implementing
+/// `FminRelaxed` as fully exact (matching [`Fmin`]) is also conforming --
+/// exact is inside the relaxed latitude, which is why wasm/cranelift reuse
+/// their native `Fmin`/`Fmax` lowering unchanged for the relaxed pair (their
+/// native instruction already IS the WebAssembly-rules-exact semantics), and
+/// why the interpreter/CTFE evaluate `FminRelaxed`/`FmaxRelaxed` as exact
+/// (the canonical refinement of "any of the latitude", chosen for
+/// deterministic const-eval). Only naga/SPIR-V actually diverges: it lowers
+/// `FminRelaxed` to the single `MathFunction::Min` GLSL op instead of the
+/// ~15-20-op exact expansion `Fmin` requires. See
+/// `docs/numeric-intrinsics-semantics.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(binary(FminRelaxed)))]
+pub struct FminRelaxed {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
+/// Floating point maximum, RELAXED contract. See [`FminRelaxed`] for the
+/// pinned latitude (the maximum-side mirror).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(kind(binary(FmaxRelaxed)))]
+pub struct FmaxRelaxed {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
 /// Floating point clamp: `clamp(arg, lo, hi)`. A dedicated ternary op (not
 /// composed at this layer) so the IR carries clamp semantics as a unit and
 /// each backend lowers it as it sees fit. All three backends currently

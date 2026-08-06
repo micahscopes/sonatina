@@ -40,6 +40,8 @@ pub trait Interpret {
         inst::arith::Fabs,
         inst::arith::Fmin,
         inst::arith::Fmax,
+        inst::arith::FminRelaxed,
+        inst::arith::FmaxRelaxed,
         inst::arith::Ffloor,
         inst::arith::Fceil,
         inst::arith::Ftrunc,

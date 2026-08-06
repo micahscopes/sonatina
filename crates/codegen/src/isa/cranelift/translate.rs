@@ -289,6 +289,24 @@ fn translate_function(
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
                 }
+            } else if let Some(fmin) = <&sonatina_ir::inst::arith::FminRelaxed as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *fmin.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *fmin.rhs(), &value_map, &mut builder)?;
+                // Relaxed contract: cranelift's native `fmin` already IS the
+                // WebAssembly-rules-exact semantics, so it trivially
+                // conforms to the weaker relaxed latitude too. Same
+                // instruction as `Fmin` above -- zero new backend surface.
+                let result_val = builder.ins().fmin(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fmax) = <&sonatina_ir::inst::arith::FmaxRelaxed as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let lhs = resolve_value(function, *fmax.lhs(), &value_map, &mut builder)?;
+                let rhs = resolve_value(function, *fmax.rhs(), &value_map, &mut builder)?;
+                let result_val = builder.ins().fmax(lhs, rhs);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
             } else if let Some(ffloor) = <&sonatina_ir::inst::arith::Ffloor as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let val = resolve_value(function, *ffloor.arg(), &value_map, &mut builder)?;
                 // Rounding family: single native instruction each, no

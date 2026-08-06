@@ -1182,6 +1182,28 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    // Relaxed min/max: same `f32.min`/`f32.max` native
+                    // instruction as the exact ops above -- wasm's native
+                    // instruction already IS the pinned "WebAssembly rules"
+                    // exact semantics, so it is trivially a conforming
+                    // implementation of the weaker relaxed contract too.
+                    // Zero new backend surface.
+                    else if let Some(fmin) = <&sonatina_ir::inst::arith::FminRelaxed as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fmin.lhs(), &value_map, &mut body, wb).ok_or("unresolved fmin_relaxed lhs")?;
+                            let rhs = resolve_value(function, *fmin.rhs(), &value_map, &mut body, wb).ok_or("unresolved fmin_relaxed rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Min, &[lhs, rhs], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(fmax) = <&sonatina_ir::inst::arith::FmaxRelaxed as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *fmax.lhs(), &value_map, &mut body, wb).ok_or("unresolved fmax_relaxed lhs")?;
+                            let rhs = resolve_value(function, *fmax.rhs(), &value_map, &mut body, wb).ok_or("unresolved fmax_relaxed rhs")?;
+                            let wval = body.add_op(wb, Operator::F32Max, &[lhs, rhs], &[WType::F32]);
+                            value_map.insert(result, wval);
+                        }
+                    }
                     // Rounding family: single native instruction each, no
                     // bit-twiddling, no NaN/-0 subtlety.
                     else if let Some(ffloor) = <&sonatina_ir::inst::arith::Ffloor as InstDowncast>::downcast(inst_set, inst_data) {

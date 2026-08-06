@@ -1079,6 +1079,8 @@ impl GvnSolver {
                 | BinaryInstKind::Fdiv
                 | BinaryInstKind::Fmin
                 | BinaryInstKind::Fmax
+                | BinaryInstKind::FminRelaxed
+                | BinaryInstKind::FmaxRelaxed
                 | BinaryInstKind::Feq
                 | BinaryInstKind::Flt
                 | BinaryInstKind::Fle => return None,

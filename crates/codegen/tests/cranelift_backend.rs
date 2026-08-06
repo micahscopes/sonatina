@@ -890,6 +890,194 @@ fn cross_backend_f32_min_max_nan_zero_inf_differential() {
     }
 }
 
+/// Build a module with `min_relaxed(a,b)`, `max_relaxed(a,b)`, `f32 -> f32`,
+/// using the new `FminRelaxed`/`FmaxRelaxed` Sonatina ops. Mirrors
+/// `build_f32_intrinsics_module` above.
+fn build_f32_relaxed_intrinsics_module() -> sonatina_ir::Module {
+    let mb = native_module_builder();
+    let isa = native_isa();
+    let is = isa.inst_set();
+
+    let sig = Signature::new_single(
+        "f32_min_relaxed",
+        Linkage::Public,
+        &[Type::F32, Type::F32],
+        Type::F32,
+    );
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let b = fb.args()[1];
+    let result = fb.insert_inst(arith::FminRelaxed::new(is, a, b), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let sig = Signature::new_single(
+        "f32_max_relaxed",
+        Linkage::Public,
+        &[Type::F32, Type::F32],
+        Type::F32,
+    );
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let a = fb.args()[0];
+    let b = fb.args()[1];
+    let result = fb.insert_inst(arith::FmaxRelaxed::new(is, a, b), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    mb.build()
+}
+
+/// PROVE item 3 (slice 1, float-semantics type API): on wasm and cranelift,
+/// `FminRelaxed`/`FmaxRelaxed` lower to the EXACT SAME native instruction as
+/// `Fmin`/`Fmax` (`f32.min`/`f32.max`, `fmin`/`fmax`) -- the relaxed contract
+/// is satisfied trivially because native already IS a conforming
+/// implementation, with zero new backend surface. This is a differential/
+/// oracle test proving relaxed == exact bit-for-bit on BOTH backends, over
+/// the SAME edge-input set (normal values, NaN, +-0.0, +-inf) used by
+/// `cross_backend_f32_min_max_nan_zero_inf_differential` above: if this ever
+/// diverges, it means a backend's `FminRelaxed`/`FmaxRelaxed` arm stopped
+/// reusing the exact op's native instruction (e.g. someone "improved" it into
+/// a different lowering), which would be a regression even though it stays
+/// within the relaxed contract's latitude, because wasm/cranelift's whole
+/// design rationale is "zero new backend surface, same instruction".
+#[test]
+fn cranelift_and_wasm_f32_relaxed_minmax_equals_exact_native() {
+    use sonatina_codegen::isa::wasm::WasmBackend;
+
+    let exact_module = build_f32_intrinsics_module();
+    let relaxed_module = build_f32_relaxed_intrinsics_module();
+
+    let cranelift_backend = CraneliftBackend::new();
+    let cranelift_exact = cranelift_backend
+        .compile_module(&exact_module)
+        .expect("cranelift exact compile");
+    let cranelift_relaxed = cranelift_backend
+        .compile_module(&relaxed_module)
+        .expect("cranelift relaxed compile");
+
+    let cl_min: fn(f32, f32) -> f32 = unsafe {
+        std::mem::transmute(cranelift_exact.get_func_ptr::<fn(f32, f32) -> f32>("f32_min").unwrap())
+    };
+    let cl_max: fn(f32, f32) -> f32 = unsafe {
+        std::mem::transmute(cranelift_exact.get_func_ptr::<fn(f32, f32) -> f32>("f32_max").unwrap())
+    };
+    let cl_min_relaxed: fn(f32, f32) -> f32 = unsafe {
+        std::mem::transmute(
+            cranelift_relaxed
+                .get_func_ptr::<fn(f32, f32) -> f32>("f32_min_relaxed")
+                .unwrap(),
+        )
+    };
+    let cl_max_relaxed: fn(f32, f32) -> f32 = unsafe {
+        std::mem::transmute(
+            cranelift_relaxed
+                .get_func_ptr::<fn(f32, f32) -> f32>("f32_max_relaxed")
+                .unwrap(),
+        )
+    };
+
+    let wasm_backend = WasmBackend::new();
+    let wasm_exact_artifact = wasm_backend.compile_module(&exact_module).expect("wasm exact compile");
+    let wasm_relaxed_artifact = wasm_backend.compile_module(&relaxed_module).expect("wasm relaxed compile");
+    wasmparser::validate(&wasm_exact_artifact.bytes).expect("valid exact wasm");
+    wasmparser::validate(&wasm_relaxed_artifact.bytes).expect("valid relaxed wasm");
+    let engine = wasmtime::Engine::default();
+
+    let exact_wasm_module = wasmtime::Module::new(&engine, &wasm_exact_artifact.bytes).expect("load exact wasm");
+    let mut exact_store = wasmtime::Store::new(&engine, ());
+    let exact_instance =
+        wasmtime::Instance::new(&mut exact_store, &exact_wasm_module, &[]).expect("instantiate exact wasm");
+    let wasm_min = exact_instance
+        .get_typed_func::<(f32, f32), f32>(&mut exact_store, "f32_min")
+        .expect("f32_min export");
+    let wasm_max = exact_instance
+        .get_typed_func::<(f32, f32), f32>(&mut exact_store, "f32_max")
+        .expect("f32_max export");
+
+    let relaxed_wasm_module = wasmtime::Module::new(&engine, &wasm_relaxed_artifact.bytes).expect("load relaxed wasm");
+    let mut relaxed_store = wasmtime::Store::new(&engine, ());
+    let relaxed_instance =
+        wasmtime::Instance::new(&mut relaxed_store, &relaxed_wasm_module, &[]).expect("instantiate relaxed wasm");
+    let wasm_min_relaxed = relaxed_instance
+        .get_typed_func::<(f32, f32), f32>(&mut relaxed_store, "f32_min_relaxed")
+        .expect("f32_min_relaxed export");
+    let wasm_max_relaxed = relaxed_instance
+        .get_typed_func::<(f32, f32), f32>(&mut relaxed_store, "f32_max_relaxed")
+        .expect("f32_max_relaxed export");
+
+    let nan_a = f32::from_bits(0x7fc0_1234);
+    let nan_b = f32::NAN;
+    let edge_inputs: &[(f32, f32)] = &[
+        (1.0, 2.0),
+        (2.0, 1.0),
+        (-1.0, 1.0),
+        (0.0, 0.0),
+        (0.0, -0.0),
+        (-0.0, 0.0),
+        (-0.0, -0.0),
+        (f32::INFINITY, 1.0),
+        (f32::NEG_INFINITY, 1.0),
+        (f32::INFINITY, f32::NEG_INFINITY),
+        (nan_a, 1.0),
+        (1.0, nan_a),
+        (nan_a, nan_b),
+        (nan_a, f32::INFINITY),
+    ];
+
+    for &(a, b) in edge_inputs {
+        let cl_min_v = cl_min(a, b);
+        let cl_min_relaxed_v = cl_min_relaxed(a, b);
+        let cl_max_v = cl_max(a, b);
+        let cl_max_relaxed_v = cl_max_relaxed(a, b);
+        let wa_min_v = wasm_min.call(&mut exact_store, (a, b)).expect("wasm min call");
+        let wa_min_relaxed_v = wasm_min_relaxed
+            .call(&mut relaxed_store, (a, b))
+            .expect("wasm min_relaxed call");
+        let wa_max_v = wasm_max.call(&mut exact_store, (a, b)).expect("wasm max call");
+        let wa_max_relaxed_v = wasm_max_relaxed
+            .call(&mut relaxed_store, (a, b))
+            .expect("wasm max_relaxed call");
+
+        // NaN payload/sign is spec-unspecified even for the EXACT op, so
+        // compare NaN-ness for NaN cases and bits otherwise (same convention
+        // as `cross_backend_f32_min_max_nan_zero_inf_differential`).
+        if cl_min_v.is_nan() {
+            assert!(cl_min_relaxed_v.is_nan(), "cranelift min_relaxed({a:?},{b:?}) should be NaN");
+            assert!(wa_min_v.is_nan() && wa_min_relaxed_v.is_nan(), "wasm min/min_relaxed({a:?},{b:?}) should be NaN");
+        } else {
+            assert_eq!(
+                cl_min_v.to_bits(), cl_min_relaxed_v.to_bits(),
+                "cranelift: relaxed min({a:?},{b:?}) must equal exact min bit-for-bit (same native instruction)"
+            );
+            assert_eq!(
+                wa_min_v.to_bits(), wa_min_relaxed_v.to_bits(),
+                "wasm: relaxed min({a:?},{b:?}) must equal exact min bit-for-bit (same native instruction)"
+            );
+        }
+        if cl_max_v.is_nan() {
+            assert!(cl_max_relaxed_v.is_nan(), "cranelift max_relaxed({a:?},{b:?}) should be NaN");
+            assert!(wa_max_v.is_nan() && wa_max_relaxed_v.is_nan(), "wasm max/max_relaxed({a:?},{b:?}) should be NaN");
+        } else {
+            assert_eq!(
+                cl_max_v.to_bits(), cl_max_relaxed_v.to_bits(),
+                "cranelift: relaxed max({a:?},{b:?}) must equal exact max bit-for-bit (same native instruction)"
+            );
+            assert_eq!(
+                wa_max_v.to_bits(), wa_max_relaxed_v.to_bits(),
+                "wasm: relaxed max({a:?},{b:?}) must equal exact max bit-for-bit (same native instruction)"
+            );
+        }
+    }
+}
+
 /// Build a module with `floor(x)`, `ceil(x)`, `trunc(x)`, `round(x)`, all
 /// `f32 -> f32`, using the new `Ffloor`/`Fceil`/`Ftrunc`/`Fround` Sonatina
 /// ops. Mirrors `build_f32_intrinsics_module` above.

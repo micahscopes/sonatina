@@ -3550,6 +3550,127 @@ fn spirv_f32_minmaxabsclamp_lowering_is_exact_and_branch_free() {
     eprintln!("spirv_f32_minmaxabsclamp_lowering_is_exact_and_branch_free OK: {select_count} selects, 0 branches");
 }
 
+/// Slice 1 of the float-semantics design (the typed opt-in,
+/// `/workspace/mb2/FLOAT_SEMANTICS_TYPE_API_DESIGN.md`): THE POINT. Plain
+/// `Fmin`/`Fmax` (reachable from a naive `f32` `min`/`max` in Fe) must keep
+/// paying the pinned-exact ~15-20-op branch-free integer expansion; the new
+/// `FminRelaxed`/`FmaxRelaxed` ops (reachable only through the `Regular`
+/// domain newtype in Fe) must lower to a SINGLE native `MathFunction::Min`/
+/// `Max` WGSL call -- literally `min(...)`/`max(...)`, no bitcast, no
+/// select. Two structurally-identical kernels (same ABI, same op count),
+/// differing only in Fmin/Fmax vs FminRelaxed/FmaxRelaxed, so any WGSL delta
+/// is attributable to the op choice alone, not kernel shape. A third
+/// "baseline" kernel with no min/max at all isolates how many `select(`s the
+/// trailing `F32ToI32` return-ABI conversion contributes on its own, so the
+/// exact-vs-relaxed delta can be attributed precisely.
+#[test]
+fn spirv_f32_min_relaxed_is_single_op_exact_min_is_not() {
+    fn build_kernel(is: &dyn sonatina_ir::InstSetBase, relaxed: bool, with_minmax: bool) -> sonatina_ir::module::Module {
+        let mb = native_module_builder();
+        let name = if with_minmax {
+            if relaxed { "f32_min_relaxed" } else { "f32_min_exact" }
+        } else {
+            "f32_identity_baseline"
+        };
+        let sig = Signature::new_single(name, Linkage::Public, &[Type::I32, Type::I32], Type::I32);
+        let func_ref = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(func_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+
+        let a = fb.args()[0];
+        let b = fb.args()[1];
+        let af = fb.insert_inst(cast::I32ToF32::new(is, a), Type::F32);
+        let bf = fb.insert_inst(cast::I32ToF32::new(is, b), Type::F32);
+
+        let result_f = if !with_minmax {
+            fb.insert_inst(arith::Fadd::new(is, af, bf), Type::F32)
+        } else if relaxed {
+            fb.insert_inst(arith::FminRelaxed::new(is, af, bf), Type::F32)
+        } else {
+            fb.insert_inst(arith::Fmin::new(is, af, bf), Type::F32)
+        };
+        let out = fb.insert_inst(cast::F32ToI32::new(is, result_f), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, out));
+        fb.seal_all();
+        fb.finish();
+
+        mb.build()
+    }
+
+    fn compile_wgsl(module: &sonatina_ir::module::Module) -> String {
+        let backend = SpirvBackend::new().with_workgroup_size(1, 1, 1);
+        let artifact = backend.compile_module(module).expect("kernel must compile to SPIR-V");
+        assert_eq!(artifact.words[0], 0x07230203, "valid SPIR-V magic");
+        artifact.wgsl.as_ref().expect("WGSL side artifact").clone()
+    }
+
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+
+    let baseline_wgsl = compile_wgsl(&build_kernel(is, false, false));
+    let baseline_selects = baseline_wgsl.matches("select(").count();
+
+    let exact_wgsl = compile_wgsl(&build_kernel(is, false, true));
+    let relaxed_wgsl = compile_wgsl(&build_kernel(is, true, true));
+
+    // Relaxed: a single native `min(` call, no extra `select(`s beyond
+    // whatever the I32<->F32 ABI conversion already contributes on its own
+    // (the baseline kernel, which has no min/max at all).
+    assert!(
+        relaxed_wgsl.contains("min("),
+        "expected a native `min(` call in the relaxed WGSL; got:\n{relaxed_wgsl}"
+    );
+    let relaxed_selects = relaxed_wgsl.matches("select(").count();
+    assert_eq!(
+        relaxed_selects, baseline_selects,
+        "FminRelaxed must add ZERO select()s beyond the ABI-conversion baseline \
+         ({baseline_selects}); relaxed WGSL:\n{relaxed_wgsl}"
+    );
+
+    // Exact: the pinned branch-free integer expansion, strictly more
+    // selects than the relaxed kernel (and than the baseline), and no
+    // native `min(` call.
+    assert!(
+        !exact_wgsl.contains("min("),
+        "exact Fmin must NOT lower to a native `min(` call; got:\n{exact_wgsl}"
+    );
+    let exact_selects = exact_wgsl.matches("select(").count();
+    assert!(
+        exact_selects > relaxed_selects,
+        "exact Fmin must cost strictly more select()s than relaxed FminRelaxed \
+         (exact={exact_selects}, relaxed={relaxed_selects}, baseline={baseline_selects})"
+    );
+    assert!(
+        exact_selects >= baseline_selects + 2,
+        "exact Fmin's emit_exact_fminmax must add >= 2 selects (pick + nan-detect) \
+         over the ABI baseline; exact={exact_selects}, baseline={baseline_selects}"
+    );
+
+    for wgsl in [&exact_wgsl, &relaxed_wgsl] {
+        assert!(
+            !wgsl.contains("if ") && !wgsl.contains("else") && !wgsl.contains("loop {"),
+            "both exact and relaxed WGSL must stay branch-free (no if/else/loop); got:\n{wgsl}"
+        );
+        let reparsed = naga::front::wgsl::parse_str(wgsl).expect("naga wgsl-in must reparse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&reparsed)
+        .expect("browser-profile validation must accept the module");
+    }
+
+    eprintln!(
+        "spirv_f32_min_relaxed_is_single_op_exact_min_is_not OK: baseline={baseline_selects} \
+         selects, relaxed={relaxed_selects} selects, exact={exact_selects} selects"
+    );
+    eprintln!("=== EXACT (Fmin) WGSL ===\n{exact_wgsl}");
+    eprintln!("=== RELAXED (FminRelaxed) WGSL ===\n{relaxed_wgsl}");
+}
+
 /// Rounding-family (VERIFY item 2): `Ffloor`/`Fceil`/`Ftrunc`/`Fround` must
 /// each emit a single native `MathFunction` call (`floor`/`ceil`/`trunc`/
 /// `round` in WGSL), no branch/phi, mirroring
