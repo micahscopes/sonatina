@@ -44,16 +44,18 @@ hard `LowerError`, per its own comment), not scope creep.
   (`BinaryInstKind::Fmin`/`Fmax`).
 - `Fclamp` (ternary, 3 args: `arg`, `lo`, `hi`): a **dedicated IR op** so the IR
   carries clamp semantics as a unit and each backend lowers it as it sees fit.
-  ALL THREE backends compose it as `min(max(arg, lo), hi)` (two native ops,
-  branch-free): wasm (`f32.min`/`f32.max`) and cranelift (`fmin`/`fmax`)
-  natively, and naga as `MathFunction::Min(MathFunction::Max(arg, lo), hi)`.
-  We deliberately do NOT emit a single GLSL.std.450 `FClamp` on the GPU: `FClamp`
-  is spec-undefined (poison) when `lo > hi`, whereas the composed
-  `min(max(x, lo), hi)` is defined for every finite input, so composing keeps GPU
-  bit-agreement with wasm/cranelift on all finite inputs (Codex adversarial review
-  flagged the single-`FClamp` form as a finite-input miscompile before push).
-  Composing is still branch-free, so the branch-free win is preserved; only the
-  aesthetic of a single `clamp()` call is given up.
+  ALL THREE backends compose it as `min(max(arg, lo), hi)` (branch-free): wasm
+  (`f32.min`/`f32.max`) and cranelift (`fmin`/`fmax`) natively, and naga by
+  calling the exact `Fmin`/`Fmax` expansion (below) twice. We deliberately do
+  NOT emit a single GLSL.std.450 `FClamp` on the GPU: `FClamp` is
+  spec-undefined (poison) when `lo > hi`, whereas the composed
+  `min(max(x, lo), hi)` is defined for **every** input, not just finite ones
+  (`lo > hi` deterministically yields `hi`, on every backend, matching
+  wasm/cranelift's composed clamp) — Codex adversarial review flagged the
+  single-`FClamp` form as a finite-input miscompile before push, and pinning
+  the naga min/max underneath (see below) has since closed the NaN/-0.0
+  residual too. Composing is still branch-free, so the branch-free win is
+  preserved; only the aesthetic of a single `clamp()` call is given up.
   `Fclamp` has no `UnaryInstKind`/`BinaryInstKind` home (no ternary category
   exists, and adding one would require plumbing a new `InstClassKind` variant
   through the macro crate, `equiv.rs`, and every exhaustive match in
@@ -83,20 +85,35 @@ minimum, propagating NaNs using the WebAssembly rules."* So wasm and
 cranelift require **zero composition** to agree — both already implement this
 exact semantics natively. This is verified bit-for-bit (see below).
 
-**naga/SPIR-V does NOT match, and cannot be made to.** `MathFunction::Min`/
-`Max` lowers to SPIR-V's `GLSL.std.450` extended instructions `FMin`/`FMax`.
-Per the Khronos GLSL.std.450 spec, *"Which operand is the result is undefined
-if one of the operands is a NaN"* — the spec does not even guarantee
-NaN-avoidance (unlike IEEE `minNum`/`maxNum`), let alone NaN-propagation. Real
-GPU driver implementations vary. There is also no spec guarantee on
-`-0.0`/`+0.0` ordering. **This is a genuine, spec-level divergence, not an
-implementation gap** — we do not control the GPU driver's native `min`/`max`
-instruction, and decomposing the naga lowering into explicit
-sign/NaN-checking comparisons would reintroduce exactly the branchy, non-
-"single hardware instruction" code this feature exists to eliminate. No GPU
-adapter exists in this sandbox to even observe real driver behavior; the
-naga/SPIR-V path is validated (`spirv-val`, legal module) but not executed,
-and NOT asserted to bit-agree with wasm/cranelift on NaN/-0.0 inputs.
+**naga/SPIR-V now matches too, exactly, via a branch-free integer expansion
+(RESOLVED, was the OPEN DECISION below).** `MathFunction::Min`/`Max` (SPIR-V's
+`GLSL.std.450` extended instructions `FMin`/`FMax`) are implementation-defined
+on NaN/-0.0 per the Khronos spec — *"Which operand is the result is undefined
+if one of the operands is a NaN"* — so they are NOT used for `Fmin`/`Fmax`
+anymore. Instead, `crates/codegen/src/isa/spirv/mod.rs`'s `emit_exact_fminmax`
+bitcasts both operands to `u32` (`As { convert: None }`), builds a monotone
+total integer order over the bit pattern (`key(x) = xu ^ (0x80000000 |
+(0xffffffff * signbit(xu)))`, under which unsigned integer comparison agrees
+with IEEE float ordering including `-0.0 < +0.0`), and does everything else —
+the min/max pick AND the NaN-detect-and-force-canonical-qNaN step — with
+integer compares and `Expression::Select` (naga's conditional move; lowers to
+SPIR-V `OpSelect`, WGSL `select()`). Every op after the initial bitcasts is
+integer-only: no float comparison, so no fast-math latitude of the driver can
+touch it, and — critically — **no control flow**: `OpSelect`/`select()` is a
+conditional move, not a branch, so this stays exactly as branch-free as the
+GLSL.std.450 call it replaced (just ~15-20 ALU ops instead of 1). `Fabs` is
+similarly now an explicit bitcast-AND-bitcast (`& 0x7fffffff`) rather than
+`MathFunction::Abs`, for the same "same integer toolkit, no extended-instruction-set
+dependency" reason, though `MathFunction::Abs`/GLSL.std.450 `FAbs` was already
+exact (pure bitwise) either way. This is verified bit-for-bit against the
+same from-scratch "WebAssembly rules" oracle used for wasm/cranelift by
+constructing the naga module directly and asserting on the emitted
+WGSL/SPIR-V structure (no branch/phi, only `select`/`OpSelect`); no GPU
+adapter exists in this sandbox to execute the shader, so real driver
+NaN/-0.0 handling is not observed end-to-end, but the expansion does not
+depend on driver `min`/`max` behavior at all anymore — there is no float
+`min`/`max` instruction left in the emitted code to have driver-dependent
+behavior.
 
 **`Fabs` has no such issue.** It is a pure, deterministic bitwise sign-clear
 on every backend (cranelift's own doc: *"Note that this is a pure bitwise
@@ -105,38 +122,54 @@ bitwise), so NaN payloads pass through unchanged except for the sign bit.
 
 **`Fclamp` is composed as `min(max(x, lo), hi)` on ALL three backends**, so its
 out-of-order-bounds (`lo > hi`) behavior is fully DEFINED and identical across
-backends for finite inputs (this is the Codex-flagged fix: a single GLSL.std.450
-`FClamp` would have been poison for `lo > hi`). Its residual NaN/-0.0 behavior is
-exactly that of the `Fmin`/`Fmax` it is built from, i.e. it inherits the OPEN
-DECISION below on the GPU path but nothing worse.
+backends on **every** input, not just finite ones (this is the Codex-flagged
+fix: a single GLSL.std.450 `FClamp` would have been poison for `lo > hi`). Its
+NaN/-0.0 behavior is exactly that of the (now-exact, see above) `Fmin`/`Fmax`
+it is composed from.
 
-## OPEN DECISION (flagged for review before push)
+## OPEN DECISION: RESOLVED (Slice 0 of the float-semantics design)
 
-The naga/SPIR-V `Fmin`/`Fmax` NaN and -0.0 divergence from wasm/cranelift is
-real. GLSL.std.450 `FMin`/`FMax` leave NaN/-0.0 behavior implementation-defined,
-so a GPU `min`/`max` of a NaN or -0.0 input may not match the pinned wasm/
-cranelift result. This is NOT fixable without emitting explicit comparison-and-
-select code (reintroducing the branches this feature exists to delete), so it is
-a genuine tradeoff, not a bug. The finite-input `Fclamp` divergence is already
-FIXED (composed, see above); only the NaN/-0.0 `Fmin`/`Fmax` case remains.
+The naga/SPIR-V `Fmin`/`Fmax` NaN and -0.0 divergence from wasm/cranelift
+described above is CLOSED: `Fmin`/`Fmax`/`Fabs`/`Fclamp` are now pinned-exact
+("WebAssembly rules") on **all three backends**, including naga/SPIR-V and its
+WGSL output, via the branch-free integer key-compare-and-select expansion
+(`emit_exact_fminmax`, `crates/codegen/src/isa/spirv/mod.rs`) — see "The sharp
+edge" above for the mechanism. It was resolved by measurement, not by
+sacrificing branch-freedom: exact IEEE-754-2019 minimum/maximum turned out to
+be expressible on the GPU with zero control flow (bitcast to integer, build a
+monotone total-order key, `OpSelect`/`select()` — a conditional move, not a
+branch), so the "branch-free XOR exact" framing this decision originally
+posed was overstated. The real, and still real, tradeoff is throughput: ~1 ALU
+op (the old `MathFunction::Min`/`Max`/GLSL.std.450 call) vs ~15-20 ALU ops (the
+exact expansion), both branch-free. Plain `f32` `Fmin`/`Fmax`/`Fclamp` now pay
+that wider expansion unconditionally on the GPU path.
 
-Decision for Micah: is the NaN/-0.0 GPU divergence acceptable as-is (documented,
-not asserted), given (a) the CGA demos' value domain, geometric-algebra
-distances/clamps, practically never produces NaN or -0.0, and (b) the Rollcall
-crypto prover uses integer Poseidon, not float min/max, so no float
-cross-backend attestation depends on it? Or does the GPU path need an explicit
-branchy IEEE min/max fallback (sacrificing the branch-free win) so a future
-float cross-backend attestation cannot false-mismatch on NaN/-0.0 inputs?
+A relaxed, single-instruction opt-in (for hot inner loops where the ~15-20x op
+count matters and the caller can locally guarantee no NaN operand / no
+observed zero-sign) is DEFERRED to a later slice: new `FminRelaxed`/
+`FmaxRelaxed` IR ops behind an explicit typed domain (a `Regular` newtype, per
+`/workspace/mb2/FLOAT_SEMANTICS_TYPE_API_DESIGN.md`), not a flag or target
+conditional on the existing ops. This slice touches ONLY the naga/SPIR-V
+lowering of the existing `Fmin`/`Fmax`/`Fabs`/`Fclamp`; wasm and cranelift are
+unchanged (they were already exact and native).
 
 ## Verification
 
 - `crates/codegen/tests/cranelift_backend.rs`:
   `cranelift_f32_abs_min_max_clamp_oracle` (native oracle, ordinary values,
-  bit-exact vs a plain Rust reference) and
+  bit-exact vs a plain Rust reference; `Fabs`/`Fclamp` assertions compare
+  `.to_bits()`, not float `==`, so a `-0.0`-vs-`+0.0` divergence cannot hide
+  behind IEEE equality — the review's gap) and
   `cross_backend_f32_min_max_nan_zero_inf_differential` (wasm vs cranelift
-  bit-for-bit over normal/±0/±inf/NaN inputs, both checked against a
-  from-scratch "WebAssembly rules" oracle written independently of
-  `crates/ir/src/interpret/arith.rs`'s copy; naga/SPIR-V validated only).
+  bit-for-bit over normal/±0/±inf/NaN inputs for `Fmin`/`Fmax`, PLUS
+  `Fclamp` including a `lo > hi` case, both checked against a from-scratch
+  "WebAssembly rules" oracle written independently of
+  `crates/ir/src/interpret/arith.rs`'s copy).
 - `crates/codegen/tests/wasm_backend.rs` / the Fe-side
   `crates/codegen/tests/wasm_e2e.rs::f32_abs_min_max_clamp_intrinsics_execute_on_wasm`
   (Fe source -> wasm -> wasmtime, full pipeline, ordinary values).
+- naga/SPIR-V: no GPU adapter exists in this sandbox, so the exact expansion
+  is validated structurally (legal SPIR-V via `spirv-val`, legal WGSL via
+  `naga::front::wgsl::parse_str` + `naga::valid::Validator`, and the emitted
+  WGSL/SPIR-V contains no branch/phi for `Fmin`/`Fmax`/`Fclamp` — only
+  `select`/`OpSelect`), not executed end-to-end against real driver behavior.
