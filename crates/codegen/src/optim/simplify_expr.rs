@@ -375,7 +375,11 @@ pub(crate) fn simplify_unary_with_same_inner(
         | UnaryInstKind::EvmClz
         | UnaryInstKind::Fneg
         | UnaryInstKind::Fsqrt
-        | UnaryInstKind::Fabs => {
+        | UnaryInstKind::Fabs
+        | UnaryInstKind::Ffloor
+        | UnaryInstKind::Fceil
+        | UnaryInstKind::Ftrunc
+        | UnaryInstKind::Fround => {
             SimplifyExprResult::NoChange
         }
     }

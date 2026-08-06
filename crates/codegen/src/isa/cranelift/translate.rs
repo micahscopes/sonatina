@@ -289,6 +289,35 @@ fn translate_function(
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
                 }
+            } else if let Some(ffloor) = <&sonatina_ir::inst::arith::Ffloor as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let val = resolve_value(function, *ffloor.arg(), &value_map, &mut builder)?;
+                // Rounding family: single native instruction each, no
+                // bit-twiddling, no NaN/-0 subtlety.
+                let result_val = builder.ins().floor(val);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fceil) = <&sonatina_ir::inst::arith::Fceil as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let val = resolve_value(function, *fceil.arg(), &value_map, &mut builder)?;
+                let result_val = builder.ins().ceil(val);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(ftrunc) = <&sonatina_ir::inst::arith::Ftrunc as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let val = resolve_value(function, *ftrunc.arg(), &value_map, &mut builder)?;
+                let result_val = builder.ins().trunc(val);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
+            } else if let Some(fround) = <&sonatina_ir::inst::arith::Fround as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                let val = resolve_value(function, *fround.arg(), &value_map, &mut builder)?;
+                // cranelift's `nearest` doc: "Round floating point round to
+                // integral, towards nearest with ties to even" -- exactly
+                // `Fround`'s pinned `roundTiesToEven` semantics.
+                let result_val = builder.ins().nearest(val);
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    value_map.insert(result, result_val);
+                }
             } else if let Some(fclamp) = <&sonatina_ir::inst::arith::Fclamp as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let arg = resolve_value(function, *fclamp.arg(), &value_map, &mut builder)?;
                 let lo = resolve_value(function, *fclamp.lo(), &value_map, &mut builder)?;

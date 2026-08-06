@@ -11,6 +11,10 @@ super::impl_inst_build! {Fabs, (arg: ValueId)}
 super::impl_inst_build! {Fmin, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Fmax, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Fclamp, (arg: ValueId, lo: ValueId, hi: ValueId)}
+super::impl_inst_build! {Ffloor, (arg: ValueId)}
+super::impl_inst_build! {Fceil, (arg: ValueId)}
+super::impl_inst_build! {Ftrunc, (arg: ValueId)}
+super::impl_inst_build! {Fround, (arg: ValueId)}
 super::impl_inst_build! {Add, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Uaddo, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Uaddsat, (lhs: ValueId, rhs: ValueId)}

@@ -111,6 +111,30 @@ impl VerifyInst for arith::Fabs {
     }
 }
 
+impl VerifyInst for arith::Ffloor {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_unary_f32(verifier, inst_id, *self.arg(), "ffloor");
+    }
+}
+
+impl VerifyInst for arith::Fceil {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_unary_f32(verifier, inst_id, *self.arg(), "fceil");
+    }
+}
+
+impl VerifyInst for arith::Ftrunc {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_unary_f32(verifier, inst_id, *self.arg(), "ftrunc");
+    }
+}
+
+impl VerifyInst for arith::Fround {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_unary_f32(verifier, inst_id, *self.arg(), "fround");
+    }
+}
+
 impl VerifyInst for arith::Fclamp {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
         let location = verifier.inst_location(inst_id);

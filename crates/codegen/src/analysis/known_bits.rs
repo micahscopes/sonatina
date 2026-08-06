@@ -355,7 +355,11 @@ impl KnownBitsQuery {
             | UnaryInstKind::EvmClz
             | UnaryInstKind::Fneg
             | UnaryInstKind::Fsqrt
-            | UnaryInstKind::Fabs => {
+            | UnaryInstKind::Fabs
+            | UnaryInstKind::Ffloor
+            | UnaryInstKind::Fceil
+            | UnaryInstKind::Ftrunc
+            | UnaryInstKind::Fround => {
                 KnownBits::unknown(ty)
             }
         }

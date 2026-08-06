@@ -3549,3 +3549,90 @@ fn spirv_f32_minmaxabsclamp_lowering_is_exact_and_branch_free() {
 
     eprintln!("spirv_f32_minmaxabsclamp_lowering_is_exact_and_branch_free OK: {select_count} selects, 0 branches");
 }
+
+/// Rounding-family (VERIFY item 2): `Ffloor`/`Fceil`/`Ftrunc`/`Fround` must
+/// each emit a single native `MathFunction` call (`floor`/`ceil`/`trunc`/
+/// `round` in WGSL), no branch/phi, mirroring
+/// `spirv_f32_minmaxabsclamp_lowering_is_exact_and_branch_free` above.
+/// `Fround` in particular must reparse/validate as WGSL's `round()`, which is
+/// ties-to-even by spec (matching wasm `f32.nearest`/cranelift `nearest`);
+/// this test does not (and cannot, no GPU adapter here) execute the shader,
+/// so the ties-to-even claim itself is pinned by the naga source-level check
+/// in `arith::Fround`'s doc comment plus `cranelift_backend.rs`'s oracle, not
+/// here -- this test only asserts the *shape* of the emitted code.
+#[test]
+fn spirv_f32_rounding_lowering_is_exact_and_branch_free() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    let sig = Signature::new_single(
+        "f32_rounding", Linkage::Public, &[Type::I32], Type::I32,
+    );
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let a = fb.args()[0];
+    let af = fb.insert_inst(cast::I32ToF32::new(is, a), Type::F32);
+
+    let floor = fb.insert_inst(arith::Ffloor::new(is, af), Type::F32);
+    let ceil = fb.insert_inst(arith::Fceil::new(is, af), Type::F32);
+    let trunc = fb.insert_inst(arith::Ftrunc::new(is, af), Type::F32);
+    let round = fb.insert_inst(arith::Fround::new(is, af), Type::F32);
+
+    let s1 = fb.insert_inst(arith::Fadd::new(is, floor, ceil), Type::F32);
+    let s2 = fb.insert_inst(arith::Fadd::new(is, s1, trunc), Type::F32);
+    let s3 = fb.insert_inst(arith::Fadd::new(is, s2, round), Type::F32);
+    let out = fb.insert_inst(cast::F32ToI32::new(is, s3), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, out));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new().with_workgroup_size(1, 1, 1);
+    let artifact = backend
+        .compile_module(&module)
+        .expect("rounding-family kernel must compile to SPIR-V");
+    assert_eq!(artifact.words[0], 0x07230203, "valid SPIR-V magic");
+
+    let wgsl = artifact.wgsl.as_ref().expect("WGSL side artifact");
+
+    assert!(
+        !wgsl.contains("if ") && !wgsl.contains("else") && !wgsl.contains("loop {"),
+        "rounding-family WGSL must be branch-free (no if/else/loop); got:\n{wgsl}"
+    );
+    for (op, wgsl_fn) in [
+        (stringify!(Ffloor), "floor("),
+        (stringify!(Fceil), "ceil("),
+        (stringify!(Ftrunc), "trunc("),
+        (stringify!(Fround), "round("),
+    ] {
+        assert!(
+            wgsl.contains(wgsl_fn),
+            "expected a single native `{wgsl_fn}` call for {op}; WGSL:\n{wgsl}"
+        );
+    }
+    // Unlike the exact Fmin/Fmax expansion, the rounding family has no
+    // NaN/-0.0 ambiguity to work around, so each op is a single
+    // `MathFunction` `OpExtInst`/WGSL call, not an integer expansion: the
+    // `floor(`/`ceil(`/`trunc(`/`round(` containment checks above already
+    // pin that "single call, no branch" shape. (The kernel's trailing
+    // `F32ToI32` return-ABI conversion legitimately emits its own
+    // `select(`s for saturation -- unrelated to this family -- so this test
+    // does not assert a global "zero select" count.)
+
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse the rounding-family WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation must accept the rounding-family module");
+
+    eprintln!("spirv_f32_rounding_lowering_is_exact_and_branch_free OK: floor/ceil/trunc/round all single-OpExtInst, 0 branches, 0 selects");
+}

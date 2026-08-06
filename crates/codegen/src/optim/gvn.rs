@@ -140,7 +140,11 @@ fn make_gvn_unary_key(
         | UnaryInstKind::EvmClz
         | UnaryInstKind::Fneg
         | UnaryInstKind::Fsqrt
-        | UnaryInstKind::Fabs => {
+        | UnaryInstKind::Fabs
+        | UnaryInstKind::Ffloor
+        | UnaryInstKind::Fceil
+        | UnaryInstKind::Ftrunc
+        | UnaryInstKind::Fround => {
             None
         }
     }
@@ -1057,7 +1061,13 @@ impl GvnSolver {
                 UnaryInstKind::Not => !arg,
                 UnaryInstKind::IsZero => fold_result_imm(arg.is_zero().into(), result_ty)?,
                 UnaryInstKind::EvmClz => fold_evm_clz(arg)?,
-                UnaryInstKind::Fneg | UnaryInstKind::Fsqrt | UnaryInstKind::Fabs => return None,
+                UnaryInstKind::Fneg
+                | UnaryInstKind::Fsqrt
+                | UnaryInstKind::Fabs
+                | UnaryInstKind::Ffloor
+                | UnaryInstKind::Fceil
+                | UnaryInstKind::Ftrunc
+                | UnaryInstKind::Fround => return None,
             }
         } else if let InstClassKind::Binary(kind) = insn_expr.kind() {
             let (lhs, rhs) = insn_expr.binary_args()?;
