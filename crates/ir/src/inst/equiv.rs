@@ -40,6 +40,8 @@ pub enum BinaryInstKind {
     Fdiv,
     Fmin,
     Fmax,
+    FminRelaxed,
+    FmaxRelaxed,
     Feq,
     Flt,
     Fle,

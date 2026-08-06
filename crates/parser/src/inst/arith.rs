@@ -10,6 +10,8 @@ super::impl_inst_build! {Fsqrt, (arg: ValueId)}
 super::impl_inst_build! {Fabs, (arg: ValueId)}
 super::impl_inst_build! {Fmin, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Fmax, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {FminRelaxed, (lhs: ValueId, rhs: ValueId)}
+super::impl_inst_build! {FmaxRelaxed, (lhs: ValueId, rhs: ValueId)}
 super::impl_inst_build! {Fclamp, (arg: ValueId, lo: ValueId, hi: ValueId)}
 super::impl_inst_build! {Ffloor, (arg: ValueId)}
 super::impl_inst_build! {Fceil, (arg: ValueId)}

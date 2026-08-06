@@ -165,6 +165,34 @@ impl Interpret for Fmax {
     }
 }
 
+/// `FminRelaxed`/`FmaxRelaxed` evaluate AS EXACT: the canonical refinement of
+/// the relaxed "any latitude" contract, chosen so const-eval stays
+/// deterministic and backend-independent (a program CTFE-folding a relaxed
+/// min/max gets the same answer regardless of which backend eventually runs
+/// it). Reuses the same `wasm_rules_fmin`/`wasm_rules_fmax` pinned functions
+/// as `Fmin`/`Fmax` above.
+impl Interpret for FminRelaxed {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(binary_f32(
+            state.lookup_val(*self.lhs()),
+            state.lookup_val(*self.rhs()),
+            wasm_rules_fmin,
+        ))
+    }
+}
+
+impl Interpret for FmaxRelaxed {
+    fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
+        state.set_action(Action::Continue);
+        single_result(binary_f32(
+            state.lookup_val(*self.lhs()),
+            state.lookup_val(*self.rhs()),
+            wasm_rules_fmax,
+        ))
+    }
+}
+
 impl Interpret for Neg {
     fn interpret(&self, state: &mut dyn State) -> super::EvalResults {
         state.set_action(Action::Continue);

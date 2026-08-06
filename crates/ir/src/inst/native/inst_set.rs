@@ -15,6 +15,8 @@ pub struct NativeInstSet(
     arith::Fabs,
     arith::Fmin,
     arith::Fmax,
+    arith::FminRelaxed,
+    arith::FmaxRelaxed,
     arith::Fclamp,
     arith::Ffloor,
     arith::Fceil,

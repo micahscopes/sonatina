@@ -25,6 +25,8 @@ define_inst_set_base! {
         arith::Fabs,
         arith::Fmin,
         arith::Fmax,
+        arith::FminRelaxed,
+        arith::FmaxRelaxed,
         arith::Fclamp,
         arith::Ffloor,
         arith::Fceil,

@@ -8,6 +8,18 @@ Added on branch `backend-numeric-intrinsics` (off `04d3ec91`): `Fabs`, `Fmin`,
 native instruction on every backend, no bit-twiddling). See "The rounding
 family" section below.
 
+**UPDATE (slice 1 of the float-semantics type API, on top of the Slice 0
+NaN/-0 fix): `FminRelaxed`/`FmaxRelaxed` added.** See "The relaxed pair"
+section below. Summary: two NEW `BinaryInstKind` variants, never merged with
+`Fmin`/`Fmax`, carrying a DIFFERENT, weaker contract ("any IEEE
+`minNum`/`maxNum`-family latitude on NaN/-0.0, exact otherwise") that wasm's
+native `f32.min`/`f32.max` and cranelift's native `fmin`/`fmax` already
+satisfy trivially (same instruction, zero new backend surface on those two
+targets), and that naga/SPIR-V satisfies via the single `MathFunction::Min`/
+`Max` GLSL op -- the pre-Slice-0 `Fmin`/`Fmax` lowering, relocated here. The
+opt-in is reached only through Fe's `Regular` domain newtype
+(`/workspace/mb2/FLOAT_SEMANTICS_TYPE_API_DESIGN.md`), never from plain `f32`.
+
 ## The template: `Fsqrt`
 
 Traced end-to-end before writing anything:
@@ -193,6 +205,80 @@ backends on **every** input, not just finite ones (this is the Codex-flagged
 fix: a single GLSL.std.450 `FClamp` would have been poison for `lo > hi`). Its
 NaN/-0.0 behavior is exactly that of the (now-exact, see above) `Fmin`/`Fmax`
 it is composed from.
+
+## The relaxed pair: FminRelaxed/FmaxRelaxed (Slice 1 of the float-semantics type API)
+
+`Fmin`/`Fmax`/`Fabs`/`Fclamp` are pinned-exact everywhere (above); that is the
+safe DEFAULT, but it costs the GPU path ~15-20 branch-free ALU ops per
+min/max where a single native instruction would do. Slice 1 adds an
+explicit, narrower, TYPED opt-in for hot loops that can locally guarantee "no
+NaN operand, zero-sign of the result never observed": `FminRelaxed`/
+`FmaxRelaxed`, two new `BinaryInstKind` variants with a contract that is
+honestly WEAKER than `Fmin`/`Fmax`'s, not merely "the same op, relaxed by a
+flag":
+
+> Any behavior within IEEE 754-2019 `minNum`/`maxNum`-family latitude on NaN
+> operands and signed-zero ties is a conforming result; exact (the `Fmin`/
+> `Fmax` answer) is always inside that latitude, so an exact implementation
+> of `FminRelaxed`/`FmaxRelaxed` is also conforming.
+
+This is the direct fix for "one IR opcode cannot safely have different
+target semantics": instead of a flag or capability gating a single op's
+lowering, there are now TWO opcodes, each satisfied honestly by every
+backend's chosen lowering:
+
+- **wasm**: `f32.min`/`f32.max` -- the SAME native instruction `Fmin`/`Fmax`
+  already use. Native wasm min/max already implements the pinned-exact
+  "WebAssembly rules", which is inside the relaxed latitude, so this is zero
+  new backend surface: the wasm arm for `FminRelaxed`/`FmaxRelaxed` is
+  textually identical to the `Fmin`/`Fmax` arm, just reading a different IR
+  op (`crates/codegen/src/isa/wasm/translate.rs`).
+- **cranelift**: `fmin`/`fmax` -- same reasoning, same instruction as `Fmin`/
+  `Fmax` (`crates/codegen/src/isa/cranelift/translate.rs`).
+- **naga/SPIR-V**: `naga::Expression::Math { fun: MathFunction::Min/Max }` --
+  the single GLSL.std.450 `FMin`/`FMax` extended instruction, implementation-
+  defined on NaN/-0.0 per the Khronos spec. This is the PRE-Slice-0 lowering
+  `Fmin`/`Fmax` used to have (relocated, not deleted): 1 ALU op instead of
+  the ~15-20-op `emit_exact_fminmax` expansion `Fmin`/`Fmax` now require
+  (`crates/codegen/src/isa/spirv/mod.rs`).
+- **interpreter/CTFE**: evaluate AS EXACT (`wasm_rules_fmin`/`wasm_rules_fmax`,
+  the same functions `Fmin`/`Fmax` use) -- the canonical refinement of "any
+  latitude", chosen so const-eval stays deterministic and backend-
+  independent. A program that CTFE-folds a relaxed min/max gets the same
+  answer regardless of which backend eventually executes it.
+- **verifier**: mirrors `verify_binary_f32` (same f32-typed-operands rule as
+  `Fmin`/`Fmax`).
+- **GVN/SCCP/equivalence**: new `BinaryInstKind` entries, NEVER merged with
+  the exact `Fmin`/`Fmax` kinds (conservative: folding relaxed results INTO
+  exact code would be sound since exact is inside the relaxed latitude, but
+  folding exact results into relaxed reasoning would not be, so this skips
+  both directions rather than trying to encode the one-way relationship).
+  Constant folding across `FminRelaxed`/`FmaxRelaxed` is declined the same
+  way it already is for `Fmin`/`Fmax` (no float constant folding at this
+  layer at all, `crates/codegen/src/optim/{gvn,sccp_simplify,simplify_expr}.rs`).
+- **EVM**: not registered in `EvmInstSet`/`EvmMachineInstSet` at all (same as
+  every other float op) -- fails closed by omission, no separate guard
+  needed.
+
+No new IR ternary op for a "relaxed clamp": `Regular::clamp` in Fe is
+composed as `self.max(lo).min(hi)` from the relaxed min/max, mirroring
+`Fclamp`'s own `min(max(x,lo),hi)` composition and, for the identical
+poison-avoidance reason, staying defined (not `FClamp`-poison) when
+`lo > hi`. GPU cost: 2 GLSL ops, matching today's composed-`Fclamp` shape.
+
+Verification: `crates/codegen/tests/spirv_backend.rs`'s
+`spirv_f32_min_relaxed_is_single_op_exact_min_is_not` builds two
+structurally-identical kernels (same ABI, same op count) differing only in
+`Fmin` vs `FminRelaxed`, and asserts the relaxed WGSL contains a native
+`min(` call with ZERO extra `select()`s beyond the I32<->F32 ABI-conversion
+baseline, while the exact WGSL contains no `min(` call at all and strictly
+more `select()`s. `crates/codegen/tests/cranelift_backend.rs`'s
+`cranelift_and_wasm_f32_relaxed_minmax_equals_exact_native` is a
+differential/oracle test proving relaxed == exact bit-for-bit on BOTH wasm
+and cranelift over the full NaN/±0.0/±inf edge-input set (same set used by
+`cross_backend_f32_min_max_nan_zero_inf_differential`): on those two
+backends the relaxed op is not merely "conforming", it is IDENTICAL, because
+it is the same native instruction.
 
 ## OPEN DECISION: RESOLVED (Slice 0 of the float-semantics design)
 
