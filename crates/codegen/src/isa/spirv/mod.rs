@@ -434,9 +434,16 @@ fn emit_single_inst(
             let arg = resolve_naga_value(*op.arg(), function, word, value_map, phi_locals, func).unwrap();
             let lo = resolve_naga_value(*op.lo(), function, word, value_map, phi_locals, func).unwrap();
             let hi = resolve_naga_value(*op.hi(), function, word, value_map, phi_locals, func).unwrap();
-            // This is the ONE hardware-native win this feature is chasing: a single
-            // `OpExtInst FClamp` / WGSL `clamp()` call, no branches.
-            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Clamp, arg, arg1: Some(lo), arg2: Some(hi), arg3: None }, naga::Span::UNDEFINED);
+            // Compose as min(max(arg, lo), hi) rather than a single GLSL.std.450 `FClamp`.
+            // GLSL.std.450 `FClamp` is spec-undefined (poison) when lo > hi, whereas the
+            // pinned wasm/cranelift semantics (min(max(x, lo), hi)) are defined for ALL
+            // finite inputs. Composing from Max then Min keeps GPU bit-agreement with
+            // wasm/cranelift on every finite input and stays branch-free (two OpExtInst,
+            // no control flow). The residual NaN/-0.0 divergence of Min/Max (the OPEN
+            // DECISION, see the Fmin/Fmax notes above) is inherited unchanged, not widened.
+            let max_h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Max, arg, arg1: Some(lo), arg2: None, arg3: None }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(max_h, max_h)), naga::Span::UNDEFINED);
+            let h = func.expressions.append(naga::Expression::Math { fun: naga::MathFunction::Min, arg: max_h, arg1: Some(hi), arg2: None, arg3: None }, naga::Span::UNDEFINED);
             target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
             value_map.insert(result, h);
             return true;

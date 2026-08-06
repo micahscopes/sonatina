@@ -42,15 +42,18 @@ hard `LowerError`, per its own comment), not scope creep.
 - `Fabs` (unary, 1 arg): mirrors `Fsqrt` exactly (`UnaryInstKind::Fabs`).
 - `Fmin`, `Fmax` (binary, 2 args): mirror `Fadd`/`Fsub`/etc
   (`BinaryInstKind::Fmin`/`Fmax`).
-- `Fclamp` (ternary, 3 args: `arg`, `lo`, `hi`): a **dedicated** op, not
-  composed as `Fmin(Fmax(x, lo), hi)` at this layer. Rationale: naga's
-  `MathFunction::Clamp` is a genuine single hardware instruction
-  (`GLSL.std.450 FClamp` / WGSL `clamp()`), which is the actual motivating win
-  ("branch-free single hardware instructions") for the GPU backend — composing
-  it from two ops at the IR level would forever prevent naga from ever
-  emitting a single `clamp()` call. wasm and cranelift have no native clamp
-  instruction either way, so they compose it as `min(max(arg, lo), hi)`
-  (documented at each backend's lowering site; both compose identically).
+- `Fclamp` (ternary, 3 args: `arg`, `lo`, `hi`): a **dedicated IR op** so the IR
+  carries clamp semantics as a unit and each backend lowers it as it sees fit.
+  ALL THREE backends compose it as `min(max(arg, lo), hi)` (two native ops,
+  branch-free): wasm (`f32.min`/`f32.max`) and cranelift (`fmin`/`fmax`)
+  natively, and naga as `MathFunction::Min(MathFunction::Max(arg, lo), hi)`.
+  We deliberately do NOT emit a single GLSL.std.450 `FClamp` on the GPU: `FClamp`
+  is spec-undefined (poison) when `lo > hi`, whereas the composed
+  `min(max(x, lo), hi)` is defined for every finite input, so composing keeps GPU
+  bit-agreement with wasm/cranelift on all finite inputs (Codex adversarial review
+  flagged the single-`FClamp` form as a finite-input miscompile before push).
+  Composing is still branch-free, so the branch-free win is preserved; only the
+  aesthetic of a single `clamp()` call is given up.
   `Fclamp` has no `UnaryInstKind`/`BinaryInstKind` home (no ternary category
   exists, and adding one would require plumbing a new `InstClassKind` variant
   through the macro crate, `equiv.rs`, and every exhaustive match in
@@ -100,22 +103,30 @@ on every backend (cranelift's own doc: *"Note that this is a pure bitwise
 operation"*; wasm `f32.abs` and GLSL.std.450 `FAbs` are equivalently
 bitwise), so NaN payloads pass through unchanged except for the sign bit.
 
-**`Fclamp`'s composition inherits the same caveat two levels down** on wasm/
-cranelift (`min(max(x, lo), hi)`, both native, both pinned), but on naga it is
-a single opaque `FClamp` call, whose own NaN/out-of-order-bounds behavior is
-likewise implementation-defined (naga's own SPIR-V backend comment: *"Clamp is
-undefined if min > max"*).
+**`Fclamp` is composed as `min(max(x, lo), hi)` on ALL three backends**, so its
+out-of-order-bounds (`lo > hi`) behavior is fully DEFINED and identical across
+backends for finite inputs (this is the Codex-flagged fix: a single GLSL.std.450
+`FClamp` would have been poison for `lo > hi`). Its residual NaN/-0.0 behavior is
+exactly that of the `Fmin`/`Fmax` it is built from, i.e. it inherits the OPEN
+DECISION below on the GPU path but nothing worse.
 
 ## OPEN DECISION (flagged for review before push)
 
-The naga/SPIR-V Fmin/Fmax/Fclamp NaN and -0.0 divergence from wasm/cranelift
-is real and, as far as this sandbox can determine, not fixable without
-sacrificing the single-hardware-instruction win. It is a spec-level property
-of GLSL.std.450, not a bug in this implementation. Flagging for Micah/Codex
-review before the sonatina branch is pushed: is this divergence acceptable
-given the demo's actual value domain (geometric-algebra distances/clamps,
-which practically never produce NaN or -0.0), or does it need an explicit
-guard/fallback for the GPU path?
+The naga/SPIR-V `Fmin`/`Fmax` NaN and -0.0 divergence from wasm/cranelift is
+real. GLSL.std.450 `FMin`/`FMax` leave NaN/-0.0 behavior implementation-defined,
+so a GPU `min`/`max` of a NaN or -0.0 input may not match the pinned wasm/
+cranelift result. This is NOT fixable without emitting explicit comparison-and-
+select code (reintroducing the branches this feature exists to delete), so it is
+a genuine tradeoff, not a bug. The finite-input `Fclamp` divergence is already
+FIXED (composed, see above); only the NaN/-0.0 `Fmin`/`Fmax` case remains.
+
+Decision for Micah: is the NaN/-0.0 GPU divergence acceptable as-is (documented,
+not asserted), given (a) the CGA demos' value domain, geometric-algebra
+distances/clamps, practically never produces NaN or -0.0, and (b) the Rollcall
+crypto prover uses integer Poseidon, not float min/max, so no float
+cross-backend attestation depends on it? Or does the GPU path need an explicit
+branchy IEEE min/max fallback (sacrificing the branch-free win) so a future
+float cross-backend attestation cannot false-mismatch on NaN/-0.0 inputs?
 
 ## Verification
 
