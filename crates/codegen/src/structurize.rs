@@ -210,6 +210,23 @@ impl Structurer<'_> {
         self.loop_tree.is_in_loop(b, lp)
     }
 
+    /// A block that is ALWAYS a CFG dead end: its only instruction is
+    /// `Unreachable` (no other side effects, no successors, no phi inputs to
+    /// preserve). `wasm_lower.rs::trap_block` creates and caches exactly ONE
+    /// such block per function and reuses it for EVERY dynamic-index bounds
+    /// check and checked-usize-overflow check, so it legitimately has many
+    /// predecessors spread across the whole function -- not the "one true
+    /// position in the region tree" every other block has. Referencing it
+    /// from more than one arm is therefore not a real "multiply owned"
+    /// block; the general active/consumed cycle guard in `build_seq` would
+    /// otherwise reject the SECOND (and every later) bounds check in any
+    /// function with more than one dynamically-indexed access, once
+    /// `Unreachable` stops being an unconditional hard error.
+    fn is_shared_trap_block(&self, block: BlockId) -> bool {
+        matches!(self.term(block), Term::Unreachable)
+            && self.function.layout.iter_inst(block).count() == 1
+    }
+
     /// Build the region sequence for the maximal single-entry area entered at
     /// `start`, following structured successors, stopping before `stop` and at
     /// the boundaries of `cur_loop` (its header on a backedge, or a fallthrough
@@ -246,6 +263,18 @@ impl Structurer<'_> {
                 {
                     break;
                 }
+            }
+
+            // A shared trap block dead-ends here regardless of how many
+            // other predecessors also reach it elsewhere in the function; see
+            // `is_shared_trap_block`. `consumed.insert` is idempotent (a
+            // HashSet re-insert is a harmless no-op), so this is safe to hit
+            // on the first occurrence AND every later one.
+            if self.is_shared_trap_block(b) {
+                consumed.insert(b);
+                regions.push(Region::Block(b));
+                cur = None;
+                continue;
             }
 
             if active.contains(&b) || !consumed.insert(b) {

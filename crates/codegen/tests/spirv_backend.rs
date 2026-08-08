@@ -4038,3 +4038,91 @@ fn spirv_mem_op_under_i64_word_fails_closed() {
     assert!(!msg.is_empty(), "expected a named error, got an empty message");
     eprintln!("i64-word Mem op correctly fails closed: {msg}");
 }
+
+/// `wasm_lower.rs::trap_block` creates and caches exactly ONE trap block per
+/// function, reused for EVERY dynamically-indexed bounds check
+/// (`crates/codegen/src/sonatina/wasm_lower.rs::trap_block`, mb2 fe-codegen).
+/// A function with two SEQUENTIAL bounds-checked accesses branches to the
+/// SAME `Unreachable`-only `BlockId` from two different `Br` sites. Without
+/// `Structurer::is_shared_trap_block`'s special case, the second occurrence
+/// hits `build_seq`'s general active/consumed cycle guard and the whole
+/// function fails to structurize ("cyclic or multiply consumed block") --
+/// this was found live against `field_mul_bn254_fr_loop.fe` (Rung 3's own
+/// target fixture has ~dozens of dynamically-indexed accesses in one
+/// function) and is NOT one of the 4 originally-reported Codex findings, but
+/// is the same class of defect: a real kernel silently could not reach the
+/// SPIR-V backend at all.
+#[test]
+fn spirv_two_bounds_checks_sharing_one_trap_block_compiles() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    let sig = Signature::new_single(
+        "two_reads", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let ok1 = fb.append_block();
+    let check2 = fb.append_block();
+    let ok2 = fb.append_block();
+    let trap = fb.append_block(); // SHARED by both checks, like wasm_lower.rs's cache
+
+    fb.switch_to_block(entry);
+    let j = fb.args()[0];
+    let k = fb.args()[1];
+    let size = fb.make_imm_value(32i32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let eight = fb.make_imm_value(8i32);
+    let cond1 = fb.insert_inst(cmp::Lt::new(is, j, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond1, ok1, trap));
+
+    fb.switch_to_block(ok1);
+    let four = fb.make_imm_value(4i32);
+    let off_j = fb.insert_inst(arith::Mul::new(is, j, four), Type::I32);
+    let addr_j = fb.insert_inst(arith::Add::new(is, base, off_j), Type::I32);
+    let val_j = fb.insert_inst(data::Mload::new(is, addr_j, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, check2));
+
+    fb.switch_to_block(check2);
+    let cond2 = fb.insert_inst(cmp::Lt::new(is, k, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond2, ok2, trap));
+
+    fb.switch_to_block(ok2);
+    let off_k = fb.insert_inst(arith::Mul::new(is, k, four), Type::I32);
+    let addr_k = fb.insert_inst(arith::Add::new(is, base, off_k), Type::I32);
+    let val_k = fb.insert_inst(data::Mload::new(is, addr_k, Type::I32), Type::I32);
+    let sum = fb.insert_inst(arith::Add::new(is, val_j, val_k), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+
+    fb.switch_to_block(trap);
+    fb.insert_inst_no_result(control_flow::Unreachable::new(is));
+
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new().with_workgroup_size(1, 1, 1);
+    let artifact = backend
+        .compile_module(&module)
+        .expect("two bounds checks sharing one cached trap block must still structurize/compile");
+
+    assert_eq!(artifact.words[0], 0x0723_0203, "valid SPIR-V magic");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(wgsl.contains("fe_trapped"), "trap channel must appear in WGSL:\n{wgsl}");
+
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in should reparse the shared-trap-block WGSL");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+        .validate(&reparsed)
+        .expect("re-validation of the reparsed WGSL should also pass");
+
+    eprintln!(
+        "two bounds checks sharing one cached trap block OK: {} SPIR-V words",
+        artifact.words.len()
+    );
+}
