@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use sonatina_ir::{
     BlockId, Function, InstDowncast, InstSetBase,
     cfg::ControlFlowGraph,
-    inst::control_flow::{Br, BrTable, Jump, Return},
+    inst::control_flow::{Br, BrTable, Jump, Return, Unreachable},
 };
 
 use crate::{
@@ -111,6 +111,21 @@ enum Term {
     Jump(BlockId),
     Br(BlockId, BlockId),
     Return,
+    /// A block terminated by Sonatina `Unreachable` (the array/memory bounds
+    /// trap `wasm_lower.rs` emits for every dynamically-indexed access).
+    /// Classified Return-like throughout this pass (excluded from loop SCC
+    /// membership, treated as a chain terminator) so a trap arm structures
+    /// exactly the way an early-return arm does. Kept as its own variant
+    /// (rather than literally reusing `Term::Return`) so the SPIR-V emitter
+    /// can tell "real return value" apart from "poison" by re-inspecting the
+    /// block's own instructions.
+    ///
+    /// Guards Codex NO-GO bug 4 (wrong value on unconditional trap): without
+    /// this arm, `structurize_function` hard-errors ("unsupported
+    /// terminator") on ANY function containing a bounds trap, i.e. every
+    /// function with a dynamically-indexed array access, so no array kernel
+    /// could reach the SPIR-V emitter at all.
+    Unreachable,
     Other,
 }
 
@@ -134,6 +149,9 @@ impl Structurer<'_> {
             if <&Return as InstDowncast>::downcast(self.is, d).is_some() {
                 return Term::Return;
             }
+            if <&Unreachable as InstDowncast>::downcast(self.is, d).is_some() {
+                return Term::Unreachable;
+            }
             if <&BrTable as InstDowncast>::downcast(self.is, d).is_some() {
                 return Term::Other;
             }
@@ -142,7 +160,7 @@ impl Structurer<'_> {
     }
 
     fn returns(&self, b: BlockId) -> bool {
-        matches!(self.term(b), Term::Return)
+        matches!(self.term(b), Term::Return | Term::Unreachable)
     }
 
     /// Whether every path from `start` stays outside `lp` and terminates in a
@@ -167,7 +185,7 @@ impl Structurer<'_> {
                 return false;
             }
             let result = match s.term(block) {
-                Term::Return => true,
+                Term::Return | Term::Unreachable => true,
                 Term::Jump(target) => visit(s, target, lp, visiting, memo),
                 Term::Br(nz, z) => {
                     visit(s, nz, lp, visiting, memo) && visit(s, z, lp, visiting, memo)
@@ -269,7 +287,7 @@ impl Structurer<'_> {
                         cur = Some(t);
                     }
                 }
-                Term::Return => {
+                Term::Return | Term::Unreachable => {
                     regions.push(Region::Block(b));
                     cur = None;
                 }
