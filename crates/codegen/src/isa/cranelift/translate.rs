@@ -408,6 +408,21 @@ fn translate_function(
             } else if let Some(and) = <&sonatina_ir::inst::logic::And as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let lhs = resolve_value(function, *and.lhs(), &value_map, &mut builder)?;
                 let rhs = resolve_value(function, *and.rhs(), &value_map, &mut builder)?;
+                // See widen_to_match_bitwise's doc comment: the SAME
+                // I32-Sonatina-typed-but-I64-cranelift-actual pointer issue
+                // Add/Sub/Mul needed widening for also hits And -- confirmed
+                // live via the pointer-round-up idiom
+                // `(base + align-1) & ~(align-1)` (wasm_lower.rs's
+                // lower_alloc_object), which lowers to Sonatina Add then
+                // And. `band` requires exact operand-width match, same as
+                // `iadd`. Deliberately SIGN-extend here, not
+                // `widen_to_match`'s zero-extend: `~(align-1)` is a negative
+                // i32 mask (e.g. `-8`), and zero-extending it truncates the
+                // upper 32 bits of a real 64-bit stack address instead of
+                // just the low align bits (caught via SIGSEGV in
+                // `cranelift_mem_alloc_dynamic_pointer_round_up_idiom_
+                // executes`, not by the verifier).
+                let (lhs, rhs) = widen_to_match_bitwise(&mut builder, lhs, rhs);
                 let result_val = builder.ins().band(lhs, rhs);
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
@@ -415,6 +430,13 @@ fn translate_function(
             } else if let Some(or) = <&sonatina_ir::inst::logic::Or as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let lhs = resolve_value(function, *or.lhs(), &value_map, &mut builder)?;
                 let rhs = resolve_value(function, *or.rhs(), &value_map, &mut builder)?;
+                // Same width-coercion as And above (sign-extend, see
+                // widen_to_match_bitwise's doc comment); not observed to
+                // fire in the 4 target kernels' address arithmetic today,
+                // but Or is an equally plausible bitwise-address idiom for a
+                // future kernel, and this is a no-op for every
+                // already-matching case.
+                let (lhs, rhs) = widen_to_match_bitwise(&mut builder, lhs, rhs);
                 let result_val = builder.ins().bor(lhs, rhs);
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
@@ -422,6 +444,9 @@ fn translate_function(
             } else if let Some(xor) = <&sonatina_ir::inst::logic::Xor as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let lhs = resolve_value(function, *xor.lhs(), &value_map, &mut builder)?;
                 let rhs = resolve_value(function, *xor.rhs(), &value_map, &mut builder)?;
+                // Same width-coercion as And/Or above (sign-extend, see
+                // widen_to_match_bitwise's doc comment).
+                let (lhs, rhs) = widen_to_match_bitwise(&mut builder, lhs, rhs);
                 let result_val = builder.ins().bxor(lhs, rhs);
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
@@ -997,6 +1022,13 @@ fn translate_function(
 
     if let Err(e) = jit.define_function(func_id, &mut ctx) {
         eprintln!("[cranelift] CLIF IR (error):\n{}", ctx.func.display());
+        // `ModuleError`'s `Display` only prints the collapsed "Compilation
+        // error: Verifier errors" wrapper; `{e:#?}` walks down to the
+        // itemized `VerifierError` list (instruction + value IDs for each
+        // individual violation), essential for diagnosing which specific
+        // operand/type mismatch tripped the verifier rather than just
+        // knowing that SOMETHING did.
+        eprintln!("[cranelift] verifier detail: {e:#?}");
         return Err(format!("cranelift define_function failed: {e}"));
     }
 
@@ -1017,12 +1049,22 @@ fn translate_function(
 /// the way wasm's actual 32-bit address space does. Plain `Add`/`Sub`/`Mul`
 /// on a stack address and an i32-typed offset would otherwise be a raw
 /// cranelift width mismatch (a verifier error, not a silent miscompile:
-/// cranelift's own arithmetic opcodes require matching operand widths, so
-/// this fails LOUD, never wrong, without this fix -- confirmed empirically
-/// via `cranelift_mem_alloc_dynamic_array_executes` before this change).
-/// Zero-extension (not sign-extension) is correct: every value this widens
-/// is a byte offset, an array index, or an allocation size -- all
-/// non-negative by construction in this IR.
+/// cranelift's own binary opcodes require matching operand widths, so this
+/// fails LOUD, never wrong, without this fix).
+///
+/// Zero-extension (not sign-extension) is correct HERE specifically:
+/// Add/Sub/Mul's operands in this IR are byte offsets, array indices, or
+/// allocation sizes -- non-negative quantities by construction.
+///
+/// Used by Add/Sub/Mul only (confirmed via
+/// `cranelift_mem_alloc_dynamic_array_executes`). And/Or/Xor need a
+/// DIFFERENT (sign-extending) policy for their bitwise-mask operands -- see
+/// `widen_to_match_bitwise` below, and its doc comment for why zero-
+/// extension is wrong there specifically (it looked like the same fix at
+/// first, per `CRANELIFT_HUNCH.md`, but zero-extending a negative alignment
+/// mask like `-8i32` truncates a real 64-bit stack pointer's upper bits
+/// instead of preserving them -- a verifier-invisible bug caught only by
+/// actually executing the JIT'd code).
 fn widen_to_match(
     builder: &mut FunctionBuilder,
     a: clif::Value,
@@ -1037,6 +1079,54 @@ fn widen_to_match(
         (builder.ins().uextend(tb, a), b)
     } else {
         (a, builder.ins().uextend(ta, b))
+    }
+}
+
+/// Widen the narrower of `a`/`b` to the wider's width via SIGN-extension,
+/// for bitwise (`And`/`Or`/`Xor`) operands specifically.
+///
+/// This is deliberately a *different* policy from `widen_to_match` above.
+/// `widen_to_match` zero-extends because Add/Sub/Mul's operands in this IR
+/// are byte offsets / sizes / indices -- non-negative quantities where
+/// zero-extension is the width-correct choice.
+///
+/// Bitwise masks are not offsets: the pointer-round-up idiom
+/// `(base + align-1) & ~(align-1)` (`wasm_lower.rs`'s `lower_alloc_object`)
+/// materializes `~(align-1)` as a small NEGATIVE i32 immediate (e.g.
+/// `-8i32` = `0xFFFF_FFF8`, wasm/Sonatina's 32-bit-address-space spelling
+/// of "clear the low 3 bits"). Zero-extending that i32 pattern to i64 gives
+/// `0x0000_0000_FFFF_FFF8` -- which, ANDed against a REAL 64-bit stack
+/// pointer (always far above 2^32 on a real process, e.g. `0x00007ffX_...`
+/// on Linux/x86_64), clears the ENTIRE upper 32 bits of the address instead
+/// of just the low 3, producing a bogus, almost-certainly-unmapped address.
+/// This was caught by the `cranelift_mem_alloc_dynamic_pointer_round_up_
+/// idiom_executes` regression test, which SIGSEGV'd at runtime (the
+/// verifier accepts either extension -- widths match either way -- so this
+/// class of bug is invisible to the verifier and only shows up by actually
+/// executing the JIT'd code, not merely compiling it).
+///
+/// Sign-extension is the width-correct choice for a bitwise mask: it
+/// replicates the i32 pattern's top bit, so `0xFFFF_FFF8` (top bit 1)
+/// widens to `0xFFFF_FFFF_FFFF_FFF8` (all upper bits also 1, correctly
+/// clearing only the low 3 bits of a 64-bit value, same as the i32 pattern
+/// clears only the low 3 bits of a 32-bit value). For a small POSITIVE
+/// mask (top bit 0, e.g. an alignment-check constant like `7`),
+/// sign-extension and zero-extension produce an IDENTICAL result, so this
+/// is strictly a superset fix with no regression risk for that case.
+fn widen_to_match_bitwise(
+    builder: &mut FunctionBuilder,
+    a: clif::Value,
+    b: clif::Value,
+) -> (clif::Value, clif::Value) {
+    let ta = builder.func.dfg.value_type(a);
+    let tb = builder.func.dfg.value_type(b);
+    if ta == tb {
+        return (a, b);
+    }
+    if ta.bits() < tb.bits() {
+        (builder.ins().sextend(tb, a), b)
+    } else {
+        (a, builder.ins().sextend(ta, b))
     }
 }
 

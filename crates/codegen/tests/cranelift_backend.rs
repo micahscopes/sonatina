@@ -5,7 +5,7 @@ use sonatina_ir::{
     builder::ModuleBuilder,
     func_cursor::InstInserter,
     global_variable::{GlobalVariableData, GvInitializer},
-    inst::{arith, cmp, control_flow, data},
+    inst::{arith, cmp, control_flow, data, logic},
     isa::{Isa, native::Native},
     module::ModuleCtx,
 };
@@ -1508,6 +1508,64 @@ fn cranelift_mem_alloc_dynamic_odd_size_zero_inits_and_executes() {
         std::mem::transmute(ptr)
     };
     assert_eq!(f(), 0, "an untouched window of an odd-sized allocation must read back zero");
+}
+
+/// Regression (`CRANELIFT_HUNCH.md`, confirmed live against
+/// `poseidon_merkle_root_loop.fe`): `wasm_lower.rs`'s pointer-round-up idiom
+/// -- `raw = MemAllocDynamic(size + ALIGN - 1); rounded = (raw + (ALIGN-1))
+/// & !(ALIGN-1)` -- lowers to Sonatina `Add` then `And`, both nominally I32.
+/// `widen_to_match` was wired into Add/Sub/Mul but NOT And/Or/Xor, so the
+/// `And` against a raw `iconst.i32` mask hit a cranelift operand-width
+/// verifier error (`band` requires exact type match, same family as
+/// `iadd`) whenever it followed an Add that HAD been widened to the real
+/// i64 stack address. This test reproduces that EXACT 2-instruction shape
+/// (not just And alone) and executes it, not just compiles it.
+#[test]
+fn cranelift_mem_alloc_dynamic_pointer_round_up_idiom_executes() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = {
+        let ctx = ModuleCtx::new(&isa);
+        ModuleBuilder::new(ctx)
+    };
+
+    let sig = Signature::new_single("round_up", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    // size + ALIGN - 1 = 20 + 7 = 27 bytes requested (mirrors
+    // lower_alloc_object's own over-allocation), then round the RETURNED
+    // pointer up to an 8-byte boundary via (raw + 7) & !7.
+    let size = fb.make_imm_value(27i32);
+    let raw = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let seven = fb.make_imm_value(7i32);
+    let biased = fb.insert_inst(arith::Add::new(is, raw, seven), Type::I32);
+    let neg_align = fb.make_imm_value(-8i32); // !7 as a two's-complement i32 mask
+    let rounded = fb.insert_inst(logic::And::new(is, biased, neg_align), Type::I32);
+
+    // Store through the ROUNDED pointer and read it back, proving the
+    // rounded address is a real, usable, in-bounds pointer, not just that
+    // the And instruction compiles.
+    let val = fb.make_imm_value(0x5a5au32 as i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, rounded, val, Type::I32));
+    let loaded = fb.insert_inst(data::Mload::new(is, rounded, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend.compile_module(&module).expect(
+        "the pointer-round-up idiom (Add then And on a MemAllocDynamic result) must compile",
+    );
+
+    let f: fn() -> i32 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn() -> i32>("round_up").unwrap();
+        std::mem::transmute(ptr)
+    };
+    assert_eq!(f(), 0x5a5a, "store/load through the rounded-up pointer must round-trip correctly");
 }
 
 /// Codex bug 1's analog (heap-exhaustion aliasing), the compile-time half:
