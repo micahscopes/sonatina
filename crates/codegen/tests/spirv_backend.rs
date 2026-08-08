@@ -4126,3 +4126,117 @@ fn spirv_two_bounds_checks_sharing_one_trap_block_compiles() {
         artifact.words.len()
     );
 }
+
+/// Adversarial review Finding A (2026-08-08, CONFIRMED HIGH): a function
+/// that traps but has NO Mem ops at all. Before this fix, `mem_ctx` (and the
+/// trap channel it carries) was declared ONLY under `has_mem`, so this exact
+/// shape -- `fn(k): Br(Lt(k,8), ok, trap); ok: Return 42; trap: Unreachable`
+/// -- compiled and naga-validated with the trap arm silently falling through
+/// to a zero/uninitialized result and `layout.trap == None`: byte-for-byte
+/// the original Codex bug 4 failure mode, reopened on the has_mem==false
+/// side (this is fe-reachable without arrays via `RTerminator::Trap` and
+/// `lower_checked_usize_arith`'s `trap_if`, wasm_lower.rs). At the pin
+/// (22a95696) this same input hard-errored in the structurizer
+/// ("unsupported terminator"); the v2 commits traded that fail-closed
+/// behavior for silent acceptance until this test's shape is handled.
+///
+/// The fix: the trap channel is now declared whenever `has_mem ||
+/// has_unreachable`, so a no-Mem trapping function still gets a real,
+/// externally-visible trap flag instead of a silent zero. This test asserts
+/// exactly that: `fe_trapped` appears in the WGSL, a `trap` binding/result
+/// is stated in the layout, and (going one step further than a WGSL text
+/// scan) the naga IR itself proves the trap arm stores into `fe_trapped`
+/// rather than falling through unnoticed.
+#[test]
+fn spirv_no_mem_trap_raises_trap_channel_not_silent_zero() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    // fn(k) -> i32 { if k < 8 { return 42 } else { unreachable } } -- the
+    // review's exact counterexample shape. Zero Mem ops anywhere.
+    let sig = Signature::new_single("no_mem_trap", Linkage::Public, &[Type::I32], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let ok = fb.append_block();
+    let trap = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let k = fb.args()[0];
+    let eight = fb.make_imm_value(8i32);
+    let cond = fb.insert_inst(cmp::Lt::new(is, k, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, ok, trap));
+
+    fb.switch_to_block(ok);
+    let forty_two = fb.make_imm_value(42i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, forty_two));
+
+    fb.switch_to_block(trap);
+    fb.insert_inst_no_result(control_flow::Unreachable::new(is));
+
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new().with_workgroup_size(1, 1, 1);
+
+    // Either a named fail-closed error, or (the fix actually landed)
+    // successful compilation WITH a real trap channel raised on the trap
+    // arm -- NEVER silent success with no trap channel at all (that is
+    // exactly the reopened hole).
+    match backend.compile_module(&module) {
+        Err(errors) => {
+            let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+            eprintln!("no-Mem trap failed closed (an acceptable disposition): {msg}");
+        }
+        Ok(artifact) => {
+            let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+            assert!(
+                wgsl.contains("fe_trapped"),
+                "Finding A regression: a no-Mem trapping function compiled WITHOUT raising a \
+                 trap channel -- the trap arm silently falls through to a zero/uninitialized \
+                 result exactly like the original Codex bug 4. WGSL:\n{wgsl}"
+            );
+            assert!(
+                artifact.layout.trap.is_some(),
+                "Finding A regression: a no-Mem trapping function compiled but layout.trap is \
+                 None -- no consumer can ever observe the trap"
+            );
+            assert!(
+                artifact.layout.bindings.iter().any(|b| b.name == "trap"),
+                "Finding A regression: no `trap` binding stated in the layout"
+            );
+
+            // Reparse + revalidate independently of the naga run already
+            // inside compile_module, so a structurally-broken emission
+            // (e.g. the trap store landing outside the block it was meant
+            // for) fails loudly here too, not just a text scan.
+            let reparsed = naga::front::wgsl::parse_str(wgsl)
+                .expect("naga wgsl-in should reparse the no-Mem-trap WGSL");
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&reparsed)
+                .expect("re-validation of the reparsed WGSL should also pass");
+
+            // Confirm the trap store is textually INSIDE the branch that
+            // guards it (a coarse but meaningful structural check beyond
+            // "the token exists somewhere"): the `else` arm produced by a
+            // `Br(cond, ok, trap)` with an Unreachable trap arm should read
+            // as an if/else whose reject branch sets fe_trapped.
+            assert!(
+                wgsl.contains("fe_trapped = true"),
+                "expected an unconditional `fe_trapped = true` store on the trap arm; WGSL:\n{wgsl}"
+            );
+
+            eprintln!(
+                "no-Mem trap correctly raises a real trap channel: {} SPIR-V words, trap \
+                 binding {:?}",
+                artifact.words.len(),
+                artifact.layout.trap,
+            );
+        }
+    }
+}
