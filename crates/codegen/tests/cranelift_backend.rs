@@ -1332,3 +1332,322 @@ fn cross_backend_f32_rounding_differential() {
         assert_eq!(cl.3.to_bits(), wa.3.to_bits(), "cranelift and wasm round({x}) disagree bit-for-bit [ties-to-even]");
     }
 }
+
+// ===========================================================================
+// Rung 3 STEP 2 (native leg): `MemAllocDynamic`/`Mload`/`Mstore` -- function-
+// local `[u32; N]` arrays -- lowered to real cranelift stack slots + native
+// loads/stores. Before this rung, `MemAllocDynamic` was unhandled
+// ("unsupported instruction for CraneliftBackend: Opaque"); `Mload`/`Mstore`
+// and `Unreachable` (traps) were ALREADY lowered (pre-existing, used by the
+// object model), so those two need no test coverage here beyond what already
+// exists elsewhere in this file -- these tests specifically exercise the
+// NEW `MemAllocDynamic` arm and its pre-scan guards.
+// ===========================================================================
+
+/// The S2-A-shaped probe, executed (not just compiled): allocate an 8-word
+/// array, store into two elements, bounds-check a dynamic index (the exact
+/// Lt+Br+Unreachable shape wasm_lower.rs emits for every Fe array access),
+/// and load back through the ok arm. Confirms MemAllocDynamic + Mstore +
+/// Mload + the trap arm all execute correctly together on native, and that
+/// untouched elements read back as zero (the explicit `emit_small_memset`
+/// zero-init).
+#[test]
+fn cranelift_mem_alloc_dynamic_array_executes() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = {
+        let ctx = ModuleCtx::new(&isa);
+        ModuleBuilder::new(ctx)
+    };
+
+    let sig = Signature::new_single("probe", Linkage::Public, &[Type::I32], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let ok = fb.append_block();
+    let trap = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let k = fb.args()[0];
+    let alloc_size = fb.make_imm_value(32i32); // 8 elements * 4 bytes
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    let twelve = fb.make_imm_value(12i32);
+    let addr3 = fb.insert_inst(arith::Add::new(is, base, twelve), Type::I32);
+    let val3 = fb.make_imm_value(0xABCDi32);
+    fb.insert_inst_no_result(data::Mstore::new(is, addr3, val3, Type::I32));
+    let twenty = fb.make_imm_value(20i32);
+    let addr5 = fb.insert_inst(arith::Add::new(is, base, twenty), Type::I32);
+    let val5 = fb.make_imm_value(0x1234i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, addr5, val5, Type::I32));
+
+    let eight = fb.make_imm_value(8i32);
+    let in_bounds = fb.insert_inst(cmp::Lt::new(is, k, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, in_bounds, ok, trap));
+
+    fb.switch_to_block(ok);
+    let four = fb.make_imm_value(4i32);
+    let off = fb.insert_inst(arith::Mul::new(is, k, four), Type::I32);
+    let addr_k = fb.insert_inst(arith::Add::new(is, base, off), Type::I32);
+    let loaded = fb.insert_inst(data::Mload::new(is, addr_k, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
+
+    fb.switch_to_block(trap);
+    fb.insert_inst_no_result(control_flow::Unreachable::new(is));
+
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend
+        .compile_module(&module)
+        .expect("MemAllocDynamic array kernel should compile natively");
+
+    let probe: fn(i32) -> i32 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn(i32) -> i32>("probe").unwrap();
+        std::mem::transmute(ptr)
+    };
+
+    assert_eq!(probe(3), 0xABCD, "a[3] should read back what was stored");
+    assert_eq!(probe(5), 0x1234, "a[5] should read back what was stored");
+    assert_eq!(probe(0), 0, "an untouched element should read back zero (explicit zero-init)");
+    assert_eq!(probe(7), 0, "an untouched element should read back zero (explicit zero-init)");
+}
+
+/// Two independent `MemAllocDynamic` calls in the same function must never
+/// alias: each gets its OWN stack slot (unlike SPIR-V's shared emulated
+/// heap, native has no capacity to exhaust or bump pointer to collide).
+#[test]
+fn cranelift_mem_alloc_dynamic_two_arrays_do_not_alias() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = {
+        let ctx = ModuleCtx::new(&isa);
+        ModuleBuilder::new(ctx)
+    };
+
+    let sig = Signature::new_single("two_arrays", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let size = fb.make_imm_value(16i32);
+    let a = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let b = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let va = fb.make_imm_value(111i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, a, va, Type::I32));
+    let vb = fb.make_imm_value(222i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, b, vb, Type::I32));
+    let la = fb.insert_inst(data::Mload::new(is, a, Type::I32), Type::I32);
+    let lb = fb.insert_inst(data::Mload::new(is, b, Type::I32), Type::I32);
+    let sum = fb.insert_inst(arith::Add::new(is, la, lb), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend.compile_module(&module).expect("two-array kernel should compile");
+
+    let f: fn() -> i32 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn() -> i32>("two_arrays").unwrap();
+        std::mem::transmute(ptr)
+    };
+    assert_eq!(f(), 333, "storing into b must not clobber a (or vice versa)");
+}
+
+/// Codex bug 1's analog (heap-exhaustion aliasing), the compile-time half:
+/// a `MemAllocDynamic` whose size is not a compile-time constant is
+/// unsupported (cranelift stack slots are sized at IR-construction time),
+/// and must fail closed rather than silently guessing a size.
+///
+/// `CraneliftBackend::compile_module` does NOT propagate a per-function
+/// translation error as a module-level `Err` (`translate_module`'s
+/// established, pre-existing convention: skip that one definition, log it,
+/// keep compiling everything else -- exactly what
+/// `native.rs::compile_and_verify_definitions` on the fe-codegen side
+/// exists to turn into a hard failure at the wrapper level). So "fails
+/// closed" here is verified the SAME way that wrapper verifies it: the
+/// skipped function is declared but never defined, and
+/// `get_finalized_function` panics for a declared-but-skipped definition
+/// (an upstream cranelift-jit assertion, not a Sonatina-side panic) --
+/// caught via `catch_unwind`, matching the established pattern.
+#[test]
+fn cranelift_mem_alloc_non_constant_size_fails_closed() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = {
+        let ctx = ModuleCtx::new(&isa);
+        ModuleBuilder::new(ctx)
+    };
+    let sig = Signature::new_single("dyn_size", Linkage::Public, &[Type::I32], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let n = fb.args()[0];
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, n), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, base));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend
+        .compile_module(&module)
+        .expect("compile_module itself succeeds; the ONE bad definition is skipped, not hard-failed");
+    let defined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        artifact.get_func_ptr::<fn(i32) -> i32>("dyn_size")
+    }))
+    .ok()
+    .flatten();
+    assert!(
+        defined.is_none(),
+        "a non-constant MemAllocDynamic size must fail closed: `dyn_size` must be \
+         declared-but-undefined (skipped), never a callable pointer"
+    );
+    eprintln!(
+        "non-constant MemAllocDynamic size correctly fails closed: the function was skipped \
+         (declared, never defined), the same postcondition native.rs::compile_and_verify_\
+         definitions checks for"
+    );
+}
+
+/// Cross-backend consistency guard (not a native memory-safety concern: a
+/// loop-carried allocation on native just reuses the same, correctly-sized
+/// stack slot every iteration, which is memory-safe). Ported from the
+/// SPIR-V pre-scan: fail closed rather than silently diverge from wasm's
+/// growing-arena semantics for a hypothetical future loop-carried-array
+/// kernel.
+#[test]
+fn cranelift_mem_alloc_inside_loop_fails_closed() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = {
+        let ctx = ModuleCtx::new(&isa);
+        ModuleBuilder::new(ctx)
+    };
+    let sig = Signature::new_single("loop_alloc", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let three = fb.make_imm_value(3i32);
+    let cond = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, body, exit));
+
+    fb.switch_to_block(body);
+    let alloc_size = fb.make_imm_value(16i32);
+    let _base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend
+        .compile_module(&module)
+        .expect("compile_module itself succeeds; the ONE bad definition is skipped, not hard-failed");
+    let defined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        artifact.get_func_ptr::<fn() -> i32>("loop_alloc")
+    }))
+    .ok()
+    .flatten();
+    assert!(
+        defined.is_none(),
+        "MemAllocDynamic inside a loop must fail closed: `loop_alloc` must be \
+         declared-but-undefined (skipped), never a callable pointer"
+    );
+    eprintln!(
+        "loop-carried allocation correctly fails closed on native: the function was skipped \
+         (declared, never defined)"
+    );
+}
+
+/// The native analog of the adversarial review's Finding A: a function that
+/// traps with NO Mem ops at all (`fn(k): Br(Lt(k,8), ok, trap); ok: Return
+/// 42; trap: Unreachable`). Unlike SPIR-V (which had to simulate poison via
+/// an OR-accumulator flag because a GPU shader cannot actually trap), native
+/// code has a REAL trap instruction available, and `Unreachable` already
+/// lowered to one (`builder.ins().trap(...)`, pre-existing, untouched by
+/// this rung) -- so there is no "silent zero" failure mode possible here by
+/// construction: the function either returns the correct in-bounds value or
+/// the process traps, never a wrong answer.
+///
+/// This test proves the function compiles (the module-level concern
+/// `Unreachable` used to raise before it was lowered at all -- though on
+/// this fork it has been supported since before this rung) and that the
+/// non-trapping path computes the right answer. It deliberately does NOT
+/// invoke the trapping path: a native trap is a real SIGILL/UD2, which
+/// would abort this test binary, not something `catch_unwind` can recover
+/// from. The trap arm's presence as a genuine `trap` instruction (not a
+/// silently-dropped no-op) is structural, inherited from the pre-existing
+/// `Unreachable` arm this rung does not touch.
+#[test]
+fn cranelift_no_mem_trap_compiles_and_ok_path_executes_correctly() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = {
+        let ctx = ModuleCtx::new(&isa);
+        ModuleBuilder::new(ctx)
+    };
+    let sig = Signature::new_single("no_mem_trap", Linkage::Public, &[Type::I32], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let ok = fb.append_block();
+    let trap = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let k = fb.args()[0];
+    let eight = fb.make_imm_value(8i32);
+    let cond = fb.insert_inst(cmp::Lt::new(is, k, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, ok, trap));
+
+    fb.switch_to_block(ok);
+    let forty_two = fb.make_imm_value(42i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, forty_two));
+
+    fb.switch_to_block(trap);
+    fb.insert_inst_no_result(control_flow::Unreachable::new(is));
+
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend
+        .compile_module(&module)
+        .expect("a no-Mem-ops trapping function must still compile on native");
+
+    let f: fn(i32) -> i32 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn(i32) -> i32>("no_mem_trap").unwrap();
+        std::mem::transmute(ptr)
+    };
+    assert_eq!(f(0), 42, "the non-trapping (in-bounds) path must compute the correct value");
+    assert_eq!(f(7), 42, "the non-trapping (in-bounds) path must compute the correct value");
+    eprintln!(
+        "no-Mem trap: function compiles, ok path executes correctly; trap arm not invoked \
+         (a real native trap would abort the test process) but structurally present as a \
+         genuine `trap` instruction via the pre-existing Unreachable arm."
+    );
+}

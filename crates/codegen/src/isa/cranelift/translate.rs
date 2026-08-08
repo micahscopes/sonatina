@@ -164,6 +164,26 @@ fn translate_function(
     // individually, emitting intrinsic calls for EVM-specific operations
     // (addmod, mulmod) and errors for truly unsupported ones.
 
+    // Rung 3 STEP 2 (native leg): loop-membership analysis for
+    // `MemAllocDynamic`, mirroring the SAME pre-scan the SPIR-V private-heap
+    // translator already runs. Cranelift stack slots are sized once, at
+    // IR-construction time (this loop), not re-allocated per invocation of
+    // the code that references them -- so a `MemAllocDynamic` inside a
+    // Sonatina loop would silently lower to "the SAME stack slot, reused
+    // every iteration" rather than wasm's growing-arena semantics (a fresh
+    // region per iteration). That is memory-safe on native (no aliasing
+    // hazard the way an exhausted SPIR-V emulated heap had), but it is a
+    // SILENT SEMANTIC DIVERGENCE from wasm/SPIR-V for a hypothetical future
+    // kernel that relies on per-iteration freshness. Fail closed for
+    // cross-backend consistency, the same reason the SPIR-V pre-scan does,
+    // not because native's OWN memory model is unsafe here.
+    let mut cfg = sonatina_ir::cfg::ControlFlowGraph::default();
+    cfg.compute(function);
+    let mut domtree = crate::domtree::DomTree::new();
+    domtree.compute(&cfg);
+    let mut loop_tree = crate::loop_analysis::LoopTree::new();
+    loop_tree.compute(&cfg, &domtree);
+
     for block in function.layout.iter_block() {
         let clif_block = block_map[&block];
         if block != entry {
@@ -194,6 +214,7 @@ fn translate_function(
             if let Some(add) = <&sonatina_ir::inst::arith::Add as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let lhs = resolve_value(function, *add.lhs(), &value_map, &mut builder)?;
                 let rhs = resolve_value(function, *add.rhs(), &value_map, &mut builder)?;
+                let (lhs, rhs) = widen_to_match(&mut builder, lhs, rhs);
                 let result_val = builder.ins().iadd(lhs, rhs);
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
@@ -201,6 +222,7 @@ fn translate_function(
             } else if let Some(sub) = <&sonatina_ir::inst::arith::Sub as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let lhs = resolve_value(function, *sub.lhs(), &value_map, &mut builder)?;
                 let rhs = resolve_value(function, *sub.rhs(), &value_map, &mut builder)?;
+                let (lhs, rhs) = widen_to_match(&mut builder, lhs, rhs);
                 let result_val = builder.ins().isub(lhs, rhs);
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
@@ -208,6 +230,7 @@ fn translate_function(
             } else if let Some(mul) = <&sonatina_ir::inst::arith::Mul as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let lhs = resolve_value(function, *mul.lhs(), &value_map, &mut builder)?;
                 let rhs = resolve_value(function, *mul.rhs(), &value_map, &mut builder)?;
+                let (lhs, rhs) = widen_to_match(&mut builder, lhs, rhs);
                 let result_val = builder.ins().imul(lhs, rhs);
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     value_map.insert(result, result_val);
@@ -658,6 +681,103 @@ fn translate_function(
                         value_map.insert(result, loaded);
                     }
                 }
+            } else if let Some(alloc) = <&sonatina_ir::inst::data::MemAllocDynamic as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                // Rung 3 STEP 2 (native leg): function-local `[u32; N]`
+                // arrays lower to `MemAllocDynamic` + `Mload`/`Mstore`
+                // (the SAME backend-neutral op set the SPIR-V private-heap
+                // emulation consumes). `Mload`/`Mstore` already lower to
+                // plain native loads/stores above/below (pre-existing,
+                // used by the object model), and `Unreachable` already
+                // lowers to a real `trap` instruction further down -- both
+                // untouched by this rung. The ONLY missing piece was
+                // `MemAllocDynamic` itself ("unsupported instruction for
+                // CraneliftBackend: Opaque").
+                //
+                // Cranelift has REAL memory: unlike SPIR-V's emulated
+                // shared heap + bump pointer (needed because a GPU storage
+                // buffer has no general allocator), each MemAllocDynamic
+                // site gets its OWN correctly-sized stack slot here --
+                // simpler AND stronger than the SPIR-V scheme, since
+                // distinct arrays can never alias each other by
+                // construction (no shared heap to exhaust). This is the
+                // exact same "one stack slot per instruction site" idiom
+                // the pre-existing Alloca/ObjAlloc arms already use.
+                //
+                // Codex bug 1's analog (heap-exhaustion aliasing): closed
+                // by construction (see above), but the size must still be
+                // a compile-time constant (stack slots are sized at
+                // IR-construction time) and the instruction must not sit
+                // inside a loop (see the pre-scan comment above `cfg`).
+                // Both fail closed with a named `Err`, which
+                // `translate_module`'s existing skip-and-report convention
+                // (and `native.rs::compile_and_verify_definitions`'s
+                // missing-definition check, on the fe-codegen side) already
+                // turns into a hard, non-silent failure -- never a wrong
+                // compile.
+                let Some(size_imm) = function.dfg.value_imm(*alloc.size()) else {
+                    return Err(
+                        "cranelift: MemAllocDynamic with a non-constant size is unsupported \
+                         (stack slots are sized at compile time). Fail closed."
+                            .to_string(),
+                    );
+                };
+                let size_bytes: u32 = match size_imm {
+                    Immediate::I1(v) => v as u32,
+                    Immediate::I8(v) => v as u8 as u32,
+                    Immediate::I32(v) => v as u32,
+                    Immediate::I64(v) => u32::try_from(v).map_err(|_| {
+                        "cranelift: MemAllocDynamic size does not fit a u32 stack-slot size. \
+                         Fail closed."
+                            .to_string()
+                    })?,
+                    _ => {
+                        return Err(
+                            "cranelift: MemAllocDynamic size has an unsupported immediate \
+                             kind. Fail closed."
+                                .to_string(),
+                        );
+                    }
+                };
+                if loop_tree.loop_of_block(block).is_some() {
+                    return Err(
+                        "cranelift: MemAllocDynamic inside a loop is unsupported (the same \
+                         stack slot would be silently reused every iteration instead of \
+                         wasm's fresh-per-iteration arena semantics). Fail closed."
+                            .to_string(),
+                    );
+                }
+                if let Some(result) = function.dfg.inst_result(inst_id) {
+                    // 8-byte-aligned, matching Fe's own array-base alignment
+                    // convention (`layout_utils.rs`) and the SPIR-V private
+                    // heap's word alignment; not load-bearing for native
+                    // (real byte-addressed memory tolerates any alignment
+                    // on x86_64/aarch64) but keeps the three backends'
+                    // provenance assumptions identical.
+                    let slot = builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot, size_bytes, 3,
+                        ),
+                    );
+                    let addr = builder.ins().stack_addr(clif::types::I64, slot, 0);
+                    // Explicit zero-init: cranelift stack slots are NOT
+                    // zero-initialized by the OS/runtime (unlike wasm's
+                    // linear memory, which starts zeroed). Matches the
+                    // SPIR-V `fe_heap`'s load-bearing `ZeroValue` init for
+                    // the same reason -- keep all three backends' "freshly
+                    // allocated array reads as zero before any store"
+                    // contract identical.
+                    if size_bytes > 0 {
+                        builder.emit_small_memset(
+                            jit.target_config(),
+                            addr,
+                            0,
+                            size_bytes as u64,
+                            8,
+                            cranelift_codegen::ir::MemFlags::new(),
+                        );
+                    }
+                    value_map.insert(result, addr);
+                }
             } else if let Some(alloca) = <&sonatina_ir::inst::data::Alloca as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 if let Some(result) = function.dfg.inst_result(inst_id) {
                     let slot = builder.create_sized_stack_slot(
@@ -864,6 +984,43 @@ fn translate_function(
     }
 
     Ok(())
+}
+
+/// Zero-extend the narrower of `a`/`b` to match the wider one's cranelift
+/// type, if they differ; a no-op (returns both unchanged) when they already
+/// match, which is every pre-existing call site's shape.
+///
+/// Rung 3 STEP 2 (native leg): needed for address arithmetic on a
+/// `MemAllocDynamic` result. Sonatina types that result `Type::I32`
+/// (matching wasm's 32-bit linear-memory address space, the SAME
+/// backend-neutral IR the SPIR-V translator also consumes unchanged), but
+/// the cranelift lowering of `MemAllocDynamic` produces a REAL, native
+/// pointer-width (`I64`) `stack_addr` value -- Sonatina's own type system
+/// has no notion of "logical i32 address, physically wider on this target"
+/// the way wasm's actual 32-bit address space does. Plain `Add`/`Sub`/`Mul`
+/// on a stack address and an i32-typed offset would otherwise be a raw
+/// cranelift width mismatch (a verifier error, not a silent miscompile:
+/// cranelift's own arithmetic opcodes require matching operand widths, so
+/// this fails LOUD, never wrong, without this fix -- confirmed empirically
+/// via `cranelift_mem_alloc_dynamic_array_executes` before this change).
+/// Zero-extension (not sign-extension) is correct: every value this widens
+/// is a byte offset, an array index, or an allocation size -- all
+/// non-negative by construction in this IR.
+fn widen_to_match(
+    builder: &mut FunctionBuilder,
+    a: clif::Value,
+    b: clif::Value,
+) -> (clif::Value, clif::Value) {
+    let ta = builder.func.dfg.value_type(a);
+    let tb = builder.func.dfg.value_type(b);
+    if ta == tb {
+        return (a, b);
+    }
+    if ta.bits() < tb.bits() {
+        (builder.ins().uextend(tb, a), b)
+    } else {
+        (a, builder.ins().uextend(ta, b))
+    }
 }
 
 fn resolve_scalar_value(
