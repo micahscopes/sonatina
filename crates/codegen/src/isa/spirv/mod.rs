@@ -167,6 +167,14 @@ pub struct SpirvLayout {
     /// modes). `None` in Grid and Render modes: the whole output array (Grid) or
     /// the color target (Render) is the result, so there is no single readback slot.
     pub result: Option<SpirvResult>,
+    /// Where the per-invocation trap-status word lands for readback, for
+    /// kernels using function-local `[u32; N]` arrays (Codex bug 3's fix: an
+    /// unambiguous status channel separate from the result). `Some` for
+    /// Scalar-mode Mem-op-bearing kernels (a fixed single-invocation slot,
+    /// mirroring `result`). `None` for Grid (the whole `trap` binding is the
+    /// per-pixel array, same "no single slot" reasoning as `result` in Grid
+    /// mode) and for any kernel with no Mem ops (nothing to report).
+    pub trap: Option<SpirvResult>,
     /// Render mode: the `@vertex` entry point name (`None` for compute modes).
     pub vertex_entry: Option<String>,
     /// Render mode: the `@fragment` entry point name (`None` for compute modes).
@@ -205,6 +213,12 @@ pub struct SpirvBackend {
     /// `@location(0) vec4<f32>` color. Driver-declared, off by default; mutually
     /// exclusive with grid and batch.
     pub render: bool,
+    /// Word capacity of the emulated private-storage heap (`fe_heap`) declared
+    /// for kernels using function-local `[u32; N]` arrays (`MemAllocDynamic` /
+    /// `Mload` / `Mstore`). Default 8192 words (32KB), matching
+    /// `RUNG3_SPIRV_ARRAYS_DESIGN.md`. Irrelevant (and the heap is undeclared)
+    /// for kernels with no Mem ops.
+    pub heap_words: u32,
 }
 
 impl SpirvBackend {
@@ -213,6 +227,7 @@ impl SpirvBackend {
             workgroup_size: [64, 1, 1],
             grid: false,
             render: false,
+            heap_words: 8192,
         }
     }
 
@@ -230,6 +245,12 @@ impl SpirvBackend {
         self.render = true;
         self
     }
+
+    /// Override the private-heap word capacity for Mem-op-bearing kernels.
+    pub fn with_private_heap_words(mut self, words: u32) -> Self {
+        self.heap_words = words;
+        self
+    }
 }
 
 impl Backend for SpirvBackend {
@@ -245,9 +266,14 @@ impl Backend for SpirvBackend {
 
     #[cfg(feature = "spirv-backend")]
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        let (naga_mod, layout) =
-            translate_to_naga(module, self.workgroup_size, self.grid, self.render)
-                .map_err(|e| vec![SpirvError::Translation(e)])?;
+        let (naga_mod, layout) = translate_to_naga(
+            module,
+            self.workgroup_size,
+            self.grid,
+            self.render,
+            self.heap_words,
+        )
+        .map_err(|e| vec![SpirvError::Translation(e)])?;
 
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
@@ -343,6 +369,142 @@ fn lit_u32(func: &mut naga::Function, v: u32) -> naga::Handle<naga::Expression> 
     func.expressions.append(naga::Expression::Literal(naga::Literal::U32(v)), naga::Span::UNDEFINED)
 }
 
+/// Function-scoped state for kernels using the private-storage heap
+/// emulation of function-local `[u32; N]` arrays (`RUNG3_SPIRV_ARRAYS_DESIGN.md`
+/// section 2). Declared once per entry function, only when the function
+/// contains a Mem op (`has_mem`), and threaded read-only through every
+/// region-emission function so `MemAllocDynamic`/`Mload`/`Mstore` can be
+/// lowered no matter how deeply they are nested in structured control flow.
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy)]
+struct MemCtx {
+    /// `var<function> fe_heap: array<u32, heap_words>`, zero-initialized.
+    heap: naga::Handle<naga::LocalVariable>,
+    /// `var<function> fe_bump: u32`, the bump-pointer allocator, init 0.
+    bump: naga::Handle<naga::LocalVariable>,
+    /// `var<function> fe_trapped: bool`, init false. An OR-accumulator: any
+    /// guard site ORs its own failure condition in; never cleared once set.
+    /// This is the externally-visible status channel that closes Codex bug 3
+    /// (poison-sentinel collision): a consumer reads this flag instead of
+    /// trying to infer failure from an in-band magic result value.
+    trapped: naga::Handle<naga::LocalVariable>,
+    heap_words: u32,
+}
+
+/// OR-accumulate `mem_ctx.trapped` with a freshly computed boolean condition
+/// (read-modify-write, so an EARLIER guard's `true` is never clobbered by a
+/// LATER guard's `false`). Used at every dynamic (runtime-computed) guard:
+/// heap-allocation overflow and misaligned access.
+#[cfg(feature = "spirv-backend")]
+fn mark_trapped_if(
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    mem_ctx: MemCtx,
+    cond: naga::Handle<naga::Expression>,
+) {
+    let ptr = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.trapped), naga::Span::UNDEFINED);
+    let cur = emit_expr(func, target, naga::Expression::Load { pointer: ptr });
+    let or = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::LogicalOr, left: cur, right: cond });
+    let ptr2 = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.trapped), naga::Span::UNDEFINED);
+    target.push(naga::Statement::Store { pointer: ptr2, value: or }, naga::Span::UNDEFINED);
+}
+
+/// Unconditionally set `mem_ctx.trapped = true`. Used at Unreachable (trap)
+/// sites, where the condition is already known statically (control flow
+/// reached this point at all only because the guard failed), so no OR-load
+/// is needed -- `true OR x == true` regardless of `x`.
+#[cfg(feature = "spirv-backend")]
+fn mark_trapped_always(func: &mut naga::Function, target: &mut naga::Block, mem_ctx: MemCtx) {
+    let one = func.expressions.append(naga::Expression::Literal(naga::Literal::Bool(true)), naga::Span::UNDEFINED);
+    let ptr = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.trapped), naga::Span::UNDEFINED);
+    target.push(naga::Statement::Store { pointer: ptr, value: one }, naga::Span::UNDEFINED);
+}
+
+/// Compute the guarded, clamped `fe_heap` element pointer for a Mem access at
+/// byte address `addr` (already resolved to a naga u32 expression). Emits,
+/// in order:
+///  1. Codex bug 2 (silent misaligned-access miscompile): `addr & 3 != 0` is
+///     computed and OR'd into `mem_ctx.trapped`. The naive `addr >> 2` a
+///     translator could do without this check silently discards the low
+///     bits and aliases any non-4-aligned address onto the word it happens
+///     to fall in; here that same aliased read/write still happens (SPIR-V
+///     has no sub-word access to a `var<function> array<u32>`) but is now
+///     FLAGGED, not silently trusted. Fe's own array codegen always
+///     produces 8-aligned bases/strides (`layout_utils.rs`), so this guard
+///     is not expected to fire for accepted Fe programs; it exists so the
+///     translator does not merely ASSUME that invariant.
+///  2. Codex bug 1 (heap-exhaustion aliasing), the per-access half: the word
+///     index is `Min`-clamped into `[0, heap_words)` via `Select` so a bad or
+///     wrapped address can only ever produce an in-range `OpAccessChain`
+///     (wrong-but-bounded, never UB), independent of the allocation-time
+///     guard in the `MemAllocDynamic` arm above.
+#[cfg(feature = "spirv-backend")]
+fn emit_mem_access(
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    mem_ctx: MemCtx,
+    addr: naga::Handle<naga::Expression>,
+) -> naga::Handle<naga::Expression> {
+    let three = lit_u32(func, 3);
+    let low_bits = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::And, left: addr, right: three });
+    let zero = lit_u32(func, 0);
+    let misaligned = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::NotEqual, left: low_bits, right: zero });
+    mark_trapped_if(func, target, mem_ctx, misaligned);
+
+    let two = lit_u32(func, 2);
+    let word_idx = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::ShiftRight, left: addr, right: two });
+    let max_idx = lit_u32(func, mem_ctx.heap_words.saturating_sub(1));
+    let heap_words_lit = lit_u32(func, mem_ctx.heap_words);
+    let in_range = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Less, left: word_idx, right: heap_words_lit });
+    let clamped = emit_expr(func, target, naga::Expression::Select { condition: in_range, accept: word_idx, reject: max_idx });
+    let idx_i32 = emit_expr(func, target, naga::Expression::As { expr: clamped, kind: naga::ScalarKind::Sint, convert: Some(4) });
+
+    let heap_ptr = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.heap), naga::Span::UNDEFINED);
+    // Access returns a pointer -- no Emit needed (matches the existing
+    // ObjIndex convention above).
+    func.expressions.append(naga::Expression::Access { base: heap_ptr, index: idx_i32 }, naga::Span::UNDEFINED)
+}
+
+/// Store the final `mem_ctx.trapped` value (as u32 0/1) into the trap-status
+/// output at `index`, alongside the ordinary result store. This is the write
+/// side of Codex bug 3's fix: the read side is simply "the consumer checks
+/// this word", which is out of scope here (no GPU execution in this
+/// sandbox) but the channel itself is real, not a placeholder.
+#[cfg(feature = "spirv-backend")]
+fn emit_trap_store(
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    mem_ctx: MemCtx,
+    trap_var: naga::Handle<naga::GlobalVariable>,
+    index: naga::Handle<naga::Expression>,
+) {
+    let ptr = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.trapped), naga::Span::UNDEFINED);
+    let trapped_bool = emit_expr(func, target, naga::Expression::Load { pointer: ptr });
+    let trapped_u32 = emit_expr(func, target, naga::Expression::As { expr: trapped_bool, kind: naga::ScalarKind::Uint, convert: Some(4) });
+    let trap_global = func.expressions.append(naga::Expression::GlobalVariable(trap_var), naga::Span::UNDEFINED);
+    let trap_ptr = func.expressions.append(naga::Expression::Access { base: trap_global, index }, naga::Span::UNDEFINED);
+    target.push(naga::Statement::Store { pointer: trap_ptr, value: trapped_u32 }, naga::Span::UNDEFINED);
+}
+
+/// Whether `block`'s terminator is Sonatina `Unreachable` (an array/memory
+/// bounds trap). Distinct from `find_block_return_value`: there is no value
+/// to resolve, only a poison signal to raise via `mark_trapped_always`.
+#[cfg(feature = "spirv-backend")]
+fn block_ends_unreachable(
+    block: sonatina_ir::BlockId,
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+) -> bool {
+    use sonatina_ir::InstDowncast;
+    function.layout.iter_inst(block).any(|inst_id| {
+        <&sonatina_ir::inst::control_flow::Unreachable as InstDowncast>::downcast(
+            inst_set,
+            function.dfg.inst(inst_id),
+        )
+        .is_some()
+    })
+}
+
 /// Exact, branch-free "WebAssembly rules" (IEEE 754-2019 `minimum`/`maximum`)
 /// f32 min/max for the naga/SPIR-V and WGSL backends. Bitcasts both operands
 /// to `u32` and does everything else in integer space -- no float compare, no
@@ -431,6 +593,7 @@ fn emit_single_inst(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    mem_ctx: Option<MemCtx>,
 ) -> bool {
     use sonatina_ir::InstDowncast;
     let inst_data = function.dfg.inst(inst_id);
@@ -970,6 +1133,61 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some(alloc) = <&sonatina_ir::inst::data::MemAllocDynamic as InstDowncast>::downcast(inst_set, inst_data) {
+        // Private-storage heap emulation (RUNG3_SPIRV_ARRAYS_DESIGN.md section
+        // 2): fe_bump is a monotone bump pointer into fe_heap.
+        //
+        // Guards Codex bug 1 (silent heap-exhaustion aliasing). The pre-scan in
+        // `translate_to_naga` already PROVES, at compile time, that the sum of
+        // every MemAllocDynamic's constant `size` in this function is <=
+        // mem_ctx.heap_words*4, and fails closed (named error, no module
+        // emitted) on any allocation whose size is not a compile-time constant
+        // or that sits inside a loop (whose trip count would make the total
+        // unbounded and unprovable). So the overflow this guard checks for is
+        // unreachable BY CONSTRUCTION in any module this translator accepts.
+        // The runtime check below is a second, independent line of defense:
+        // if it is ever reached anyway (e.g. a future relaxation of the
+        // pre-scan), the allocation is refused (bump frozen at its old value,
+        // not silently advanced past capacity) and `mem_ctx.trapped` is
+        // raised, rather than the old bump/no-check scheme where excess
+        // allocations silently clamp-and-alias onto the SAME last heap word.
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let mem_ctx = mem_ctx.expect("MemAllocDynamic requires mem_ctx (has_mem pre-scan gate)");
+            let size = resolve_naga_value(*alloc.size(), function, word, value_map, phi_locals, func).unwrap();
+            let bump_ptr = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.bump), naga::Span::UNDEFINED);
+            let old_bump = emit_expr(func, target, naga::Expression::Load { pointer: bump_ptr });
+            let new_bump = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Add, left: old_bump, right: size });
+            // Unsigned wraparound check (new_bump < old_bump means size wrapped
+            // the u32 add) OR new_bump exceeds the declared heap capacity.
+            let overflowed = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Less, left: new_bump, right: old_bump });
+            let cap = lit_u32(func, mem_ctx.heap_words.saturating_mul(4));
+            let too_big = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Greater, left: new_bump, right: cap });
+            let bad = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::LogicalOr, left: overflowed, right: too_big });
+            mark_trapped_if(func, target, mem_ctx, bad);
+            // Freeze the bump pointer on overflow instead of advancing it past
+            // capacity: keep_old = select(bad, old_bump, new_bump).
+            let kept_bump = emit_expr(func, target, naga::Expression::Select { condition: bad, accept: old_bump, reject: new_bump });
+            let bump_ptr2 = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.bump), naga::Span::UNDEFINED);
+            target.push(naga::Statement::Store { pointer: bump_ptr2, value: kept_bump }, naga::Span::UNDEFINED);
+            value_map.insert(result, old_bump);
+            return true;
+        }
+    } else if let Some(load) = <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(inst_set, inst_data) {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let mem_ctx = mem_ctx.expect("Mload requires mem_ctx (has_mem pre-scan gate)");
+            let addr = resolve_naga_value(*load.addr(), function, word, value_map, phi_locals, func).unwrap();
+            let elem = emit_mem_access(func, target, mem_ctx, addr);
+            let loaded = emit_expr(func, target, naga::Expression::Load { pointer: elem });
+            value_map.insert(result, loaded);
+            return true;
+        }
+    } else if let Some(store) = <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(inst_set, inst_data) {
+        let mem_ctx = mem_ctx.expect("Mstore requires mem_ctx (has_mem pre-scan gate)");
+        let addr = resolve_naga_value(*store.addr(), function, word, value_map, phi_locals, func).unwrap();
+        let value = resolve_naga_value(*store.value(), function, word, value_map, phi_locals, func).unwrap();
+        let elem = emit_mem_access(func, target, mem_ctx, addr);
+        target.push(naga::Statement::Store { pointer: elem, value }, naga::Span::UNDEFINED);
+        return true;
     } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(&val_id) = ret.args().as_slice().first() {
             let was_cached = value_map.contains_key(&val_id);
@@ -998,9 +1216,10 @@ fn emit_block_to_target(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    mem_ctx: Option<MemCtx>,
 ) {
     for inst_id in function.layout.iter_inst(block) {
-        emit_single_inst(inst_id, function, inst_set, word, func, target, value_map, phi_locals, result_expr);
+        emit_single_inst(inst_id, function, inst_set, word, func, target, value_map, phi_locals, result_expr, mem_ctx);
     }
 }
 
@@ -1015,10 +1234,11 @@ fn emit_naga_block_instructions(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    mem_ctx: Option<MemCtx>,
 ) {
     let mut target = naga::Block::new();
     emit_phi_loads_for_block(function, inst_set, block, func, &mut target, value_map, phi_locals);
-    emit_block_to_target(function, inst_set, word, block, func, &mut target, value_map, phi_locals, result_expr);
+    emit_block_to_target(function, inst_set, word, block, func, &mut target, value_map, phi_locals, result_expr, mem_ctx);
     func.body.extend_block(target);
 }
 
@@ -1061,6 +1281,7 @@ fn emit_naga_regions(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    mem_ctx: Option<MemCtx>,
 ) -> Result<(), String> {
     let mut region_idx = 0;
     while region_idx < regions.len() {
@@ -1069,15 +1290,33 @@ fn emit_naga_regions(
             crate::structurize::Region::Block(block_id) => {
                 emit_naga_block_instructions(
                     function, inst_set, word, *block_id, word_type,
-                    func, value_map, phi_locals, result_expr,
+                    func, value_map, phi_locals, result_expr, mem_ctx,
                 );
+                // Codex bug 4 (wrong value on unconditional trap): a block
+                // reached unconditionally at THIS (unnested) level whose
+                // terminator is `Unreachable` is, by construction of
+                // `structurize_function` (Unreachable is classified
+                // Return-like, always ending its region chain), the LAST
+                // region at this nesting level -- nothing here needs to be
+                // skipped afterward. Before this arm existed, `emit_single_inst`
+                // had no case for `Unreachable` at all, so a top-level trap
+                // silently produced no statements and the function fell
+                // through to the store-zero fallback (`0x0000_0000`), never
+                // reaching the poison contract the design specifies.
+                if let Some(mem_ctx) = mem_ctx {
+                    if block_ends_unreachable(*block_id, function, inst_set) {
+                        let mut target = naga::Block::new();
+                        mark_trapped_always(func, &mut target, mem_ctx);
+                        func.body.extend_block(target);
+                    }
+                }
                 region_idx += 1;
             }
             crate::structurize::Region::Loop { header, body } => {
                 let mut loop_target = naga::Block::new();
                 let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
-                    func, value_map, phi_locals, result_expr, &mut loop_target,
+                    func, value_map, phi_locals, result_expr, &mut loop_target, mem_ctx,
                 )?;
                 func.body.extend_block(loop_target);
                 region_idx += 1;
@@ -1086,7 +1325,7 @@ fn emit_naga_regions(
                     let mut continuation_result = None;
                     emit_naga_regions(
                         function, inst_set, word, &regions[region_idx..], word_type, f32_type,
-                        bool_type, func, value_map, phi_locals, &mut continuation_result,
+                        bool_type, func, value_map, phi_locals, &mut continuation_result, mem_ctx,
                     )?;
                     let mut continuation = std::mem::replace(&mut func.body, saved_body);
                     if let Some(value) = continuation_result {
@@ -1143,7 +1382,7 @@ fn emit_naga_regions(
                 let mut may_return = false;
                 emit_if_region(
                     function, inst_set, word, region, word_type, f32_type, bool_type, func, &mut target,
-                    value_map, phi_locals, transport, &mut may_return,
+                    value_map, phi_locals, transport, &mut may_return, mem_ctx,
                 )?;
                 func.body.extend_block(target);
                 region_idx += 1;
@@ -1152,7 +1391,7 @@ fn emit_naga_regions(
                     let mut continuation_result = None;
                     emit_naga_regions(
                         function, inst_set, word, &regions[region_idx..], word_type, f32_type,
-                        bool_type, func, value_map, phi_locals, &mut continuation_result,
+                        bool_type, func, value_map, phi_locals, &mut continuation_result, mem_ctx,
                     )?;
                     let mut continuation = std::mem::replace(&mut func.body, saved_body);
                     if let Some(value) = continuation_result {
@@ -1318,6 +1557,7 @@ fn emit_if_region(
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     transport: StructuredReturnTransport,
     may_return: &mut bool,
+    mem_ctx: Option<MemCtx>,
 ) -> Result<(), String> {
     use sonatina_ir::InstDowncast;
     let crate::structurize::Region::IfThenElse { header, then_branch, else_branch, merge } = region else {
@@ -1330,7 +1570,7 @@ fn emit_if_region(
         function, inst_set, *header, func, target, value_map, phi_locals,
     );
     let mut ignored_result = None;
-    emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, &mut ignored_result);
+    emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, &mut ignored_result, mem_ctx);
     let branch = function.layout.iter_inst(*header).find_map(|inst_id|
         <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(inst_id))
     ).ok_or_else(|| format!("spirv structurize: if header {header:?} has no branch"))?;
@@ -1348,8 +1588,8 @@ fn emit_if_region(
     let mut else_returns = false;
     let mut then_edge_emitted = false;
     let mut else_edge_emitted = false;
-    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, f32_type, bool_type, func, &mut accept, &mut then_values, phi_locals, transport, *merge, &mut then_returns, &mut then_edge_emitted)?;
-    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, f32_type, bool_type, func, &mut reject, &mut else_values, phi_locals, transport, *merge, &mut else_returns, &mut else_edge_emitted)?;
+    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, f32_type, bool_type, func, &mut accept, &mut then_values, phi_locals, transport, *merge, &mut then_returns, &mut then_edge_emitted, mem_ctx)?;
+    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, f32_type, bool_type, func, &mut reject, &mut else_values, phi_locals, transport, *merge, &mut else_returns, &mut else_edge_emitted, mem_ctx)?;
     *may_return |= then_returns || else_returns;
     let then_outcome = arm_outcome(function, inst_set, *header, then_branch);
     let else_outcome = arm_outcome(function, inst_set, *header, else_branch);
@@ -1436,9 +1676,20 @@ fn arm_outcome(
     let Some(last) = regions.last() else { return ArmOutcome::Predecessor(header) };
     match last {
         crate::structurize::Region::Block(block) => {
-            let returns = function.layout.iter_inst(*block).any(|iid|
-                <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, function.dfg.inst(iid)).is_some()
-            );
+            // A block ending in `Return` OR `Unreachable` is Terminal: neither
+            // has a real CFG successor, so this arm never becomes a
+            // predecessor of some later merge. Treating only `Return` as
+            // Terminal (the pre-array-support state) made a trap arm report
+            // `Predecessor`, which trips the "merge-less conditional has a
+            // fallthrough arm" hard error for EVERY bounds-checked array
+            // access, since `find_merge`'s postdominator walk already
+            // (correctly) computes `merge: None` whenever one arm is a true
+            // CFG dead end (Codex bug 4's structural precondition).
+            let returns = function.layout.iter_inst(*block).any(|iid| {
+                let inst = function.dfg.inst(iid);
+                <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst).is_some()
+                    || <&sonatina_ir::inst::control_flow::Unreachable as InstDowncast>::downcast(inst_set, inst).is_some()
+            });
             if returns { ArmOutcome::Terminal } else { ArmOutcome::Predecessor(*block) }
         }
         crate::structurize::Region::IfThenElse { merge: Some(_), .. } => ArmOutcome::AlreadyAtMerge,
@@ -1465,6 +1716,7 @@ fn emit_non_loop_regions(
     fallthrough_merge: Option<sonatina_ir::BlockId>,
     may_return: &mut bool,
     edge_emitted: &mut bool,
+    mem_ctx: Option<MemCtx>,
 ) -> Result<(), String> {
     let mut region_idx = 0;
     while region_idx < regions.len() {
@@ -1473,7 +1725,7 @@ fn emit_non_loop_regions(
             crate::structurize::Region::Block(block) => {
                 emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
                 let mut block_result = None;
-                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, &mut block_result);
+                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, &mut block_result, mem_ctx);
                 if find_block_return_value(*block, function, inst_set).is_some() {
                     let value = block_result.ok_or_else(|| format!("spirv: unresolved structured return in {block:?}"))?;
                     let pointer = func.expressions.append(
@@ -1488,6 +1740,18 @@ fn emit_non_loop_regions(
                     );
                     target.push(naga::Statement::Store { pointer, value: returned }, naga::Span::UNDEFINED);
                     *may_return = true;
+                } else if let Some(mem_ctx) = mem_ctx {
+                    // Codex bug 4 analog, nested (non-loop) arm: a bounds-trap
+                    // arm (`if idx<len {...} else { unreachable }`, `merge:
+                    // None` per `find_merge`'s postdominator walk) is, by
+                    // `structurize_function`'s Unreachable-is-Return-like
+                    // classification, ALWAYS the last region at this nesting
+                    // level -- nothing here needs `transport`/`may_return`
+                    // (no sibling region depends on it); only the externally
+                    // visible trapped flag needs raising.
+                    if block_ends_unreachable(*block, function, inst_set) {
+                        mark_trapped_always(func, target, mem_ctx);
+                    }
                 }
                 region_idx += 1;
             }
@@ -1495,7 +1759,7 @@ fn emit_non_loop_regions(
                 let mut nested_returns = false;
                 emit_if_region(
                     function, inst_set, word, region, word_type, f32_type, bool_type,
-                    func, target, value_map, phi_locals, transport, &mut nested_returns,
+                    func, target, value_map, phi_locals, transport, &mut nested_returns, mem_ctx,
                 )?;
                 region_idx += 1;
                 if nested_returns {
@@ -1506,7 +1770,7 @@ fn emit_non_loop_regions(
                         function, inst_set, word, &regions[region_idx..], word_type,
                         f32_type, bool_type, func, &mut continuation, value_map,
                         phi_locals, transport, fallthrough_merge,
-                        &mut continuation_returns, &mut continuation_edge_emitted,
+                        &mut continuation_returns, &mut continuation_edge_emitted, mem_ctx,
                     )?;
                     if regions[region_idx..].is_empty()
                         && *nested_merge == fallthrough_merge
@@ -1558,7 +1822,7 @@ fn emit_non_loop_regions(
                 let mut no_result = None;
                 let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
-                    func, value_map, phi_locals, &mut no_result, target,
+                    func, value_map, phi_locals, &mut no_result, target, mem_ctx,
                 )?;
                 if loop_return.is_some() {
                     return Err(format!(
@@ -1643,6 +1907,7 @@ fn emit_regions_in_loop(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    mem_ctx: Option<MemCtx>,
 ) -> Result<RegionOutcome, String> {
     use sonatina_ir::InstDowncast;
     let mut outcome = None;
@@ -1650,7 +1915,8 @@ fn emit_regions_in_loop(
         match region {
             crate::structurize::Region::Block(block) => {
                 emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
-                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, result_expr);
+                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, result_expr, mem_ctx);
+                let mut terminated = false;
                 for inst_id in function.layout.iter_inst(*block) {
                     let inst = function.dfg.inst(inst_id);
                     if let Some(jump) = <&sonatina_ir::inst::control_flow::Jump as InstDowncast>::downcast(inst_set, inst) {
@@ -1677,7 +1943,29 @@ fn emit_regions_in_loop(
                         *may_return = true;
                         target.push(naga::Statement::Break, naga::Span::UNDEFINED);
                         return Ok(RegionOutcome::Terminal);
+                    } else if let Some(mem_ctx) = mem_ctx {
+                        if <&sonatina_ir::inst::control_flow::Unreachable as InstDowncast>::downcast(inst_set, inst).is_some() {
+                            // Codex bug 4 analog, mid-loop bounds trap (e.g. a
+                            // dynamically-indexed store inside a `while`):
+                            // raise the flag and `Break` out of the loop
+                            // rather than let the (undefined/poison) trap
+                            // arm silently fall through as ordinary control
+                            // flow. `Break` here also bounds how much
+                            // garbage-but-safe computation runs after a
+                            // detected fault, though correctness does not
+                            // depend on that -- every access is independently
+                            // clamped (see `emit_mem_access`) and the
+                            // consumer is expected to check `mem_ctx.trapped`
+                            // before trusting anything this invocation wrote.
+                            mark_trapped_always(func, target, mem_ctx);
+                            target.push(naga::Statement::Break, naga::Span::UNDEFINED);
+                            terminated = true;
+                            break;
+                        }
                     }
+                }
+                if terminated {
+                    return Ok(RegionOutcome::Terminal);
                 }
                 outcome = Some(RegionOutcome::Fallthrough(*block));
             }
@@ -1688,7 +1976,7 @@ fn emit_regions_in_loop(
                 emit_phi_loads_for_block(
                     function, inst_set, *header, func, target, value_map, phi_locals,
                 );
-                emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr);
+                emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr, mem_ctx);
                 let branch = function.layout.iter_inst(*header).find_map(|iid|
                     <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(iid))
                 ).ok_or_else(|| format!("spirv: if header {header:?} has no branch"))?;
@@ -1699,10 +1987,10 @@ fn emit_regions_in_loop(
                 let mut accept_values = value_map.clone();
                 let mut reject_values = value_map.clone();
                 let then_outcome = if then_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
-                    emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut accept, &mut accept_values, phi_locals, result_expr)?
+                    emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut accept, &mut accept_values, phi_locals, result_expr, mem_ctx)?
                 };
                 let else_outcome = if else_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
-                    emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut reject, &mut reject_values, phi_locals, result_expr)?
+                    emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut reject, &mut reject_values, phi_locals, result_expr, mem_ctx)?
                 };
                 if let Some(merge) = merge {
                     // `from == merge` means the arm already LANDED at the merge
@@ -1736,7 +2024,7 @@ fn emit_regions_in_loop(
                 let mut nested_result = None;
                 let inner_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
-                    func, value_map, phi_locals, &mut nested_result, target,
+                    func, value_map, phi_locals, &mut nested_result, target, mem_ctx,
                 )?;
                 if inner_return.is_some() {
                     return Err(format!(
@@ -1771,7 +2059,7 @@ fn emit_regions_in_loop(
                     );
                     emit_block_to_target(
                         function, inst_set, word, *exit, func, target, value_map, phi_locals,
-                        result_expr,
+                        result_expr, mem_ctx,
                     );
                     let value = resolve_naga_value(
                         ret, function, word, value_map, phi_locals, func,
@@ -1827,6 +2115,7 @@ fn emit_recursive_loop_region(
     // the arm rather than the function root. (`func.body` cannot be passed here
     // directly — it would alias the `&mut func` this fn also needs.)
     target: &mut naga::Block,
+    mem_ctx: Option<MemCtx>,
 ) -> Result<Option<StructuredReturnTransport>, String> {
     use sonatina_ir::InstDowncast;
     let mut loop_blocks = std::collections::HashSet::new();
@@ -1903,7 +2192,7 @@ fn emit_recursive_loop_region(
     emit_phi_loads_for_block(function, inst_set, header, func, &mut loop_body, value_map, phi_locals);
     emit_block_to_target(
         function, inst_set, word, header, func, &mut loop_body, value_map,
-        phi_locals, &mut nested_result_expr,
+        phi_locals, &mut nested_result_expr, mem_ctx,
     );
     let branch = function.layout.iter_inst(header).find_map(|iid|
         <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(iid))
@@ -1932,7 +2221,7 @@ fn emit_recursive_loop_region(
         let body_outcome = emit_regions_in_loop(
             function, inst_set, word, body_regions, header, word_type, f32_type, bool_type,
             return_local, did_return_local, &mut may_return, func, &mut continue_arm,
-            &mut continue_values, phi_locals, &mut nested_result_expr,
+            &mut continue_values, phi_locals, &mut nested_result_expr, mem_ctx,
         )?;
         // Fallthrough(header) is a trailing nested loop whose exit IS this
         // loop's back-edge: its exit arm already stored this header's phi
@@ -1958,7 +2247,7 @@ fn emit_recursive_loop_region(
         );
         emit_block_to_target(
             function, inst_set, word, exit, func, &mut exit_arm, &mut exit_values,
-            phi_locals, &mut nested_result_expr,
+            phi_locals, &mut nested_result_expr, mem_ctx,
         );
         let value = resolve_naga_value(ret, function, word, &mut exit_values, phi_locals, func)
             .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
@@ -2118,6 +2407,9 @@ fn spirv_instruction_is_lowered(
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjLoad as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjIndex as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::MemAllocDynamic as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::Mload as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::Mstore as InstDowncast>::downcast(is, inst).is_some()
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -2126,6 +2418,7 @@ fn translate_to_naga(
     workgroup_size: [u32; 3],
     grid: bool,
     render: bool,
+    heap_words: u32,
 ) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
 
@@ -2226,12 +2519,28 @@ fn translate_to_naga(
     // div|mod): Sonatina integers are signless, so u32 is exact for wrapping
     // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
     // silently emit the signed WGSL operator.
-    let (param_count, has_obj_alloc) = module
+    let (param_count, has_obj_alloc, has_mem) = module
         .func_store
-        .try_view(first_func, |f| -> Result<(usize, bool), String> {
+        .try_view(first_func, |f| -> Result<(usize, bool, bool), String> {
             let pc = f.arg_values.len();
             let is = f.inst_set();
             let mut has_alloc = false;
+            let mut has_mem = false;
+            // Codex bug 1 (heap-exhaustion aliasing), the compile-time half:
+            // the running sum of every MemAllocDynamic's constant size in
+            // this function. Compared against the declared heap capacity
+            // below; any allocation whose size can't be proven constant, or
+            // that sits inside a loop (unbounded total), fails closed instead
+            // of being summed. This makes the runtime overflow check in the
+            // translator's MemAllocDynamic arm PROVABLY unreachable for any
+            // module this pre-scan accepts, rather than the only defense.
+            let mut mem_heap_bytes: u64 = 0;
+            let mut cfg = sonatina_ir::cfg::ControlFlowGraph::default();
+            cfg.compute(f);
+            let mut domtree = crate::domtree::DomTree::new();
+            domtree.compute(&cfg);
+            let mut loop_tree = crate::loop_analysis::LoopTree::new();
+            loop_tree.compute(&cfg, &domtree);
             if word == WordKind::I64
                 && f.dfg
                     .value_ids()
@@ -2290,6 +2599,61 @@ fn translate_to_naga(
                     .is_some()
                     {
                         has_alloc = true;
+                    }
+                    if let Some(alloc) = <&sonatina_ir::inst::data::MemAllocDynamic as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
+                        has_mem = true;
+                        let Some(size_imm) = f.dfg.value_imm(*alloc.size()) else {
+                            return Err(
+                                "spirv: MemAllocDynamic with a non-constant size is \
+                                 unsupported (the private-heap capacity proof requires \
+                                 every allocation size to be known at compile time). \
+                                 Fail closed."
+                                    .to_string(),
+                            );
+                        };
+                        let size_bytes: u64 = match size_imm {
+                            sonatina_ir::Immediate::I1(v) => v as u64,
+                            sonatina_ir::Immediate::I8(v) => v as u8 as u64,
+                            sonatina_ir::Immediate::I32(v) => v as u32 as u64,
+                            sonatina_ir::Immediate::I64(v) => v as u64,
+                            _ => {
+                                return Err(
+                                    "spirv: MemAllocDynamic size has an unsupported \
+                                     immediate kind. Fail closed."
+                                        .to_string(),
+                                );
+                            }
+                        };
+                        if loop_tree.loop_of_block(bid).is_some() {
+                            return Err(
+                                "spirv: MemAllocDynamic inside a loop is unsupported (the \
+                                 total bytes allocated would depend on the runtime trip \
+                                 count, making the compile-time private-heap capacity \
+                                 proof unbounded). Fail closed."
+                                    .to_string(),
+                            );
+                        }
+                        mem_heap_bytes = mem_heap_bytes.saturating_add(size_bytes);
+                    }
+                    if let Some(load) = <&sonatina_ir::inst::data::Mload as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
+                        has_mem = true;
+                        if *load.ty() != sonatina_ir::Type::I32 {
+                            return Err(format!(
+                                "spirv: Mload of type {:?} is unsupported (Mem ops admit \
+                                 I32 only, under the u32 word only). Fail closed.",
+                                load.ty()
+                            ));
+                        }
+                    }
+                    if let Some(store) = <&sonatina_ir::inst::data::Mstore as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
+                        has_mem = true;
+                        if *store.ty() != sonatina_ir::Type::I32 {
+                            return Err(format!(
+                                "spirv: Mstore of type {:?} is unsupported (Mem ops admit \
+                                 I32 only, under the u32 word only). Fail closed.",
+                                store.ty()
+                            ));
+                        }
                     }
                     if word == WordKind::U32 {
                         if let Some(op) = unsupported_signed_op_under_u32(is, inst_data) {
@@ -2369,7 +2733,26 @@ fn translate_to_naga(
                     }
                 }
             }
-            Ok((pc, has_alloc))
+            if has_mem && word == WordKind::I64 {
+                return Err(
+                    "spirv i64: MemAllocDynamic/Mload/Mstore (function-local arrays) are \
+                     unsupported under the i64 word (Mem ops admit the u32 browser word \
+                     only). Fail closed."
+                        .to_string(),
+                );
+            }
+            if has_mem {
+                let heap_capacity_bytes = (heap_words as u64) * 4;
+                if mem_heap_bytes > heap_capacity_bytes {
+                    return Err(format!(
+                        "spirv: MemAllocDynamic static allocation total ({mem_heap_bytes} \
+                         bytes) exceeds the private heap capacity ({heap_capacity_bytes} \
+                         bytes = {heap_words} words); increase with_private_heap_words or \
+                         reduce array usage. Fail closed."
+                    ));
+                }
+            }
+            Ok((pc, has_alloc, has_mem))
         })
         .ok_or_else(|| "spirv: first function body is unavailable".to_string())??;
 
@@ -2398,6 +2781,19 @@ fn translate_to_naga(
         }
     }
 
+    // Batch (ObjAlloc) mode reuses the output storage buffer AS the
+    // allocation (a completely different mechanism from the private-heap
+    // array emulation, `RUNG3_SPIRV_ARRAYS_DESIGN.md` section 1, option B
+    // REJECTED). Combining the two is out of scope here: fail closed with a
+    // named error rather than silently picking one interpretation.
+    if has_obj_alloc && has_mem {
+        return Err(
+            "spirv: function-local [u32; N] arrays (MemAllocDynamic/Mload/Mstore) inside a \
+             batch (ObjAlloc) mode kernel are unsupported. Fail closed."
+                .to_string(),
+        );
+    }
+
     // ======================================================================
     // Render mode (fork push #3). ONE module, two entry points: a fixed
     // fullscreen-triangle `@vertex` and a `@fragment` that binds args 0,1 to
@@ -2423,6 +2819,13 @@ fn translate_to_naga(
             return Err(format!(
                 "spirv render: a render kernel needs at least (px, py) args; got {param_count}"
             ));
+        }
+        if has_mem {
+            return Err(
+                "spirv render: function-local [u32; N] arrays (MemAllocDynamic/Mload/Mstore) \
+                 are unsupported in render mode. Fail closed."
+                    .to_string(),
+            );
         }
         if has_obj_alloc {
             return Err(
@@ -2665,6 +3068,9 @@ fn translate_to_naga(
                 if let Err(err) = emit_naga_regions(
                     function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
                     &mut fs, &mut value_map, &mut phi_locals, &mut result_expr,
+                    // Render mode fails closed on has_mem (checked above), so
+                    // there is never a heap/trap context here.
+                    None,
                 ) {
                     body_error = Some(err);
                 }
@@ -2743,6 +3149,9 @@ fn translate_to_naga(
                 SpirvBuiltinInput { arg_index: 1, source: SpirvBuiltinSource::FragmentPositionY, scalar: SpirvScalarKind::I32 },
             ],
             result: None,
+            // Render mode fails closed on has_mem (checked above): never a
+            // trap channel here.
+            trap: None,
             vertex_entry: Some("vs_fullscreen".to_string()),
             fragment_entry: Some("fs_main".to_string()),
             color_target_format: Some("rgba8unorm".to_string()),
@@ -2872,6 +3281,43 @@ fn translate_to_naga(
         naga::Span::UNDEFINED,
     );
 
+    // Codex bug 3 (poison-sentinel collision): an externally visible,
+    // per-invocation trap-status output, declared ONLY for has_mem kernels.
+    // A dynamic `array<u32>` in both Scalar (written at index 0) and Grid
+    // (written per-pixel, same `linear` index as the result) modes, so a
+    // consumer never has to infer failure from an in-band magic result
+    // value -- it reads this word instead. `0` = completed without a Mem
+    // guard firing; `1` = `fe_trapped` was set (heap exhaustion, a
+    // misaligned access, or an array-bounds trap).
+    let trap_var = if has_mem {
+        let trap_array_ty = naga_mod.types.insert(
+            naga::Type {
+                name: Some("TrapArray".into()),
+                inner: naga::TypeInner::Array {
+                    base: word_type,
+                    size: naga::ArraySize::Dynamic,
+                    stride: word_width,
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        Some(naga_mod.global_variables.append(
+            naga::GlobalVariable {
+                name: Some("trap".into()),
+                space: naga::AddressSpace::Storage {
+                    access: naga::StorageAccess::LOAD | naga::StorageAccess::STORE,
+                },
+                binding: Some(naga::ResourceBinding { group: 0, binding: 2 }),
+                ty: trap_array_ty,
+                init: None,
+                memory_decorations: naga::ir::MemoryDecorations::empty(),
+            },
+            naga::Span::UNDEFINED,
+        ))
+    } else {
+        None
+    };
+
     // u32 vec3 type for global_invocation_id
     let u32_type = naga_mod.types.insert(
         naga::Type {
@@ -2931,6 +3377,47 @@ fn translate_to_naga(
         named_expressions: Default::default(),
         body: naga::Block::new(),
         diagnostic_filter_leaf: None,
+    };
+
+    // Private-storage heap emulation locals (RUNG3_SPIRV_ARRAYS_DESIGN.md
+    // section 2), declared ONLY for has_mem kernels so kernels with no Mem
+    // ops stay byte-identical to before this rung landed.
+    let mem_ctx = if has_mem {
+        let heap_len = std::num::NonZeroU32::new(heap_words)
+            .ok_or_else(|| "spirv: heap_words must be nonzero".to_string())?;
+        let heap_ty = naga_mod.types.insert(
+            naga::Type {
+                name: Some("FeHeap".into()),
+                inner: naga::TypeInner::Array {
+                    base: word_type,
+                    size: naga::ArraySize::Constant(heap_len),
+                    stride: 4,
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        // Explicit ZeroValue init is load-bearing: it matches wasm's
+        // zero-initialized arena, and removes a WGSL/SPIR-V divergence --
+        // WGSL zero-inits `var<function>` implicitly; SPIR-V without an
+        // initializer does not (`RUNG3_SPIRV_ARRAYS_DESIGN.md` section 2).
+        let heap_zero = func.expressions.append(naga::Expression::ZeroValue(heap_ty), naga::Span::UNDEFINED);
+        let heap = func.local_variables.append(
+            naga::LocalVariable { name: Some("fe_heap".into()), ty: heap_ty, init: Some(heap_zero) },
+            naga::Span::UNDEFINED,
+        );
+        let bump_zero = func.expressions.append(naga::Expression::Literal(naga::Literal::U32(0)), naga::Span::UNDEFINED);
+        let bump = func.local_variables.append(
+            naga::LocalVariable { name: Some("fe_bump".into()), ty: word_type, init: Some(bump_zero) },
+            naga::Span::UNDEFINED,
+        );
+        let trapped_false = func.expressions.append(naga::Expression::Literal(naga::Literal::Bool(false)), naga::Span::UNDEFINED);
+        let trapped = func.local_variables.append(
+            naga::LocalVariable { name: Some("fe_trapped".into()), ty: bool_type, init: Some(trapped_false) },
+            naga::Span::UNDEFINED,
+        );
+        Some(MemCtx { heap, bump, trapped, heap_words })
+    } else {
+        None
     };
 
     // Translate the first Sonatina function
@@ -3090,7 +3577,7 @@ fn translate_to_naga(
             };
             if let Err(err) = emit_naga_regions(
                 function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
-                &mut func, &mut value_map, &mut phi_locals, &mut result_expr,
+                &mut func, &mut value_map, &mut phi_locals, &mut result_expr, mem_ctx,
             ) {
                 body_error = Some(err);
             }
@@ -3192,6 +3679,11 @@ fn translate_to_naga(
             naga::Statement::Store { pointer: ptr, value: result_val },
             naga::Span::UNDEFINED,
         );
+        if let (Some(mem_ctx), Some(trap_var)) = (mem_ctx, trap_var) {
+            let mut trap_tail = naga::Block::new();
+            emit_trap_store(&mut func, &mut trap_tail, mem_ctx, trap_var, idx_i32);
+            func.body.extend_block(trap_tail);
+        }
     } else if !has_obj_alloc {
         let output_expr = func.expressions.append(
             naga::Expression::GlobalVariable(output_var),
@@ -3217,6 +3709,12 @@ fn translate_to_naga(
             naga::Statement::Store { pointer: result_field, value: final_val },
             naga::Span::UNDEFINED,
         );
+        if let (Some(mem_ctx), Some(trap_var)) = (mem_ctx, trap_var) {
+            let zero_idx = func.expressions.append(naga::Expression::Literal(naga::Literal::I32(0)), naga::Span::UNDEFINED);
+            let mut trap_tail = naga::Block::new();
+            emit_trap_store(&mut func, &mut trap_tail, mem_ctx, trap_var, zero_idx);
+            func.body.extend_block(trap_tail);
+        }
     }
 
     naga_mod.entry_points.push(naga::EntryPoint {
@@ -3246,28 +3744,43 @@ fn translate_to_naga(
         },
         workgroup_size,
         word,
-        bindings: vec![
-            SpirvBinding {
-                group: 0,
-                binding: 0,
-                name: "output".to_string(),
-                access: Access::ReadWrite,
-                role: Role::Output,
-                stride: word_width,
-                span: word_width,
-                members: Vec::new(),
-            },
-            SpirvBinding {
-                group: 0,
-                binding: 1,
-                name: "input".to_string(),
-                access: Access::Read,
-                role: Role::Input,
-                stride: input_span,
-                span: input_span,
-                members: layout_input_members,
-            },
-        ],
+        bindings: {
+            let mut bindings = vec![
+                SpirvBinding {
+                    group: 0,
+                    binding: 0,
+                    name: "output".to_string(),
+                    access: Access::ReadWrite,
+                    role: Role::Output,
+                    stride: word_width,
+                    span: word_width,
+                    members: Vec::new(),
+                },
+                SpirvBinding {
+                    group: 0,
+                    binding: 1,
+                    name: "input".to_string(),
+                    access: Access::Read,
+                    role: Role::Input,
+                    stride: input_span,
+                    span: input_span,
+                    members: layout_input_members,
+                },
+            ];
+            if has_mem {
+                bindings.push(SpirvBinding {
+                    group: 0,
+                    binding: 2,
+                    name: "trap".to_string(),
+                    access: Access::ReadWrite,
+                    role: Role::Output,
+                    stride: word_width,
+                    span: word_width,
+                    members: Vec::new(),
+                });
+            }
+            bindings
+        },
         builtin_inputs: if grid {
             vec![
                 SpirvBuiltinInput { arg_index: 0, source: SpirvBuiltinSource::GlobalInvocationIdX, scalar: SpirvScalarKind::I32 },
@@ -3287,6 +3800,15 @@ fn translate_to_naga(
                 offset: 0,
                 width: word_width,
             })
+        },
+        // Same "no single slot" reasoning as `result`: Grid writes `trap` per
+        // pixel (the whole binding is the answer), Scalar writes one word at
+        // index 0. `None` when the kernel has no Mem ops (no `trap` binding
+        // was declared at all).
+        trap: if has_mem && !grid {
+            Some(SpirvResult { group: 0, binding: 2, offset: 0, width: word_width })
+        } else {
+            None
         },
         // Compute modes (Scalar/Grid/Batch) have no vertex/fragment stages and no
         // color target.
