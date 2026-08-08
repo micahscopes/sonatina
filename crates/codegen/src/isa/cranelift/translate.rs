@@ -766,13 +766,30 @@ fn translate_function(
                     // the same reason -- keep all three backends' "freshly
                     // allocated array reads as zero before any store"
                     // contract identical.
+                    //
+                    // `buffer_align` is passed as 1 (no claimed alignment),
+                    // NOT the slot's real 8-byte base alignment: real Fe
+                    // sizes are NOT always multiples of 8 (`lower_alloc_object`
+                    // over-allocates by up to ALIGN-1 bytes so the RETURNED
+                    // POINTER can be rounded up after the fact, e.g. a
+                    // requested N*8-byte array can arrive here as N*8+7) --
+                    // confirmed empirically: `emit_small_memset`'s own
+                    // internal invariant (`greatest_divisible_power_of_two(size)
+                    // >= buffer_align`) panicked ("size is smaller than
+                    // dest's alignment value") on the real
+                    // poseidon_merkle_root_loop.fe kernel with a hardcoded
+                    // `buffer_align: 8`. `buffer_align` only hints an
+                    // optimization (whether the emitted zero-fill stores get
+                    // `.set_aligned()`); it is never a correctness lever --
+                    // the slot's actual base address is still 8-aligned via
+                    // `align_shift` above regardless of this value.
                     if size_bytes > 0 {
                         builder.emit_small_memset(
                             jit.target_config(),
                             addr,
                             0,
                             size_bytes as u64,
-                            8,
+                            1,
                             cranelift_codegen::ir::MemFlags::new(),
                         );
                     }

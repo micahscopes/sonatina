@@ -1458,6 +1458,58 @@ fn cranelift_mem_alloc_dynamic_two_arrays_do_not_alias() {
     assert_eq!(f(), 333, "storing into b must not clobber a (or vice versa)");
 }
 
+/// Regression: `lower_alloc_object` (wasm_lower.rs) over-allocates by up to
+/// ALIGN-1 bytes so the RETURNED POINTER can be rounded up after the fact
+/// (e.g. a logically-N*8-byte array can arrive at `MemAllocDynamic` as
+/// N*8+7 bytes) -- real Fe-emitted sizes are NOT always clean multiples of
+/// 8. `emit_small_memset`'s own internal invariant panicked
+/// ("size is smaller than dest's alignment value") when this arm claimed a
+/// flat 8-byte `buffer_align` for the zero-init regardless of the actual
+/// size; found live against `poseidon_merkle_root_loop.fe`. Exercises a
+/// deliberately odd (13-byte) allocation to pin the fix.
+#[test]
+fn cranelift_mem_alloc_dynamic_odd_size_zero_inits_and_executes() {
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = {
+        let ctx = ModuleCtx::new(&isa);
+        ModuleBuilder::new(ctx)
+    };
+
+    let sig = Signature::new_single("odd_size", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    // 13 bytes: not a multiple of 8, 4, or even 2 -- greatest_divisible_
+    // power_of_two(13) == 1, the tightest possible case.
+    let size = fb.make_imm_value(13i32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let nine = fb.make_imm_value(9i32);
+    let addr9 = fb.insert_inst(arith::Add::new(is, base, nine), Type::I32);
+    let val = fb.make_imm_value(7i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, addr9, val, Type::I32));
+    // Reading back an UNTOUCHED byte-addressed i32 window (base+0) must be
+    // zero (explicit zero-init), not garbage.
+    let loaded = fb.insert_inst(data::Mload::new(is, base, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = CraneliftBackend::new();
+    let artifact = backend
+        .compile_module(&module)
+        .expect("an odd-sized (13-byte) MemAllocDynamic should compile and zero-init cleanly");
+
+    let f: fn() -> i32 = unsafe {
+        let ptr = artifact.get_func_ptr::<fn() -> i32>("odd_size").unwrap();
+        std::mem::transmute(ptr)
+    };
+    assert_eq!(f(), 0, "an untouched window of an odd-sized allocation must read back zero");
+}
+
 /// Codex bug 1's analog (heap-exhaustion aliasing), the compile-time half:
 /// a `MemAllocDynamic` whose size is not a compile-time constant is
 /// unsupported (cranelift stack slots are sized at IR-construction time),
