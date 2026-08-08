@@ -3757,3 +3757,284 @@ fn spirv_f32_rounding_lowering_is_exact_and_branch_free() {
 
     eprintln!("spirv_f32_rounding_lowering_is_exact_and_branch_free OK: floor/ceil/trunc/round all single-OpExtInst, 0 branches, 0 selects");
 }
+
+// ===========================================================================
+// Rung 3 STEP 2: SPIR-V lowering of function-local [u32; N] arrays
+// (MemAllocDynamic / Mload / Mstore), a private-storage `fe_heap` +
+// `fe_bump` emulation (RUNG3_SPIRV_ARRAYS_DESIGN.md). Hand-built Sonatina IR
+// (no Fe compiler in this crate), mirroring this file's existing style.
+//
+// Each test names the specific Codex adversarial-review finding it guards
+// against (heap-exhaustion aliasing, misaligned-access miscompile,
+// poison-sentinel collision, wrong-value-on-unconditional-trap).
+// ===========================================================================
+
+/// The S2-A probe from the design doc: `probe(k) -> u32` allocates an 8-word
+/// array, stores a constant at a[3], then bounds-checks a dynamic load a[k]
+/// (Lt + Br + an Unreachable trap arm -- the exact shape `wasm_lower.rs`
+/// emits for every Fe dynamic array access). Exercises MemAllocDynamic,
+/// Mstore, Mload, and the Unreachable-as-trap path together.
+#[test]
+fn spirv_array_probe_compiles_naga_valid_with_heap_and_trap_channel() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    let sig = Signature::new_single("probe", Linkage::Public, &[Type::I32], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let ok = fb.append_block();
+    let trap = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let k = fb.args()[0];
+    let alloc_size = fb.make_imm_value(32i32); // 8 words * 4 bytes
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    let twelve = fb.make_imm_value(12i32);
+    let addr3 = fb.insert_inst(arith::Add::new(is, base, twelve), Type::I32);
+    let stored = fb.make_imm_value(0xABCDi32);
+    fb.insert_inst_no_result(data::Mstore::new(is, addr3, stored, Type::I32));
+    let eight = fb.make_imm_value(8i32);
+    let in_bounds = fb.insert_inst(cmp::Lt::new(is, k, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, in_bounds, ok, trap));
+
+    fb.switch_to_block(ok);
+    let four = fb.make_imm_value(4i32);
+    let byte_off = fb.insert_inst(arith::Mul::new(is, k, four), Type::I32);
+    let addr_k = fb.insert_inst(arith::Add::new(is, base, byte_off), Type::I32);
+    let loaded = fb.insert_inst(data::Mload::new(is, addr_k, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
+
+    fb.switch_to_block(trap);
+    fb.insert_inst_no_result(control_flow::Unreachable::new(is));
+
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new().with_workgroup_size(1, 1, 1);
+    let artifact = backend.compile_module(&module).expect(
+        "array probe (MemAllocDynamic/Mstore/Mload + a bounds trap) should compile to \
+         naga-validated SPIR-V",
+    );
+
+    assert_eq!(artifact.words[0], 0x0723_0203, "valid SPIR-V magic");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(wgsl.contains("fe_heap"), "private heap local must appear in WGSL:\n{wgsl}");
+    assert!(wgsl.contains("fe_bump"), "bump pointer local must appear in WGSL:\n{wgsl}");
+    assert!(
+        wgsl.contains("fe_trapped"),
+        "trap-status local must appear in WGSL (Codex bugs 1/2/3/4's shared channel):\n{wgsl}"
+    );
+
+    // Codex bug 3 (poison-sentinel collision): the trap channel is a real,
+    // separate binding stated in the layout, not folded into the result.
+    assert!(
+        artifact.layout.trap.is_some(),
+        "a Scalar-mode Mem-bearing kernel must state a trap SpirvResult"
+    );
+    assert!(
+        artifact.layout.bindings.iter().any(|b| b.name == "trap"),
+        "layout bindings must include the trap channel"
+    );
+    assert_ne!(
+        artifact.layout.trap.map(|t| t.binding),
+        artifact.layout.result.map(|r| r.binding),
+        "trap and result must occupy DIFFERENT bindings (never overload the result slot)"
+    );
+
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in should reparse the array-probe WGSL");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+        .validate(&reparsed)
+        .expect("re-validation of the reparsed WGSL should also pass");
+
+    eprintln!(
+        "array probe OK: {} SPIR-V words; WGSL carries fe_heap/fe_bump/fe_trapped; trap binding \
+         is a distinct group 0 binding {} (result is binding {})",
+        artifact.words.len(),
+        artifact.layout.trap.unwrap().binding,
+        artifact.layout.result.unwrap().binding,
+    );
+}
+
+/// Codex bug 1 (heap-exhaustion aliasing): a single allocation whose constant
+/// size exceeds the declared private-heap capacity (default 8192 words =
+/// 32768 bytes) must fail the compile OUTRIGHT, never silently clamp the
+/// bump pointer and let two logically distinct arrays alias the same heap
+/// word.
+#[test]
+fn spirv_mem_alloc_exceeding_heap_capacity_fails_closed_at_compile_time() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("big_alloc", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let too_big = fb.make_imm_value(40_000i32); // > 32768-byte default heap
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, too_big), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, base));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new();
+    let errors = match backend.compile_module(&module) {
+        Ok(_) => panic!(
+            "an allocation exceeding the private heap capacity must fail closed at compile \
+             time, never silently clamp-and-alias"
+        ),
+        Err(errors) => errors,
+    };
+    let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+    assert!(
+        msg.contains("exceeds the private heap capacity"),
+        "expected a named heap-capacity error, got: {msg}"
+    );
+    eprintln!("heap overflow correctly fails closed at compile time: {msg}");
+}
+
+/// Codex bug 1's loop-carried corollary: a `MemAllocDynamic` inside a loop
+/// body has a total byte cost that depends on the runtime trip count, which
+/// the compile-time capacity proof cannot bound. Must fail closed rather than
+/// silently summing only the per-iteration size (which would UNDER-count the
+/// true total and let the same aliasing bug through at runtime).
+#[test]
+fn spirv_mem_alloc_inside_loop_fails_closed() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("loop_alloc", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let three = fb.make_imm_value(3i32);
+    let cond = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, body, exit));
+
+    fb.switch_to_block(body);
+    let alloc_size = fb.make_imm_value(16i32);
+    let _base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new();
+    let errors = match backend.compile_module(&module) {
+        Ok(_) => panic!("MemAllocDynamic inside a loop must fail closed (unbounded compile-time total)"),
+        Err(errors) => errors,
+    };
+    let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+    assert!(
+        msg.contains("MemAllocDynamic inside a loop"),
+        "expected the loop-carried-allocation error, got: {msg}"
+    );
+    eprintln!("loop-carried allocation correctly fails closed: {msg}");
+}
+
+/// Design section 2: Mem ops admit the I32 element type ONLY. A `Mload` of
+/// any other type must fail closed (never silently truncate/widen through
+/// the u32 heap word). I1 is used here specifically because it is the one
+/// integral type the pre-scan's generic narrow/mixed-carrier-type check does
+/// NOT already reject on its own, so this test is known to exercise the
+/// Mem-specific type gate rather than a different, earlier check.
+#[test]
+fn spirv_mem_non_i32_type_fails_closed() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("bool_mem", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let size = fb.make_imm_value(16i32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let flag = fb.insert_inst(data::Mload::new(is, base, Type::I1), Type::I1);
+    let widened = fb.insert_inst(cast::Zext::new(is, flag, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, widened));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new();
+    let errors = match backend.compile_module(&module) {
+        Ok(_) => panic!("an I1-typed Mload must fail closed (Mem ops admit I32 only)"),
+        Err(errors) => errors,
+    };
+    let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+    assert!(
+        msg.contains("Mload of type") && msg.contains("I32 only"),
+        "expected the named Mem-element-type rejection, got: {msg}"
+    );
+    eprintln!("non-I32 Mem access correctly fails closed: {msg}");
+}
+
+/// Design section 2: Mem ops are supported under the u32 (browser) word
+/// only. A kernel returning I64 (selecting the i64 word) that also uses
+/// MemAllocDynamic/Mload must fail closed rather than emit an ambiguous
+/// mixed-width heap.
+#[test]
+fn spirv_mem_op_under_i64_word_fails_closed() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("i64_mem", Linkage::Public, &[], Type::I64);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let size = fb.make_imm_value(16i32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let loaded = fb.insert_inst(data::Mload::new(is, base, Type::I32), Type::I32);
+    let widened = fb.insert_inst(cast::Zext::new(is, loaded, Type::I64), Type::I64);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, widened));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let backend = SpirvBackend::new();
+    // Whichever named check fires first (the i64-word Mem gate, or the more
+    // general narrow/mixed-carrier-type check, since an I32-typed address
+    // under an I64 word ALSO trips that one), the load-bearing property is
+    // "fails closed with a named error", not one specific message.
+    let errors = match backend.compile_module(&module) {
+        Ok(_) => panic!("Mem ops under the i64 word must fail closed (u32 word only)"),
+        Err(errors) => errors,
+    };
+    let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+    assert!(!msg.is_empty(), "expected a named error, got an empty message");
+    eprintln!("i64-word Mem op correctly fails closed: {msg}");
+}
