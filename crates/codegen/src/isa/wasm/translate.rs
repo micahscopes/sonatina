@@ -1675,6 +1675,30 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    // Representation-preserving scalar reinterpretation. Wasm
+                    // exposes the two 32-bit directions directly; integer
+                    // signedness is not represented in its i32 carrier.
+                    else if let Some(bitcast) = <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let from = resolve_value(function, *bitcast.from(), &value_map, &mut body, wb)
+                                .ok_or("unresolved bitcast source")?;
+                            let from_ty = function.dfg.value_ty(*bitcast.from());
+                            let to_ty = *bitcast.ty();
+                            let (op, result_ty) = match (from_ty, to_ty) {
+                                (Type::I32, Type::F32) => (Operator::F32ReinterpretI32, WType::F32),
+                                (Type::F32, Type::I32) => (Operator::I32ReinterpretF32, WType::I32),
+                                _ if from_ty == to_ty => {
+                                    value_map.insert(result, from);
+                                    continue;
+                                }
+                                _ => return Err(format!(
+                                    "unsupported wasm bitcast `{from_ty:?}` -> `{to_ty:?}`"
+                                )),
+                            };
+                            let value = body.add_op(wb, op, &[from], &[result_ty]);
+                            value_map.insert(result, value);
+                        }
+                    }
                     else if let Some(trunc) = <&sonatina_ir::inst::cast::Trunc as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
                             let val = resolve_value(function, *trunc.from(), &value_map, &mut body, wb).ok_or("unresolved trunc")?;
