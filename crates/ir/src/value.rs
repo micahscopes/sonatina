@@ -192,7 +192,12 @@ impl Immediate {
     }
 
     pub fn bitcast(self, ty: Type) -> Self {
-        Self::from_i256(I256::from(self.unsigned_value()), ty)
+        match (self, ty) {
+            (Self::I32(bits), Type::F32) => Self::F32(bits as u32),
+            (Self::F32(bits), Type::I32) => Self::I32(bits as i32),
+            (value, target) if value.ty() == target => value,
+            (value, target) => Self::from_i256(I256::from(value.unsigned_value()), target),
+        }
     }
 
     pub fn imm_eq(self, rhs: Self) -> Self {
@@ -785,6 +790,15 @@ mod tests {
         assert_eq!(negative_zero.to_string(), "0x80000000");
         assert_eq!(nan_payload.to_string(), "0x7fc01234");
         assert_ne!(negative_zero, Immediate::F32(0));
+    }
+
+    #[test]
+    fn bitcast_preserves_every_i32_f32_bit() {
+        for bits in [0u32, 1, 0x3f80_0000, 0x8000_0000, 0x7fc0_1234] {
+            let float = Immediate::I32(bits as i32).bitcast(crate::Type::F32);
+            assert_eq!(float, Immediate::F32(bits));
+            assert_eq!(float.bitcast(crate::Type::I32), Immediate::I32(bits as i32));
+        }
     }
 
     #[test]
