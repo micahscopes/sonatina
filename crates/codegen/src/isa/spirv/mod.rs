@@ -2124,12 +2124,14 @@ fn emit_non_loop_regions(
                 if let Some(msg) = mem_error.take() {
                     return Err(msg);
                 }
-                if find_block_return_value(*block, function, inst_set).is_some() {
-                    let value = block_result.ok_or_else(|| format!("spirv: unresolved structured return in {block:?}"))?;
-                    let pointer = func.expressions.append(
-                        naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
-                    );
-                    target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+                if block_has_return(*block, function, inst_set) {
+                    if find_block_return_value(*block, function, inst_set).is_some() {
+                        let value = block_result.ok_or_else(|| format!("spirv: unresolved structured return in {block:?}"))?;
+                        let pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
+                        );
+                        target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+                    }
                     let returned = func.expressions.append(
                         naga::Expression::Literal(naga::Literal::Bool(true)), naga::Span::UNDEFINED,
                     );
@@ -2262,11 +2264,11 @@ fn allocate_return_transport(
 ) -> Result<StructuredReturnTransport, String> {
     let return_ty = function.layout.iter_block().find_map(|block| {
         find_block_return_value(block, function, inst_set).map(|value| function.dfg.value_ty(value))
-    }).ok_or_else(|| "spirv: value kernel has no return value".to_string())?;
+    });
     let return_naga_ty = match return_ty {
-        sonatina_ir::Type::F32 => f32_type,
-        sonatina_ir::Type::I1 => bool_type,
-        _ => word_type,
+        Some(sonatina_ir::Type::F32) => f32_type,
+        Some(sonatina_ir::Type::I1) => bool_type,
+        Some(_) | None => word_type,
     };
     let result = func.local_variables.append(
         naga::LocalVariable { name: Some("structured_result".into()), ty: return_naga_ty, init: None },
@@ -2328,11 +2330,12 @@ fn emit_regions_in_loop(
                             return Ok(RegionOutcome::Terminal);
                         }
                     } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst) {
-                        let value_id = ret.args().as_slice().first().ok_or_else(|| "spirv: unit return in value kernel".to_string())?;
-                        let value = resolve_naga_value(*value_id, function, word, value_map, phi_locals, func)
-                            .ok_or_else(|| format!("spirv: unresolved return in {block:?}"))?;
-                        let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
-                        target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+                        if let Some(value_id) = ret.args().as_slice().first() {
+                            let value = resolve_naga_value(*value_id, function, word, value_map, phi_locals, func)
+                                .ok_or_else(|| format!("spirv: unresolved return in {block:?}"))?;
+                            let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
+                            target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+                        }
                         let returned = func.expressions.append(
                             naga::Expression::Literal(naga::Literal::Bool(true)),
                             naga::Span::UNDEFINED,
@@ -2459,7 +2462,7 @@ fn emit_regions_in_loop(
                 emit_exact_phi_edge(
                     function, inst_set, word, *from, *exit, func, target, value_map, phi_locals,
                 )?;
-                if let Some(ret) = find_block_return_value(*exit, function, inst_set) {
+                if block_has_return(*exit, function, inst_set) {
                     emit_phi_loads_for_block(
                         function, inst_set, *exit, func, target, value_map, phi_locals,
                     );
@@ -2471,18 +2474,20 @@ fn emit_regions_in_loop(
                     if let Some(msg) = mem_error.take() {
                         return Err(msg);
                     }
-                    let value = resolve_naga_value(
-                        ret, function, word, value_map, phi_locals, func,
-                    )
-                    .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
-                    let pointer = func.expressions.append(
-                        naga::Expression::LocalVariable(return_local),
-                        naga::Span::UNDEFINED,
-                    );
-                    target.push(
-                        naga::Statement::Store { pointer, value },
-                        naga::Span::UNDEFINED,
-                    );
+                    if let Some(ret) = find_block_return_value(*exit, function, inst_set) {
+                        let value = resolve_naga_value(
+                            ret, function, word, value_map, phi_locals, func,
+                        )
+                        .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
+                        let pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(return_local),
+                            naga::Span::UNDEFINED,
+                        );
+                        target.push(
+                            naga::Statement::Store { pointer, value },
+                            naga::Span::UNDEFINED,
+                        );
+                    }
                     let returned = func.expressions.append(
                         naga::Expression::Literal(naga::Literal::Bool(true)),
                         naga::Span::UNDEFINED,
@@ -2545,11 +2550,11 @@ fn emit_recursive_loop_region(
 
     let return_ty = function.layout.iter_block().find_map(|block| {
         find_block_return_value(block, function, inst_set).map(|value| function.dfg.value_ty(value))
-    }).ok_or_else(|| "spirv: value kernel has no return value".to_string())?;
+    });
     let return_naga_ty = match return_ty {
-        sonatina_ir::Type::F32 => f32_type,
-        sonatina_ir::Type::I1 => bool_type,
-        _ => word_type,
+        Some(sonatina_ir::Type::F32) => f32_type,
+        Some(sonatina_ir::Type::I1) => bool_type,
+        Some(_) | None => word_type,
     };
     let return_local = func.local_variables.append(
         naga::LocalVariable { name: Some("loop_result".into()), ty: return_naga_ty, init: None },
@@ -2654,8 +2659,7 @@ fn emit_recursive_loop_region(
     emit_exact_phi_edge(
         function, inst_set, word, header, exit, func, &mut exit_arm, &mut exit_values, phi_locals,
     )?;
-    let exit_return = find_block_return_value(exit, function, inst_set);
-    if let Some(ret) = exit_return {
+    if block_has_return(exit, function, inst_set) {
         emit_phi_loads_for_block(
             function, inst_set, exit, func, &mut exit_arm, &mut exit_values, phi_locals,
         );
@@ -2667,10 +2671,12 @@ fn emit_recursive_loop_region(
         if let Some(msg) = mem_error.take() {
             return Err(msg);
         }
-        let value = resolve_naga_value(ret, function, word, &mut exit_values, phi_locals, func)
-            .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
-        let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
-        exit_arm.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+        if let Some(ret) = find_block_return_value(exit, function, inst_set) {
+            let value = resolve_naga_value(ret, function, word, &mut exit_values, phi_locals, func)
+                .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
+            let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
+            exit_arm.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+        }
         let returned = func.expressions.append(
             naga::Expression::Literal(naga::Literal::Bool(true)),
             naga::Span::UNDEFINED,
@@ -2739,6 +2745,22 @@ fn find_block_return_value(
         }
     }
     None
+}
+
+#[cfg(feature = "spirv-backend")]
+fn block_has_return(
+    block: sonatina_ir::BlockId,
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+) -> bool {
+    use sonatina_ir::InstDowncast;
+    function.layout.iter_inst(block).any(|inst_id| {
+        <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(
+            inst_set,
+            function.dfg.inst(inst_id),
+        )
+        .is_some()
+    })
 }
 
 /// Under a u32 word, these signedness-sensitive ops have no correct signless
