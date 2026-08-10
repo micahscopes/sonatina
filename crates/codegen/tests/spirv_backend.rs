@@ -1553,6 +1553,53 @@ fn build_external_record_compute_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+fn build_unit_compute_loop_with_exit_store_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_ty = mb.declare_array_type(Type::I32, 8);
+    let array_ref_ty = mb.objref_type(array_ty);
+    let word_ref_ty = mb.objref_type(Type::I32);
+    let sig = Signature::new_unit("unit_compute_loop", Linkage::Public, &[array_ref_ty]);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let values = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let eight = fb.make_imm_value(8i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, body, exit));
+
+    fb.switch_to_block(body);
+    let slot = fb.insert_inst(data::ObjIndex::new(is, values, i), word_ref_ty);
+    fb.insert_inst_no_result(data::ObjStore::new(is, slot, i));
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    let first = fb.insert_inst(data::ObjIndex::new(is, values, zero), word_ref_ty);
+    let receipt = fb.make_imm_value(99i32);
+    fb.insert_inst_no_result(data::ObjStore::new(is, first, receipt));
+    fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 fn build_external_record_render_module() -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
         if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
@@ -2069,6 +2116,40 @@ fn explicit_compute_roots_external_record_and_emits_no_implicit_buffers() {
     )
     .validate(&reparsed)
     .expect("external-resource compute WGSL must validate under browser capabilities");
+}
+
+#[test]
+fn explicit_unit_compute_loop_preserves_exit_block_side_effects() {
+    let resource = SpirvExternalResource {
+        arg_index: 0,
+        group: 0,
+        binding: 0,
+        name: "values".to_string(),
+        access: Access::ReadWrite,
+        element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+        stride: 4,
+        length: 8,
+    };
+    let artifact = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(1, 1, 1)
+        .with_external_resource(resource)
+        .compile_module(&build_unit_compute_loop_with_exit_store_module())
+        .expect("unit-return compute loop should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    assert!(wgsl.contains("loop {"), "source loop must survive:\n{wgsl}");
+    assert!(
+        wgsl.contains("values[i32(0u)] = 99u;"),
+        "the unit-return loop exit store must not be dropped:\n{wgsl}"
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse unit compute loop WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("unit compute loop WGSL must validate under browser capabilities");
 }
 
 #[test]
