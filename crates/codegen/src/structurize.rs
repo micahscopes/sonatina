@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use bit_set::BitSet;
 use sonatina_ir::{
     BlockId, Function, InstDowncast, InstSetBase,
     cfg::ControlFlowGraph,
@@ -57,6 +58,74 @@ pub struct StructuredCfg {
     pub block_order: Vec<BlockId>,
 }
 
+/// Dense post-dominator sets for every reachable block. Merge discovery asks
+/// the same post-dominance question at every conditional, so computing these
+/// sets once avoids rebuilding a full reachability graph and fixed point for
+/// each branch.
+struct PostDominators {
+    blocks: Vec<BlockId>,
+    indices: HashMap<BlockId, usize>,
+    sets: Vec<BitSet>,
+}
+
+impl PostDominators {
+    fn compute(cfg: &ControlFlowGraph, blocks: &[BlockId]) -> Self {
+        let indices = blocks
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, block)| (block, index))
+            .collect::<HashMap<_, _>>();
+        let successors = blocks
+            .iter()
+            .map(|block| {
+                cfg.succs_of(*block)
+                    .filter_map(|successor| indices.get(successor).copied())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let all = (0..blocks.len()).collect::<BitSet>();
+        let mut sets = successors
+            .iter()
+            .enumerate()
+            .map(|(index, successors)| {
+                if successors.is_empty() {
+                    [index].into_iter().collect()
+                } else {
+                    all.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        loop {
+            let mut changed = false;
+            for (index, successors) in successors.iter().enumerate() {
+                let Some((&first, rest)) = successors.split_first() else {
+                    continue;
+                };
+                let mut intersection = sets[first].clone();
+                for successor in rest {
+                    intersection.intersect_with(&sets[*successor]);
+                }
+                intersection.insert(index);
+                if intersection != sets[index] {
+                    sets[index] = intersection;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        Self {
+            blocks: blocks.to_vec(),
+            indices,
+            sets,
+        }
+    }
+}
+
 /// Compute structured control flow for a function.
 ///
 /// Requires a reducible CFG (which Fe always produces). Returns an error
@@ -79,11 +148,12 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
         });
     }
 
+    let postdom = PostDominators::compute(&cfg, &rpo);
     let s = Structurer {
         function,
         is: function.inst_set(),
-        cfg: &cfg,
         loop_tree: &loop_tree,
+        postdom: &postdom,
     };
     let mut active = HashSet::new();
     let mut consumed = HashSet::new();
@@ -132,8 +202,8 @@ enum Term {
 struct Structurer<'a> {
     function: &'a Function,
     is: &'a dyn InstSetBase,
-    cfg: &'a ControlFlowGraph,
     loop_tree: &'a LoopTree,
+    postdom: &'a PostDominators,
 }
 
 impl Structurer<'_> {
@@ -197,13 +267,7 @@ impl Structurer<'_> {
             result
         }
 
-        visit(
-            self,
-            start,
-            lp,
-            &mut HashSet::new(),
-            &mut HashMap::new(),
-        )
+        visit(self, start, lp, &mut HashSet::new(), &mut HashMap::new())
     }
 
     fn in_loop(&self, b: BlockId, lp: Loop) -> bool {
@@ -256,10 +320,7 @@ impl Structurer<'_> {
                 }
                 // A fallthrough exit (a non-return block outside the loop) is
                 // resumed by the caller, not structured inside the loop.
-                if !self.in_loop(b, lp)
-                    && b != start
-                    && !self.returns(b)
-                    && !allow_return_corridor
+                if !self.in_loop(b, lp) && b != start && !self.returns(b) && !allow_return_corridor
                 {
                     break;
                 }
@@ -326,12 +387,9 @@ impl Structurer<'_> {
                     // there, without mistaking an unrelated outer join for
                     // this conditional's merge.
                     let merge = self.find_merge(b, cur_loop)?;
-                    let then_branch = self.build_branch(
-                        b, nz, merge, cur_loop, active, consumed,
-                    )?;
-                    let else_branch = self.build_branch(
-                        b, z, merge, cur_loop, active, consumed,
-                    )?;
+                    let then_branch =
+                        self.build_branch(b, nz, merge, cur_loop, active, consumed)?;
+                    let else_branch = self.build_branch(b, z, merge, cur_loop, active, consumed)?;
                     regions.push(Region::IfThenElse {
                         header: b,
                         then_branch,
@@ -392,7 +450,10 @@ impl Structurer<'_> {
                 }
                 return Ok(vec![
                     Region::Block(target),
-                    Region::LoopExit { from: target, target: exit },
+                    Region::LoopExit {
+                        from: target,
+                        target: exit,
+                    },
                 ]);
             }
             self.validate_loop_exit_target(lp, from, target)?;
@@ -514,65 +575,21 @@ impl Structurer<'_> {
         let Term::Br(_, _) = self.term(header) else {
             return Ok(None);
         };
-        let reachable = self.reachable_from(header);
-        let mut postdom = reachable
+        let header_index = self.postdom.indices[&header];
+        let strict = self.postdom.sets[header_index]
             .iter()
-            .copied()
-            .map(|block| {
-                let successors = self
-                    .cfg
-                    .succs_of(block)
-                    .copied()
-                    .filter(|successor| reachable.contains(successor))
-                    .collect::<Vec<_>>();
-                let initial = if successors.is_empty() {
-                    HashSet::from([block])
-                } else {
-                    reachable.clone()
-                };
-                (block, initial)
-            })
-            .collect::<HashMap<_, _>>();
-
-        loop {
-            let mut changed = false;
-            for &block in &reachable {
-                let successors = self
-                    .cfg
-                    .succs_of(block)
-                    .copied()
-                    .filter(|successor| reachable.contains(successor))
-                    .collect::<Vec<_>>();
-                if successors.is_empty() {
-                    continue;
-                }
-                let mut intersection = postdom[&successors[0]].clone();
-                for successor in &successors[1..] {
-                    intersection.retain(|candidate| postdom[successor].contains(candidate));
-                }
-                intersection.insert(block);
-                if intersection != postdom[&block] {
-                    postdom.insert(block, intersection);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-
-        let strict = postdom[&header]
-            .iter()
-            .copied()
+            .map(|index| self.postdom.blocks[index])
             .filter(|candidate| *candidate != header && Some(*candidate) != loop_hdr)
-            .collect::<HashSet<_>>();
+            .collect::<Vec<_>>();
         let immediate = strict
             .iter()
             .copied()
             .filter(|candidate| {
-                strict
-                    .iter()
-                    .all(|other| candidate == other || postdom[candidate].contains(other))
+                let candidate_index = self.postdom.indices[candidate];
+                strict.iter().all(|other| {
+                    candidate == other
+                        || self.postdom.sets[candidate_index].contains(self.postdom.indices[other])
+                })
             })
             .collect::<Vec<_>>();
         match immediate.as_slice() {
@@ -584,18 +601,6 @@ impl Structurer<'_> {
                 immediate.len()
             )),
         }
-    }
-
-    fn reachable_from(&self, from: BlockId) -> HashSet<BlockId> {
-        let mut seen = HashSet::new();
-        let mut pending = vec![from];
-        while let Some(block) = pending.pop() {
-            if !seen.insert(block) {
-                continue;
-            }
-            pending.extend(self.cfg.succs_of(block).copied());
-        }
-        seen
     }
 }
 
@@ -769,12 +774,7 @@ mod tests {
         fb.switch_to_block(entry);
         fb.insert_inst_no_result(Br::new(is, fb.args()[0], nested, shared));
         fb.switch_to_block(nested);
-        fb.insert_inst_no_result(Br::new(
-            is,
-            fb.args()[1],
-            nested_then,
-            nested_else,
-        ));
+        fb.insert_inst_no_result(Br::new(is, fb.args()[1], nested_then, nested_else));
         fb.switch_to_block(nested_then);
         fb.insert_inst_no_result(Jump::new(is, shared));
         fb.switch_to_block(nested_else);
@@ -832,7 +832,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*selected, Some(merge));
-                assert!(matches!(else_branch.as_slice(), [Region::Block(block)] if *block == shared_forwarder));
+                assert!(
+                    matches!(else_branch.as_slice(), [Region::Block(block)] if *block == shared_forwarder)
+                );
                 assert!(matches!(
                     then_branch.as_slice(),
                     [Region::IfThenElse { merge: Some(inner_merge), .. }]
