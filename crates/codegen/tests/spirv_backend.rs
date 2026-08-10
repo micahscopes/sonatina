@@ -2447,7 +2447,7 @@ fn build_u32_sar_probe() -> sonatina_ir::Module {
 }
 
 /// A scalar u32 kernel `sar_nonimm(a, sh) = a >> sh` whose shift amount is a
-/// runtime value (not an immediate); this must fail closed under the u32 word.
+/// runtime value.
 fn build_u32_sar_nonimm() -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
         if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
@@ -2635,7 +2635,7 @@ fn spirv_u32_eq_ne_shape() {
 }
 
 /// Test 3.3.2: the u32 `Sar` arm emits bitcast-i32 / shift / bitcast-u32 and
-/// validates; a non-immediate shift amount fails closed with the named error.
+/// validates for both immediate and runtime shift amounts.
 #[test]
 fn spirv_u32_sar_shape() {
     let module = build_u32_sar_probe();
@@ -2660,17 +2660,22 @@ fn spirv_u32_sar_shape() {
     .validate(&reparsed)
     .expect("browser-profile validation (default caps) must accept the u32 Sar module");
 
-    // A non-immediate shift amount fails closed with the named error.
-    let bad = build_u32_sar_nonimm();
-    let err = match SpirvBackend::new().with_workgroup_size(1, 1, 1).compile_module(&bad) {
-        Ok(_) => panic!("non-immediate-bits Sar under u32 must fail closed"),
-        Err(errs) => errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
-    };
-    assert!(
-        err.contains("non-immediate shift amount"),
-        "non-imm Sar must name the fail-closed reason: {err}"
-    );
-    eprintln!("spirv_u32_sar_shape OK: bitcast-shift-bitcast + non-imm fails closed");
+    let dynamic = SpirvBackend::new()
+        .with_workgroup_size(1, 1, 1)
+        .compile_module(&build_u32_sar_nonimm())
+        .expect("runtime-amount u32 Sar must compile");
+    let dynamic_wgsl = dynamic.wgsl.as_ref().expect("runtime Sar WGSL");
+    assert!(dynamic_wgsl.contains("bitcast<i32>"));
+    assert!(dynamic_wgsl.contains(">>"));
+    let reparsed = naga::front::wgsl::parse_str(dynamic_wgsl)
+        .expect("runtime-amount Sar WGSL must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser profile must validate runtime-amount Sar");
+    eprintln!("spirv_u32_sar_shape OK: immediate and runtime amounts");
 }
 
 #[test]
@@ -3150,9 +3155,8 @@ fn render_wgsl_shape() {
     eprintln!("render_wgsl_shape OK: 2 entry points, {} words", art.words.len());
 }
 
-/// The new op arm: a u32 kernel `shr_probe(a) = a >> 4` emits a DIRECT logical
-/// `>>` on the u32 (no bitcast dance, unlike Sar) and validates browser-profile.
-/// A non-immediate u32 shift amount and an i64 `Shr` both fail closed.
+/// U32 shift-left emits a direct WGSL `<<` and validates with either an
+/// immediate or runtime amount.
 #[test]
 fn spirv_u32_shl_shape() {
     let isa = native_isa();
@@ -3188,6 +3192,38 @@ fn spirv_u32_shl_shape() {
     )
     .validate(&reparsed)
     .expect("browser-profile validation must accept scalar Shl");
+
+    let mb2 = native_module_builder();
+    let sig2 = Signature::new_single(
+        "shl_nonimm",
+        Linkage::Public,
+        &[Type::I32, Type::I32],
+        Type::I32,
+    );
+    let fr2 = mb2.declare_function(sig2).unwrap();
+    let mut fb2 = mb2.func_builder::<InstInserter>(fr2);
+    let entry2 = fb2.append_block();
+    fb2.switch_to_block(entry2);
+    let value2 = fb2.args()[0];
+    let bits2 = fb2.args()[1];
+    let shifted2 = fb2.insert_inst(arith::Shl::new(is, bits2, value2), Type::I32);
+    fb2.insert_inst_no_result(control_flow::Return::new_single(is, shifted2));
+    fb2.seal_all();
+    fb2.finish();
+    let dynamic = SpirvBackend::new()
+        .with_workgroup_size(1, 1, 1)
+        .compile_module(&mb2.build())
+        .expect("runtime-amount u32 Shl must compile");
+    let dynamic_wgsl = dynamic.wgsl.as_ref().expect("runtime Shl WGSL");
+    assert!(dynamic_wgsl.contains("<<"));
+    let reparsed = naga::front::wgsl::parse_str(dynamic_wgsl)
+        .expect("runtime-amount Shl WGSL must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser profile must validate runtime-amount Shl");
 }
 
 #[test]
@@ -3233,7 +3269,7 @@ fn spirv_u32_shr_shape() {
     .validate(&reparsed)
     .expect("browser-profile validation (default caps) must accept the u32 Shr module");
 
-    // A non-immediate u32 shift amount fails closed with the named reason.
+    // A runtime u32 shift amount lowers directly and validates.
     {
         let is2 = isa.inst_set();
         let mb2 = native_module_builder();
@@ -3248,15 +3284,20 @@ fn spirv_u32_shr_shape() {
         fb2.insert_inst_no_result(control_flow::Return::new_single(is2, s2));
         fb2.seal_all();
         fb2.finish();
-        let bad = mb2.build();
-        let err = match SpirvBackend::new().with_workgroup_size(1, 1, 1).compile_module(&bad) {
-            Ok(_) => panic!("non-immediate-bits Shr under u32 must fail closed"),
-            Err(errs) => errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; "),
-        };
-        assert!(
-            err.contains("non-immediate shift amount"),
-            "non-imm Shr must name the fail-closed reason: {err}"
-        );
+        let dynamic = SpirvBackend::new()
+            .with_workgroup_size(1, 1, 1)
+            .compile_module(&mb2.build())
+            .expect("runtime-amount u32 Shr must compile");
+        let dynamic_wgsl = dynamic.wgsl.as_ref().expect("runtime Shr WGSL");
+        assert!(dynamic_wgsl.contains(">>"));
+        let reparsed = naga::front::wgsl::parse_str(dynamic_wgsl)
+            .expect("runtime-amount Shr WGSL must reparse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&reparsed)
+        .expect("browser profile must validate runtime-amount Shr");
     }
 
     // An i64-word Shr fails closed (only the u32 browser word lowers `>>`).
@@ -3284,7 +3325,9 @@ fn spirv_u32_shr_shape() {
             "i64 Shr must name the fail-closed reason: {err}"
         );
     }
-    eprintln!("spirv_u32_shr_shape OK: direct logical `>>`, non-imm + i64 fail closed");
+    eprintln!(
+        "spirv_u32_shr_shape OK: direct logical `>>`, immediate/runtime amounts + i64 fail closed"
+    );
 }
 
 /// Fail-closed: the four render preconditions each err, and the error names render.

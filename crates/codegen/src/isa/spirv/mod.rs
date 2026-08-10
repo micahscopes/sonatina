@@ -1179,20 +1179,29 @@ fn emit_single_inst(
     } else if let Some(sar) = <&sonatina_ir::inst::arith::Sar as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let val = resolve_naga_value(*sar.value(), function, word, value_map, phi_locals, func).unwrap();
-            let shift_amount = if let Some(imm) = function.dfg.value_imm(*sar.bits()) {
-                match imm {
+            let bits_u32 = if let Some(imm) = function.dfg.value_imm(*sar.bits()) {
+                let shift_amount = match imm {
                     sonatina_ir::Immediate::I64(v) => v as u32,
                     sonatina_ir::Immediate::I32(v) => v as u32,
                     sonatina_ir::Immediate::I8(v) => v as u32,
                     _ => 0,
-                }
-            } else { 0 };
-            // WGSL requires the shift amount to be u32 even when the shifted value
-            // is i32; keep the literal u32 for both words.
-            let bits_u32 = func.expressions.append(
-                naga::Expression::Literal(naga::Literal::U32(shift_amount)),
-                naga::Span::UNDEFINED,
-            );
+                };
+                func.expressions.append(
+                    naga::Expression::Literal(naga::Literal::U32(shift_amount)),
+                    naga::Span::UNDEFINED,
+                )
+            } else {
+                debug_assert_eq!(word, WordKind::U32);
+                resolve_naga_value(
+                    *sar.bits(),
+                    function,
+                    word,
+                    value_map,
+                    phi_locals,
+                    func,
+                )
+                .unwrap()
+            };
             match word {
                 WordKind::U32 => {
                     // The u32 word carries a signed Q12 value; WGSL `>>` on a `u32`
@@ -1229,23 +1238,33 @@ fn emit_single_inst(
             return true;
         }
     } else if let Some(shl) = <&sonatina_ir::inst::arith::Shl as InstDowncast>::downcast(inst_set, inst_data) {
-        // Shift-left is sign-agnostic. As with the existing Shr path, materialize
-        // the immediate amount as WGSL u32 while preserving the runtime value's
-        // carrier bits exactly.
+        // Shift-left is sign-agnostic. Immediate and runtime u32 amounts both map
+        // directly to WGSL's integer shift operand.
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let val = resolve_naga_value(*shl.value(), function, word, value_map, phi_locals, func).unwrap();
-            let shift_amount = if let Some(imm) = function.dfg.value_imm(*shl.bits()) {
-                match imm {
+            let bits_u32 = if let Some(imm) = function.dfg.value_imm(*shl.bits()) {
+                let shift_amount = match imm {
                     sonatina_ir::Immediate::I64(v) => v as u32,
                     sonatina_ir::Immediate::I32(v) => v as u32,
                     sonatina_ir::Immediate::I8(v) => v as u32,
                     _ => 0,
-                }
-            } else { 0 };
-            let bits_u32 = func.expressions.append(
-                naga::Expression::Literal(naga::Literal::U32(shift_amount)),
-                naga::Span::UNDEFINED,
-            );
+                };
+                func.expressions.append(
+                    naga::Expression::Literal(naga::Literal::U32(shift_amount)),
+                    naga::Span::UNDEFINED,
+                )
+            } else {
+                debug_assert_eq!(word, WordKind::U32);
+                resolve_naga_value(
+                    *shl.bits(),
+                    function,
+                    word,
+                    value_map,
+                    phi_locals,
+                    func,
+                )
+                .unwrap()
+            };
             let h = func.expressions.append(
                 naga::Expression::Binary { op: naga::BinaryOperator::ShiftLeft, left: val, right: bits_u32 },
                 naga::Span::UNDEFINED,
@@ -1258,23 +1277,31 @@ fn emit_single_inst(
         // Logical (unsigned) shift right. Fe lowers unsigned `>>` to `Shr`. Under
         // the u32 word this is the EASY case: WGSL `>>` on a `u32` IS a logical
         // shift, so no bitcast dance (unlike `Sar`), just shift the u32 value with
-        // a u32 literal amount. The i64 word fails closed in the pre-scan (only the
-        // u32 browser word lowers `>>`), and a non-immediate amount fails closed
-        // there too, so `bits` is an immediate here.
+        // the resolved u32 amount. The i64 word fails closed in the pre-scan.
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let val = resolve_naga_value(*shr.value(), function, word, value_map, phi_locals, func).unwrap();
-            let shift_amount = if let Some(imm) = function.dfg.value_imm(*shr.bits()) {
-                match imm {
+            let bits_u32 = if let Some(imm) = function.dfg.value_imm(*shr.bits()) {
+                let shift_amount = match imm {
                     sonatina_ir::Immediate::I64(v) => v as u32,
                     sonatina_ir::Immediate::I32(v) => v as u32,
                     sonatina_ir::Immediate::I8(v) => v as u32,
                     _ => 0,
-                }
-            } else { 0 };
-            let bits_u32 = func.expressions.append(
-                naga::Expression::Literal(naga::Literal::U32(shift_amount)),
-                naga::Span::UNDEFINED,
-            );
+                };
+                func.expressions.append(
+                    naga::Expression::Literal(naga::Literal::U32(shift_amount)),
+                    naga::Span::UNDEFINED,
+                )
+            } else {
+                resolve_naga_value(
+                    *shr.bits(),
+                    function,
+                    word,
+                    value_map,
+                    phi_locals,
+                    func,
+                )
+                .unwrap()
+            };
             let h = func.expressions.append(
                 naga::Expression::Binary { op: naga::BinaryOperator::ShiftRight, left: val, right: bits_u32 },
                 naga::Span::UNDEFINED,
@@ -3200,56 +3227,9 @@ fn translate_to_naga(
                                  not yet designed). Fail closed."
                             ));
                         }
-                        // `Sar` is now word-aware (i32-bitcast arithmetic shift), but the
-                        // u32 arm materializes the shift amount as a `Literal::U32`, so the
-                        // `bits` operand must be an immediate. A non-immediate shift amount
-                        // fails closed here with a named error rather than silently reading 0.
-                        if let Some(sar) =
-                            <&sonatina_ir::inst::arith::Sar as sonatina_ir::InstDowncast>::downcast(
-                                is, inst_data,
-                            )
-                        {
-                            if f.dfg.value_imm(*sar.bits()).is_none() {
-                                return Err(
-                                    "spirv u32: sar with a non-immediate shift amount is \
-                                     unsupported (the u32 arithmetic shift materializes the \
-                                     amount as a WGSL u32 literal). Fail closed."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                        // `Shr` (logical shift) has the SAME immediate-only rule as
-                        // `Sar` under u32: the amount is materialized as a WGSL u32
-                        // literal. A non-immediate amount fails closed rather than
-                        // silently reading 0.
-                        if let Some(shr) =
-                            <&sonatina_ir::inst::arith::Shr as sonatina_ir::InstDowncast>::downcast(
-                                is, inst_data,
-                            )
-                        {
-                            if f.dfg.value_imm(*shr.bits()).is_none() {
-                                return Err(
-                                    "spirv u32: shr with a non-immediate shift amount is \
-                                     unsupported (the u32 logical shift materializes the \
-                                     amount as a WGSL u32 literal). Fail closed."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                        if let Some(shl) =
-                            <&sonatina_ir::inst::arith::Shl as sonatina_ir::InstDowncast>::downcast(
-                                is, inst_data,
-                            )
-                        {
-                            if f.dfg.value_imm(*shl.bits()).is_none() {
-                                return Err(
-                                    "spirv u32: shl with a non-immediate shift amount is \
-                                     unsupported (the u32 shift-left materializes the \
-                                     amount as a WGSL u32 literal). Fail closed."
-                                        .to_string(),
-                                );
-                            }
-                        }
+                        // WGSL accepts runtime u32 shift amounts directly. Sar
+                        // still bitcasts only the shifted value through i32; Shl
+                        // and Shr remain direct u32 operations.
                     }
                     // `Shr` (logical/unsigned shift) is only lowered for the u32
                     // browser word, where WGSL `>>` on a `u32` IS the logical shift.
