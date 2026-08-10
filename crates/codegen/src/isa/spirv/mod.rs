@@ -55,6 +55,11 @@ pub enum LayoutMode {
     Scalar,
     Batch,
     Grid,
+    /// Unit-returning compute stage with explicit external resources and no
+    /// implicit result buffer. Unlike Grid and Batch, this mode is never
+    /// inferred from the function body; the compiler supplies the stage
+    /// interface explicitly.
+    Compute,
     /// Render mode: ONE SPIR-V module with two entry points, a fixed
     /// fullscreen-triangle `@vertex` and a `@fragment` that binds args 0,1 to
     /// `u32(position.xy)` (the analog of Grid's `global_invocation_id.xy`), runs
@@ -78,6 +83,7 @@ pub enum Access {
 pub enum Role {
     Output,
     Input,
+    Resource,
 }
 
 /// Logical Sonatina scalar type of one ABI value. This describes the source
@@ -101,6 +107,43 @@ pub struct SpirvBindingMember {
     pub offset: u32,
     pub width: u32,
     pub scalar: SpirvScalarKind,
+}
+
+/// One field in the element record of an externally bound storage resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpirvResourceField {
+    pub name: String,
+    pub scalar: SpirvScalarKind,
+    pub offset: u32,
+}
+
+/// Compiler-supplied storage element layout. B4 deliberately starts with the
+/// browser u32 carrier and POD records of browser words. This is enough for
+/// packed f32 pairs and crypto word buffers without conflating external
+/// storage with the private `Mem` heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpirvResourceElement {
+    Scalar(SpirvScalarKind),
+    Record {
+        fields: Vec<SpirvResourceField>,
+        span: u32,
+    },
+}
+
+/// One explicit storage resource rooted at a function argument. `arg_index`
+/// is semantic compiler metadata; the translator maps that argument value to
+/// the emitted Naga global before ordinary ObjIndex/ObjProj/ObjLoad/ObjStore
+/// lowering runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpirvExternalResource {
+    pub arg_index: u32,
+    pub group: u32,
+    pub binding: u32,
+    pub name: String,
+    pub access: Access,
+    pub element: SpirvResourceElement,
+    pub stride: u32,
+    pub length: u32,
 }
 
 /// Physical shader builtin supplying a logical source-language argument without
@@ -139,6 +182,14 @@ pub struct SpirvBinding {
     /// Typed source arguments stored in this binding. Empty for outputs and
     /// padding-only inputs.
     pub members: Vec<SpirvBindingMember>,
+    /// Element layout for an authored external resource. `None` for implicit
+    /// input/output/diagnostic bindings.
+    pub resource_element: Option<SpirvResourceElement>,
+    /// Declared element count for an authored external resource.
+    pub resource_length: Option<u32>,
+    /// Kernel argument rooted at this resource global. `None` for implicit
+    /// compiler bindings.
+    pub resource_arg_index: Option<u32>,
 }
 
 /// Where the scalar result lands for readback.
@@ -213,6 +264,11 @@ pub struct SpirvBackend {
     /// `@location(0) vec4<f32>` color. Driver-declared, off by default; mutually
     /// exclusive with grid and batch.
     pub render: bool,
+    /// Explicit unit-returning compute stage. This is distinct from legacy
+    /// Grid, whose return value is written to an implicit output image buffer.
+    pub compute: bool,
+    /// Bound resource roots supplied by the Fe stage-interface derivation.
+    pub external_resources: Vec<SpirvExternalResource>,
     /// Word capacity of the emulated private-storage heap (`fe_heap`) declared
     /// for kernels using function-local `[u32; N]` arrays (`MemAllocDynamic` /
     /// `Mload` / `Mstore`). Default 8192 words (32KB), matching
@@ -227,6 +283,8 @@ impl SpirvBackend {
             workgroup_size: [64, 1, 1],
             grid: false,
             render: false,
+            compute: false,
+            external_resources: Vec::new(),
             heap_words: 8192,
         }
     }
@@ -243,6 +301,16 @@ impl SpirvBackend {
 
     pub fn with_render(mut self) -> Self {
         self.render = true;
+        self
+    }
+
+    pub fn with_compute(mut self) -> Self {
+        self.compute = true;
+        self
+    }
+
+    pub fn with_external_resource(mut self, resource: SpirvExternalResource) -> Self {
+        self.external_resources.push(resource);
         self
     }
 
@@ -271,6 +339,8 @@ impl Backend for SpirvBackend {
             self.workgroup_size,
             self.grid,
             self.render,
+            self.compute,
+            &self.external_resources,
             self.heap_words,
         )
         .map_err(|e| vec![SpirvError::Translation(e)])?;
@@ -367,6 +437,155 @@ fn emit_expr(
 #[cfg(feature = "spirv-backend")]
 fn lit_u32(func: &mut naga::Function, v: u32) -> naga::Handle<naga::Expression> {
     func.expressions.append(naga::Expression::Literal(naga::Literal::U32(v)), naga::Span::UNDEFINED)
+}
+
+#[cfg(feature = "spirv-backend")]
+fn append_external_resources(
+    naga_mod: &mut naga::Module,
+    resources: &[SpirvExternalResource],
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+) -> Result<
+    (
+        Vec<(u32, naga::Handle<naga::GlobalVariable>)>,
+        Vec<SpirvBinding>,
+    ),
+    String,
+> {
+    if !resources.is_empty() && word != WordKind::U32 {
+        return Err(
+            "spirv: external resources currently require the u32 browser word"
+                .to_string(),
+        );
+    }
+
+    fn admitted_scalar(
+        scalar: SpirvScalarKind,
+        word_type: naga::Handle<naga::Type>,
+    ) -> Result<naga::Handle<naga::Type>, String> {
+        match scalar {
+            SpirvScalarKind::I32 | SpirvScalarKind::U32 => Ok(word_type),
+            other => Err(format!(
+                "spirv: external storage scalar {other:?} is unsupported; B4 v1 admits u32 browser words only"
+            )),
+        }
+    }
+
+    let mut roots = Vec::with_capacity(resources.len());
+    let mut bindings = Vec::with_capacity(resources.len());
+    let mut names = std::collections::HashSet::new();
+    for resource in resources {
+        if resource.name.is_empty() || !names.insert(resource.name.clone()) {
+            return Err(format!(
+                "spirv: external resource names must be nonempty and unique; got {:?}",
+                resource.name
+            ));
+        }
+        if resource.stride == 0 || resource.stride % 4 != 0 {
+            return Err(format!(
+                "spirv: external resource {} stride {} must be a nonzero multiple of 4",
+                resource.name, resource.stride
+            ));
+        }
+
+        let (element_type, element_span) = match &resource.element {
+            SpirvResourceElement::Scalar(scalar) => {
+                (admitted_scalar(*scalar, word_type)?, 4)
+            }
+            SpirvResourceElement::Record { fields, span } => {
+                if fields.is_empty() || *span == 0 || *span % 4 != 0 {
+                    return Err(format!(
+                        "spirv: external resource {} record must have fields and a 4-byte-aligned nonzero span",
+                        resource.name
+                    ));
+                }
+                let mut naga_fields = Vec::with_capacity(fields.len());
+                let mut previous_end = 0;
+                for field in fields {
+                    if field.name.is_empty() || field.offset % 4 != 0 {
+                        return Err(format!(
+                            "spirv: external resource {} has an unnamed or unaligned record field",
+                            resource.name
+                        ));
+                    }
+                    if field.offset < previous_end || field.offset + 4 > *span {
+                        return Err(format!(
+                            "spirv: external resource {} record fields overlap or exceed span {}",
+                            resource.name, span
+                        ));
+                    }
+                    naga_fields.push(naga::StructMember {
+                        name: Some(field.name.clone()),
+                        ty: admitted_scalar(field.scalar, word_type)?,
+                        binding: None,
+                        offset: field.offset,
+                    });
+                    previous_end = field.offset + 4;
+                }
+                let ty = naga_mod.types.insert(
+                    naga::Type {
+                        name: Some(format!("{}_element", resource.name)),
+                        inner: naga::TypeInner::Struct {
+                            members: naga_fields,
+                            span: *span,
+                        },
+                    },
+                    naga::Span::UNDEFINED,
+                );
+                (ty, *span)
+            }
+        };
+        if resource.stride < element_span {
+            return Err(format!(
+                "spirv: external resource {} stride {} is smaller than element span {}",
+                resource.name, resource.stride, element_span
+            ));
+        }
+        let array_type = naga_mod.types.insert(
+            naga::Type {
+                name: Some(format!("{}_array", resource.name)),
+                inner: naga::TypeInner::Array {
+                    base: element_type,
+                    size: naga::ArraySize::Dynamic,
+                    stride: resource.stride,
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        let access = match resource.access {
+            Access::Read => naga::StorageAccess::LOAD,
+            Access::ReadWrite => naga::StorageAccess::LOAD | naga::StorageAccess::STORE,
+        };
+        let global = naga_mod.global_variables.append(
+            naga::GlobalVariable {
+                name: Some(resource.name.clone()),
+                space: naga::AddressSpace::Storage { access },
+                binding: Some(naga::ResourceBinding {
+                    group: resource.group,
+                    binding: resource.binding,
+                }),
+                ty: array_type,
+                init: None,
+                memory_decorations: naga::ir::MemoryDecorations::empty(),
+            },
+            naga::Span::UNDEFINED,
+        );
+        roots.push((resource.arg_index, global));
+        bindings.push(SpirvBinding {
+            group: resource.group,
+            binding: resource.binding,
+            name: resource.name.clone(),
+            access: resource.access,
+            role: Role::Resource,
+            stride: resource.stride,
+            span: element_span,
+            members: Vec::new(),
+            resource_element: Some(resource.element.clone()),
+            resource_length: Some(resource.length),
+            resource_arg_index: Some(resource.arg_index),
+        });
+    }
+    Ok((roots, bindings))
 }
 
 /// The private-storage heap proper (`fe_heap`/`fe_bump`), present only for
@@ -920,6 +1139,42 @@ fn emit_single_inst(
             value_map.insert(result, converted);
             return true;
         }
+    } else if let Some(bitcast) =
+        <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(inst_set, inst_data)
+    {
+        // A Sonatina Bitcast is a representation-preserving reinterpretation,
+        // not a numeric conversion. The browser word admits the exact 32-bit
+        // scalar pair needed by storage records: i32 bits <-> f32.
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let from = resolve_naga_value(
+                *bitcast.from(),
+                function,
+                word,
+                value_map,
+                phi_locals,
+                func,
+            )
+            .unwrap();
+            let kind = match *bitcast.ty() {
+                sonatina_ir::Type::I32 => naga::ScalarKind::Uint,
+                sonatina_ir::Type::F32 => naga::ScalarKind::Float,
+                _ => unreachable!("unsupported Bitcast rejected by SPIR-V pre-scan"),
+            };
+            let h = func.expressions.append(
+                naga::Expression::As {
+                    expr: from,
+                    kind,
+                    convert: None,
+                },
+                naga::Span::UNDEFINED,
+            );
+            target.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(h, h)),
+                naga::Span::UNDEFINED,
+            );
+            value_map.insert(result, h);
+            return true;
+        }
     } else if let Some(sar) = <&sonatina_ir::inst::arith::Sar as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let val = resolve_naga_value(*sar.value(), function, word, value_map, phi_locals, func).unwrap();
@@ -1182,6 +1437,54 @@ fn emit_single_inst(
                 naga::Span::UNDEFINED,
             );
             value_map.insert(result, h);
+            return true;
+        }
+    } else if let Some(obj_proj) =
+        <&sonatina_ir::inst::data::ObjProj as InstDowncast>::downcast(inst_set, inst_data)
+    {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let Some((&object, indices)) = obj_proj.values().split_first() else {
+                *mem_error = Some("spirv: ObjProj has no object operand".to_string());
+                return false;
+            };
+            let Some(mut base) = resolve_naga_value(
+                object,
+                function,
+                word,
+                value_map,
+                phi_locals,
+                func,
+            ) else {
+                *mem_error = Some(format!(
+                    "spirv: ObjProj object operand {object:?} is unresolved"
+                ));
+                return false;
+            };
+            for &index in indices {
+                let Some(immediate) = function.dfg.value_imm(index) else {
+                    *mem_error = Some(
+                        "spirv: ObjProj requires compile-time field indices".to_string(),
+                    );
+                    return false;
+                };
+                let field = match immediate {
+                    sonatina_ir::Immediate::I8(value) => value as u8 as u32,
+                    sonatina_ir::Immediate::I32(value) => value as u32,
+                    sonatina_ir::Immediate::I64(value) => value as u32,
+                    _ => {
+                        *mem_error = Some(
+                            "spirv: ObjProj field index has an unsupported immediate type"
+                                .to_string(),
+                        );
+                        return false;
+                    }
+                };
+                base = func.expressions.append(
+                    naga::Expression::AccessIndex { base, index: field },
+                    naga::Span::UNDEFINED,
+                );
+            }
+            value_map.insert(result, base);
             return true;
         }
     } else if let Some(alloc) = <&sonatina_ir::inst::data::MemAllocDynamic as InstDowncast>::downcast(inst_set, inst_data) {
@@ -2517,10 +2820,12 @@ fn spirv_instruction_is_lowered(
         || <&sonatina_ir::inst::cast::U32ToF32 as InstDowncast>::downcast(is, inst).is_some()
         || <&sonatina_ir::inst::cast::F32ToI32 as InstDowncast>::downcast(is, inst).is_some()
         || <&sonatina_ir::inst::cast::F32ToU32 as InstDowncast>::downcast(is, inst).is_some()
+        || <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAlloc as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjLoad as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjIndex as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjProj as InstDowncast>::downcast(is, inst).is_some()
         || <&data::MemAllocDynamic as InstDowncast>::downcast(is, inst).is_some()
         || <&data::Mload as InstDowncast>::downcast(is, inst).is_some()
         || <&data::Mstore as InstDowncast>::downcast(is, inst).is_some()
@@ -2532,6 +2837,8 @@ fn translate_to_naga(
     workgroup_size: [u32; 3],
     grid: bool,
     render: bool,
+    compute: bool,
+    external_resources: &[SpirvExternalResource],
     heap_words: u32,
 ) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
@@ -2559,6 +2866,7 @@ fn translate_to_naga(
                  and i64 words are supported"
             ));
         }
+        None if compute && sig.returns_unit() => WordKind::U32,
         None => {
             return Err(
                 "spirv: kernel has no single return value; the word width cannot be derived"
@@ -2567,7 +2875,58 @@ fn translate_to_naga(
         }
     };
 
+    if [grid, render, compute].into_iter().filter(|enabled| *enabled).count() > 1 {
+        return Err(
+            "spirv: grid, render, and explicit compute modes are mutually exclusive"
+                .to_string(),
+        );
+    }
+    if !external_resources.is_empty() && !(compute || render) {
+        return Err(
+            "spirv: external resources require explicit compute or render mode"
+                .to_string(),
+        );
+    }
+    if compute && !sig.returns_unit() {
+        return Err(
+            "spirv compute: explicit compute stages must return unit; results belong in external resources"
+                .to_string(),
+        );
+    }
+
+    let mut resource_arg_indices = std::collections::HashSet::new();
+    for (position, resource) in external_resources.iter().enumerate() {
+        if resource.group != 0 || resource.binding != position as u32 {
+            return Err(format!(
+                "spirv: external resources must occupy contiguous group 0 bindings in declaration order; resource {} requested @group({}) @binding({})",
+                resource.name, resource.group, resource.binding
+            ));
+        }
+        if resource.length == 0 {
+            return Err(format!(
+                "spirv: external resource {} must have a nonzero length",
+                resource.name
+            ));
+        }
+        let arg_index = resource.arg_index as usize;
+        if arg_index >= sig.args().len() {
+            return Err(format!(
+                "spirv: external resource {} refers to missing kernel arg {}",
+                resource.name, resource.arg_index
+            ));
+        }
+        if !resource_arg_indices.insert(arg_index) {
+            return Err(format!(
+                "spirv: kernel arg {} is rooted by more than one external resource",
+                resource.arg_index
+            ));
+        }
+    }
+
     for (i, &arg_ty) in sig.args().iter().enumerate() {
+        if resource_arg_indices.contains(&i) {
+            continue;
+        }
         if word == WordKind::I64 && arg_ty != sonatina_ir::Type::I64 {
             return Err(format!(
                 "spirv i64: kernel arg {i} has type {arg_ty:?}; i64 kernels require homogeneous i64 arguments"
@@ -2721,6 +3080,25 @@ fn translate_to_naga(
                             "spirv: instruction `{}` is unsupported by the SPIR-V translator",
                             inst_data.as_text()
                         ));
+                    }
+                    if let Some(bitcast) =
+                        <&sonatina_ir::inst::cast::Bitcast as sonatina_ir::InstDowncast>::downcast(
+                            is, inst_data,
+                        )
+                    {
+                        let from_ty = f.dfg.value_ty(*bitcast.from());
+                        let to_ty = *bitcast.ty();
+                        let admitted = word == WordKind::U32
+                            && matches!(
+                                (from_ty, to_ty),
+                                (sonatina_ir::Type::I32, sonatina_ir::Type::F32)
+                                    | (sonatina_ir::Type::F32, sonatina_ir::Type::I32)
+                            );
+                        if !admitted {
+                            return Err(format!(
+                                "spirv: Bitcast supports exactly i32 <-> f32 under the u32 browser word; got {from_ty:?} -> {to_ty:?}"
+                            ));
+                        }
                     }
                     if <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(
                         is, inst_data,
@@ -2930,6 +3308,353 @@ fn translate_to_naga(
         );
     }
 
+    let (external_roots, external_layout_bindings) = append_external_resources(
+        &mut naga_mod,
+        external_resources,
+        word,
+        word_type,
+    )?;
+
+    // ======================================================================
+    // Explicit compute mode. The stage returns unit and communicates only via
+    // authored external resources. Ordinary scalar arguments, if any, occupy
+    // one read-only parameter record after the authored resource bindings.
+    // ======================================================================
+    if compute {
+        if has_obj_alloc {
+            return Err(
+                "spirv compute: external-resource compute must not contain ObjAlloc or select Batch"
+                    .to_string(),
+            );
+        }
+
+        let parameter_args = sig
+            .args()
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(index, _)| !resource_arg_indices.contains(index))
+            .collect::<Vec<_>>();
+        let mut parameter_members = Vec::with_capacity(parameter_args.len());
+        let mut layout_parameter_members = Vec::with_capacity(parameter_args.len());
+        let mut parameter_span = 0;
+        let mut parameter_align = 1;
+        for (arg_index, ty) in &parameter_args {
+            let (naga_ty, width, scalar) = match ty {
+                sonatina_ir::Type::I32 => (word_type, 4, SpirvScalarKind::I32),
+                sonatina_ir::Type::F32 => (f32_type, 4, SpirvScalarKind::F32),
+                _ => {
+                    return Err(format!(
+                        "spirv compute: parameter arg {arg_index} has unsupported storage type {ty:?}"
+                    ));
+                }
+            };
+            parameter_span = (parameter_span + width - 1) & !(width - 1);
+            parameter_members.push(naga::StructMember {
+                name: Some(format!("p{arg_index}")),
+                ty: naga_ty,
+                binding: None,
+                offset: parameter_span,
+            });
+            layout_parameter_members.push(SpirvBindingMember {
+                arg_index: *arg_index as u32,
+                offset: parameter_span,
+                width,
+                scalar,
+            });
+            parameter_span += width;
+            parameter_align = parameter_align.max(width);
+        }
+        parameter_span = (parameter_span + parameter_align - 1) & !(parameter_align - 1);
+        let parameter_binding = external_resources.len() as u32;
+        let parameter_var = if parameter_members.is_empty() {
+            None
+        } else {
+            let parameter_type = naga_mod.types.insert(
+                naga::Type {
+                    name: Some("Params".into()),
+                    inner: naga::TypeInner::Struct {
+                        members: parameter_members,
+                        span: parameter_span,
+                    },
+                },
+                naga::Span::UNDEFINED,
+            );
+            Some(naga_mod.global_variables.append(
+                naga::GlobalVariable {
+                    name: Some("params".into()),
+                    space: naga::AddressSpace::Storage {
+                        access: naga::StorageAccess::LOAD,
+                    },
+                    binding: Some(naga::ResourceBinding {
+                        group: 0,
+                        binding: parameter_binding,
+                    }),
+                    ty: parameter_type,
+                    init: None,
+                    memory_decorations: naga::ir::MemoryDecorations::empty(),
+                },
+                naga::Span::UNDEFINED,
+            ))
+        };
+
+        let needs_trap_channel = has_mem || has_unreachable;
+        let trap_binding = parameter_binding + u32::from(parameter_var.is_some());
+        let trap_var = if needs_trap_channel {
+            let trap_type = naga_mod.types.insert(
+                naga::Type {
+                    name: Some("TrapArray".into()),
+                    inner: naga::TypeInner::Array {
+                        base: word_type,
+                        size: naga::ArraySize::Dynamic,
+                        stride: 4,
+                    },
+                },
+                naga::Span::UNDEFINED,
+            );
+            Some(naga_mod.global_variables.append(
+                naga::GlobalVariable {
+                    name: Some("trap".into()),
+                    space: naga::AddressSpace::Storage {
+                        access: naga::StorageAccess::LOAD | naga::StorageAccess::STORE,
+                    },
+                    binding: Some(naga::ResourceBinding {
+                        group: 0,
+                        binding: trap_binding,
+                    }),
+                    ty: trap_type,
+                    init: None,
+                    memory_decorations: naga::ir::MemoryDecorations::empty(),
+                },
+                naga::Span::UNDEFINED,
+            ))
+        } else {
+            None
+        };
+
+        let mut func = naga::Function {
+            name: Some("main".into()),
+            arguments: Vec::new(),
+            result: None,
+            local_variables: naga::Arena::new(),
+            expressions: naga::Arena::new(),
+            named_expressions: Default::default(),
+            body: naga::Block::new(),
+            diagnostic_filter_leaf: None,
+        };
+        let mem_ctx = if needs_trap_channel {
+            let heap = if has_mem {
+                let heap_len = std::num::NonZeroU32::new(heap_words)
+                    .ok_or_else(|| "spirv: heap_words must be nonzero".to_string())?;
+                let heap_type = naga_mod.types.insert(
+                    naga::Type {
+                        name: Some("FeHeap".into()),
+                        inner: naga::TypeInner::Array {
+                            base: word_type,
+                            size: naga::ArraySize::Constant(heap_len),
+                            stride: 4,
+                        },
+                    },
+                    naga::Span::UNDEFINED,
+                );
+                let heap_zero = func.expressions.append(
+                    naga::Expression::ZeroValue(heap_type),
+                    naga::Span::UNDEFINED,
+                );
+                let heap = func.local_variables.append(
+                    naga::LocalVariable {
+                        name: Some("fe_heap".into()),
+                        ty: heap_type,
+                        init: Some(heap_zero),
+                    },
+                    naga::Span::UNDEFINED,
+                );
+                let bump_zero = func.expressions.append(
+                    naga::Expression::Literal(naga::Literal::U32(0)),
+                    naga::Span::UNDEFINED,
+                );
+                let bump = func.local_variables.append(
+                    naga::LocalVariable {
+                        name: Some("fe_bump".into()),
+                        ty: word_type,
+                        init: Some(bump_zero),
+                    },
+                    naga::Span::UNDEFINED,
+                );
+                Some(HeapCtx {
+                    heap,
+                    bump,
+                    heap_words,
+                })
+            } else {
+                None
+            };
+            let trapped_false = func.expressions.append(
+                naga::Expression::Literal(naga::Literal::Bool(false)),
+                naga::Span::UNDEFINED,
+            );
+            let trapped = func.local_variables.append(
+                naga::LocalVariable {
+                    name: Some("fe_trapped".into()),
+                    ty: bool_type,
+                    init: Some(trapped_false),
+                },
+                naga::Span::UNDEFINED,
+            );
+            Some(MemCtx { heap, trapped })
+        } else {
+            None
+        };
+
+        let mut body_error = None;
+        module.func_store.try_view(first_func, |function| {
+            let inst_set = function.inst_set();
+            let mut value_map = HashMap::new();
+            let mut phi_locals = HashMap::new();
+            for &(arg_index, global) in &external_roots {
+                let Some(&arg_value) = function.arg_values.get(arg_index as usize) else {
+                    body_error = Some(format!(
+                        "spirv compute: external resource arg {arg_index} disappeared during lowering"
+                    ));
+                    return;
+                };
+                let root = func.expressions.append(
+                    naga::Expression::GlobalVariable(global),
+                    naga::Span::UNDEFINED,
+                );
+                value_map.insert(arg_value, root);
+            }
+            if let Some(parameter_var) = parameter_var {
+                let params = func.expressions.append(
+                    naga::Expression::GlobalVariable(parameter_var),
+                    naga::Span::UNDEFINED,
+                );
+                for (member_index, (arg_index, _)) in parameter_args.iter().enumerate() {
+                    let field = func.expressions.append(
+                        naga::Expression::AccessIndex {
+                            base: params,
+                            index: member_index as u32,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    let loaded = func.expressions.append(
+                        naga::Expression::Load { pointer: field },
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(field, field)),
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                        naga::Span::UNDEFINED,
+                    );
+                    value_map.insert(function.arg_values[*arg_index], loaded);
+                }
+            }
+            let scfg = match crate::structurize::structurize_function(function) {
+                Ok(scfg) => scfg,
+                Err(error) => {
+                    body_error = Some(error);
+                    return;
+                }
+            };
+            let mut ignored_result = None;
+            if let Err(error) = emit_naga_regions(
+                function,
+                inst_set,
+                word,
+                &scfg.regions,
+                word_type,
+                f32_type,
+                bool_type,
+                &mut func,
+                &mut value_map,
+                &mut phi_locals,
+                &mut ignored_result,
+                mem_ctx,
+            ) {
+                body_error = Some(error);
+            }
+        });
+        if let Some(error) = body_error {
+            return Err(error);
+        }
+        if let (Some(mem_ctx), Some(trap_var)) = (mem_ctx, trap_var) {
+            let zero = func.expressions.append(
+                naga::Expression::Literal(naga::Literal::I32(0)),
+                naga::Span::UNDEFINED,
+            );
+            let mut tail = naga::Block::new();
+            emit_trap_store(&mut func, &mut tail, mem_ctx, trap_var, zero);
+            func.body.extend_block(tail);
+        }
+        naga_mod.entry_points.push(naga::EntryPoint {
+            name: "main".into(),
+            stage: naga::ShaderStage::Compute,
+            early_depth_test: None,
+            workgroup_size,
+            workgroup_size_overrides: None,
+            function: func,
+            mesh_info: None,
+            task_payload: None,
+            incoming_ray_payload: None,
+        });
+
+        let mut bindings = external_layout_bindings;
+        if parameter_var.is_some() {
+            bindings.push(SpirvBinding {
+                group: 0,
+                binding: parameter_binding,
+                name: "params".to_string(),
+                access: Access::Read,
+                role: Role::Input,
+                stride: parameter_span,
+                span: parameter_span,
+                members: layout_parameter_members,
+                resource_element: None,
+                resource_length: None,
+                resource_arg_index: None,
+            });
+        }
+        if needs_trap_channel {
+            bindings.push(SpirvBinding {
+                group: 0,
+                binding: trap_binding,
+                name: "trap".to_string(),
+                access: Access::ReadWrite,
+                role: Role::Output,
+                stride: 4,
+                span: 4,
+                members: Vec::new(),
+                resource_element: None,
+                resource_length: None,
+                resource_arg_index: None,
+            });
+        }
+        return Ok((
+            naga_mod,
+            SpirvLayout {
+                entry_point: "main".to_string(),
+                mode: LayoutMode::Compute,
+                workgroup_size,
+                word,
+                bindings,
+                builtin_inputs: Vec::new(),
+                result: None,
+                trap: needs_trap_channel.then_some(SpirvResult {
+                    group: 0,
+                    binding: trap_binding,
+                    offset: 0,
+                    width: 4,
+                }),
+                vertex_entry: None,
+                fragment_entry: None,
+                color_target_format: None,
+            },
+        ));
+    }
+
     // ======================================================================
     // Render mode (fork push #3). ONE module, two entry points: a fixed
     // fullscreen-triangle `@vertex` and a `@fragment` that binds args 0,1 to
@@ -2982,8 +3707,26 @@ fn translate_to_naga(
         if has_obj_alloc {
             return Err(
                 "spirv render: render and batch (ObjAlloc) modes are mutually exclusive"
-                    .to_string(),
+                .to_string(),
             );
+        }
+        if let Some(resource) = external_resources
+            .iter()
+            .find(|resource| resource.access != Access::Read)
+        {
+            return Err(format!(
+                "spirv render: external resource {} must be read-only",
+                resource.name
+            ));
+        }
+        if let Some(resource) = external_resources
+            .iter()
+            .find(|resource| resource.arg_index < 2)
+        {
+            return Err(format!(
+                "spirv render: external resource {} cannot replace fragment coordinate arg {}",
+                resource.name, resource.arg_index
+            ));
         }
 
         // ---- types: f32, vec4<f32> (the vertex/fragment stage I/O) ----------
@@ -2999,20 +3742,28 @@ fn translate_to_naga(
         // ---- broadcast input struct (args 2..), exactly the Grid shape -------
         // Binding 0 (the compute output buffer) is simply ABSENT in render mode;
         // the input storage buffer stays at @group(0) @binding(1), no renumbering.
-        let broadcast = param_count - 2;
-        let effective_params = broadcast.max(1);
+        let parameter_args = sig
+            .args()
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(2)
+            .filter(|(index, _)| !resource_arg_indices.contains(index))
+            .collect::<Vec<_>>();
+        let emit_parameter_binding = external_resources.is_empty() || !parameter_args.is_empty();
+        let effective_params = parameter_args.len().max(1);
         let mut input_members = Vec::with_capacity(effective_params);
-        let mut layout_input_members = Vec::with_capacity(broadcast);
+        let mut layout_input_members = Vec::with_capacity(parameter_args.len());
         let mut input_span = 0;
         let mut input_align = 1;
-        for (i, ty) in sig.args().iter().skip(2).copied().enumerate() {
+        for (arg_index, ty) in &parameter_args {
             let (naga_ty, width, scalar) = match ty {
                 sonatina_ir::Type::I32 => (word_type, 4, SpirvScalarKind::I32),
                 sonatina_ir::Type::F32 => (f32_type, 4, SpirvScalarKind::F32),
-                _ => return Err(format!("spirv render: broadcast arg {} has unsupported storage type {ty:?}", i + 2)),
+                _ => return Err(format!("spirv render: broadcast arg {arg_index} has unsupported storage type {ty:?}")),
             };
-            input_members.push(naga::StructMember { name: Some(format!("p{i}")), ty: naga_ty, binding: None, offset: input_span });
-            layout_input_members.push(SpirvBindingMember { arg_index: (i + 2) as u32, offset: input_span, width, scalar });
+            input_members.push(naga::StructMember { name: Some(format!("p{arg_index}")), ty: naga_ty, binding: None, offset: input_span });
+            layout_input_members.push(SpirvBindingMember { arg_index: *arg_index as u32, offset: input_span, width, scalar });
             input_span += width;
             input_align = input_align.max(width);
         }
@@ -3021,24 +3772,33 @@ fn translate_to_naga(
             input_span = word_width;
         }
         input_span = (input_span + input_align - 1) & !(input_align - 1);
-        let input_struct = naga_mod.types.insert(
-            naga::Type {
-                name: Some("Input".into()),
-                inner: naga::TypeInner::Struct { members: input_members, span: input_span },
-            },
-            naga::Span::UNDEFINED,
-        );
-        let input_var = naga_mod.global_variables.append(
-            naga::GlobalVariable {
-                name: Some("input".into()),
-                space: naga::AddressSpace::Storage { access: naga::StorageAccess::LOAD },
-                binding: Some(naga::ResourceBinding { group: 0, binding: 1 }),
-                ty: input_struct,
-                init: None,
-                memory_decorations: naga::ir::MemoryDecorations::empty(),
-            },
-            naga::Span::UNDEFINED,
-        );
+        let parameter_binding = if external_resources.is_empty() {
+            1
+        } else {
+            external_resources.len() as u32
+        };
+        let input_var = if emit_parameter_binding {
+            let input_struct = naga_mod.types.insert(
+                naga::Type {
+                    name: Some("Input".into()),
+                    inner: naga::TypeInner::Struct { members: input_members, span: input_span },
+                },
+                naga::Span::UNDEFINED,
+            );
+            Some(naga_mod.global_variables.append(
+                naga::GlobalVariable {
+                    name: Some("input".into()),
+                    space: naga::AddressSpace::Storage { access: naga::StorageAccess::LOAD },
+                    binding: Some(naga::ResourceBinding { group: 0, binding: parameter_binding }),
+                    ty: input_struct,
+                    init: None,
+                    memory_decorations: naga::ir::MemoryDecorations::empty(),
+                },
+                naga::Span::UNDEFINED,
+            ))
+        } else {
+            None
+        };
 
         // ---- @vertex: fullscreen triangle from vertex_index -----------------
         // vi=0 -> (-1,-1); vi=1 -> (3,-1); vi=2 -> (-1,3). No vertex buffer, no
@@ -3136,12 +3896,26 @@ fn translate_to_naga(
                     naga::Handle<naga::LocalVariable>,
                 > = HashMap::new();
 
-                // The broadcast input global (unused if there are no args 2..; an
-                // unused GlobalVariable is legal, as in Grid's gradient kernel).
-                let input_expr = fs.expressions.append(
-                    naga::Expression::GlobalVariable(input_var),
-                    naga::Span::UNDEFINED,
-                );
+                for &(arg_index, global) in &external_roots {
+                    let Some(&arg_value) = function.arg_values.get(arg_index as usize) else {
+                        body_error = Some(format!(
+                            "spirv render: external resource arg {arg_index} disappeared during lowering"
+                        ));
+                        return;
+                    };
+                    let root = fs.expressions.append(
+                        naga::Expression::GlobalVariable(global),
+                        naga::Span::UNDEFINED,
+                    );
+                    value_map.insert(arg_value, root);
+                }
+
+                let input_expr = input_var.map(|input_var| {
+                    fs.expressions.append(
+                        naga::Expression::GlobalVariable(input_var),
+                        naga::Span::UNDEFINED,
+                    )
+                });
 
                 // Prologue: px = u32(pos.x), py = u32(pos.y). The fragment center
                 // (px + 0.5) truncates to the pixel index, the render-mode analog
@@ -3189,11 +3963,14 @@ fn translate_to_naga(
                     value_map.insert(a1, py);
                 }
 
-                // Args 2.. load from the broadcast input struct at member idx - 2,
-                // the SAME castless path Grid uses.
-                for (idx, &arg_val) in function.arg_values.iter().enumerate().skip(2) {
+                // Ordinary args load from the parameter record. Resource args
+                // are already rooted as globals above and never enter params.
+                for (member_index, (arg_index, _)) in parameter_args.iter().enumerate() {
                     let field = fs.expressions.append(
-                        naga::Expression::AccessIndex { base: input_expr, index: (idx - 2) as u32 },
+                        naga::Expression::AccessIndex {
+                            base: input_expr.expect("parameter args require input binding"),
+                            index: member_index as u32,
+                        },
                         naga::Span::UNDEFINED,
                     );
                     let loaded = fs.expressions.append(
@@ -3208,7 +3985,7 @@ fn translate_to_naga(
                         naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
                         naga::Span::UNDEFINED,
                     );
-                    value_map.insert(arg_val, loaded);
+                    value_map.insert(function.arg_values[*arg_index], loaded);
                 }
 
                 // The mode-blind body: SAME structurizer + region emission Grid and
@@ -3286,16 +4063,25 @@ fn translate_to_naga(
             mode: LayoutMode::Render,
             workgroup_size: [0, 0, 0],
             word,
-            bindings: vec![SpirvBinding {
-                group: 0,
-                binding: 1,
-                name: "input".to_string(),
-                access: Access::Read,
-                role: Role::Input,
-                stride: input_span,
-                span: input_span,
-                members: layout_input_members,
-            }],
+            bindings: {
+                let mut bindings = external_layout_bindings;
+                if emit_parameter_binding {
+                    bindings.push(SpirvBinding {
+                        group: 0,
+                        binding: parameter_binding,
+                        name: "input".to_string(),
+                        access: Access::Read,
+                        role: Role::Input,
+                        stride: input_span,
+                        span: input_span,
+                        members: layout_input_members,
+                        resource_element: None,
+                        resource_length: None,
+                        resource_arg_index: None,
+                    });
+                }
+                bindings
+            },
             builtin_inputs: vec![
                 SpirvBuiltinInput { arg_index: 0, source: SpirvBuiltinSource::FragmentPositionX, scalar: SpirvScalarKind::I32 },
                 SpirvBuiltinInput { arg_index: 1, source: SpirvBuiltinSource::FragmentPositionY, scalar: SpirvScalarKind::I32 },
@@ -3920,6 +4706,9 @@ fn translate_to_naga(
                     stride: word_width,
                     span: word_width,
                     members: Vec::new(),
+                    resource_element: None,
+                    resource_length: None,
+                    resource_arg_index: None,
                 },
                 SpirvBinding {
                     group: 0,
@@ -3930,6 +4719,9 @@ fn translate_to_naga(
                     stride: input_span,
                     span: input_span,
                     members: layout_input_members,
+                    resource_element: None,
+                    resource_length: None,
+                    resource_arg_index: None,
                 },
             ];
             if needs_trap_channel {
@@ -3942,6 +4734,9 @@ fn translate_to_naga(
                     stride: word_width,
                     span: word_width,
                     members: Vec::new(),
+                    resource_element: None,
+                    resource_length: None,
+                    resource_arg_index: None,
                 });
             }
             bindings

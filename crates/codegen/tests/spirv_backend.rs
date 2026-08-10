@@ -1,7 +1,8 @@
 use sonatina_codegen::Backend;
 use sonatina_codegen::isa::spirv::{
-    LayoutMode, Role, SpirvBackend, SpirvBuiltinInput, SpirvBuiltinSource, SpirvLayout,
-    SpirvBindingMember, SpirvScalarKind, WordKind,
+    Access, LayoutMode, Role, SpirvBackend, SpirvBuiltinInput, SpirvBuiltinSource,
+    SpirvExternalResource, SpirvLayout, SpirvBindingMember, SpirvResourceElement,
+    SpirvResourceField, SpirvScalarKind, WordKind,
 };
 use sonatina_ir::{
     Immediate, Linkage, Signature, Type,
@@ -34,6 +35,14 @@ fn assert_layout_metadata_invariants(layout: &SpirvLayout, arg_count: usize) {
     }
     for binding in &layout.bindings {
         assert!(binding.stride >= binding.span, "stride must cover span");
+        if let Some(arg_index) = binding.resource_arg_index {
+            let slot = seen.get_mut(arg_index as usize).expect("resource arg index in range");
+            assert!(!*slot, "argument {arg_index} described twice");
+            *slot = true;
+            assert_eq!(binding.role, Role::Resource);
+            assert!(binding.resource_element.is_some());
+            assert!(binding.resource_length.is_some());
+        }
         let mut end = 0;
         for member in &binding.members {
             assert!(member.width > 0 && member.offset % member.width == 0, "member must be naturally aligned");
@@ -1479,6 +1488,144 @@ fn build_grid_objalloc_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+/// Grid kernel whose result is the exact i32 bit pattern round-tripped through
+/// f32. This pins representation-preserving Bitcast lowering independently of
+/// the numeric i32/f32 conversion instructions.
+fn build_grid_bitcast_roundtrip_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_bitcast_roundtrip", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let as_f32 = fb.insert_inst(cast::Bitcast::new(is, px, Type::F32), Type::F32);
+    let as_i32 = fb.insert_inst(cast::Bitcast::new(is, as_f32, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, as_i32));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+fn build_external_record_compute_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let record_ty = mb.declare_struct_type("ComplexF32Bits", &[Type::I32, Type::I32], false);
+    let record_ref_ty = mb.objref_type(record_ty);
+    let word_ref_ty = mb.objref_type(Type::I32);
+    let array_ty = mb.declare_array_type(record_ty, 1);
+    let array_ref_ty = mb.objref_type(array_ty);
+    let sig = Signature::new_unit("write_external_record", Linkage::Public, &[array_ref_ty]);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let orbit = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    let sample = fb.insert_inst(data::ObjIndex::new(is, orbit, zero), record_ref_ty);
+    let re = fb.insert_inst(
+        data::ObjProj::new(is, smallvec::smallvec![sample, zero]),
+        word_ref_ty,
+    );
+    let im = fb.insert_inst(
+        data::ObjProj::new(is, smallvec::smallvec![sample, one]),
+        word_ref_ty,
+    );
+    let re_bits = fb.make_imm_value(1.0f32.to_bits() as i32);
+    let im_bits = fb.make_imm_value((-2.0f32).to_bits() as i32);
+    fb.insert_inst_no_result(data::ObjStore::new(is, re, re_bits));
+    fb.insert_inst_no_result(data::ObjStore::new(is, im, im_bits));
+    fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+fn build_external_record_render_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let record_ty = mb.declare_struct_type("ComplexF32Bits", &[Type::I32, Type::I32], false);
+    let record_ref_ty = mb.objref_type(record_ty);
+    let word_ref_ty = mb.objref_type(Type::I32);
+    let array_ty = mb.declare_array_type(record_ty, 1);
+    let array_ref_ty = mb.objref_type(array_ty);
+    let sig = Signature::new_single(
+        "read_external_record",
+        Linkage::Public,
+        &[Type::I32, Type::I32, array_ref_ty],
+        Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let orbit = fb.args()[2];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    let sample = fb.insert_inst(data::ObjIndex::new(is, orbit, zero), record_ref_ty);
+    let re = fb.insert_inst(
+        data::ObjProj::new(is, smallvec::smallvec![sample, zero]),
+        word_ref_ty,
+    );
+    let im = fb.insert_inst(
+        data::ObjProj::new(is, smallvec::smallvec![sample, one]),
+        word_ref_ty,
+    );
+    let re_bits = fb.insert_inst(data::ObjLoad::new(is, re), Type::I32);
+    let im_bits = fb.insert_inst(data::ObjLoad::new(is, im), Type::I32);
+    let color = fb.insert_inst(
+        sonatina_ir::inst::logic::Xor::new(is, re_bits, im_bits),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, color));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+fn external_complex_resource(arg_index: u32, access: Access) -> SpirvExternalResource {
+    SpirvExternalResource {
+        arg_index,
+        group: 0,
+        binding: 0,
+        name: "orbit".to_string(),
+        access,
+        element: SpirvResourceElement::Record {
+            fields: vec![
+                SpirvResourceField {
+                    name: "re_bits".to_string(),
+                    scalar: SpirvScalarKind::U32,
+                    offset: 0,
+                },
+                SpirvResourceField {
+                    name: "im_bits".to_string(),
+                    scalar: SpirvScalarKind::U32,
+                    offset: 4,
+                },
+            ],
+            span: 8,
+        },
+        stride: 8,
+        length: 1,
+    }
+}
+
 /// Execute a Grid-mode WGSL compute shader under the browser profile
 /// (`Features::empty()`, no SHADER_INT64) and read back the whole output grid.
 /// Hard-fails if no adapter is available: this is an EXECUTED gate (lavapipe is
@@ -1872,6 +2019,84 @@ fn grid_parallel_loop_phi_swap_executes_on_lavapipe() {
 
     let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
     assert_eq!(output, vec![2211; 64], "three parallel swaps must end at (22, 11)");
+}
+
+#[test]
+fn grid_i32_f32_bitcast_roundtrip_wgsl_shape() {
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&build_grid_bitcast_roundtrip_module())
+        .expect("i32/f32 bitcast roundtrip should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    assert!(wgsl.contains("bitcast<f32>"), "i32 bits must reinterpret as f32:\n{wgsl}");
+    assert!(wgsl.contains("bitcast<u32>"), "f32 bits must reinterpret as u32:\n{wgsl}");
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse bitcast WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("bitcast WGSL must validate under browser capabilities");
+}
+
+#[test]
+fn explicit_compute_roots_external_record_and_emits_no_implicit_buffers() {
+    let artifact = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(1, 1, 1)
+        .with_external_resource(external_complex_resource(0, Access::ReadWrite))
+        .compile_module(&build_external_record_compute_module())
+        .expect("external record compute should compile");
+    assert_eq!(artifact.layout.mode, LayoutMode::Compute);
+    assert_layout_metadata_invariants(&artifact.layout, 1);
+    assert_eq!(artifact.layout.bindings.len(), 1, "resource-only compute has no implicit input/output");
+    let orbit = &artifact.layout.bindings[0];
+    assert_eq!((orbit.group, orbit.binding), (0, 0));
+    assert_eq!((orbit.span, orbit.stride, orbit.resource_length), (8, 8, Some(1)));
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    assert!(wgsl.contains("re_bits: u32"), "record field must survive:\n{wgsl}");
+    assert!(wgsl.contains("im_bits: u32"), "record field must survive:\n{wgsl}");
+    assert!(wgsl.contains("var<storage, read_write> orbit"), "resource root must be a storage global:\n{wgsl}");
+    assert!(!wgsl.contains("var<storage, read_write> output"), "explicit compute has no implicit output:\n{wgsl}");
+    assert!(!wgsl.contains("var<storage, read> input"), "resource-only compute has no parameter buffer:\n{wgsl}");
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse external-resource compute WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("external-resource compute WGSL must validate under browser capabilities");
+}
+
+#[test]
+fn render_roots_same_external_record_read_only_without_parameter_buffer() {
+    let artifact = SpirvBackend::new()
+        .with_render()
+        .with_external_resource(external_complex_resource(2, Access::Read))
+        .compile_module(&build_external_record_render_module())
+        .expect("external record render should compile");
+    assert_eq!(artifact.layout.mode, LayoutMode::Render);
+    assert_layout_metadata_invariants(&artifact.layout, 3);
+    assert_eq!(artifact.layout.bindings.len(), 1, "resource-only render has no parameter buffer");
+    let orbit = &artifact.layout.bindings[0];
+    assert_eq!(orbit.access, Access::Read);
+    assert_eq!(orbit.resource_arg_index, Some(2));
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    assert!(wgsl.contains("var<storage> orbit"), "fragment resource must use WGSL's read-only storage form:\n{wgsl}");
+    assert!(!wgsl.contains("var<storage, read> input"), "resource-only render has no parameter buffer:\n{wgsl}");
+    assert!(wgsl.contains("].re_bits"), "record load must preserve resource indexing and projection:\n{wgsl}");
+    assert!(wgsl.contains("].im_bits"), "record load must preserve both fields:\n{wgsl}");
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse external-resource render WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("external-resource render WGSL must validate under browser capabilities");
 }
 
 #[test]
