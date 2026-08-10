@@ -631,6 +631,7 @@ struct MemCtx {
     trapped: naga::Handle<naga::LocalVariable>,
 }
 
+#[cfg(feature = "spirv-backend")]
 impl MemCtx {
     /// The heap context, or an explanatory panic if this `MemCtx` was
     /// constructed for a no-Mem trapping function (should be unreachable:
