@@ -1336,11 +1336,47 @@ fn translate_icmp(
 ) -> Result<(), String> {
     let lhs_val = resolve_scalar_value(module, function, lhs, value_map, builder)?;
     let rhs_val = resolve_scalar_value(module, function, rhs, value_map, builder)?;
+    let signed = matches!(
+        cc,
+        IntCC::SignedLessThan
+            | IntCC::SignedGreaterThan
+            | IntCC::SignedLessThanOrEqual
+            | IntCC::SignedGreaterThanOrEqual
+    );
+    let (lhs_val, rhs_val) = widen_integer_comparison_operands(builder, lhs_val, rhs_val, signed);
     let result_val = builder.ins().icmp(cc, lhs_val, rhs_val);
     if let Some(result) = function.dfg.inst_result(inst_id) {
         value_map.insert(result, result_val);
     }
     Ok(())
+}
+
+fn widen_integer_comparison_operands(
+    builder: &mut FunctionBuilder,
+    lhs: clif::Value,
+    rhs: clif::Value,
+    signed: bool,
+) -> (clif::Value, clif::Value) {
+    let lhs_ty = builder.func.dfg.value_type(lhs);
+    let rhs_ty = builder.func.dfg.value_type(rhs);
+    if lhs_ty == rhs_ty {
+        return (lhs, rhs);
+    }
+    if lhs_ty.bits() < rhs_ty.bits() {
+        let lhs = if signed {
+            builder.ins().sextend(rhs_ty, lhs)
+        } else {
+            builder.ins().uextend(rhs_ty, lhs)
+        };
+        (lhs, rhs)
+    } else {
+        let rhs = if signed {
+            builder.ins().sextend(lhs_ty, rhs)
+        } else {
+            builder.ins().uextend(lhs_ty, rhs)
+        };
+        (lhs, rhs)
+    }
 }
 
 fn translate_fcmp(

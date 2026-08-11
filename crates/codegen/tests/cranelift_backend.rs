@@ -5,7 +5,7 @@ use sonatina_ir::{
     builder::ModuleBuilder,
     func_cursor::InstInserter,
     global_variable::{GlobalVariableData, GvInitializer},
-    inst::{arith, cmp, control_flow, data, logic},
+    inst::{arith, cast, cmp, control_flow, data, logic},
     isa::{Isa, native::Native},
     module::ModuleCtx,
 };
@@ -794,6 +794,36 @@ fn cranelift_wide_scalar_returns_use_a_caller_owned_buffer() {
         std::mem::transmute(artifact.get_func_ptr::<Sum>("sum_wide_f32").unwrap())
     };
     assert_eq!(sum(6.0, 2.0), 27.0);
+}
+
+#[test]
+fn cranelift_integer_comparison_legalizes_narrow_enum_carriers() {
+    let mb = native_module_builder();
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let sig = Signature::new_single("is_one", Linkage::Public, &[Type::I32], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let narrow = fb.insert_inst(cast::Trunc::new(is, fb.args()[0], Type::I8), Type::I8);
+    let one = fb.make_imm_value(1i32);
+    let equal = fb.insert_inst(cmp::Eq::new(is, narrow, one), Type::I1);
+    let result = fb.insert_inst(cast::Zext::new(is, equal, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let artifact = CraneliftBackend::new()
+        .compile_module(&mb.build())
+        .expect("cranelift compile");
+    type Entry = extern "C" fn(i32) -> i32;
+    let entry: Entry = unsafe {
+        std::mem::transmute(artifact.get_func_ptr::<Entry>("is_one").unwrap())
+    };
+    assert_eq!(entry(0), 0);
+    assert_eq!(entry(1), 1);
+    assert_eq!(entry(257), 1);
 }
 
 /// Oracle test (VERIFY item 4): native/cranelift executes `Fabs`/`Fmin`/
