@@ -645,6 +645,157 @@ fn build_f32_intrinsics_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+fn build_f32_comparison_module() -> sonatina_ir::Module {
+    let mb = native_module_builder();
+    let isa = native_isa();
+    let is = isa.inst_set();
+
+    macro_rules! comparison {
+        ($name:literal, $inst:ident) => {{
+            let sig = Signature::new_single(
+                $name,
+                Linkage::Public,
+                &[Type::F32, Type::F32],
+                Type::I1,
+            );
+            let func_ref = mb.declare_function(sig).unwrap();
+            let mut fb = mb.func_builder::<InstInserter>(func_ref);
+            let entry = fb.append_block();
+            fb.switch_to_block(entry);
+            let result = fb.insert_inst(
+                cmp::$inst::new(is, fb.args()[0], fb.args()[1]),
+                Type::I1,
+            );
+            fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+            fb.seal_all();
+            fb.finish();
+        }};
+    }
+
+    comparison!("f32_eq", Feq);
+    comparison!("f32_lt", Flt);
+    comparison!("f32_le", Fle);
+
+    mb.build()
+}
+
+#[test]
+fn cranelift_f32_comparisons_preserve_ordered_ieee_semantics() {
+    let artifact = CraneliftBackend::new()
+        .compile_module(&build_f32_comparison_module())
+        .expect("cranelift compile");
+
+    type Compare = extern "C" fn(f32, f32) -> u8;
+    let eq: Compare = unsafe {
+        std::mem::transmute(artifact.get_func_ptr::<Compare>("f32_eq").unwrap())
+    };
+    let lt: Compare = unsafe {
+        std::mem::transmute(artifact.get_func_ptr::<Compare>("f32_lt").unwrap())
+    };
+    let le: Compare = unsafe {
+        std::mem::transmute(artifact.get_func_ptr::<Compare>("f32_le").unwrap())
+    };
+
+    for (lhs, rhs) in [
+        (-3.5, -3.5),
+        (-3.5, 2.0),
+        (2.0, -3.5),
+        (0.0, -0.0),
+        (f32::INFINITY, f32::INFINITY),
+        (f32::NEG_INFINITY, 0.0),
+        (f32::NAN, 1.0),
+        (1.0, f32::NAN),
+    ] {
+        assert_eq!(eq(lhs, rhs) != 0, lhs == rhs, "eq({lhs:?}, {rhs:?})");
+        assert_eq!(lt(lhs, rhs) != 0, lhs < rhs, "lt({lhs:?}, {rhs:?})");
+        assert_eq!(le(lhs, rhs) != 0, lhs <= rhs, "le({lhs:?}, {rhs:?})");
+    }
+}
+
+fn build_wide_scalar_return_module() -> sonatina_ir::Module {
+    let mb = native_module_builder();
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let result_tys = [Type::F32; 4];
+
+    let wide = mb
+        .declare_function(Signature::new(
+            "wide_f32",
+            Linkage::Public,
+            &[Type::F32, Type::F32],
+            &result_tys,
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(wide);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let lhs = fb.args()[0];
+    let rhs = fb.args()[1];
+    let add = fb.insert_inst(arith::Fadd::new(is, lhs, rhs), Type::F32);
+    let sub = fb.insert_inst(arith::Fsub::new(is, lhs, rhs), Type::F32);
+    let mul = fb.insert_inst(arith::Fmul::new(is, lhs, rhs), Type::F32);
+    let div = fb.insert_inst(arith::Fdiv::new(is, lhs, rhs), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new(
+        is,
+        [add, sub, mul, div]
+            .into_iter()
+            .collect::<smallvec::SmallVec<[_; 2]>>()
+            .into(),
+    ));
+    fb.seal_all();
+    fb.finish();
+
+    let sum = mb
+        .declare_function(Signature::new_single(
+            "sum_wide_f32",
+            Linkage::Public,
+            &[Type::F32, Type::F32],
+            Type::F32,
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(sum);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let results = fb.insert_inst_results(
+        control_flow::Call::new(
+            is,
+            wide,
+            [fb.args()[0], fb.args()[1]].into_iter().collect(),
+        ),
+        &result_tys,
+    );
+    let first = fb.insert_inst(arith::Fadd::new(is, results[0], results[1]), Type::F32);
+    let second = fb.insert_inst(arith::Fadd::new(is, results[2], results[3]), Type::F32);
+    let total = fb.insert_inst(arith::Fadd::new(is, first, second), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, total));
+    fb.seal_all();
+    fb.finish();
+
+    mb.build()
+}
+
+#[test]
+fn cranelift_wide_scalar_returns_use_a_caller_owned_buffer() {
+    let artifact = CraneliftBackend::new()
+        .compile_module(&build_wide_scalar_return_module())
+        .expect("cranelift compile");
+
+    type Wide = extern "C" fn(*mut u128, f32, f32);
+    let wide: Wide = unsafe {
+        std::mem::transmute(artifact.get_func_ptr::<Wide>("wide_f32").unwrap())
+    };
+    let mut slots = [0u128; 4];
+    wide(slots.as_mut_ptr(), 6.0, 2.0);
+    let values = slots.map(|slot| f32::from_bits(slot as u32));
+    assert_eq!(values, [8.0, 4.0, 12.0, 3.0]);
+
+    type Sum = extern "C" fn(f32, f32) -> f32;
+    let sum: Sum = unsafe {
+        std::mem::transmute(artifact.get_func_ptr::<Sum>("sum_wide_f32").unwrap())
+    };
+    assert_eq!(sum(6.0, 2.0), 27.0);
+}
+
 /// Oracle test (VERIFY item 4): native/cranelift executes `Fabs`/`Fmin`/
 /// `Fmax`/`Fclamp` correctly on ordinary values, bit-exact vs a plain Rust
 /// reference.

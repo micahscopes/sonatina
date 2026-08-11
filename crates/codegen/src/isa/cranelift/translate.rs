@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::{self as clif, InstBuilder, instructions::BlockArg};
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{FuncId, Linkage, Module as ClifModule};
 use cranelift_jit::JITModule;
@@ -66,11 +66,33 @@ fn returns_struct(sig: &Signature) -> bool {
     sig.ret_tys().iter().any(|ty| matches!(ty, Type::Compound(_)))
 }
 
+/// Cranelift's host ABIs do not admit an arbitrary number of direct scalar
+/// results. Keep the Sonatina multi-result IR intact, but lower result lists
+/// wider than the common two-register envelope through one caller-owned
+/// buffer. Every scalar occupies one sixteen-byte slot, preserving its own
+/// bit-width in the low-address bytes. This is a private JIT ABI shared by
+/// declarations, definitions, and calls below; it is not exposed as a C
+/// struct layout.
+fn returns_many_scalars(sig: &Signature) -> bool {
+    sig.ret_tys().len() > 2 && !returns_struct(sig)
+}
+
+fn returns_indirectly(sig: &Signature) -> bool {
+    returns_struct(sig) || returns_many_scalars(sig)
+}
+
+fn scalar_return_buffer_size(arity: usize) -> u32 {
+    u32::try_from(arity)
+        .expect("native scalar return arity exceeds u32")
+        .checked_mul(16)
+        .expect("native scalar return buffer size overflow")
+}
+
 fn sonatina_sig_to_clif(sig: &Signature, jit: &JITModule) -> clif::Signature {
     let mut clif_sig = jit.make_signature();
 
     // If returning a struct, add hidden sret pointer as first param
-    if returns_struct(sig) {
+    if returns_indirectly(sig) {
         clif_sig.params.push(clif::AbiParam::new(clif::types::I64));
     }
 
@@ -80,8 +102,8 @@ fn sonatina_sig_to_clif(sig: &Signature, jit: &JITModule) -> clif::Signature {
         }
     }
 
-    if returns_struct(sig) {
-        // Struct return via sret pointer — no return values in signature
+    if returns_indirectly(sig) {
+        // Aggregate or wide scalar-list return via sret pointer.
     } else {
         for &ret_ty in sig.ret_tys() {
             if let Some(clif_ty) = sonatina_type_to_clif(ret_ty) {
@@ -139,7 +161,13 @@ fn translate_function(
         block_map.insert(block, clif_block);
     }
 
-    let has_sret = module.ctx.func_sig(func_ref, |sig| returns_struct(sig));
+    let (has_sret, has_struct_sret, scalar_sret_tys) = module.ctx.func_sig(func_ref, |sig| {
+        (
+            returns_indirectly(sig),
+            returns_struct(sig),
+            returns_many_scalars(sig).then(|| sig.ret_tys().to_vec()),
+        )
+    });
 
     let entry = function.layout.entry_block().ok_or("no entry block")?;
     let clif_entry = block_map[&entry];
@@ -505,6 +533,12 @@ fn translate_function(
                 translate_icmp(IntCC::SignedLessThanOrEqual, *sle.lhs(), *sle.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(sge) = <&sonatina_ir::inst::cmp::Sge as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 translate_icmp(IntCC::SignedGreaterThanOrEqual, *sge.lhs(), *sge.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
+            } else if let Some(feq) = <&sonatina_ir::inst::cmp::Feq as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                translate_fcmp(FloatCC::Equal, *feq.lhs(), *feq.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
+            } else if let Some(flt) = <&sonatina_ir::inst::cmp::Flt as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                translate_fcmp(FloatCC::LessThan, *flt.lhs(), *flt.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
+            } else if let Some(fle) = <&sonatina_ir::inst::cmp::Fle as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
+                translate_fcmp(FloatCC::LessThanOrEqual, *fle.lhs(), *fle.rhs(), inst_id, module, function, &mut value_map, &mut builder)?;
             } else if let Some(sext) = <&sonatina_ir::inst::cast::Sext as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let val = resolve_value(function, *sext.from(), &value_map, &mut builder)?;
                 let to_ty = sonatina_type_to_clif_or_err(*sext.ty())?;
@@ -545,19 +579,48 @@ fn translate_function(
                 builder.ins().brif(cond, nz_block, &nz_args, z_block, &z_args);
             } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 if let Some(sret) = sret_ptr {
-                    // Write return value to sret pointer, then return void
-                    for &val_id in ret.args().as_slice() {
-                        let val = resolve_value(function, val_id, &value_map, &mut builder)?;
-                        // Copy 32 bytes from val (pointer) to sret (pointer)
-                        for i in 0..4 {
-                            let limb = builder.ins().load(
-                                clif::types::I64,
-                                cranelift_codegen::ir::MemFlags::new(),
-                                val, (i * 8) as i32,
-                            );
+                    if has_struct_sret {
+                        // Write the existing pointer-represented aggregate return.
+                        for &val_id in ret.args().as_slice() {
+                            let val = resolve_value(function, val_id, &value_map, &mut builder)?;
+                            // Copy 32 bytes from val (pointer) to sret (pointer)
+                            for i in 0..4 {
+                                let limb = builder.ins().load(
+                                    clif::types::I64,
+                                    cranelift_codegen::ir::MemFlags::new(),
+                                    val, (i * 8) as i32,
+                                );
+                                builder.ins().store(
+                                    cranelift_codegen::ir::MemFlags::new(),
+                                    limb, sret, (i * 8) as i32,
+                                );
+                            }
+                        }
+                    } else {
+                        let return_tys = scalar_sret_tys
+                            .as_deref()
+                            .ok_or("missing native scalar indirect-return layout")?;
+                        if ret.args().len() != return_tys.len() {
+                            return Err(format!(
+                                "native scalar indirect return has {} values for {} result types",
+                                ret.args().len(),
+                                return_tys.len()
+                            ));
+                        }
+                        for (index, (&val_id, &ty)) in ret
+                            .args()
+                            .as_slice()
+                            .iter()
+                            .zip(return_tys)
+                            .enumerate()
+                        {
+                            let val = resolve_value(function, val_id, &value_map, &mut builder)?;
+                            sonatina_type_to_clif_or_err(ty)?;
                             builder.ins().store(
                                 cranelift_codegen::ir::MemFlags::new(),
-                                limb, sret, (i * 8) as i32,
+                                val,
+                                sret,
+                                (index * 16) as i32,
                             );
                         }
                     }
@@ -598,15 +661,29 @@ fn translate_function(
                         .ok_or_else(|| format!("unknown callee {:?}", callee))?;
                     let clif_func_ref = jit.declare_func_in_func(*clif_func_id, builder.func);
                     let ir_results = function.dfg.inst_results(inst_id);
-                    let callee_returns_struct = !ir_results.is_empty()
-                        && matches!(function.dfg.value_ty(ir_results[0]), Type::Compound(_));
+                    let (callee_returns_struct, callee_returns_many_scalars, callee_ret_tys) =
+                        module.ctx.func_sig(callee, |sig| {
+                            (
+                                returns_struct(sig),
+                                returns_many_scalars(sig),
+                                sig.ret_tys().to_vec(),
+                            )
+                        });
+                    let callee_returns_indirectly =
+                        callee_returns_struct || callee_returns_many_scalars;
 
                     let mut call_args: Vec<clif::Value> = Vec::new();
-                    let sret_slot = if callee_returns_struct {
-                        // Allocate caller-owned space for struct return
+                    let sret_slot = if callee_returns_indirectly {
+                        // Allocate caller-owned space for aggregate or wide
+                        // scalar-list return.
+                        let bytes = if callee_returns_struct {
+                            32
+                        } else {
+                            scalar_return_buffer_size(callee_ret_tys.len())
+                        };
                         let slot = builder.create_sized_stack_slot(
                             cranelift_codegen::ir::StackSlotData::new(
-                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 32, 0,
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot, bytes, 0,
                             ),
                         );
                         let addr = builder.ins().stack_addr(clif::types::I64, slot, 0);
@@ -625,9 +702,33 @@ fn translate_function(
                     let clif_call = builder.ins().call(clif_func_ref, &call_args);
 
                     if let Some(sret_addr) = sret_slot {
-                        // Result is in the sret buffer we allocated
-                        if !ir_results.is_empty() {
-                            value_map.insert(ir_results[0], sret_addr);
+                        if callee_returns_struct {
+                            // Aggregate result is represented by the address.
+                            if !ir_results.is_empty() {
+                                value_map.insert(ir_results[0], sret_addr);
+                            }
+                        } else {
+                            if ir_results.len() != callee_ret_tys.len() {
+                                return Err(format!(
+                                    "native scalar indirect call has {} IR results for {} result types",
+                                    ir_results.len(),
+                                    callee_ret_tys.len()
+                                ));
+                            }
+                            for (index, (&ir_result, &ty)) in ir_results
+                                .iter()
+                                .zip(&callee_ret_tys)
+                                .enumerate()
+                            {
+                                let clif_ty = sonatina_type_to_clif_or_err(ty)?;
+                                let value = builder.ins().load(
+                                    clif_ty,
+                                    cranelift_codegen::ir::MemFlags::new(),
+                                    sret_addr,
+                                    (index * 16) as i32,
+                                );
+                                value_map.insert(ir_result, value);
+                            }
                         }
                     } else {
                         let results = builder.inst_results(clif_call).to_vec();
@@ -1236,6 +1337,25 @@ fn translate_icmp(
     let lhs_val = resolve_scalar_value(module, function, lhs, value_map, builder)?;
     let rhs_val = resolve_scalar_value(module, function, rhs, value_map, builder)?;
     let result_val = builder.ins().icmp(cc, lhs_val, rhs_val);
+    if let Some(result) = function.dfg.inst_result(inst_id) {
+        value_map.insert(result, result_val);
+    }
+    Ok(())
+}
+
+fn translate_fcmp(
+    cc: FloatCC,
+    lhs: ValueId,
+    rhs: ValueId,
+    inst_id: sonatina_ir::inst::InstId,
+    module: &Module,
+    function: &Function,
+    value_map: &mut HashMap<ValueId, clif::Value>,
+    builder: &mut FunctionBuilder,
+) -> Result<(), String> {
+    let lhs_val = resolve_scalar_value(module, function, lhs, value_map, builder)?;
+    let rhs_val = resolve_scalar_value(module, function, rhs, value_map, builder)?;
+    let result_val = builder.ins().fcmp(cc, lhs_val, rhs_val);
     if let Some(result) = function.dfg.inst_result(inst_id) {
         value_map.insert(result, result_val);
     }
