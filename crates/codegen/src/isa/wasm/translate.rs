@@ -2029,6 +2029,16 @@ fn translate_function(
                 }
             }
 
+            // WAFFLE's stackifier may inline a cross-block SSA definition at
+            // each use. That is only semantics-preserving for pure values.
+            // Sonatina values can depend on memory (for example `1 / m[pivot]`)
+            // and must retain their definition-time snapshot even if a loop
+            // mutates that memory before later uses. Make every cross-block
+            // use explicit before structurization; redundant parameters are a
+            // later optimization concern, while reloading mutable memory is a
+            // miscompile.
+            body.convert_to_max_ssa(None);
+
             Ok::<(), String>(())
         })
         .ok_or_else(|| "function has no body".to_string())??;
