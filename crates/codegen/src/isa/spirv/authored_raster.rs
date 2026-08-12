@@ -252,7 +252,7 @@ fn append_state_binding(
 fn location_binding(location: u32) -> naga::Binding {
     naga::Binding::Location {
         location,
-        interpolation: None,
+        interpolation: Some(naga::Interpolation::Perspective),
         sampling: None,
         blend_src: None,
         per_primitive: false,
