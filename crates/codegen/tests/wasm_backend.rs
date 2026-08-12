@@ -1531,3 +1531,79 @@ fn wasm_i32_signed_ops_execute() {
         "wasm_i32_signed_ops_execute OK: i32 Lt/Slt/Sar execute; signed vs unsigned disagree on 0x80000000; -4096>>12 == -1"
     );
 }
+
+/// Portable integer division/remainder must preserve both width and signedness,
+/// including WebAssembly's trapping behavior rather than silently fabricating
+/// EVM-style zero results for a zero divisor.
+#[test]
+fn wasm_integer_div_rem_execute_and_trap() {
+    let isa = Native::new(native_triple());
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    macro_rules! binary {
+        ($name:literal, $ty:expr, $inst:expr) => {{
+            let sig = Signature::new_single(
+                $name,
+                Linkage::Public,
+                &[$ty, $ty],
+                $ty,
+            );
+            let fr = mb.declare_function(sig).unwrap();
+            let mut fb = mb.func_builder::<InstInserter>(fr);
+            let entry = fb.append_block();
+            fb.switch_to_block(entry);
+            let lhs = fb.args()[0];
+            let rhs = fb.args()[1];
+            let result = fb.insert_inst($inst(is, lhs, rhs), $ty);
+            fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+            fb.seal_all();
+            fb.finish();
+        }};
+    }
+
+    binary!("udiv32", Type::I32, arith::Udiv::new);
+    binary!("umod32", Type::I32, arith::Umod::new);
+    binary!("sdiv32", Type::I32, arith::Sdiv::new);
+    binary!("smod32", Type::I32, arith::Smod::new);
+    binary!("udiv64", Type::I64, arith::Udiv::new);
+    binary!("umod64", Type::I64, arith::Umod::new);
+
+    let artifact = WasmBackend::new()
+        .compile_module(&mb.build())
+        .expect("integer div/rem should translate to Wasm");
+    wasmparser::validate(&artifact.bytes).expect("integer div/rem Wasm must validate");
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+
+    let udiv32 = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "udiv32")
+        .unwrap();
+    let umod32 = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "umod32")
+        .unwrap();
+    let sdiv32 = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "sdiv32")
+        .unwrap();
+    let smod32 = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "smod32")
+        .unwrap();
+    let udiv64 = instance
+        .get_typed_func::<(i64, i64), i64>(&mut store, "udiv64")
+        .unwrap();
+    let umod64 = instance
+        .get_typed_func::<(i64, i64), i64>(&mut store, "umod64")
+        .unwrap();
+
+    assert_eq!(udiv32.call(&mut store, (-2, 2)).unwrap(), i32::MAX);
+    assert_eq!(umod32.call(&mut store, (-1, 7)).unwrap(), 3);
+    assert_eq!(sdiv32.call(&mut store, (-17, 5)).unwrap(), -3);
+    assert_eq!(smod32.call(&mut store, (-17, 5)).unwrap(), -2);
+    assert_eq!(udiv64.call(&mut store, (-2, 2)).unwrap(), i64::MAX);
+    assert_eq!(umod64.call(&mut store, (-1, 7)).unwrap(), 1);
+    assert!(udiv32.call(&mut store, (1, 0)).is_err());
+    assert!(sdiv32.call(&mut store, (i32::MIN, -1)).is_err());
+    assert_eq!(smod32.call(&mut store, (i32::MIN, -1)).unwrap(), 0);
+}

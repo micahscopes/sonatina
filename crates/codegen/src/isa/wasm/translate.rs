@@ -1105,6 +1105,51 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
+                    // Integer division/remainder preserve Sonatina's explicit
+                    // signedness in the selected WebAssembly opcode. Wasm
+                    // provides the required divide-by-zero trap directly; its
+                    // signed division also traps MIN / -1, while signed
+                    // remainder returns zero for that pair as specified.
+                    else if let Some(div) = <&sonatina_ir::inst::arith::Udiv as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *div.lhs(), &value_map, &mut body, wb).ok_or("unresolved udiv lhs")?;
+                            let rhs = resolve_value(function, *div.rhs(), &value_map, &mut body, wb).ok_or("unresolved udiv rhs")?;
+                            let ty = result_waffle_type(function, result);
+                            let op = if ty == WType::I32 { Operator::I32DivU } else { Operator::I64DivU };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[ty]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(div) = <&sonatina_ir::inst::arith::Sdiv as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *div.lhs(), &value_map, &mut body, wb).ok_or("unresolved sdiv lhs")?;
+                            let rhs = resolve_value(function, *div.rhs(), &value_map, &mut body, wb).ok_or("unresolved sdiv rhs")?;
+                            let ty = result_waffle_type(function, result);
+                            let op = if ty == WType::I32 { Operator::I32DivS } else { Operator::I64DivS };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[ty]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(rem) = <&sonatina_ir::inst::arith::Umod as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *rem.lhs(), &value_map, &mut body, wb).ok_or("unresolved umod lhs")?;
+                            let rhs = resolve_value(function, *rem.rhs(), &value_map, &mut body, wb).ok_or("unresolved umod rhs")?;
+                            let ty = result_waffle_type(function, result);
+                            let op = if ty == WType::I32 { Operator::I32RemU } else { Operator::I64RemU };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[ty]);
+                            value_map.insert(result, wval);
+                        }
+                    }
+                    else if let Some(rem) = <&sonatina_ir::inst::arith::Smod as InstDowncast>::downcast(inst_set, inst_data) {
+                        if let Some(result) = function.dfg.inst_result(inst_id) {
+                            let lhs = resolve_value(function, *rem.lhs(), &value_map, &mut body, wb).ok_or("unresolved smod lhs")?;
+                            let rhs = resolve_value(function, *rem.rhs(), &value_map, &mut body, wb).ok_or("unresolved smod rhs")?;
+                            let ty = result_waffle_type(function, result);
+                            let op = if ty == WType::I32 { Operator::I32RemS } else { Operator::I64RemS };
+                            let wval = body.add_op(wb, op, &[lhs, rhs], &[ty]);
+                            value_map.insert(result, wval);
+                        }
+                    }
                     // Bitwise and
                     else if let Some(and) = <&sonatina_ir::inst::logic::And as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {
