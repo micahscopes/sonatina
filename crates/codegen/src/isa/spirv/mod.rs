@@ -7,6 +7,9 @@ use sonatina_ir::Module;
 
 use crate::backend::Backend;
 
+#[cfg(feature = "spirv-backend")]
+mod authored_raster;
+
 #[derive(Debug)]
 pub enum SpirvError {
     UnsupportedTarget(String),
@@ -155,6 +158,7 @@ pub enum SpirvBuiltinSource {
     GlobalInvocationIdY,
     FragmentPositionX,
     FragmentPositionY,
+    VertexIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,6 +239,12 @@ pub struct SpirvLayout {
     pub color_target_format: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpirvRasterPipeline {
+    pub vertex_entry: String,
+    pub fragment_entry: String,
+}
+
 pub struct SpirvArtifact {
     pub words: Vec<u32>,
     /// WGSL source for wgpu execution (available when spirv-backend feature is on)
@@ -267,6 +277,9 @@ pub struct SpirvBackend {
     /// Explicit unit-returning compute stage. This is distinct from legacy
     /// Grid, whose return value is written to an implicit output image buffer.
     pub compute: bool,
+    /// Paired source-authored vertex and fragment bodies. Their flattened
+    /// signatures are checked as one raster interface by the backend.
+    pub authored_raster: Option<SpirvRasterPipeline>,
     /// Bound resource roots supplied by the Fe stage-interface derivation.
     pub external_resources: Vec<SpirvExternalResource>,
     /// Word capacity of the emulated private-storage heap (`fe_heap`) declared
@@ -284,6 +297,7 @@ impl SpirvBackend {
             grid: false,
             render: false,
             compute: false,
+            authored_raster: None,
             external_resources: Vec::new(),
             heap_words: 8192,
         }
@@ -306,6 +320,18 @@ impl SpirvBackend {
 
     pub fn with_compute(mut self) -> Self {
         self.compute = true;
+        self
+    }
+
+    pub fn with_authored_raster(
+        mut self,
+        vertex_entry: impl Into<String>,
+        fragment_entry: impl Into<String>,
+    ) -> Self {
+        self.authored_raster = Some(SpirvRasterPipeline {
+            vertex_entry: vertex_entry.into(),
+            fragment_entry: fragment_entry.into(),
+        });
         self
     }
 
@@ -340,6 +366,7 @@ impl Backend for SpirvBackend {
             self.grid,
             self.render,
             self.compute,
+            self.authored_raster.as_ref(),
             &self.external_resources,
             self.heap_words,
         )
@@ -2888,10 +2915,18 @@ fn translate_to_naga(
     grid: bool,
     render: bool,
     compute: bool,
+    authored_raster: Option<&SpirvRasterPipeline>,
     external_resources: &[SpirvExternalResource],
     heap_words: u32,
 ) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
+
+    if let Some(raster) = authored_raster {
+        if grid || render || compute {
+            return Err("spirv raster: authored raster, grid, fullscreen render, and compute modes are mutually exclusive".to_string());
+        }
+        return authored_raster::translate(module, raster, external_resources);
+    }
 
     // Content-derived word scalar: the kernel's own Sonatina return type is the
     // word-width SSOT (no hardwire, no config knob). I32 -> u32 (browser profile,
