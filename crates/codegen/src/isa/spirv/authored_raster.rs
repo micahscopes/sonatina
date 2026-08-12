@@ -110,6 +110,24 @@ pub(super) fn translate(
                             "spirv raster: signedness-sensitive `{op}` is unsupported under the u32 browser carrier",
                         ));
                     }
+                    let divisor = <&sonatina_ir::inst::arith::Udiv as InstDowncast>::downcast(inst_set, data)
+                        .map(|op| *op.rhs())
+                        .or_else(|| <&sonatina_ir::inst::arith::Umod as InstDowncast>::downcast(inst_set, data).map(|op| *op.rhs()));
+                    if let Some(divisor) = divisor {
+                        let nonzero = function.dfg.value_imm(divisor).is_some_and(|value| {
+                            match value {
+                                sonatina_ir::Immediate::I8(value) => value != 0,
+                                sonatina_ir::Immediate::I32(value) => value != 0,
+                                sonatina_ir::Immediate::I64(value) => value != 0,
+                                _ => false,
+                            }
+                        });
+                        if !nonzero {
+                            return Err(format!(
+                                "spirv raster: {stage} integer division/remainder requires a statically nonzero divisor because raster stages have no trap channel",
+                            ));
+                        }
+                    }
                 }
             }
             Ok(())
