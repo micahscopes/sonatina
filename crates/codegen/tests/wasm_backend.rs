@@ -912,6 +912,53 @@ func public %float_bits() -> f32 {
     assert_eq!(bits.call(&mut store, ()).unwrap().to_bits(), 0x4049_0fdb);
 }
 
+#[test]
+fn wasm_cross_block_memory_dependent_value_is_snapshotted() {
+    let source = r#"
+target = "wasm32-unknown-native"
+
+func public %snapshot(v0.i32, v1.i32) -> f32 {
+    block0:
+        mstore v0 0x3f000000.f32 f32;
+        v2.f32 = mload v0 f32;
+        v3.f32 = fdiv 0x3f800000.f32 v2;
+        jump block1;
+
+    block1:
+        v4.i32 = phi (0.i32 block0) (v8 block2);
+        v5.i1 = lt v4 v1;
+        br v5 block2 block3;
+
+    block2:
+        v6.f32 = mload v0 f32;
+        v7.f32 = fmul v6 v3;
+        mstore v0 v7 f32;
+        v8.i32 = add v4 1.i32;
+        jump block1;
+
+    block3:
+        v9.f32 = mload v0 f32;
+        return v9;
+}
+"#;
+    let module = sonatina_parser::parse_module(source)
+        .expect("snapshot module should parse")
+        .module;
+    let artifact = WasmBackend::new()
+        .compile_module(&module)
+        .expect("snapshot module should compile");
+    wasmparser::validate(&artifact.bytes).expect("snapshot wasm should validate");
+
+    let engine = wasmtime::Engine::default();
+    let wasm_module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &wasm_module, &[]).unwrap();
+    let snapshot = instance
+        .get_typed_func::<(i32, i32), f32>(&mut store, "snapshot")
+        .unwrap();
+    assert_eq!(snapshot.call(&mut store, (1024, 3)).unwrap(), 4.0);
+}
+
 fn native_triple() -> TargetTriple {
     let arch = if cfg!(target_arch = "x86_64") {
         Architecture::X86_64
