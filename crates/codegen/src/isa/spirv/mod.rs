@@ -1086,7 +1086,9 @@ fn emit_single_inst(
             return true;
         }
     } else if let Some((lhs_id, rhs_id, naga_op)) =
-        <&sonatina_ir::inst::arith::Fadd as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Add))
+        <&sonatina_ir::inst::arith::Udiv as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Divide))
+        .or_else(|| <&sonatina_ir::inst::arith::Umod as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Modulo)))
+        .or_else(|| <&sonatina_ir::inst::arith::Fadd as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Add)))
         .or_else(|| <&sonatina_ir::inst::arith::Fsub as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Subtract)))
         .or_else(|| <&sonatina_ir::inst::arith::Fmul as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Multiply)))
         .or_else(|| <&sonatina_ir::inst::arith::Fdiv as InstDowncast>::downcast(inst_set, inst_data).map(|i| (*i.lhs(), *i.rhs(), naga::BinaryOperator::Divide)))
@@ -2863,6 +2865,8 @@ fn spirv_instruction_is_lowered(
         || <&arith::Add as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Sub as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Mul as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Udiv as InstDowncast>::downcast(is, inst).is_some()
+        || <&arith::Umod as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fneg as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fadd as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Fsub as InstDowncast>::downcast(is, inst).is_some()
