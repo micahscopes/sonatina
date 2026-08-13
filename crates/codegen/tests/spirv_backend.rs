@@ -2237,6 +2237,29 @@ fn grid_loop_exit_phi_executes_on_lavapipe() {
 }
 
 #[test]
+fn grid_conditional_break_cascade_compiles_browser_wgsl() {
+    let module = build_grid_multi_exit_f32_phi_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("conditional loop breaks should compile without a fixed-work workaround");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("conditional-break WGSL must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("conditional-break WGSL must validate under browser capabilities");
+    assert!(
+        wgsl.matches("break;").count() >= 3,
+        "the header exit and two body exits must remain real loop breaks:\n{wgsl}",
+    );
+}
+
+#[test]
 fn grid_multi_exit_f32_phi_executes_on_lavapipe() {
     let module = build_grid_multi_exit_f32_phi_module();
     let artifact = SpirvBackend::new()
