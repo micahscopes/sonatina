@@ -2352,6 +2352,7 @@ fn emit_regions_in_loop(
     word: WordKind,
     regions: &[crate::structurize::Region],
     loop_header: sonatina_ir::BlockId,
+    loop_exit: sonatina_ir::BlockId,
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
@@ -2452,10 +2453,10 @@ fn emit_regions_in_loop(
                 let mut accept_values = value_map.clone();
                 let mut reject_values = value_map.clone();
                 let then_outcome = if then_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
-                    emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut accept, &mut accept_values, phi_locals, result_expr, mem_ctx)?
+                    emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, loop_exit, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut accept, &mut accept_values, phi_locals, result_expr, mem_ctx)?
                 };
                 let else_outcome = if else_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
-                    emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut reject, &mut reject_values, phi_locals, result_expr, mem_ctx)?
+                    emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, loop_exit, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut reject, &mut reject_values, phi_locals, result_expr, mem_ctx)?
                 };
                 if let Some(merge) = merge {
                     // `from == merge` means the arm already LANDED at the merge
@@ -2469,6 +2470,26 @@ fn emit_regions_in_loop(
                     }
                     if let RegionOutcome::Fallthrough(from) = else_outcome && from != *merge {
                         emit_exact_phi_edge(function, inst_set, word, from, *merge, func, &mut reject, &mut reject_values, phi_locals)?;
+                    }
+                    if *merge == loop_exit {
+                        // A source-level `break` nested in a conditional can
+                        // make the loop's canonical exit the conditional's
+                        // immediate postdominator. Such a direct arm is empty
+                        // in the region tree: its edge is represented by the
+                        // arm's `Fallthrough(header)` outcome. Preserve the
+                        // exact exit-phi transfer above, then terminate every
+                        // still-falling-through arm with a Naga `Break`.
+                        if matches!(then_outcome, RegionOutcome::Fallthrough(_)) {
+                            accept.push(naga::Statement::Break, naga::Span::UNDEFINED);
+                        }
+                        if matches!(else_outcome, RegionOutcome::Fallthrough(_)) {
+                            reject.push(naga::Statement::Break, naga::Span::UNDEFINED);
+                        }
+                        target.push(
+                            naga::Statement::If { condition, accept, reject },
+                            naga::Span::UNDEFINED,
+                        );
+                        return Ok(RegionOutcome::Terminal);
                     }
                     outcome = Some(RegionOutcome::Fallthrough(*merge));
                 } else if matches!(then_outcome, RegionOutcome::Terminal) && matches!(else_outcome, RegionOutcome::Terminal) {
@@ -2694,7 +2715,7 @@ fn emit_recursive_loop_region(
         )?;
     } else {
         let body_outcome = emit_regions_in_loop(
-            function, inst_set, word, body_regions, header, word_type, f32_type, bool_type,
+            function, inst_set, word, body_regions, header, exit, word_type, f32_type, bool_type,
             return_local, did_return_local, &mut may_return, func, &mut continue_arm,
             &mut continue_values, phi_locals, &mut nested_result_expr, mem_ctx,
         )?;
@@ -2702,11 +2723,12 @@ fn emit_recursive_loop_region(
         // loop's back-edge: its exit arm already stored this header's phi
         // locals, and falling off the Naga loop body is an implicit continue.
         // Any other fallthrough would silently continue instead of breaking;
-        // fail closed until the break-cascade lands.
+        // conditional break cascades are consumed above, so remaining shapes
+        // still fail closed.
         if let RegionOutcome::Fallthrough(resume) = body_outcome && resume != header {
             return Err(format!(
                 "spirv structurize: loop {header:?} body falls through to {resume:?} \
-                 instead of terminating (break-cascade not supported yet)"
+                 instead of terminating"
             ));
         }
     }
