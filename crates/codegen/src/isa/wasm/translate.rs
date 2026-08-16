@@ -92,6 +92,13 @@ fn scalar_memory_arg(memory: waffle::Memory, ty: Type) -> Result<waffle::MemoryA
     })
 }
 
+#[derive(Clone, Copy)]
+struct CanonicalArenaFunctions {
+    alloc: Func,
+    checkpoint: Func,
+    rewind: Func,
+}
+
 pub(super) fn translate_module(
     module: &Module,
     import_modules: &HashMap<String, String>,
@@ -224,9 +231,9 @@ pub(super) fn translate_module(
     }
 
     // Imported functions must occupy the lowest Wasm function indexes.
-    let canonical_alloc = canonical_arena
+    let canonical_arena = canonical_arena
         .then(|| synthesize_canonical_arena(&mut wmod, memory, &mut func_names));
-    let canonical_memory_alloc = canonical_memory
+    let canonical_memory_arena = canonical_memory
         .map(|manifest| synthesize_canonical_memory(
             &mut wmod,
             memory,
@@ -234,7 +241,7 @@ pub(super) fn translate_module(
             manifest,
         ))
         .transpose()?;
-    let canonical_alloc = canonical_alloc.or(canonical_memory_alloc);
+    let canonical_arena = canonical_arena.or(canonical_memory_arena);
 
     // Pass 1: declare every translatable defined function up front (placeholder
     // bodies), recording the Sonatina `FuncRef` -> WAFFLE `Func` mapping. Doing
@@ -366,7 +373,7 @@ pub(super) fn translate_module(
             memory,
             &func_map,
             &global_map,
-            canonical_alloc,
+            canonical_arena,
             table,
             &target_slots,
             &indirect_signatures,
@@ -406,7 +413,7 @@ fn synthesize_canonical_arena(
     module: &mut WaffleModule<'static>,
     memory: waffle::Memory,
     func_names: &mut Vec<String>,
-) -> Func {
+) -> CanonicalArenaFunctions {
     const HEAP_BASE: u32 = 1024;
     const PAGE_SHIFT: u32 = 16;
     const PAGE_MASK: u32 = (1 << PAGE_SHIFT) - 1;
@@ -515,7 +522,112 @@ fn synthesize_canonical_arena(
         kind: ExportKind::Func(reset_func),
     });
     func_names.push("fe_cabi_reset".to_string());
-    alloc
+    let checkpoint = synthesize_arena_checkpoint(module, cursor, func_names);
+    let rewind = synthesize_arena_rewind(module, cursor, HEAP_BASE, func_names);
+    CanonicalArenaFunctions {
+        alloc,
+        checkpoint,
+        rewind,
+    }
+}
+
+fn synthesize_arena_checkpoint(
+    module: &mut WaffleModule<'static>,
+    cursor: waffle::Global,
+    func_names: &mut Vec<String>,
+) -> Func {
+    let sig = module.signatures.push(SignatureData {
+        params: vec![],
+        returns: vec![WType::I32],
+    });
+    let mut body = FunctionBody::new(module, sig);
+    let current = body.add_op(
+        body.entry,
+        Operator::GlobalGet {
+            global_index: cursor,
+        },
+        &[],
+        &[WType::I32],
+    );
+    body.set_terminator(body.entry, Terminator::Return { values: vec![current] });
+    let name = "__fe_cabi_checkpoint_internal".to_string();
+    let checkpoint = module.funcs.push(FuncDecl::Body(sig, name.clone(), body));
+    func_names.push(name);
+    checkpoint
+}
+
+fn synthesize_arena_rewind(
+    module: &mut WaffleModule<'static>,
+    cursor: waffle::Global,
+    heap_base: u32,
+    func_names: &mut Vec<String>,
+) -> Func {
+    let sig = module.signatures.push(SignatureData {
+        params: vec![WType::I32],
+        returns: vec![],
+    });
+    let mut body = FunctionBody::new(module, sig);
+    let entry = body.entry;
+    let valid = body.add_block();
+    let trap = body.add_block();
+    let checkpoint = body.blocks[entry].params[0].1;
+    let base = body.add_op(
+        entry,
+        Operator::I32Const { value: heap_base },
+        &[],
+        &[WType::I32],
+    );
+    let current = body.add_op(
+        entry,
+        Operator::GlobalGet {
+            global_index: cursor,
+        },
+        &[],
+        &[WType::I32],
+    );
+    let at_or_above_base = body.add_op(
+        entry,
+        Operator::I32GeU,
+        &[checkpoint, base],
+        &[WType::I32],
+    );
+    let at_or_below_cursor = body.add_op(
+        entry,
+        Operator::I32LeU,
+        &[checkpoint, current],
+        &[WType::I32],
+    );
+    let checkpoint_valid = body.add_op(
+        entry,
+        Operator::I32And,
+        &[at_or_above_base, at_or_below_cursor],
+        &[WType::I32],
+    );
+    body.set_terminator(entry, Terminator::CondBr {
+        cond: checkpoint_valid,
+        if_true: BlockTarget {
+            block: valid,
+            args: vec![],
+        },
+        if_false: BlockTarget {
+            block: trap,
+            args: vec![],
+        },
+    });
+    body.add_op(
+        valid,
+        Operator::GlobalSet {
+            global_index: cursor,
+        },
+        &[checkpoint],
+        &[],
+    );
+    body.set_terminator(valid, Terminator::Return { values: vec![] });
+    body.set_terminator(trap, Terminator::Unreachable);
+    let name = "__fe_cabi_rewind_internal".to_string();
+    let rewind = module.funcs.push(FuncDecl::Body(sig, name.clone(), body));
+    func_names.push(name);
+    rewind
 }
 
 fn synthesize_canonical_memory(
@@ -523,7 +635,7 @@ fn synthesize_canonical_memory(
     memory: waffle::Memory,
     func_names: &mut Vec<String>,
     manifest: &CanonicalStackMemoryManifest,
-) -> Result<Func, String> {
+) -> Result<CanonicalArenaFunctions, String> {
     const HEAP_BASE: u32 = 1024;
     const HEADER_SIZE: u32 = 16;
     const MAGIC: u32 = 0x0fec_ab1e;
@@ -907,11 +1019,18 @@ fn synthesize_canonical_memory(
         &[WType::I32],
     );
     internal.set_terminator(internal.entry, Terminator::Return { values: vec![result] });
-    Ok(module.funcs.push(FuncDecl::Body(
+    let alloc = module.funcs.push(FuncDecl::Body(
         internal_sig,
         "__fe_cabi_alloc_internal".into(),
         internal,
-    )))
+    ));
+    let checkpoint = synthesize_arena_checkpoint(module, cursor, func_names);
+    let rewind = synthesize_arena_rewind(module, cursor, HEAP_BASE, func_names);
+    Ok(CanonicalArenaFunctions {
+        alloc,
+        checkpoint,
+        rewind,
+    })
 }
 
 fn translate_function(
@@ -922,7 +1041,7 @@ fn translate_function(
     memory: waffle::Memory,
     func_map: &HashMap<FuncRef, Func>,
     global_map: &HashMap<GlobalVariableRef, waffle::Global>,
-    canonical_alloc: Option<Func>,
+    canonical_arena: Option<CanonicalArenaFunctions>,
     table: Option<waffle::Table>,
     target_slots: &HashMap<FuncRef, u32>,
     indirect_signatures: &HashMap<Type, waffle::Signature>,
@@ -1530,7 +1649,7 @@ fn translate_function(
                     // it through the opt-in canonical arena with align=1 so it
                     // shares growth, overflow checks, and the one cursor.
                     else if let Some(alloc) = <&sonatina_ir::inst::data::MemAllocDynamic as InstDowncast>::downcast(inst_set, inst_data) {
-                        let canonical_alloc = canonical_alloc.ok_or(
+                        let canonical_arena = canonical_arena.ok_or(
                             "wasm translation: mem.alloc_dynamic requires the opt-in canonical arena",
                         )?;
                         let size_ty = function.dfg.value_ty(*alloc.size());
@@ -1554,12 +1673,58 @@ fn translate_function(
                         let address = body.add_op(
                             wb,
                             Operator::Call {
-                                function_index: canonical_alloc,
+                                function_index: canonical_arena.alloc,
                             },
                             &[size, align],
                             &[WType::I32],
                         );
                         value_map.insert(result, address);
+                    }
+                    // MemCheckpoint observes the current arena cursor without
+                    // allocating. It exists specifically to bracket a
+                    // compiler-proven non-escaping function frame.
+                    else if <&sonatina_ir::inst::data::MemCheckpoint as InstDowncast>::downcast(inst_set, inst_data).is_some() {
+                        let canonical_arena = canonical_arena.ok_or(
+                            "wasm translation: mem.checkpoint requires the opt-in canonical arena",
+                        )?;
+                        let result = function
+                            .dfg
+                            .inst_result(inst_id)
+                            .ok_or("mem.checkpoint has no pointer result")?;
+                        let checkpoint = body.add_op(
+                            wb,
+                            Operator::Call {
+                                function_index: canonical_arena.checkpoint,
+                            },
+                            &[],
+                            &[WType::I32],
+                        );
+                        value_map.insert(result, checkpoint);
+                    }
+                    // MemRewind restores a compiler-proven non-escaping
+                    // function frame. The synthesized helper validates that
+                    // the checkpoint belongs to the live arena prefix before
+                    // moving the cursor backwards.
+                    else if let Some(rewind) = <&sonatina_ir::inst::data::MemRewind as InstDowncast>::downcast(inst_set, inst_data) {
+                        let canonical_arena = canonical_arena.ok_or(
+                            "wasm translation: mem.rewind requires the opt-in canonical arena",
+                        )?;
+                        let checkpoint = resolve_value(
+                            function,
+                            *rewind.checkpoint(),
+                            &value_map,
+                            &mut body,
+                            wb,
+                        )
+                        .ok_or("unresolved mem.rewind checkpoint")?;
+                        body.add_op(
+                            wb,
+                            Operator::Call {
+                                function_index: canonical_arena.rewind,
+                            },
+                            &[checkpoint],
+                            &[],
+                        );
                     }
                     // Alloca — allocate a local
                     else if <&sonatina_ir::inst::data::Alloca as InstDowncast>::downcast(inst_set, inst_data).is_some() {

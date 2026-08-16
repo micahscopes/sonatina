@@ -494,6 +494,45 @@ fn dynamic_alloc_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+fn scoped_arena_module() -> sonatina_ir::Module {
+    let isa = Wasm32::new(wasm32_triple());
+    let is = isa.inst_set();
+    let mb = wasm32_module_builder();
+    let ptr_i8 = mb.ptr_type(Type::I8);
+
+    let frame = mb
+        .declare_function(Signature::new_unit("scoped_frame", Linkage::Public, &[]))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(frame);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let checkpoint = fb.insert_inst(data::MemCheckpoint::new(is), ptr_i8);
+    let sixty_four = fb.make_imm_value(64i32);
+    fb.insert_inst(data::MemAllocDynamic::new(is, sixty_four), ptr_i8);
+    fb.insert_inst_no_result(data::MemRewind::new(is, checkpoint));
+    fb.insert_return_unit();
+    fb.seal_all();
+    fb.finish();
+
+    let stale = mb
+        .declare_function(Signature::new_unit("stale_rewind", Linkage::Public, &[]))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(stale);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let base = fb.insert_inst(data::MemCheckpoint::new(is), ptr_i8);
+    let sixty_four = fb.make_imm_value(64i32);
+    fb.insert_inst(data::MemAllocDynamic::new(is, sixty_four), ptr_i8);
+    let stale = fb.insert_inst(data::MemCheckpoint::new(is), ptr_i8);
+    fb.insert_inst_no_result(data::MemRewind::new(is, base));
+    fb.insert_inst_no_result(data::MemRewind::new(is, stale));
+    fb.insert_return_unit();
+    fb.seal_all();
+    fb.finish();
+
+    mb.build()
+}
+
 #[test]
 fn canonical_arena_is_opt_in_checked_growable_and_resettable() {
     let engine = wasmtime::Engine::default();
@@ -660,6 +699,68 @@ fn mem_alloc_dynamic_uses_the_opt_in_canonical_arena() {
     dynamic.call(&mut store, 200_000).unwrap();
     assert!(memory.size(&store) > pages_before);
     assert_eq!(alloc.call(&mut store, (1, 16)).unwrap(), 201_024);
+}
+
+#[test]
+fn mem_checkpoint_and_rewind_reuse_only_the_live_arena_prefix() {
+    let error = match WasmBackend::new().compile_module(&scoped_arena_module()) {
+        Ok(_) => panic!("mem.checkpoint compiled without the canonical arena"),
+        Err(error) => error,
+    };
+    assert!(
+        error.iter().any(|error| error
+            .to_string()
+            .contains("mem.checkpoint requires the opt-in canonical arena")),
+        "{error:?}"
+    );
+
+    let artifact = WasmBackend::new()
+        .with_canonical_arena()
+        .compile_module(&scoped_arena_module())
+        .unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let alloc = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "fe_cabi_alloc")
+        .unwrap();
+    let frame = instance
+        .get_typed_func::<(), ()>(&mut store, "scoped_frame")
+        .unwrap();
+    let stale = instance
+        .get_typed_func::<(), ()>(&mut store, "stale_rewind")
+        .unwrap();
+
+    assert_eq!(alloc.call(&mut store, (3, 1)).unwrap(), 1024);
+    frame.call(&mut store, ()).unwrap();
+    assert_eq!(
+        alloc.call(&mut store, (1, 1)).unwrap(),
+        1027,
+        "the scoped allocation must be reclaimed before the next allocation"
+    );
+    assert!(
+        stale.call(&mut store, ()).is_err(),
+        "rewinding to a checkpoint above the live cursor must trap"
+    );
+    assert!(
+        instance
+            .get_func(&mut store, "__fe_cabi_checkpoint_internal")
+            .is_none()
+    );
+    assert!(
+        instance
+            .get_func(&mut store, "__fe_cabi_rewind_internal")
+            .is_none()
+    );
+
+    use sonatina_codegen::isa::wasm::CanonicalStackMemoryManifest;
+    let canonical_memory = WasmBackend::new()
+        .with_canonical_stack_memory(CanonicalStackMemoryManifest::new(std::iter::empty::<String>()))
+        .compile_module(&scoped_arena_module())
+        .unwrap();
+    wasmparser::validate(&canonical_memory.bytes).unwrap();
 }
 
 #[test]

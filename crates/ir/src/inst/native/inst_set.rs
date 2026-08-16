@@ -108,6 +108,8 @@ pub struct NativeInstSet(
     data::ObjMaterializeStack,
     data::ObjMaterializeHeap,
     data::MemAllocDynamic,
+    data::MemCheckpoint,
+    data::MemRewind,
     data::InsertValue,
     data::ExtractValue,
     logic::Not,
