@@ -2310,6 +2310,52 @@ impl VerifyInst for data::MemAllocDynamic {
     }
 }
 
+impl VerifyInst for data::MemCheckpoint {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        let Some(result_ty) = verifier.inst_result_ty(inst_id) else {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstResultTypeMismatch,
+                "mem.checkpoint must produce a raw pointer result",
+                verifier.inst_location(inst_id),
+            ));
+            return;
+        };
+        if !is_pointer_ty(verifier.ctx, result_ty) {
+            verifier.emit(
+                Diagnostic::error(
+                    DiagnosticCode::InstResultTypeMismatch,
+                    "mem.checkpoint result must be a raw pointer",
+                    verifier.inst_location(inst_id),
+                )
+                .with_note(format!("found {:?}", result_ty)),
+            );
+        }
+    }
+}
+
+impl VerifyInst for data::MemRewind {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        let location = verifier.inst_location(inst_id);
+        let Some(checkpoint_ty) = verifier.value_ty(*self.checkpoint()) else {
+            return;
+        };
+        if !is_pointer_ty(verifier.ctx, checkpoint_ty) {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                "mem.rewind checkpoint must be a raw pointer",
+                location.clone(),
+            ));
+        }
+        if verifier.inst_result_ty(inst_id).is_some() {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstResultTypeMismatch,
+                "mem.rewind must not produce a result",
+                location,
+            ));
+        }
+    }
+}
+
 impl VerifyInst for data::Gep {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
         let location = verifier.inst_location(inst_id);

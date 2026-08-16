@@ -1164,6 +1164,29 @@ func private %ops(v0.i256, v1.i256, v2.i256) -> i256 {
     }
 
     #[test]
+    fn test_arena_scope_ops_roundtrip() {
+        let source = r#"
+target = "wasm32-unknown-native"
+
+func private %scoped(v0.i32) {
+    block0:
+        v1.*i8 = mem.checkpoint;
+        v2.*i8 = mem.alloc_dynamic v0;
+        mem.rewind v1;
+        return;
+}
+"#;
+
+        let parsed = parse_module(source).unwrap();
+        let mut writer =
+            ir::ir_writer::ModuleWriter::with_debug_provider(&parsed.module, &parsed.debug);
+        let printed = writer.dump_string();
+        assert!(printed.contains("mem.checkpoint"));
+        assert!(printed.contains("mem.alloc_dynamic v0"));
+        assert!(printed.contains("mem.rewind v1"));
+    }
+
+    #[test]
     fn test_constref_and_const_ops_roundtrip() {
         let s = r#"
 target = "evm-ethereum-london"

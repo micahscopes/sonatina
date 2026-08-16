@@ -308,6 +308,22 @@ pub struct MemAllocDynamic {
     size: ValueId,
 }
 
+/// Observe the current dynamic-allocation arena cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(super::SideEffect::Read))]
+#[inst(text = "mem.checkpoint")]
+pub struct MemCheckpoint {}
+
+/// Restore the dynamic-allocation arena to an earlier live checkpoint.
+///
+/// Backends must reject checkpoints outside the currently live arena prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(super::SideEffect::Write))]
+#[inst(text = "mem.rewind")]
+pub struct MemRewind {
+    checkpoint: ValueId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Inst)]
 pub struct InsertValue {
     dest: ValueId,

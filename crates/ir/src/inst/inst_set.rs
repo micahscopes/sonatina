@@ -114,6 +114,8 @@ define_inst_set_base! {
         data::ObjMaterializeStack,
         data::ObjMaterializeHeap,
         data::MemAllocDynamic,
+        data::MemCheckpoint,
+        data::MemRewind,
         data::InsertValue,
         data::ExtractValue,
         control_flow::Call,
