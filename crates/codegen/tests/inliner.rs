@@ -125,6 +125,39 @@ func public %caller(v0.i32) -> i32 {
 }
 
 #[test]
+fn full_inliner_accepts_portable_pointer_replacement_allocations() {
+    let source = r#"
+target = "wasm32-unknown-native"
+
+func private %allocate(v0.i32) -> i32 {
+    block0:
+        v1.i32 = mem.alloc_dynamic v0;
+        return v1;
+}
+
+func public %caller(v0.i32) -> i32 {
+    block0:
+        v1.i32 = call %allocate v0;
+        return v1;
+}
+"#;
+
+    let mut parsed = sonatina_parser::parse_module(source)
+        .unwrap_or_else(|errors| panic!("parse failed: {errors:?}"));
+    let module = &mut parsed.module;
+    let allocate = find_func(module, "allocate");
+    module.ctx.set_inline_hint(allocate, InlineHint::Always);
+
+    let mut inliner = Inliner::new(full_only_inliner_test_config());
+    let stats = inliner.run(module);
+    let dumped = dump_module(module);
+
+    assert_eq!(stats.full_calls_inlined, 1, "{dumped}");
+    assert!(!dumped.contains("call %allocate"), "{dumped}");
+    assert!(dumped.contains("mem.alloc_dynamic"), "{dumped}");
+}
+
+#[test]
 fn trivial_inlining_sets_changed_flag() {
     let source = r#"
 target = "evm-ethereum-london"

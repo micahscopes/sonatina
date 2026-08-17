@@ -4,7 +4,7 @@ use sonatina_ir::{
     BlockId, ControlFlowGraph, Function, Inst, InstId, Module, Type, Value, ValueId,
     module::FuncRef, visitor::Visitor,
 };
-use sonatina_verifier::{VerifierConfig, verify_function};
+use sonatina_verifier::{VerificationLevel, VerifierConfig, verify_function};
 
 use crate::cfg_edit::{CfgEditor, CleanupMode};
 
@@ -386,17 +386,16 @@ fn validate_full_inline_callee_rewriteability(
     rpo: &[BlockId],
     reachable: &FxHashSet<BlockId>,
 ) -> Result<(), FullInlineFail> {
-    if verify_function(
-        &module.ctx,
-        callee_ref,
-        callee,
-        &VerifierConfig {
-            check_dominance: true,
-            ..VerifierConfig::default()
-        },
-    )
-    .has_errors()
-    {
+    // This guard protects the clone-and-rewrite machinery, so it needs
+    // structural validity and dominance, not a second target type check.
+    // Portable Wasm/SPIR-V IR deliberately represents linear-memory addresses
+    // with the ISA pointer replacement (`i32` on wasm32). The standalone
+    // verifier's standard type rules require abstract raw pointers for
+    // `mem.alloc_dynamic`, which would otherwise make a structurally valid
+    // portable helper impossible to inline.
+    let mut verifier_config = VerifierConfig::for_level(VerificationLevel::Fast);
+    verifier_config.check_dominance = true;
+    if verify_function(&module.ctx, callee_ref, callee, &verifier_config).has_errors() {
         return Err(FullInlineFail::MalformedCallee);
     }
 
