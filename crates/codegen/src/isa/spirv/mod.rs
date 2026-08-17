@@ -1883,6 +1883,9 @@ fn emit_naga_regions(
             crate::structurize::Region::LoopExit { from, target } => return Err(format!(
                 "spirv: loop exit edge {from:?}->{target:?} appeared outside its loop"
             )),
+            crate::structurize::Region::LoopContinue { from, target } => return Err(format!(
+                "spirv: loop continue edge {from:?}->{target:?} appeared outside its loop"
+            )),
         }
     }
     Ok(())
@@ -1930,7 +1933,8 @@ fn region_blocks(regions: &[crate::structurize::Region], out: &mut std::collecti
                 out.insert(*header);
                 region_blocks(body, out);
             }
-            crate::structurize::Region::LoopExit { .. } => {}
+            crate::structurize::Region::LoopExit { .. }
+            | crate::structurize::Region::LoopContinue { .. } => {}
         }
     }
 }
@@ -2145,7 +2149,8 @@ fn arm_outcome(
         crate::structurize::Region::IfThenElse { merge: Some(_), .. } => ArmOutcome::AlreadyAtMerge,
         crate::structurize::Region::IfThenElse { merge: None, .. }
         | crate::structurize::Region::Loop { .. }
-        | crate::structurize::Region::LoopExit { .. } => ArmOutcome::Terminal,
+        | crate::structurize::Region::LoopExit { .. }
+        | crate::structurize::Region::LoopContinue { .. } => ArmOutcome::Terminal,
     }
 }
 
@@ -2290,6 +2295,9 @@ fn emit_non_loop_regions(
             }
             crate::structurize::Region::LoopExit { from, target } => return Err(format!(
                 "spirv: loop exit edge {from:?}->{target:?} appeared outside its loop"
+            )),
+            crate::structurize::Region::LoopContinue { from, target } => return Err(format!(
+                "spirv: loop continue edge {from:?}->{target:?} appeared outside its loop"
             )),
         }
     }
@@ -2580,6 +2588,18 @@ fn emit_regions_in_loop(
                     *may_return = true;
                 }
                 target.push(naga::Statement::Break, naga::Span::UNDEFINED);
+                return Ok(RegionOutcome::Terminal);
+            }
+            crate::structurize::Region::LoopContinue { from, target: header } => {
+                if *header != loop_header {
+                    return Err(format!(
+                        "spirv: loop continue edge {from:?}->{header:?} targets a foreign header; expected {loop_header:?}"
+                    ));
+                }
+                emit_exact_phi_edge(
+                    function, inst_set, word, *from, *header, func, target, value_map, phi_locals,
+                )?;
+                target.push(naga::Statement::Continue, naga::Span::UNDEFINED);
                 return Ok(RegionOutcome::Terminal);
             }
         }

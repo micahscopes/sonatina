@@ -39,6 +39,11 @@ pub enum Region {
     /// instructions; this marker preserves the exact predecessor needed for
     /// exit-phi transport before the structured backend emits `break`.
     LoopExit { from: BlockId, target: BlockId },
+    /// A conditional edge from a loop body back to that loop's header. Direct
+    /// jumps are represented by their source `Block`, but a branch arm needs
+    /// an explicit marker so structured backends can emit `continue` and the
+    /// exact header-phi transfer without trying to consume the header twice.
+    LoopContinue { from: BlockId, target: BlockId },
     /// An if-then-else with a condition (header) block, then-regions,
     /// else-regions, and the join (merge) block, if any. The merge block itself
     /// stays a SIBLING in the enclosing `Vec<Region>`; the arm vectors contain
@@ -424,6 +429,11 @@ impl Structurer<'_> {
         if Some(target) == merge {
             return Ok(Vec::new());
         }
+        if let Some(lp) = cur_loop
+            && target == self.loop_tree.loop_header(lp)
+        {
+            return Ok(vec![Region::LoopContinue { from, target }]);
+        }
         if let Some(merge) = merge
             && self.is_transparent_forwarder(target, merge)
         {
@@ -613,7 +623,7 @@ mod tests {
         func_cursor::InstInserter,
         inst::{
             arith, cmp,
-            control_flow::{Br, Jump, Phi, Return},
+            control_flow::{Br, Jump, Phi, Return, Unreachable},
         },
         isa::{Isa, native::Native},
         module::ModuleCtx,
@@ -950,6 +960,56 @@ mod tests {
             "loop body should contain an IfThenElse, got {:?}",
             loop_region.1
         );
+    }
+
+    /// A loop-latch branch may either continue or enter a terminal trap arm.
+    /// The header is already owned by the enclosing `Loop`, so the continue
+    /// edge must be a marker rather than a second recursive region sequence.
+    #[test]
+    fn structurize_conditional_loop_continue_with_trap() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("conditional_continue", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let latch = fb.append_block();
+        let trap = fb.append_block();
+        let exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.args()[0];
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, cond, latch, exit));
+        fb.switch_to_block(latch);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, header));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        let loop_body = structured
+            .regions
+            .iter()
+            .find_map(|region| match region {
+                Region::Loop { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("expected loop region");
+        assert!(loop_body.iter().any(|region| matches!(
+            region,
+            Region::IfThenElse { then_branch, else_branch, .. }
+                if then_branch.iter().chain(else_branch).any(|arm| matches!(
+                    arm,
+                    Region::LoopContinue { from, target }
+                        if *from == latch && *target == header
+                ))
+        )));
     }
 
     /// A 2-deep nested loop structurizes as Loop-in-Loop.
