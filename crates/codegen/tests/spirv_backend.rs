@@ -1634,6 +1634,33 @@ fn build_compute_invocation_context_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+fn build_unit_compute_with_trap_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_unit("compute_with_trap", Linkage::Public, &[Type::I32]);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let ok = fb.append_block();
+    let trap = fb.append_block();
+    fb.switch_to_block(entry);
+    let limit = fb.args()[0];
+    let eight = fb.make_imm_value(8i32);
+    let valid = fb.insert_inst(cmp::Lt::new(is, limit, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, valid, ok, trap));
+    fb.switch_to_block(ok);
+    fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+    fb.switch_to_block(trap);
+    fb.insert_inst_no_result(control_flow::Unreachable::new(is));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 fn complete_compute_invocation_arguments() -> Vec<SpirvBuiltinArgument> {
     use SpirvBuiltinSource as Source;
     [
@@ -2283,6 +2310,63 @@ fn explicit_compute_rejects_duplicate_physical_builtin_sources() {
         error.iter().any(|error| error
             .to_string()
             .contains("GlobalInvocationIdX is mapped more than once")),
+        "unexpected diagnostic: {error:?}"
+    );
+}
+
+#[test]
+fn explicit_compute_trap_channel_owns_one_word_per_fixed_invocation() {
+    let artifact = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(2, 2, 1)
+        .with_dispatch_grid(2, 2, 1)
+        .compile_module(&build_unit_compute_with_trap_module())
+        .expect("fixed multi-invocation trap channel should compile");
+    assert!(artifact.layout.builtin_inputs.is_empty());
+    let trap = artifact.layout.trap.expect("trap result lane");
+    assert_eq!(trap.width, 16 * 4);
+    let binding = artifact
+        .layout
+        .bindings
+        .iter()
+        .find(|binding| binding.name == "trap")
+        .expect("trap binding");
+    assert_eq!(binding.stride, 4);
+    assert_eq!(binding.span, 16 * 4);
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    assert!(
+        wgsl.contains("@builtin(global_invocation_id)"),
+        "compiler-owned trap indexing requires the physical global id:\n{wgsl}"
+    );
+    assert!(
+        wgsl.contains("array<u32, 16>"),
+        "trap storage must have one statically sized word per invocation:\n{wgsl}"
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("multi-invocation trap WGSL should reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+        .expect("multi-invocation trap channel must stay inside browser capabilities");
+}
+
+#[test]
+fn explicit_compute_rejects_a_zero_fixed_dispatch_dimension() {
+    let result = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(2, 2, 1)
+        .with_dispatch_grid(2, 0, 1)
+        .compile_module(&build_unit_compute_with_trap_module());
+    let error = match result {
+        Ok(_) => panic!("a zero fixed dispatch dimension must fail closed"),
+        Err(error) => error,
+    };
+    assert!(
+        error.iter().any(|error| error
+            .to_string()
+            .contains("workgroup and dispatch dimensions must be nonzero")),
         "unexpected diagnostic: {error:?}"
     );
 }
