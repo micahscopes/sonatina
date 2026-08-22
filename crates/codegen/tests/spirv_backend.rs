@@ -1,8 +1,8 @@
 use sonatina_codegen::Backend;
 use sonatina_codegen::isa::spirv::{
-    Access, LayoutMode, Role, SpirvBackend, SpirvBuiltinInput, SpirvBuiltinSource,
-    SpirvExternalResource, SpirvLayout, SpirvBindingMember, SpirvResourceElement,
-    SpirvResourceField, SpirvScalarKind, WordKind,
+    Access, LayoutMode, Role, SpirvBackend, SpirvBindingMember, SpirvBuiltinArgument,
+    SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout,
+    SpirvResourceElement, SpirvResourceField, SpirvScalarKind, WordKind,
 };
 use sonatina_ir::{
     Immediate, Linkage, Signature, Type,
@@ -1600,6 +1600,66 @@ fn build_unit_compute_loop_with_exit_store_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+fn build_compute_invocation_context_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_ty = mb.declare_array_type(Type::I32, 8);
+    let array_ref_ty = mb.objref_type(array_ty);
+    let word_ref_ty = mb.objref_type(Type::I32);
+    let mut args = vec![Type::I32; 13];
+    args.push(array_ref_ty);
+    args.push(Type::I32);
+    let sig = Signature::new_unit("compute_invocation_context", Linkage::Public, &args);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let function_args = fb.args().to_vec();
+    let mut receipt = function_args[14];
+    for &value in &function_args[..13] {
+        receipt = fb.insert_inst(arith::Add::new(is, receipt, value), Type::I32);
+    }
+    let slot = fb.insert_inst(
+        data::ObjIndex::new(is, function_args[13], function_args[0]),
+        word_ref_ty,
+    );
+    fb.insert_inst_no_result(data::ObjStore::new(is, slot, receipt));
+    fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+fn complete_compute_invocation_arguments() -> Vec<SpirvBuiltinArgument> {
+    use SpirvBuiltinSource as Source;
+    [
+        Source::GlobalInvocationIdX,
+        Source::GlobalInvocationIdY,
+        Source::GlobalInvocationIdZ,
+        Source::LocalInvocationIdX,
+        Source::LocalInvocationIdY,
+        Source::LocalInvocationIdZ,
+        Source::WorkgroupIdX,
+        Source::WorkgroupIdY,
+        Source::WorkgroupIdZ,
+        Source::NumWorkgroupsX,
+        Source::NumWorkgroupsY,
+        Source::NumWorkgroupsZ,
+        Source::LocalInvocationIndex,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(arg_index, source)| SpirvBuiltinArgument {
+        arg_index: arg_index as u32,
+        source,
+    })
+    .collect()
+}
+
 fn build_external_record_render_module() -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
         if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
@@ -2116,6 +2176,115 @@ fn explicit_compute_roots_external_record_and_emits_no_implicit_buffers() {
     )
     .validate(&reparsed)
     .expect("external-resource compute WGSL must validate under browser capabilities");
+}
+
+#[test]
+fn explicit_compute_maps_complete_invocation_context_without_parameter_shims() {
+    let resource = SpirvExternalResource {
+        arg_index: 13,
+        group: 0,
+        binding: 0,
+        name: "receipts".to_string(),
+        access: Access::ReadWrite,
+        element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+        stride: 4,
+        length: 8,
+    };
+    let expected_builtins = complete_compute_invocation_arguments();
+    let mut backend = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(2, 1, 1)
+        .with_external_resource(resource);
+    for argument in &expected_builtins {
+        backend = backend.with_builtin_argument(*argument);
+    }
+    let artifact = backend
+        .compile_module(&build_compute_invocation_context_module())
+        .expect("complete compute invocation context should compile");
+    assert_eq!(artifact.layout.mode, LayoutMode::Compute);
+    assert_layout_metadata_invariants(&artifact.layout, 15);
+    assert_eq!(
+        artifact.layout.builtin_inputs,
+        expected_builtins
+            .iter()
+            .map(|argument| SpirvBuiltinInput {
+                arg_index: argument.arg_index,
+                source: argument.source,
+                scalar: SpirvScalarKind::I32,
+            })
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(artifact.layout.bindings.len(), 2);
+    let params = artifact
+        .layout
+        .bindings
+        .iter()
+        .find(|binding| binding.role == Role::Input)
+        .expect("ordinary scalar parameter binding");
+    assert_eq!(
+        params.members,
+        vec![SpirvBindingMember {
+            arg_index: 14,
+            offset: 0,
+            width: 4,
+            scalar: SpirvScalarKind::I32,
+        }]
+    );
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    for builtin in [
+        "@builtin(global_invocation_id)",
+        "@builtin(local_invocation_id)",
+        "@builtin(workgroup_id)",
+        "@builtin(num_workgroups)",
+        "@builtin(local_invocation_index)",
+    ] {
+        assert!(wgsl.contains(builtin), "missing {builtin}:\n{wgsl}");
+    }
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("complete invocation-context WGSL should reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("complete invocation context must stay inside browser capabilities");
+}
+
+#[test]
+fn explicit_compute_rejects_duplicate_physical_builtin_sources() {
+    let resource = SpirvExternalResource {
+        arg_index: 13,
+        group: 0,
+        binding: 0,
+        name: "receipts".to_string(),
+        access: Access::ReadWrite,
+        element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+        stride: 4,
+        length: 8,
+    };
+    let result = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(2, 1, 1)
+        .with_external_resource(resource)
+        .with_builtin_argument(SpirvBuiltinArgument {
+            arg_index: 0,
+            source: SpirvBuiltinSource::GlobalInvocationIdX,
+        })
+        .with_builtin_argument(SpirvBuiltinArgument {
+            arg_index: 1,
+            source: SpirvBuiltinSource::GlobalInvocationIdX,
+        })
+        .compile_module(&build_compute_invocation_context_module());
+    let error = match result {
+        Ok(_) => panic!("one physical builtin cannot ambiguously supply two logical arguments"),
+        Err(error) => error,
+    };
+    assert!(
+        error.iter().any(|error| error
+            .to_string()
+            .contains("GlobalInvocationIdX is mapped more than once")),
+        "unexpected diagnostic: {error:?}"
+    );
 }
 
 #[test]

@@ -155,13 +155,36 @@ pub struct SpirvExternalResource {
 /// Physical shader builtin supplying a logical source-language argument without
 /// buffer storage. [`SpirvBuiltinInput::scalar`] records the logical type after
 /// the backend's builtin conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpirvBuiltinSource {
     GlobalInvocationIdX,
     GlobalInvocationIdY,
+    GlobalInvocationIdZ,
+    LocalInvocationIdX,
+    LocalInvocationIdY,
+    LocalInvocationIdZ,
+    WorkgroupIdX,
+    WorkgroupIdY,
+    WorkgroupIdZ,
+    NumWorkgroupsX,
+    NumWorkgroupsY,
+    NumWorkgroupsZ,
+    LocalInvocationIndex,
     FragmentPositionX,
     FragmentPositionY,
     VertexIndex,
+}
+
+/// A source-language scalar argument supplied by one physical shader builtin.
+///
+/// The backend validates the source against the selected stage, the argument
+/// index against the lowered signature, and the argument's exact scalar type.
+/// [`SpirvBuiltinInput`] is the resulting measured layout fact, including the
+/// scalar type derived by that validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpirvBuiltinArgument {
+    pub arg_index: u32,
+    pub source: SpirvBuiltinSource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +308,10 @@ pub struct SpirvBackend {
     pub authored_raster: Option<SpirvRasterPipeline>,
     /// Bound resource roots supplied by the Fe stage-interface derivation.
     pub external_resources: Vec<SpirvExternalResource>,
+    /// Logical source arguments supplied by physical shader builtins. The
+    /// stage-interface derivation owns this list; the SPIR-V backend validates
+    /// it and records the exact admitted mapping in `SpirvLayout`.
+    pub builtin_arguments: Vec<SpirvBuiltinArgument>,
     /// Word capacity of the emulated private-storage heap (`fe_heap`) declared
     /// for kernels using function-local `[u32; N]` arrays (`MemAllocDynamic` /
     /// `Mload` / `Mstore`). Default 8192 words (32KB), matching
@@ -302,6 +329,7 @@ impl SpirvBackend {
             compute: false,
             authored_raster: None,
             external_resources: Vec::new(),
+            builtin_arguments: Vec::new(),
             heap_words: 8192,
         }
     }
@@ -343,6 +371,11 @@ impl SpirvBackend {
         self
     }
 
+    pub fn with_builtin_argument(mut self, argument: SpirvBuiltinArgument) -> Self {
+        self.builtin_arguments.push(argument);
+        self
+    }
+
     /// Override the private-heap word capacity for Mem-op-bearing kernels.
     pub fn with_private_heap_words(mut self, words: u32) -> Self {
         self.heap_words = words;
@@ -371,6 +404,7 @@ impl Backend for SpirvBackend {
             self.compute,
             self.authored_raster.as_ref(),
             &self.external_resources,
+            &self.builtin_arguments,
             self.heap_words,
         )
         .map_err(|e| vec![SpirvError::Translation(e)])?;
@@ -3072,6 +3106,31 @@ fn spirv_instruction_is_lowered(
         || <&data::Mstore as InstDowncast>::downcast(is, inst).is_some()
 }
 
+/// Return `(physical builtin family, optional vector component)` for the
+/// portable compute invocation vocabulary. Families use a compact private
+/// ordinal so this stage-neutral API does not expose naga types.
+#[cfg(feature = "spirv-backend")]
+fn compute_builtin_slot(source: SpirvBuiltinSource) -> Option<(usize, Option<u32>)> {
+    Some(match source {
+        SpirvBuiltinSource::GlobalInvocationIdX => (0, Some(0)),
+        SpirvBuiltinSource::GlobalInvocationIdY => (0, Some(1)),
+        SpirvBuiltinSource::GlobalInvocationIdZ => (0, Some(2)),
+        SpirvBuiltinSource::LocalInvocationIdX => (1, Some(0)),
+        SpirvBuiltinSource::LocalInvocationIdY => (1, Some(1)),
+        SpirvBuiltinSource::LocalInvocationIdZ => (1, Some(2)),
+        SpirvBuiltinSource::WorkgroupIdX => (2, Some(0)),
+        SpirvBuiltinSource::WorkgroupIdY => (2, Some(1)),
+        SpirvBuiltinSource::WorkgroupIdZ => (2, Some(2)),
+        SpirvBuiltinSource::NumWorkgroupsX => (3, Some(0)),
+        SpirvBuiltinSource::NumWorkgroupsY => (3, Some(1)),
+        SpirvBuiltinSource::NumWorkgroupsZ => (3, Some(2)),
+        SpirvBuiltinSource::LocalInvocationIndex => (4, None),
+        SpirvBuiltinSource::FragmentPositionX
+        | SpirvBuiltinSource::FragmentPositionY
+        | SpirvBuiltinSource::VertexIndex => return None,
+    })
+}
+
 #[cfg(feature = "spirv-backend")]
 fn translate_to_naga(
     module: &Module,
@@ -3081,6 +3140,7 @@ fn translate_to_naga(
     compute: bool,
     authored_raster: Option<&SpirvRasterPipeline>,
     external_resources: &[SpirvExternalResource],
+    builtin_arguments: &[SpirvBuiltinArgument],
     heap_words: u32,
 ) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
@@ -3088,6 +3148,9 @@ fn translate_to_naga(
     if let Some(raster) = authored_raster {
         if grid || render || compute {
             return Err("spirv raster: authored raster, grid, fullscreen render, and compute modes are mutually exclusive".to_string());
+        }
+        if !builtin_arguments.is_empty() {
+            return Err("spirv raster: authored raster does not accept compute builtin arguments".to_string());
         }
         return authored_raster::translate(module, raster, external_resources);
     }
@@ -3136,6 +3199,9 @@ fn translate_to_naga(
                 .to_string(),
         );
     }
+    if !builtin_arguments.is_empty() && !compute {
+        return Err("spirv: explicit builtin arguments currently require compute mode".to_string());
+    }
     if compute && !sig.returns_unit() {
         return Err(
             "spirv compute: explicit compute stages must return unit; results belong in external resources"
@@ -3172,8 +3238,50 @@ fn translate_to_naga(
         }
     }
 
+    let mut builtin_arg_indices = std::collections::HashSet::new();
+    let mut builtin_sources = std::collections::HashSet::new();
+    for argument in builtin_arguments {
+        let arg_index = argument.arg_index as usize;
+        let Some(&arg_ty) = sig.args().get(arg_index) else {
+            return Err(format!(
+                "spirv compute: builtin {:?} refers to missing kernel arg {}",
+                argument.source, argument.arg_index
+            ));
+        };
+        if resource_arg_indices.contains(&arg_index) {
+            return Err(format!(
+                "spirv compute: kernel arg {} cannot be both an external resource and builtin {:?}",
+                argument.arg_index, argument.source
+            ));
+        }
+        if !builtin_arg_indices.insert(arg_index) {
+            return Err(format!(
+                "spirv compute: kernel arg {} is supplied by more than one builtin",
+                argument.arg_index
+            ));
+        }
+        if !builtin_sources.insert(argument.source) {
+            return Err(format!(
+                "spirv compute: builtin {:?} is mapped more than once",
+                argument.source
+            ));
+        }
+        if compute_builtin_slot(argument.source).is_none() {
+            return Err(format!(
+                "spirv compute: builtin {:?} is not valid for a compute stage",
+                argument.source
+            ));
+        }
+        if arg_ty != sonatina_ir::Type::I32 {
+            return Err(format!(
+                "spirv compute: builtin {:?} requires an i32/u32 carrier at arg {}, got {arg_ty:?}",
+                argument.source, argument.arg_index
+            ));
+        }
+    }
+
     for (i, &arg_ty) in sig.args().iter().enumerate() {
-        if resource_arg_indices.contains(&i) {
+        if resource_arg_indices.contains(&i) || builtin_arg_indices.contains(&i) {
             continue;
         }
         if word == WordKind::I64 && arg_ty != sonatina_ir::Type::I64 {
@@ -3559,7 +3667,9 @@ fn translate_to_naga(
             .iter()
             .copied()
             .enumerate()
-            .filter(|(index, _)| !resource_arg_indices.contains(index))
+            .filter(|(index, _)| {
+                !resource_arg_indices.contains(index) && !builtin_arg_indices.contains(index)
+            })
             .collect::<Vec<_>>();
         let mut parameter_members = Vec::with_capacity(parameter_args.len());
         let mut layout_parameter_members = Vec::with_capacity(parameter_args.len());
@@ -3658,9 +3768,47 @@ fn translate_to_naga(
             None
         };
 
+        let vec3_u32_type = naga_mod.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Vector {
+                    size: naga::VectorSize::Tri,
+                    scalar: naga::Scalar {
+                        kind: naga::ScalarKind::Uint,
+                        width: 4,
+                    },
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        let mut physical_builtin_arguments = [None; 5];
+        let mut entry_arguments = Vec::new();
+        for family in 0..physical_builtin_arguments.len() {
+            if !builtin_arguments.iter().any(|argument| {
+                compute_builtin_slot(argument.source)
+                    .is_some_and(|(candidate, _)| candidate == family)
+            }) {
+                continue;
+            }
+            let (name, ty, binding) = match family {
+                0 => ("global_invocation_id", vec3_u32_type, naga::BuiltIn::GlobalInvocationId),
+                1 => ("local_invocation_id", vec3_u32_type, naga::BuiltIn::LocalInvocationId),
+                2 => ("workgroup_id", vec3_u32_type, naga::BuiltIn::WorkGroupId),
+                3 => ("num_workgroups", vec3_u32_type, naga::BuiltIn::NumWorkGroups),
+                4 => ("local_invocation_index", word_type, naga::BuiltIn::LocalInvocationIndex),
+                _ => unreachable!("portable compute builtin family"),
+            };
+            physical_builtin_arguments[family] = Some(entry_arguments.len() as u32);
+            entry_arguments.push(naga::FunctionArgument {
+                name: Some(name.to_string()),
+                ty,
+                binding: Some(naga::Binding::BuiltIn(binding)),
+            });
+        }
+
         let mut func = naga::Function {
             name: Some("main".into()),
-            arguments: Vec::new(),
+            arguments: entry_arguments,
             result: None,
             local_variables: naga::Arena::new(),
             expressions: naga::Arena::new(),
@@ -3737,6 +3885,42 @@ fn translate_to_naga(
             let inst_set = function.inst_set();
             let mut value_map = HashMap::new();
             let mut phi_locals = HashMap::new();
+            for argument in builtin_arguments {
+                let Some(&arg_value) = function.arg_values.get(argument.arg_index as usize) else {
+                    body_error = Some(format!(
+                        "spirv compute: builtin arg {} disappeared during lowering",
+                        argument.arg_index
+                    ));
+                    return;
+                };
+                let (family, component) = compute_builtin_slot(argument.source)
+                    .expect("compute builtin source was validated");
+                let physical_index = physical_builtin_arguments[family]
+                    .expect("used compute builtin family has an entry argument");
+                let physical = func.expressions.append(
+                    naga::Expression::FunctionArgument(physical_index),
+                    naga::Span::UNDEFINED,
+                );
+                let value = if let Some(component) = component {
+                    let projected = func.expressions.append(
+                        naga::Expression::AccessIndex {
+                            base: physical,
+                            index: component,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    func.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(
+                            projected, projected,
+                        )),
+                        naga::Span::UNDEFINED,
+                    );
+                    projected
+                } else {
+                    physical
+                };
+                value_map.insert(arg_value, value);
+            }
             for &(arg_index, global) in &external_roots {
                 let Some(&arg_value) = function.arg_values.get(arg_index as usize) else {
                     body_error = Some(format!(
@@ -3868,7 +4052,14 @@ fn translate_to_naga(
                 workgroup_size,
                 word,
                 bindings,
-                builtin_inputs: Vec::new(),
+                builtin_inputs: builtin_arguments
+                    .iter()
+                    .map(|argument| SpirvBuiltinInput {
+                        arg_index: argument.arg_index,
+                        source: argument.source,
+                        scalar: SpirvScalarKind::I32,
+                    })
+                    .collect(),
                 result: None,
                 trap: needs_trap_channel.then_some(SpirvResult {
                     group: 0,
