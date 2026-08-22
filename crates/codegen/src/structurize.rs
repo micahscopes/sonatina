@@ -666,7 +666,7 @@ impl Structurer<'_> {
                 let nz_reaches_z = self.reaches_before_loop_header(nz, z, cur_loop);
                 let z_reaches_nz = self.reaches_before_loop_header(z, nz, cur_loop);
                 match (nz_reaches_z, z_reaches_nz) {
-                    (true, false) => {
+                    (true, false) if self.all_nonterminal_paths_reach(nz, z, cur_loop) => {
                         if self.returns(z)
                             && let Some(stop) = enclosing_stop
                             && !self.returns(stop)
@@ -676,7 +676,7 @@ impl Structurer<'_> {
                         }
                         Ok(Some(z))
                     }
-                    (false, true) => {
+                    (false, true) if self.all_nonterminal_paths_reach(z, nz, cur_loop) => {
                         if self.returns(nz)
                             && let Some(stop) = enclosing_stop
                             && !self.returns(stop)
@@ -790,13 +790,25 @@ impl Structurer<'_> {
         fn visit(
             s: &Structurer<'_>,
             block: BlockId,
+            start: BlockId,
             target: BlockId,
             loop_header: Option<BlockId>,
+            target_downstream: &HashSet<BlockId>,
             visiting: &mut HashSet<BlockId>,
             memo: &mut HashMap<BlockId, bool>,
         ) -> bool {
             if block == target {
                 return true;
+            }
+            if s.returns(block) {
+                return true;
+            }
+            if block != start && target_downstream.contains(&block) {
+                // This path skipped `target` and rejoined computation that is
+                // also downstream of it. It is a live bypass, not an unrelated
+                // terminal corridor, so `target` cannot be this selection's
+                // merge.
+                return false;
             }
             if let Some(result) = memo.get(&block) {
                 return *result;
@@ -814,10 +826,36 @@ impl Structurer<'_> {
             }
             let result = match s.term(block) {
                 Term::Return | Term::Unreachable => true,
-                Term::Jump(next) => visit(s, next, target, loop_header, visiting, memo),
+                Term::Jump(next) => visit(
+                    s,
+                    next,
+                    start,
+                    target,
+                    loop_header,
+                    target_downstream,
+                    visiting,
+                    memo,
+                ),
                 Term::Br(nz, z) => {
-                    visit(s, nz, target, loop_header, visiting, memo)
-                        && visit(s, z, target, loop_header, visiting, memo)
+                    visit(
+                        s,
+                        nz,
+                        start,
+                        target,
+                        loop_header,
+                        target_downstream,
+                        visiting,
+                        memo,
+                    ) && visit(
+                        s,
+                        z,
+                        start,
+                        target,
+                        loop_header,
+                        target_downstream,
+                        visiting,
+                        memo,
+                    )
                 }
                 Term::Other => false,
             };
@@ -826,11 +864,17 @@ impl Structurer<'_> {
             result
         }
 
+        let target_downstream = self
+            .reachable_distances_before_loop_header(target, cur_loop)
+            .into_keys()
+            .collect::<HashSet<_>>();
         visit(
             self,
             start,
+            start,
             target,
             cur_loop.map(|lp| self.loop_tree.loop_header(lp)),
+            &target_downstream,
             &mut HashSet::new(),
             &mut HashMap::new(),
         )
@@ -1578,6 +1622,50 @@ mod tests {
             "shared loop header must be emitted exactly once: {:?}",
             structured.regions,
         );
+    }
+
+    /// A candidate forwarder is not a merge when one live path bypasses it and
+    /// rejoins the candidate's downstream continuation. An unrelated terminal
+    /// arm removes strict post-dominance, so the terminal-aware search must
+    /// still choose the downstream join rather than the skipped forwarder.
+    #[test]
+    fn structurize_rejects_bypassed_forwarder_merge() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("bypassed_forwarder", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let guarded = fb.append_block();
+        let decision = fb.append_block();
+        let forwarder = fb.append_block();
+        let merge = fb.append_block();
+        let exit = fb.append_block();
+        let trap = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.args()[0];
+        fb.insert_inst_no_result(Br::new(is, cond, guarded, forwarder));
+        fb.switch_to_block(guarded);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, decision));
+        fb.switch_to_block(decision);
+        fb.insert_inst_no_result(Br::new(is, cond, forwarder, merge));
+        fb.switch_to_block(forwarder);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(merge);
+        fb.insert_inst_no_result(Jump::new(is, exit));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(matches!(
+            structured.regions.first(),
+            Some(Region::IfThenElse { merge: Some(found), .. }) if *found == merge
+        ));
     }
 
     /// A 2-deep nested loop structurizes as Loop-in-Loop.
