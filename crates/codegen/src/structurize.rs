@@ -467,12 +467,13 @@ impl Structurer<'_> {
             return Ok(vec![Region::LoopContinue { from, target }]);
         }
         if let Some(merge) = merge
-            && self.is_transparent_forwarder(target, merge)
+            && self.is_direct_merge_arm(target, merge)
         {
-            // Empty source-level arms can share the same forwarding block.
-            // Duplicate that semantically empty region in each structured arm
-            // so its merge-edge phi transport is preserved without granting
-            // general multiply-owned blocks.
+            // A reducible CFG may share one direct-to-merge block between
+            // nested, mutually exclusive selections. A structured target is
+            // a tree, so clone that arm into each tree position. The block's
+            // original identity remains intact for exact merge-phi transport,
+            // while each emitted copy has its own branch-local value map.
             consumed.insert(target);
             return Ok(vec![Region::Block(target)]);
         }
@@ -509,9 +510,8 @@ impl Structurer<'_> {
         self.loop_direct_exit(header, lp) == Some(target)
     }
 
-    fn is_transparent_forwarder(&self, block: BlockId, target: BlockId) -> bool {
+    fn is_direct_merge_arm(&self, block: BlockId, target: BlockId) -> bool {
         matches!(self.term(block), Term::Jump(destination) if destination == target)
-            && self.function.layout.iter_inst(block).count() == 1
     }
 
     fn validate_loop_exit_target(
@@ -713,9 +713,7 @@ impl Structurer<'_> {
         let Some(lp) = cur_loop else {
             return !self.returns(block);
         };
-        block != self.loop_tree.loop_header(lp)
-            && self.in_loop(block, lp)
-            && !self.returns(block)
+        block != self.loop_tree.loop_header(lp) && self.in_loop(block, lp) && !self.returns(block)
     }
 
     /// Find the closest block reached by every nonterminal path from both
@@ -747,10 +745,13 @@ impl Structurer<'_> {
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable_by_key(|candidate| (candidate.0, candidate.1, candidate.2));
-        candidates.into_iter().map(|candidate| candidate.3).find(|candidate| {
-            self.all_nonterminal_paths_reach(left, *candidate, cur_loop)
-                && self.all_nonterminal_paths_reach(right, *candidate, cur_loop)
-        })
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.3)
+            .find(|candidate| {
+                self.all_nonterminal_paths_reach(left, *candidate, cur_loop)
+                    && self.all_nonterminal_paths_reach(right, *candidate, cur_loop)
+            })
     }
 
     fn reachable_distances_before_loop_header(
@@ -1151,6 +1152,77 @@ mod tests {
                     then_branch.as_slice(),
                     [Region::IfThenElse { merge: Some(inner_merge), .. }]
                         if *inner_merge == merge
+                ));
+            }
+            other => panic!("expected outer IfThenElse, got {other:?}"),
+        }
+    }
+
+    /// Two nested selections may share a nonempty false arm before their
+    /// common merge. Structured targets represent the selections as a tree,
+    /// so the shared arm must be cloned into both mutually exclusive paths.
+    #[test]
+    fn nested_and_outer_arms_may_share_nonempty_forwarder() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_single(
+            "shared_nonempty_forwarder",
+            Linkage::Public,
+            &[Type::I1, Type::I32],
+            Type::I32,
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let outer = fb.append_block();
+        let nested = fb.append_block();
+        let body = fb.append_block();
+        let shared_forwarder = fb.append_block();
+        let merge = fb.append_block();
+
+        let cond = fb.args()[0];
+        let value = fb.args()[1];
+        fb.switch_to_block(outer);
+        fb.insert_inst_no_result(Br::new(is, cond, nested, shared_forwarder));
+        fb.switch_to_block(nested);
+        fb.insert_inst_no_result(Br::new(is, cond, body, shared_forwarder));
+        fb.switch_to_block(body);
+        let body_value = fb.insert_inst(arith::Add::new(is, value, value), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(shared_forwarder);
+        let shared_value = fb.insert_inst(arith::Sub::new(is, value, value), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(merge);
+        let result = fb.insert_inst(
+            Phi::new(
+                is,
+                vec![(body_value, body), (shared_value, shared_forwarder)],
+            ),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        match &structured.regions[0] {
+            Region::IfThenElse {
+                then_branch,
+                else_branch,
+                merge: selected,
+                ..
+            } => {
+                assert_eq!(*selected, Some(merge));
+                assert!(
+                    matches!(else_branch.as_slice(), [Region::Block(block)] if *block == shared_forwarder)
+                );
+                assert!(matches!(
+                    then_branch.as_slice(),
+                    [Region::IfThenElse {
+                        else_branch: inner_else,
+                        merge: Some(inner_merge),
+                        ..
+                    }] if *inner_merge == merge
+                        && matches!(inner_else.as_slice(), [Region::Block(block)] if *block == shared_forwarder)
                 ));
             }
             other => panic!("expected outer IfThenElse, got {other:?}"),
