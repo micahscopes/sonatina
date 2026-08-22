@@ -4469,6 +4469,14 @@ fn spirv_array_probe_compiles_naga_valid_with_heap_and_trap_channel() {
     assert_eq!(artifact.words[0], 0x0723_0203, "valid SPIR-V magic");
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
     assert!(wgsl.contains("fe_heap"), "private heap local must appear in WGSL:\n{wgsl}");
+    assert!(
+        wgsl.contains("array<u32, 8>"),
+        "the proven eight-word allocation must size the emitted private heap exactly:\n{wgsl}"
+    );
+    assert!(
+        !wgsl.contains("array<u32, 8192>"),
+        "the default capacity is a compile-time ceiling, not per-invocation storage:\n{wgsl}"
+    );
     assert!(wgsl.contains("fe_bump"), "bump pointer local must appear in WGSL:\n{wgsl}");
     assert!(
         wgsl.contains("fe_trapped"),

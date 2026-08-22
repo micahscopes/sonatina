@@ -3477,9 +3477,9 @@ fn translate_to_naga(
     // div|mod): Sonatina integers are signless, so u32 is exact for wrapping
     // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
     // silently emit the signed WGSL operator.
-    let (param_count, has_obj_alloc, has_mem, has_unreachable) = module
+    let (param_count, has_obj_alloc, has_mem, has_unreachable, mem_heap_bytes) = module
         .func_store
-        .try_view(first_func, |f| -> Result<(usize, bool, bool, bool), String> {
+        .try_view(first_func, |f| -> Result<(usize, bool, bool, bool, u64), String> {
             let pc = f.arg_values.len();
             let is = f.inst_set();
             let mut has_alloc = false;
@@ -3728,9 +3728,28 @@ fn translate_to_naga(
                     ));
                 }
             }
-            Ok((pc, has_alloc, has_mem, has_unreachable))
+            Ok((pc, has_alloc, has_mem, has_unreachable, mem_heap_bytes))
         })
         .ok_or_else(|| "spirv: first function body is unavailable".to_string())??;
+
+    // `heap_words` is a fail-closed capacity, not an allocation request. The
+    // pre-scan above has already proved the exact static upper bound for this
+    // call-free entry, so materialize only that many private words. Emitting
+    // the full default capacity for every invocation turns a small local
+    // array into 32 KiB of private storage and multiplies that cost by the
+    // workgroup width. This was enough to make otherwise modest Fe workgroup
+    // kernels pathological for browser shader compilers.
+    let private_heap_words = if has_mem {
+        u32::try_from(mem_heap_bytes.div_ceil(4))
+            .map_err(|_| {
+                format!(
+                    "spirv: static private heap requirement ({mem_heap_bytes} bytes) does not fit in u32 words"
+                )
+            })?
+            .max(1)
+    } else {
+        0
+    };
 
     // Grid mode fail-closed checks. Grid is a driver-declared envelope fact: the
     // translator never guesses it, and when asked for it, every precondition is
@@ -3952,8 +3971,8 @@ fn translate_to_naga(
         };
         let mem_ctx = if needs_trap_channel {
             let heap = if has_mem {
-                let heap_len = std::num::NonZeroU32::new(heap_words)
-                    .ok_or_else(|| "spirv: heap_words must be nonzero".to_string())?;
+                let heap_len = std::num::NonZeroU32::new(private_heap_words)
+                    .ok_or_else(|| "spirv: derived private heap must be nonzero".to_string())?;
                 let heap_type = naga_mod.types.insert(
                     naga::Type {
                         name: Some("FeHeap".into()),
@@ -3992,7 +4011,7 @@ fn translate_to_naga(
                 Some(HeapCtx {
                     heap,
                     bump,
-                    heap_words,
+                    heap_words: private_heap_words,
                 })
             } else {
                 None
@@ -4896,8 +4915,8 @@ fn translate_to_naga(
     // result the same way the original Codex bug 4 did.
     let mem_ctx = if needs_trap_channel {
         let heap = if has_mem {
-            let heap_len = std::num::NonZeroU32::new(heap_words)
-                .ok_or_else(|| "spirv: heap_words must be nonzero".to_string())?;
+            let heap_len = std::num::NonZeroU32::new(private_heap_words)
+                .ok_or_else(|| "spirv: derived private heap must be nonzero".to_string())?;
             let heap_ty = naga_mod.types.insert(
                 naga::Type {
                     name: Some("FeHeap".into()),
@@ -4923,7 +4942,11 @@ fn translate_to_naga(
                 naga::LocalVariable { name: Some("fe_bump".into()), ty: word_type, init: Some(bump_zero) },
                 naga::Span::UNDEFINED,
             );
-            Some(HeapCtx { heap: heap_local, bump, heap_words })
+            Some(HeapCtx {
+                heap: heap_local,
+                bump,
+                heap_words: private_heap_words,
+            })
         } else {
             None
         };
