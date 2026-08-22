@@ -1499,15 +1499,19 @@ fn emit_single_inst(
             return true;
         }
     } else if let Some(is_zero) = <&sonatina_ir::inst::cmp::IsZero as InstDowncast>::downcast(inst_set, inst_data) {
-        // `x == 0`, lowered like the Eq arm to a naga bool consumed by branches /
-        // `select`. The zero literal matches the active word (the U32 browser word
-        // or the i64 word), the same shape as the immediate materialization above.
+        // `is_zero` is also Fe's logical-not carrier for i1. Naga requires both
+        // equality operands to have the same type, so a boolean operand compares
+        // with `false`; integer operands compare with their active word zero.
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let lhs = resolve_naga_value(*is_zero.lhs(), function, word, value_map, phi_locals, func).unwrap();
             let zero = func.expressions.append(
-                naga::Expression::Literal(match word {
-                    WordKind::U32 => naga::Literal::U32(0),
-                    WordKind::I64 => naga::Literal::I64(0),
+                naga::Expression::Literal(match function.dfg.value_ty(*is_zero.lhs()) {
+                    sonatina_ir::Type::I1 => naga::Literal::Bool(false),
+                    sonatina_ir::Type::I64 => naga::Literal::I64(0),
+                    _ => match word {
+                        WordKind::U32 => naga::Literal::U32(0),
+                        WordKind::I64 => naga::Literal::I64(0),
+                    },
                 }),
                 naga::Span::UNDEFINED,
             );

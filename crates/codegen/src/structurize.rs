@@ -16,7 +16,7 @@ use bit_set::BitSet;
 use sonatina_ir::{
     BlockId, Function, InstDowncast, InstSetBase,
     cfg::ControlFlowGraph,
-    inst::control_flow::{Br, BrTable, Jump, Return, Unreachable},
+    inst::control_flow::{Br, BrTable, Jump, Phi, Return, Unreachable},
 };
 
 use crate::{
@@ -163,7 +163,7 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
     };
     let mut active = HashSet::new();
     let mut consumed = HashSet::new();
-    let regions = s.build_seq(rpo[0], None, None, &mut active, &mut consumed)?;
+    let regions = s.build_seq(rpo[0], None, None, false, &mut active, &mut consumed)?;
 
     let missing = rpo
         .iter()
@@ -281,21 +281,42 @@ impl Structurer<'_> {
         self.loop_tree.is_in_loop(b, lp)
     }
 
-    /// A block that is ALWAYS a CFG dead end: its only instruction is
-    /// `Unreachable` (no other side effects, no successors, no phi inputs to
-    /// preserve). `wasm_lower.rs::trap_block` creates and caches exactly ONE
-    /// such block per function and reuses it for EVERY dynamic-index bounds
-    /// check and checked-usize-overflow check, so it legitimately has many
-    /// predecessors spread across the whole function -- not the "one true
-    /// position in the region tree" every other block has. Referencing it
-    /// from more than one arm is therefore not a real "multiply owned"
-    /// block; the general active/consumed cycle guard in `build_seq` would
-    /// otherwise reject the SECOND (and every later) bounds check in any
-    /// function with more than one dynamically-indexed access, once
-    /// `Unreachable` stops being an unconditional hard error.
-    fn is_shared_trap_block(&self, block: BlockId) -> bool {
-        matches!(self.term(block), Term::Unreachable)
+    /// A block that is always a CFG dead end and contains only its terminal.
+    ///
+    /// `wasm_lower.rs::trap_block` caches one `Unreachable` block per function,
+    /// and optimized unit-returning functions likewise commonly funnel many
+    /// arms into one bare `Return`. Neither block owns values, side effects, or
+    /// phi transport. A structured target may therefore reference it at each
+    /// tree position without violating semantics. The general consumed-block
+    /// guard must remain strict for every non-bare terminal.
+    fn is_shared_bare_terminal(&self, block: BlockId) -> bool {
+        matches!(self.term(block), Term::Return | Term::Unreachable)
             && self.function.layout.iter_inst(block).count() == 1
+    }
+
+    /// A shared, phi-free block directly before a bare terminal is likewise a
+    /// safe tree leaf. Its side effects execute once on whichever mutually
+    /// exclusive path reaches that leaf, and it owns no edge-dependent values.
+    fn is_shared_terminal_forwarder(&self, block: BlockId) -> bool {
+        let Term::Jump(target) = self.term(block) else {
+            return false;
+        };
+        self.is_shared_bare_terminal(target)
+            && self.function.layout.iter_inst(block).all(|inst_id| {
+                <&Phi as InstDowncast>::downcast(self.is, self.function.dfg.inst(inst_id)).is_none()
+            })
+    }
+
+    /// A phi-free decision block may be referenced from several mutually
+    /// exclusive CFG paths. Structured targets are trees, so each reference
+    /// needs its own region node even though all nodes retain the original
+    /// block identity. Phi-bearing decisions remain single-owner because their
+    /// incoming edge values cannot be cloned without predecessor rewriting.
+    fn is_shared_decision_block(&self, block: BlockId) -> bool {
+        matches!(self.term(block), Term::Br(_, _))
+            && self.function.layout.iter_inst(block).all(|inst_id| {
+                <&Phi as InstDowncast>::downcast(self.is, self.function.dfg.inst(inst_id)).is_none()
+            })
     }
 
     /// Build the region sequence for the maximal single-entry area entered at
@@ -308,11 +329,13 @@ impl Structurer<'_> {
         start: BlockId,
         stop: Option<BlockId>,
         cur_loop: Option<Loop>,
+        clone_shared_subtree: bool,
         active: &mut HashSet<BlockId>,
         consumed: &mut HashSet<BlockId>,
     ) -> Result<Vec<Region>, String> {
         let mut regions = Vec::new();
         let mut cur = Some(start);
+        let mut cloning = clone_shared_subtree;
         let allow_return_corridor = cur_loop
             .is_some_and(|lp| !self.in_loop(start, lp) && self.is_return_corridor(start, lp));
 
@@ -333,19 +356,46 @@ impl Structurer<'_> {
                 }
             }
 
-            // A shared trap block dead-ends here regardless of how many
-            // other predecessors also reach it elsewhere in the function; see
-            // `is_shared_trap_block`. `consumed.insert` is idempotent (a
-            // HashSet re-insert is a harmless no-op), so this is safe to hit
-            // on the first occurrence AND every later one.
-            if self.is_shared_trap_block(b) {
+            // A shared bare terminal dead-ends here regardless of how many
+            // predecessors reach it; see `is_shared_bare_terminal`.
+            if self.is_shared_bare_terminal(b) {
                 consumed.insert(b);
                 regions.push(Region::Block(b));
                 cur = None;
                 continue;
             }
 
-            if active.contains(&b) || !consumed.insert(b) {
+            // A nonempty forwarder directly into this arm's merge can also be
+            // reached after structuring a nested loop fallthrough, rather than
+            // as the branch's immediate target. As with `build_branch`'s
+            // direct-merge case, mutually exclusive tree positions may each
+            // reference the original block. Phi transport remains owned by the
+            // merge after it, and an active block is never cloned.
+            if !active.contains(&b)
+                && consumed.contains(&b)
+                && stop.is_some_and(|merge| self.is_direct_merge_arm(b, merge))
+            {
+                regions.push(Region::Block(b));
+                cur = None;
+                continue;
+            }
+            if !active.contains(&b) && consumed.contains(&b) && self.is_shared_terminal_forwarder(b)
+            {
+                let Term::Jump(terminal) = self.term(b) else {
+                    unreachable!("terminal forwarder classification changed")
+                };
+                consumed.insert(terminal);
+                regions.push(Region::Block(b));
+                regions.push(Region::Block(terminal));
+                cur = None;
+                continue;
+            }
+
+            let clone_shared_decision =
+                !active.contains(&b) && consumed.contains(&b) && self.is_shared_decision_block(b);
+            let clone_existing =
+                !active.contains(&b) && consumed.contains(&b) && (cloning || clone_shared_decision);
+            if active.contains(&b) || (!clone_existing && !consumed.insert(b)) {
                 let predecessors = self.cfg.preds_of(b).copied().collect::<Vec<_>>();
                 let successors = self.cfg.succs_of(b).copied().collect::<Vec<_>>();
                 let owner_loop = self.loop_tree.loop_of_block(b);
@@ -366,12 +416,13 @@ impl Structurer<'_> {
                      predecessor_headers={predecessor_headers:?}"
                 ));
             }
+            cloning |= clone_shared_decision;
             active.insert(b);
 
             // Open a loop when we first reach a header we are not already in.
             if let Some(lp) = self.loop_tree.loop_of_block(b) {
                 if self.loop_tree.loop_header(lp) == b && cur_loop != Some(lp) {
-                    let body = self.build_loop_body(b, lp, active, consumed)?;
+                    let body = self.build_loop_body(b, lp, cloning, active, consumed)?;
                     regions.push(Region::Loop { header: b, body });
                     if let Some(exit) = self.loop_direct_exit(b, lp) {
                         if self.returns(exit) {
@@ -410,7 +461,7 @@ impl Structurer<'_> {
                     // this conditional's merge.
                     let merge = self.find_merge(b, cur_loop, stop)?;
                     let then_branch = self
-                        .build_branch(b, nz, merge, cur_loop, active, consumed)
+                        .build_branch(b, nz, merge, cur_loop, cloning, active, consumed)
                         .map_err(|error| {
                             format!(
                                 "{error}; while structuring nonzero arm {b:?}->{nz:?}, \
@@ -419,7 +470,7 @@ impl Structurer<'_> {
                             )
                         })?;
                     let else_branch = self
-                        .build_branch(b, z, merge, cur_loop, active, consumed)
+                        .build_branch(b, z, merge, cur_loop, cloning, active, consumed)
                         .map_err(|error| {
                             format!(
                                 "{error}; while structuring zero arm {b:?}->{z:?}, \
@@ -455,6 +506,7 @@ impl Structurer<'_> {
         target: BlockId,
         merge: Option<BlockId>,
         cur_loop: Option<Loop>,
+        clone_shared_subtree: bool,
         active: &mut HashSet<BlockId>,
         consumed: &mut HashSet<BlockId>,
     ) -> Result<Vec<Region>, String> {
@@ -502,7 +554,14 @@ impl Structurer<'_> {
             self.validate_loop_exit_target(lp, from, target)?;
             return Ok(vec![Region::LoopExit { from, target }]);
         }
-        self.build_seq(target, merge, cur_loop, active, consumed)
+        self.build_seq(
+            target,
+            merge,
+            cur_loop,
+            clone_shared_subtree,
+            active,
+            consumed,
+        )
     }
 
     fn is_canonical_loop_exit(&self, lp: Loop, target: BlockId) -> bool {
@@ -539,6 +598,7 @@ impl Structurer<'_> {
         &self,
         header: BlockId,
         lp: Loop,
+        clone_shared_subtree: bool,
         active: &mut HashSet<BlockId>,
         consumed: &mut HashSet<BlockId>,
     ) -> Result<Vec<Region>, String> {
@@ -568,10 +628,19 @@ impl Structurer<'_> {
                     // separate body regions to recurse into.
                     Ok(Vec::new())
                 } else {
-                    self.build_seq(entry, None, Some(lp), active, consumed)
+                    self.build_seq(
+                        entry,
+                        None,
+                        Some(lp),
+                        clone_shared_subtree,
+                        active,
+                        consumed,
+                    )
                 }
             }
-            Term::Jump(t) => self.build_seq(t, None, Some(lp), active, consumed),
+            Term::Jump(t) => {
+                self.build_seq(t, None, Some(lp), clone_shared_subtree, active, consumed)
+            }
             _ => Err(format!(
                 "spirv structurize: loop header {header:?} must end in Jump or Br"
             )),
@@ -1067,6 +1136,133 @@ mod tests {
         assert!(matches!(s.regions[1], Region::Block(_)));
     }
 
+    /// Bounds-checked branches in a unit-returning kernel may converge on one
+    /// bare return while their failure arms share one bare trap. Both terminal
+    /// blocks are safe leaves at each structured tree position.
+    #[test]
+    fn nested_branches_may_share_bare_return_and_trap() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit(
+            "shared_bare_terminals",
+            Linkage::Public,
+            &[Type::I1, Type::I1, Type::I1],
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let left = fb.append_block();
+        let right = fb.append_block();
+        let left_live = fb.append_block();
+        let right_live = fb.append_block();
+        let return_block = fb.append_block();
+        let trap_block = fb.append_block();
+
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(Br::new(is, fb.args()[0], left, right));
+        fb.switch_to_block(left);
+        fb.insert_inst_no_result(Br::new(is, fb.args()[1], left_live, trap_block));
+        fb.switch_to_block(right);
+        fb.insert_inst_no_result(Br::new(is, fb.args()[2], right_live, trap_block));
+        fb.switch_to_block(left_live);
+        fb.insert_inst_no_result(Jump::new(is, return_block));
+        fb.switch_to_block(right_live);
+        fb.insert_inst_no_result(Jump::new(is, return_block));
+        fb.switch_to_block(return_block);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(trap_block);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(structured.block_order.contains(&return_block));
+        assert!(structured.block_order.contains(&trap_block));
+    }
+
+    /// Nested terminal arms may share one phi-free cleanup block before its
+    /// bare return while a sibling terminates independently.
+    #[test]
+    fn nested_terminal_arms_may_share_cleanup_forwarder() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit(
+            "shared_terminal_cleanup",
+            Linkage::Public,
+            &[Type::I1, Type::I1, Type::I32],
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let outer = fb.append_block();
+        let nested = fb.append_block();
+        let body = fb.append_block();
+        let cleanup = fb.append_block();
+        let return_block = fb.append_block();
+        let other_return = fb.append_block();
+
+        let outer_cond = fb.args()[0];
+        let nested_cond = fb.args()[1];
+        let value = fb.args()[2];
+        fb.switch_to_block(outer);
+        fb.insert_inst_no_result(Br::new(is, outer_cond, nested, cleanup));
+        fb.switch_to_block(nested);
+        fb.insert_inst_no_result(Br::new(is, nested_cond, body, cleanup));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Jump::new(is, other_return));
+        fb.switch_to_block(cleanup);
+        fb.insert_inst(arith::Add::new(is, value, value), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, return_block));
+        fb.switch_to_block(return_block);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(other_return);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(structured.block_order.contains(&cleanup));
+        assert!(structured.block_order.contains(&return_block));
+
+        fn count_cleanup_terminal_pairs(
+            regions: &[Region],
+            cleanup: BlockId,
+            terminal: BlockId,
+        ) -> usize {
+            let local = regions
+                .windows(2)
+                .filter(|pair| {
+                    matches!(pair[0], Region::Block(block) if block == cleanup)
+                        && matches!(pair[1], Region::Block(block) if block == terminal)
+                })
+                .count();
+            local
+                + regions
+                    .iter()
+                    .map(|region| match region {
+                        Region::IfThenElse {
+                            then_branch,
+                            else_branch,
+                            ..
+                        } => {
+                            count_cleanup_terminal_pairs(then_branch, cleanup, terminal)
+                                + count_cleanup_terminal_pairs(else_branch, cleanup, terminal)
+                        }
+                        Region::Loop { body, .. } => {
+                            count_cleanup_terminal_pairs(body, cleanup, terminal)
+                        }
+                        Region::Block(_)
+                        | Region::LoopExit { .. }
+                        | Region::LoopContinue { .. } => 0,
+                    })
+                    .sum::<usize>()
+        }
+
+        assert_eq!(
+            count_cleanup_terminal_pairs(&structured.regions, cleanup, return_block),
+            2,
+        );
+    }
+
     /// One outer arm contains a nested diamond while the sibling enters the
     /// nested diamond's convergence directly. The shared block is the outer
     /// merge; it must not be consumed inside the first arm and then visited a
@@ -1227,6 +1423,147 @@ mod tests {
             }
             other => panic!("expected outer IfThenElse, got {other:?}"),
         }
+    }
+
+    /// Two nested selections may enter the same phi-free decision corridor.
+    /// The corridor and its leaves are cloned into both mutually exclusive
+    /// tree positions, while their common merge remains a sibling.
+    #[test]
+    fn nested_and_outer_arms_may_share_decision_corridor() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit(
+            "shared_decision_corridor",
+            Linkage::Public,
+            &[Type::I1, Type::I1, Type::I1, Type::I32],
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let outer = fb.append_block();
+        let nested = fb.append_block();
+        let body = fb.append_block();
+        let shared_decision = fb.append_block();
+        let left = fb.append_block();
+        let right = fb.append_block();
+        let corridor_merge = fb.append_block();
+        let corridor_live = fb.append_block();
+        let merge = fb.append_block();
+        let trap = fb.append_block();
+
+        let outer_cond = fb.args()[0];
+        let nested_cond = fb.args()[1];
+        let shared_cond = fb.args()[2];
+        let value = fb.args()[3];
+        fb.switch_to_block(outer);
+        fb.insert_inst_no_result(Br::new(is, outer_cond, nested, shared_decision));
+        fb.switch_to_block(nested);
+        fb.insert_inst_no_result(Br::new(is, nested_cond, body, shared_decision));
+        fb.switch_to_block(body);
+        fb.insert_inst(arith::Add::new(is, value, value), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(shared_decision);
+        fb.insert_inst_no_result(Br::new(is, shared_cond, left, right));
+        fb.switch_to_block(left);
+        let left_value = fb.insert_inst(arith::Add::new(is, value, value), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, corridor_merge));
+        fb.switch_to_block(right);
+        let right_value = fb.insert_inst(arith::Sub::new(is, value, value), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, corridor_merge));
+        fb.switch_to_block(corridor_merge);
+        let selected_value = fb.insert_inst(
+            Phi::new(is, vec![(left_value, left), (right_value, right)]),
+            Type::I32,
+        );
+        let remains_live = fb.insert_inst(cmp::Lt::new(is, selected_value, value), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, remains_live, corridor_live, trap));
+        fb.switch_to_block(corridor_live);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(merge);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        fn count_headers(regions: &[Region], target: BlockId) -> usize {
+            regions
+                .iter()
+                .map(|region| match region {
+                    Region::IfThenElse {
+                        header,
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        usize::from(*header == target)
+                            + count_headers(then_branch, target)
+                            + count_headers(else_branch, target)
+                    }
+                    Region::Loop { body, .. } => count_headers(body, target),
+                    Region::Block(_) | Region::LoopExit { .. } | Region::LoopContinue { .. } => 0,
+                })
+                .sum()
+        }
+
+        assert_eq!(count_headers(&structured.regions, shared_decision), 2);
+        assert_eq!(count_headers(&structured.regions, corridor_merge), 2);
+    }
+
+    /// Mutually exclusive loops may fall through to the same nonempty block
+    /// before an enclosing merge. The forwarder is cloned at each tree
+    /// position just like a directly selected shared arm.
+    #[test]
+    fn nested_loop_fallthroughs_may_share_nonempty_forwarder() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit(
+            "shared_loop_forwarder",
+            Linkage::Public,
+            &[Type::I1, Type::I1, Type::I1, Type::I1, Type::I32],
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let outer = fb.append_block();
+        let nested = fb.append_block();
+        let left_guard = fb.append_block();
+        let right_guard = fb.append_block();
+        let left_loop = fb.append_block();
+        let right_loop = fb.append_block();
+        let shared_forwarder = fb.append_block();
+        let merge = fb.append_block();
+        let trap = fb.append_block();
+        let outer_cond = fb.args()[0];
+        let nested_cond = fb.args()[1];
+        let left_cond = fb.args()[2];
+        let right_cond = fb.args()[3];
+        let value = fb.args()[4];
+
+        fb.switch_to_block(outer);
+        fb.insert_inst_no_result(Br::new(is, outer_cond, nested, merge));
+        fb.switch_to_block(nested);
+        fb.insert_inst_no_result(Br::new(is, nested_cond, left_guard, right_guard));
+        fb.switch_to_block(left_guard);
+        fb.insert_inst_no_result(Br::new(is, left_cond, left_loop, trap));
+        fb.switch_to_block(right_guard);
+        fb.insert_inst_no_result(Br::new(is, right_cond, right_loop, trap));
+        fb.switch_to_block(left_loop);
+        fb.insert_inst_no_result(Br::new(is, left_cond, left_loop, shared_forwarder));
+        fb.switch_to_block(right_loop);
+        fb.insert_inst_no_result(Br::new(is, right_cond, right_loop, shared_forwarder));
+        fb.switch_to_block(shared_forwarder);
+        fb.insert_inst(arith::Add::new(is, value, value), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(merge);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(structured.block_order.contains(&shared_forwarder));
+        assert!(structured.block_order.contains(&merge));
     }
 
     /// An if-WITHOUT-else (triangle) structurizes with an empty arm.

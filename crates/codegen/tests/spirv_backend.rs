@@ -4057,6 +4057,25 @@ func public %bool_loop(v0.i32) -> i32 {
 }
 
 #[test]
+fn boolean_is_zero_lowers_as_logical_not() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %bool_not(v0.i32) -> i32 {
+    block0:
+        v1.i1 = is_zero v0;
+        v2.i1 = is_zero v1;
+        br v2 block1 block2;
+    block1:
+        return 1.i32;
+    block2:
+        return 0.i32;
+}
+"#;
+    let module = sonatina_parser::parse_module(source).expect("bool not should parse").module;
+    SpirvBackend::new().compile_module(&module).expect("i1 is_zero should compile");
+}
+
+#[test]
 fn f32_object_load_and_store_have_named_rejections() {
     let store = r#"
 target = "wasm32-unknown-native"
