@@ -248,13 +248,11 @@ pub struct SpirvLayout {
     /// modes). `None` in Grid and Render modes: the whole output array (Grid) or
     /// the color target (Render) is the result, so there is no single readback slot.
     pub result: Option<SpirvResult>,
-    /// Where the per-invocation trap-status word lands for readback, for
-    /// kernels using function-local `[u32; N]` arrays (Codex bug 3's fix: an
-    /// unambiguous status channel separate from the result). `Some` for
-    /// Scalar-mode Mem-op-bearing kernels (a fixed single-invocation slot,
-    /// mirroring `result`). `None` for Grid (the whole `trap` binding is the
-    /// per-pixel array, same "no single slot" reasoning as `result` in Grid
-    /// mode) and for any kernel with no Mem ops (nothing to report).
+    /// Where the trap-status lane lands for readback. Explicit compute owns one
+    /// word per invocation across its fixed workgroup and dispatch shape, so
+    /// independent invocations never race on a diagnostic store. Scalar mode
+    /// retains one word. Grid exposes the whole binding rather than a single
+    /// result descriptor. Kernels without a reachable trap omit the channel.
     pub trap: Option<SpirvResult>,
     /// Render mode: the `@vertex` entry point name (`None` for compute modes).
     pub vertex_entry: Option<String>,
@@ -289,6 +287,10 @@ impl SpirvArtifact {
 
 pub struct SpirvBackend {
     pub workgroup_size: [u32; 3],
+    /// Fixed dispatch grid in workgroups. Explicit compute uses this together
+    /// with `workgroup_size` to size compiler-owned per-invocation channels.
+    /// The default is one workgroup in each dimension.
+    pub dispatch_grid: [u32; 3],
     /// Grid mode: one invocation per pixel, args 0,1 bound to
     /// `global_invocation_id.xy`, the return value stored at
     /// `output[gid.y * (num_workgroups.x * workgroup_size[0]) + gid.x]`. A
@@ -324,6 +326,7 @@ impl SpirvBackend {
     pub fn new() -> Self {
         Self {
             workgroup_size: [64, 1, 1],
+            dispatch_grid: [1, 1, 1],
             grid: false,
             render: false,
             compute: false,
@@ -336,6 +339,11 @@ impl SpirvBackend {
 
     pub fn with_workgroup_size(mut self, x: u32, y: u32, z: u32) -> Self {
         self.workgroup_size = [x, y, z];
+        self
+    }
+
+    pub fn with_dispatch_grid(mut self, x: u32, y: u32, z: u32) -> Self {
+        self.dispatch_grid = [x, y, z];
         self
     }
 
@@ -402,6 +410,7 @@ impl Backend for SpirvBackend {
             self.grid,
             self.render,
             self.compute,
+            self.dispatch_grid,
             self.authored_raster.as_ref(),
             &self.external_resources,
             &self.builtin_arguments,
@@ -791,10 +800,8 @@ fn emit_mem_access(
 }
 
 /// Store the final `mem_ctx.trapped` value (as u32 0/1) into the trap-status
-/// output at `index`, alongside the ordinary result store. This is the write
-/// side of Codex bug 3's fix: the read side is simply "the consumer checks
-/// this word", which is out of scope here (no GPU execution in this
-/// sandbox) but the channel itself is real, not a placeholder.
+/// output at `index`, alongside the ordinary result store. The consumer checks
+/// this word after execution; the channel itself is part of the emitted ABI.
 #[cfg(feature = "spirv-backend")]
 fn emit_trap_store(
     func: &mut naga::Function,
@@ -809,6 +816,89 @@ fn emit_trap_store(
     let trap_global = func.expressions.append(naga::Expression::GlobalVariable(trap_var), naga::Span::UNDEFINED);
     let trap_ptr = func.expressions.append(naga::Expression::Access { base: trap_global, index }, naga::Span::UNDEFINED);
     target.push(naga::Statement::Store { pointer: trap_ptr, value: trapped_u32 }, naga::Span::UNDEFINED);
+}
+
+/// Linearize the physical global invocation id into the compiler-sized fixed
+/// dispatch extent. Each invocation owns one trap word, so no shader write is
+/// shared even when the authored kernel uses checked indexing or local arrays.
+#[cfg(feature = "spirv-backend")]
+fn emit_compute_invocation_index(
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    global_argument: u32,
+    extent: [u32; 3],
+) -> naga::Handle<naga::Expression> {
+    let global = func.expressions.append(
+        naga::Expression::FunctionArgument(global_argument),
+        naga::Span::UNDEFINED,
+    );
+    let x = emit_expr(
+        func,
+        target,
+        naga::Expression::AccessIndex {
+            base: global,
+            index: 0,
+        },
+    );
+    let y = emit_expr(
+        func,
+        target,
+        naga::Expression::AccessIndex {
+            base: global,
+            index: 1,
+        },
+    );
+    let z = emit_expr(
+        func,
+        target,
+        naga::Expression::AccessIndex {
+            base: global,
+            index: 2,
+        },
+    );
+    let width = lit_u32(func, extent[0]);
+    let row = emit_expr(
+        func,
+        target,
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Multiply,
+            left: y,
+            right: width,
+        },
+    );
+    let xy = emit_expr(
+        func,
+        target,
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Add,
+            left: x,
+            right: row,
+        },
+    );
+    let plane_stride = lit_u32(
+        func,
+        extent[0]
+            .checked_mul(extent[1])
+            .expect("validated compute plane extent"),
+    );
+    let plane = emit_expr(
+        func,
+        target,
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Multiply,
+            left: z,
+            right: plane_stride,
+        },
+    );
+    emit_expr(
+        func,
+        target,
+        naga::Expression::Binary {
+            op: naga::BinaryOperator::Add,
+            left: xy,
+            right: plane,
+        },
+    )
 }
 
 /// Whether `block`'s terminator is Sonatina `Unreachable` (an array/memory
@@ -3138,6 +3228,7 @@ fn translate_to_naga(
     grid: bool,
     render: bool,
     compute: bool,
+    dispatch_grid: [u32; 3],
     authored_raster: Option<&SpirvRasterPipeline>,
     external_resources: &[SpirvExternalResource],
     builtin_arguments: &[SpirvBuiltinArgument],
@@ -3151,6 +3242,9 @@ fn translate_to_naga(
         }
         if !builtin_arguments.is_empty() {
             return Err("spirv raster: authored raster does not accept compute builtin arguments".to_string());
+        }
+        if dispatch_grid != [1, 1, 1] {
+            return Err("spirv raster: a fixed dispatch grid is invalid for authored raster".to_string());
         }
         return authored_raster::translate(module, raster, external_resources);
     }
@@ -3208,6 +3302,36 @@ fn translate_to_naga(
                 .to_string(),
         );
     }
+    if !compute && dispatch_grid != [1, 1, 1] {
+        return Err("spirv: a fixed dispatch grid currently requires explicit compute mode".to_string());
+    }
+    let compute_invocation_extent = if compute {
+        if workgroup_size.contains(&0) || dispatch_grid.contains(&0) {
+            return Err(
+                "spirv compute: workgroup and dispatch dimensions must be nonzero".to_string(),
+            );
+        }
+        [
+            workgroup_size[0]
+                .checked_mul(dispatch_grid[0])
+                .ok_or_else(|| "spirv compute: x invocation extent overflows u32".to_string())?,
+            workgroup_size[1]
+                .checked_mul(dispatch_grid[1])
+                .ok_or_else(|| "spirv compute: y invocation extent overflows u32".to_string())?,
+            workgroup_size[2]
+                .checked_mul(dispatch_grid[2])
+                .ok_or_else(|| "spirv compute: z invocation extent overflows u32".to_string())?,
+        ]
+    } else {
+        [1, 1, 1]
+    };
+    let compute_invocation_count = compute_invocation_extent
+        .into_iter()
+        .try_fold(1u32, |count, extent| count.checked_mul(extent))
+        .ok_or_else(|| "spirv compute: total invocation count overflows u32".to_string())?;
+    let compute_trap_span = compute_invocation_count
+        .checked_mul(4)
+        .ok_or_else(|| "spirv compute: trap channel byte span overflows u32".to_string())?;
 
     let mut resource_arg_indices = std::collections::HashSet::new();
     for (position, resource) in external_resources.iter().enumerate() {
@@ -3737,12 +3861,14 @@ fn translate_to_naga(
         let needs_trap_channel = has_mem || has_unreachable;
         let trap_binding = parameter_binding + u32::from(parameter_var.is_some());
         let trap_var = if needs_trap_channel {
+            let trap_len = std::num::NonZeroU32::new(compute_invocation_count)
+                .expect("validated compute invocation count is nonzero");
             let trap_type = naga_mod.types.insert(
                 naga::Type {
                     name: Some("TrapArray".into()),
                     inner: naga::TypeInner::Array {
                         base: word_type,
-                        size: naga::ArraySize::Dynamic,
+                        size: naga::ArraySize::Constant(trap_len),
                         stride: 4,
                     },
                 },
@@ -3784,10 +3910,14 @@ fn translate_to_naga(
         let mut physical_builtin_arguments = [None; 5];
         let mut entry_arguments = Vec::new();
         for family in 0..physical_builtin_arguments.len() {
-            if !builtin_arguments.iter().any(|argument| {
+            let authored = builtin_arguments.iter().any(|argument| {
                 compute_builtin_slot(argument.source)
                     .is_some_and(|(candidate, _)| candidate == family)
-            }) {
+            });
+            let compiler_trap_index = needs_trap_channel
+                && compute_invocation_count > 1
+                && family == 0;
+            if !authored && !compiler_trap_index {
                 continue;
             }
             let (name, ty, binding) = match family {
@@ -3993,12 +4123,20 @@ fn translate_to_naga(
             return Err(error);
         }
         if let (Some(mem_ctx), Some(trap_var)) = (mem_ctx, trap_var) {
-            let zero = func.expressions.append(
-                naga::Expression::Literal(naga::Literal::I32(0)),
-                naga::Span::UNDEFINED,
-            );
             let mut tail = naga::Block::new();
-            emit_trap_store(&mut func, &mut tail, mem_ctx, trap_var, zero);
+            let trap_index = if compute_invocation_count == 1 {
+                lit_u32(&mut func, 0)
+            } else {
+                let global_argument = physical_builtin_arguments[0]
+                    .expect("multi-invocation trap channel requires global invocation id");
+                emit_compute_invocation_index(
+                    &mut func,
+                    &mut tail,
+                    global_argument,
+                    compute_invocation_extent,
+                )
+            };
+            emit_trap_store(&mut func, &mut tail, mem_ctx, trap_var, trap_index);
             func.body.extend_block(tail);
         }
         naga_mod.entry_points.push(naga::EntryPoint {
@@ -4037,7 +4175,7 @@ fn translate_to_naga(
                 access: Access::ReadWrite,
                 role: Role::Output,
                 stride: 4,
-                span: 4,
+                span: compute_trap_span,
                 members: Vec::new(),
                 resource_element: None,
                 resource_length: None,
@@ -4065,7 +4203,7 @@ fn translate_to_naga(
                     group: 0,
                     binding: trap_binding,
                     offset: 0,
-                    width: 4,
+                    width: compute_trap_span,
                 }),
                 vertex_entry: None,
                 fragment_entry: None,
