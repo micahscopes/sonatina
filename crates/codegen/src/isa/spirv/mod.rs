@@ -3202,7 +3202,8 @@ fn translate_to_naga(
                             && result_ty != carrier_ty
                         {
                             return Err(format!(
-                                "spirv: narrow or mixed integer instruction result {result:?} has unsupported type {result_ty:?}; expected {carrier_ty:?} carrier"
+                                "spirv: narrow or mixed integer instruction result {result:?} has unsupported type {result_ty:?}; expected {carrier_ty:?} carrier; instruction `{}`",
+                                inst_data.as_text(),
                             ));
                         }
                     }
