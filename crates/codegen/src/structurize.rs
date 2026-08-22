@@ -10,7 +10,7 @@
 //! an ambiguous merge, a loop with no recognizable header exit) returns a named
 //! `Err`, never a silently dropped branch.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use bit_set::BitSet;
 use sonatina_ir::{
@@ -635,6 +635,16 @@ impl Structurer<'_> {
                 if Some(nz) == enclosing_stop && self.returns(z) {
                     return Ok(Some(nz));
                 }
+                // A terminal arm does not need to reach the continuation for
+                // that continuation to be the structured merge. Keep an
+                // enclosing loop header or exit as an explicit continue/break
+                // edge, but otherwise resume at the live successor.
+                if self.returns(nz) && self.is_local_merge_candidate(z, cur_loop) {
+                    return Ok(Some(z));
+                }
+                if self.returns(z) && self.is_local_merge_candidate(nz, cur_loop) {
+                    return Ok(Some(nz));
+                }
                 // Search only within the current loop iteration so a later
                 // backedge cannot make the two successors appear mutually
                 // reachable.
@@ -668,6 +678,9 @@ impl Structurer<'_> {
                         {
                             return Ok(Some(stop));
                         }
+                        if let Some(merge) = self.nearest_nonterminal_merge(nz, z, cur_loop) {
+                            return Ok(Some(merge));
+                        }
                         Ok(None)
                     }
                 }
@@ -679,6 +692,125 @@ impl Structurer<'_> {
                 immediate.len()
             )),
         }
+    }
+
+    fn is_local_merge_candidate(&self, block: BlockId, cur_loop: Option<Loop>) -> bool {
+        let Some(lp) = cur_loop else {
+            return !self.returns(block);
+        };
+        block != self.loop_tree.loop_header(lp)
+            && self.in_loop(block, lp)
+            && !self.returns(block)
+    }
+
+    /// Find the closest block reached by every nonterminal path from both
+    /// successors. This complements strict post-dominance when early returns
+    /// or traps make the ordinary post-dominator set empty. In particular, a
+    /// nested loop header can be the common continuation of several guarded
+    /// arms even though terminal siblings never reach it.
+    fn nearest_nonterminal_merge(
+        &self,
+        left: BlockId,
+        right: BlockId,
+        cur_loop: Option<Loop>,
+    ) -> Option<BlockId> {
+        let left_distances = self.reachable_distances_before_loop_header(left, cur_loop);
+        let right_distances = self.reachable_distances_before_loop_header(right, cur_loop);
+        let mut candidates = left_distances
+            .iter()
+            .filter_map(|(candidate, left_distance)| {
+                let right_distance = right_distances.get(candidate)?;
+                if !self.is_local_merge_candidate(*candidate, cur_loop) {
+                    return None;
+                }
+                Some((
+                    (*left_distance).max(*right_distance),
+                    *left_distance + *right_distance,
+                    self.postdom.indices[candidate],
+                    *candidate,
+                ))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by_key(|candidate| (candidate.0, candidate.1, candidate.2));
+        candidates.into_iter().map(|candidate| candidate.3).find(|candidate| {
+            self.all_nonterminal_paths_reach(left, *candidate, cur_loop)
+                && self.all_nonterminal_paths_reach(right, *candidate, cur_loop)
+        })
+    }
+
+    fn reachable_distances_before_loop_header(
+        &self,
+        start: BlockId,
+        cur_loop: Option<Loop>,
+    ) -> HashMap<BlockId, usize> {
+        let loop_header = cur_loop.map(|lp| self.loop_tree.loop_header(lp));
+        let mut distances = HashMap::new();
+        let mut pending = VecDeque::from([(start, 0usize)]);
+        while let Some((block, distance)) = pending.pop_front() {
+            if distances.contains_key(&block) {
+                continue;
+            }
+            distances.insert(block, distance);
+            if Some(block) == loop_header && block != start {
+                continue;
+            }
+            match self.term(block) {
+                Term::Jump(next) => pending.push_back((next, distance + 1)),
+                Term::Br(nz, z) => {
+                    pending.push_back((nz, distance + 1));
+                    pending.push_back((z, distance + 1));
+                }
+                Term::Return | Term::Unreachable | Term::Other => {}
+            }
+        }
+        distances
+    }
+
+    fn all_nonterminal_paths_reach(
+        &self,
+        start: BlockId,
+        target: BlockId,
+        cur_loop: Option<Loop>,
+    ) -> bool {
+        fn visit(
+            s: &Structurer<'_>,
+            block: BlockId,
+            target: BlockId,
+            loop_header: Option<BlockId>,
+            visiting: &mut HashSet<BlockId>,
+            memo: &mut HashMap<BlockId, bool>,
+        ) -> bool {
+            if block == target {
+                return true;
+            }
+            if let Some(result) = memo.get(&block) {
+                return *result;
+            }
+            if Some(block) == loop_header || !visiting.insert(block) {
+                return false;
+            }
+            let result = match s.term(block) {
+                Term::Return | Term::Unreachable => true,
+                Term::Jump(next) => visit(s, next, target, loop_header, visiting, memo),
+                Term::Br(nz, z) => {
+                    visit(s, nz, target, loop_header, visiting, memo)
+                        && visit(s, z, target, loop_header, visiting, memo)
+                }
+                Term::Other => false,
+            };
+            visiting.remove(&block);
+            memo.insert(block, result);
+            result
+        }
+
+        visit(
+            self,
+            start,
+            target,
+            cur_loop.map(|lp| self.loop_tree.loop_header(lp)),
+            &mut HashSet::new(),
+            &mut HashMap::new(),
+        )
     }
 
     /// Whether `target` is reachable from `start` without completing the
@@ -1303,6 +1435,65 @@ mod tests {
             region,
             Region::IfThenElse { merge: Some(found), .. } if *found == latch
         )));
+    }
+
+    /// Guarded sibling paths can terminate or converge on the same nested
+    /// loop header. Terminal paths do not strictly post-dominate, but the
+    /// header is still the unique continuation of every live path and must be
+    /// emitted once as a sibling region.
+    #[test]
+    fn structurize_guarded_siblings_merge_at_nested_loop_header() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("guarded_nested_loop", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let left_guard = fb.append_block();
+        let right_guard = fb.append_block();
+        let left_path = fb.append_block();
+        let right_path = fb.append_block();
+        let loop_header = fb.append_block();
+        let loop_body = fb.append_block();
+        let trap = fb.append_block();
+        let exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.args()[0];
+        fb.insert_inst_no_result(Br::new(is, cond, left_guard, right_guard));
+        fb.switch_to_block(left_guard);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, left_path));
+        fb.switch_to_block(right_guard);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, right_path));
+        fb.switch_to_block(left_path);
+        fb.insert_inst_no_result(Jump::new(is, loop_header));
+        fb.switch_to_block(right_path);
+        fb.insert_inst_no_result(Jump::new(is, loop_header));
+        fb.switch_to_block(loop_header);
+        fb.insert_inst_no_result(Br::new(is, cond, loop_body, exit));
+        fb.switch_to_block(loop_body);
+        fb.insert_inst_no_result(Jump::new(is, loop_header));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert_eq!(
+            structured
+                .regions
+                .iter()
+                .filter(|region| matches!(
+                    region,
+                    Region::Loop { header, .. } if *header == loop_header
+                ))
+                .count(),
+            1,
+            "nested loop header must be emitted exactly once: {:?}",
+            structured.regions,
+        );
     }
 
     /// A 2-deep nested loop structurizes as Loop-in-Loop.
