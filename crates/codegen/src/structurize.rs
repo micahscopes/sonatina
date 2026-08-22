@@ -391,7 +391,7 @@ impl Structurer<'_> {
                     // arm's stop whenever both successors really converge
                     // there, without mistaking an unrelated outer join for
                     // this conditional's merge.
-                    let merge = self.find_merge(b, cur_loop)?;
+                    let merge = self.find_merge(b, cur_loop, stop)?;
                     let then_branch =
                         self.build_branch(b, nz, merge, cur_loop, active, consumed)?;
                     let else_branch = self.build_branch(b, z, merge, cur_loop, active, consumed)?;
@@ -580,9 +580,10 @@ impl Structurer<'_> {
         &self,
         header: BlockId,
         cur_loop: Option<Loop>,
+        enclosing_stop: Option<BlockId>,
     ) -> Result<Option<BlockId>, String> {
         let loop_hdr = cur_loop.map(|lp| self.loop_tree.loop_header(lp));
-        let Term::Br(_, _) = self.term(header) else {
+        let Term::Br(nz, z) = self.term(header) else {
             return Ok(None);
         };
         let header_index = self.postdom.indices[&header];
@@ -603,7 +604,57 @@ impl Structurer<'_> {
             })
             .collect::<Vec<_>>();
         match immediate.as_slice() {
-            [] => Ok(None),
+            [] => {
+                // A bounds-checked arm may either trap or continue at the
+                // other successor. The continuation is not a strict
+                // post-dominator because the trap is terminal, but it is
+                // still the structured merge for every nonterminal path.
+                // When that continuation is already the enclosing arm's
+                // stop, retain it explicitly. Otherwise the continuing arm
+                // consumes the stop and its parent consumes it a second time.
+                if Some(z) == enclosing_stop && self.returns(nz) {
+                    return Ok(Some(z));
+                }
+                if Some(nz) == enclosing_stop && self.returns(z) {
+                    return Ok(Some(nz));
+                }
+                // Search only within the current loop iteration so a later
+                // backedge cannot make the two successors appear mutually
+                // reachable.
+                let nz_reaches_z = self.reaches_before_loop_header(nz, z, cur_loop);
+                let z_reaches_nz = self.reaches_before_loop_header(z, nz, cur_loop);
+                match (nz_reaches_z, z_reaches_nz) {
+                    (true, false) => {
+                        if self.returns(z)
+                            && let Some(stop) = enclosing_stop
+                            && !self.returns(stop)
+                            && self.reaches_before_loop_header(nz, stop, cur_loop)
+                        {
+                            return Ok(Some(stop));
+                        }
+                        Ok(Some(z))
+                    }
+                    (false, true) => {
+                        if self.returns(nz)
+                            && let Some(stop) = enclosing_stop
+                            && !self.returns(stop)
+                            && self.reaches_before_loop_header(z, stop, cur_loop)
+                        {
+                            return Ok(Some(stop));
+                        }
+                        Ok(Some(nz))
+                    }
+                    _ => {
+                        if let Some(stop) = enclosing_stop
+                            && self.reaches_before_loop_header(nz, stop, cur_loop)
+                            && self.reaches_before_loop_header(z, stop, cur_loop)
+                        {
+                            return Ok(Some(stop));
+                        }
+                        Ok(None)
+                    }
+                }
+            }
             [merge] => Ok(Some(*merge)),
             _ => Err(format!(
                 "spirv structurize: {} immediate postdominator candidates for block {header:?} \
@@ -611,6 +662,41 @@ impl Structurer<'_> {
                 immediate.len()
             )),
         }
+    }
+
+    /// Whether `target` is reachable from `start` without completing the
+    /// enclosing loop iteration. Terminal return and trap paths simply stop.
+    /// This recognizes one-sided continuations without treating a later loop
+    /// iteration as evidence that two branch successors merge.
+    fn reaches_before_loop_header(
+        &self,
+        start: BlockId,
+        target: BlockId,
+        cur_loop: Option<Loop>,
+    ) -> bool {
+        let loop_header = cur_loop.map(|lp| self.loop_tree.loop_header(lp));
+        let mut pending = vec![start];
+        let mut visited = HashSet::new();
+        while let Some(block) = pending.pop() {
+            if block == target {
+                return true;
+            }
+            if Some(block) == loop_header && block != start {
+                continue;
+            }
+            if !visited.insert(block) {
+                continue;
+            }
+            match self.term(block) {
+                Term::Jump(next) => pending.push(next),
+                Term::Br(nz, z) => {
+                    pending.push(nz);
+                    pending.push(z);
+                }
+                Term::Return | Term::Unreachable | Term::Other => {}
+            }
+        }
+        false
     }
 }
 
@@ -1009,6 +1095,196 @@ mod tests {
                     Region::LoopContinue { from, target }
                         if *from == latch && *target == header
                 ))
+        )));
+    }
+
+    /// A nested guard inside a loop may trap or fall through to the other arm's
+    /// direct successor. The fallthrough is the merge for every nonterminal
+    /// path even though the terminal trap prevents strict post-dominance.
+    #[test]
+    fn structurize_loop_guard_with_trap_and_one_sided_continuation() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("guarded_loop", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let branch = fb.append_block();
+        let guarded = fb.append_block();
+        let merge = fb.append_block();
+        let trap = fb.append_block();
+        let exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.args()[0];
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, cond, branch, exit));
+        fb.switch_to_block(branch);
+        fb.insert_inst_no_result(Br::new(is, cond, guarded, merge));
+        fb.switch_to_block(guarded);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, merge));
+        fb.switch_to_block(merge);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        let loop_body = structured
+            .regions
+            .iter()
+            .find_map(|region| match region {
+                Region::Loop { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("expected loop region");
+        let outer_branch = loop_body
+            .iter()
+            .find_map(|region| match region {
+                Region::IfThenElse {
+                    then_branch,
+                    merge: Some(found),
+                    ..
+                } if *found == merge => Some(then_branch),
+                _ => None,
+            })
+            .expect("expected one-sided continuation merge");
+        assert!(outer_branch.iter().any(|region| matches!(
+            region,
+            Region::IfThenElse { merge: Some(found), .. } if *found == merge
+        )));
+    }
+
+    /// A nested checked branch can have a closer loop latch even when both the
+    /// latch and an enclosing guard may reach the same terminal trap. The
+    /// latch is the inner merge; selecting the enclosing trap consumes that
+    /// latch once per arm and produces an invalid multiply-owned region.
+    #[test]
+    fn structurize_prefers_inner_latch_over_enclosing_trap_stop() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("nested_checked_latch", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let guard_one = fb.append_block();
+        let guard_two = fb.append_block();
+        let branch = fb.append_block();
+        let body = fb.append_block();
+        let latch = fb.append_block();
+        let first_trap = fb.append_block();
+        let shared_trap = fb.append_block();
+        let exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.args()[0];
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, cond, guard_one, exit));
+        fb.switch_to_block(guard_one);
+        fb.insert_inst_no_result(Br::new(is, cond, first_trap, guard_two));
+        fb.switch_to_block(guard_two);
+        fb.insert_inst_no_result(Br::new(is, cond, shared_trap, branch));
+        fb.switch_to_block(branch);
+        fb.insert_inst_no_result(Br::new(is, cond, body, latch));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Jump::new(is, latch));
+        fb.switch_to_block(latch);
+        fb.insert_inst_no_result(Br::new(is, cond, shared_trap, header));
+        fb.switch_to_block(first_trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.switch_to_block(shared_trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        fn contains_merge(regions: &[Region], wanted: BlockId) -> bool {
+            regions.iter().any(|region| match region {
+                Region::IfThenElse {
+                    then_branch,
+                    else_branch,
+                    merge,
+                    ..
+                } => {
+                    *merge == Some(wanted)
+                        || contains_merge(then_branch, wanted)
+                        || contains_merge(else_branch, wanted)
+                }
+                Region::Loop { body, .. } => contains_merge(body, wanted),
+                _ => false,
+            })
+        }
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(
+            contains_merge(&structured.regions, latch),
+            "expected the inner branch to merge at its latch: {:?}",
+            structured.regions
+        );
+    }
+
+    /// Once an enclosing selection has established a nonterminal latch, a
+    /// nested checked arm must retain that latch as its stop. A shared trap is
+    /// reachable from the continuing arm too, but it is not that arm's merge.
+    #[test]
+    fn structurize_nested_trap_arm_retains_enclosing_latch() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("nested_trap_latch", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let decision = fb.append_block();
+        let guarded = fb.append_block();
+        let nested = fb.append_block();
+        let path = fb.append_block();
+        let latch = fb.append_block();
+        let trap = fb.append_block();
+        let exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.args()[0];
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, cond, decision, exit));
+        fb.switch_to_block(decision);
+        fb.insert_inst_no_result(Br::new(is, cond, guarded, latch));
+        fb.switch_to_block(guarded);
+        fb.insert_inst_no_result(Br::new(is, cond, nested, trap));
+        fb.switch_to_block(nested);
+        fb.insert_inst_no_result(Br::new(is, cond, path, trap));
+        fb.switch_to_block(path);
+        fb.insert_inst_no_result(Jump::new(is, latch));
+        fb.switch_to_block(latch);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, header));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        let loop_body = structured
+            .regions
+            .iter()
+            .find_map(|region| match region {
+                Region::Loop { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("expected loop region");
+        assert!(loop_body.iter().any(|region| matches!(
+            region,
+            Region::IfThenElse { merge: Some(found), .. } if *found == latch
         )));
     }
 
