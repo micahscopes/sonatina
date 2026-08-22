@@ -409,9 +409,24 @@ impl Structurer<'_> {
                     // there, without mistaking an unrelated outer join for
                     // this conditional's merge.
                     let merge = self.find_merge(b, cur_loop, stop)?;
-                    let then_branch =
-                        self.build_branch(b, nz, merge, cur_loop, active, consumed)?;
-                    let else_branch = self.build_branch(b, z, merge, cur_loop, active, consumed)?;
+                    let then_branch = self
+                        .build_branch(b, nz, merge, cur_loop, active, consumed)
+                        .map_err(|error| {
+                            format!(
+                                "{error}; while structuring nonzero arm {b:?}->{nz:?}, \
+                                 selected_merge={merge:?}, enclosing_stop={stop:?}, \
+                                 current_loop={cur_loop:?}"
+                            )
+                        })?;
+                    let else_branch = self
+                        .build_branch(b, z, merge, cur_loop, active, consumed)
+                        .map_err(|error| {
+                            format!(
+                                "{error}; while structuring zero arm {b:?}->{z:?}, \
+                                 selected_merge={merge:?}, enclosing_stop={stop:?}, \
+                                 current_loop={cur_loop:?}"
+                            )
+                        })?;
                     regions.push(Region::IfThenElse {
                         header: b,
                         then_branch,
