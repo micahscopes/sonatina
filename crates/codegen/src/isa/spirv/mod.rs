@@ -3,7 +3,10 @@
 //! Translates Sonatina IR to Naga's expression DAG + statement tree IR,
 //! then Naga emits SPIR-V. Optionally produces WGSL for debugging.
 
-use sonatina_ir::{Module, ir_writer::FuncWriter};
+use sonatina_ir::Module;
+
+#[cfg(feature = "spirv-backend")]
+use sonatina_ir::ir_writer::FuncWriter;
 
 use crate::backend::Backend;
 
@@ -2861,6 +2864,68 @@ fn block_has_return(
     })
 }
 
+#[cfg(feature = "spirv-backend")]
+fn structurize_error_with_block_ir(
+    error: String,
+    func_ref: sonatina_ir::module::FuncRef,
+    function: &sonatina_ir::Function,
+) -> String {
+    let mut labels = Vec::new();
+    for token in error.split(|character: char| !character.is_ascii_alphanumeric()) {
+        let Some(number) = token.strip_prefix("block") else {
+            continue;
+        };
+        if number.is_empty() || !number.chars().all(|character| character.is_ascii_digit()) {
+            continue;
+        }
+        if !labels.iter().any(|label| label == token) {
+            labels.push(token.to_string());
+        }
+    }
+    if labels.is_empty() {
+        return error;
+    }
+
+    let function_ir = FuncWriter::new(func_ref, function).dump_string();
+    let lines = function_ir.lines().collect::<Vec<_>>();
+    let is_block_label = |line: &str| {
+        let trimmed = line.trim();
+        let Some(name) = trimmed.strip_suffix(':') else {
+            return false;
+        };
+        let Some(number) = name.strip_prefix("block") else {
+            return false;
+        };
+        !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
+    };
+    let mut snippets = Vec::new();
+    for label in labels.into_iter().take(16) {
+        let Some(start) = lines.iter().position(|line| line.trim() == format!("{label}:")) else {
+            snippets.push(format!("{label}: <unavailable>"));
+            continue;
+        };
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find_map(|(index, line)| is_block_label(line).then_some(index))
+            .unwrap_or(lines.len());
+        let body = &lines[start..end];
+        let compact = if body.len() <= 16 {
+            body.join(" | ")
+        } else {
+            format!(
+                "{} | <{} lines omitted> | {}",
+                body[..5].join(" | "),
+                body.len() - 13,
+                body[body.len() - 8..].join(" | ")
+            )
+        };
+        snippets.push(compact);
+    }
+    format!("{error}; implicated IR: {}", snippets.join(" || "))
+}
+
 /// Under a u32 word, these signedness-sensitive ops have no correct signless
 /// lowering yet, so they fail closed. Returns the op's name if `inst_data` is one
 /// of them, else `None`. (Add/Sub/Mul are sign-agnostic under wrapping and stay
@@ -3653,7 +3718,9 @@ fn translate_to_naga(
             let scfg = match crate::structurize::structurize_function(function) {
                 Ok(scfg) => scfg,
                 Err(error) => {
-                    body_error = Some(error);
+                    body_error = Some(structurize_error_with_block_ir(
+                        error, first_func, function,
+                    ));
                     return;
                 }
             };
@@ -4090,7 +4157,12 @@ fn translate_to_naga(
                 // Scalar use (zero changes to emit_naga_regions / emit_single_inst).
                 let scfg = match crate::structurize::structurize_function(function) {
                     Ok(scfg) => scfg,
-                    Err(err) => { body_error = Some(err); return; }
+                    Err(err) => {
+                        body_error = Some(structurize_error_with_block_ir(
+                            err, first_func, function,
+                        ));
+                        return;
+                    }
                 };
                 if let Err(err) = emit_naga_regions(
                     function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
@@ -4622,7 +4694,12 @@ fn translate_to_naga(
 
             let scfg = match crate::structurize::structurize_function(function) {
                 Ok(scfg) => scfg,
-                Err(err) => { body_error = Some(err); return; }
+                Err(err) => {
+                    body_error = Some(structurize_error_with_block_ir(
+                        err, first_func, function,
+                    ));
+                    return;
+                }
             };
             if let Err(err) = emit_naga_regions(
                 function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
