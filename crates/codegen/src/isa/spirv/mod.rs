@@ -3,7 +3,7 @@
 //! Translates Sonatina IR to Naga's expression DAG + statement tree IR,
 //! then Naga emits SPIR-V. Optionally produces WGSL for debugging.
 
-use sonatina_ir::Module;
+use sonatina_ir::{Module, ir_writer::FuncWriter};
 
 use crate::backend::Backend;
 
@@ -3201,8 +3201,21 @@ fn translate_to_naga(
                             && result_ty != sonatina_ir::Type::I1
                             && result_ty != carrier_ty
                         {
+                            let function_ir = FuncWriter::new(first_func, f).dump_string();
+                            let marker = format!("v{}.", result.0);
+                            let lines = function_ir.lines().collect::<Vec<_>>();
+                            let result_ir = lines
+                                .iter()
+                                .position(|line| line.contains(&marker))
+                                .map(|line| {
+                                    let start = line.saturating_sub(16);
+                                    let end = (line + 3).min(lines.len());
+                                    lines[start..end].join(" | ")
+                                })
+                                .unwrap_or_else(|| "<result instruction unavailable>".to_string());
                             return Err(format!(
-                                "spirv: narrow or mixed integer instruction result {result:?} has unsupported type {result_ty:?}; expected {carrier_ty:?} carrier; instruction `{}`",
+                                "spirv: narrow or mixed integer instruction result {result:?} has unsupported type {result_ty:?}; expected {carrier_ty:?} carrier in `{}`; instruction `{}`; IR `{result_ir}`",
+                                sig.name(),
                                 inst_data.as_text(),
                             ));
                         }
