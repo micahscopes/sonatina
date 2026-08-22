@@ -156,6 +156,7 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
     let postdom = PostDominators::compute(&cfg, &rpo);
     let s = Structurer {
         function,
+        cfg: &cfg,
         is: function.inst_set(),
         loop_tree: &loop_tree,
         postdom: &postdom,
@@ -206,6 +207,7 @@ enum Term {
 
 struct Structurer<'a> {
     function: &'a Function,
+    cfg: &'a ControlFlowGraph,
     is: &'a dyn InstSetBase,
     loop_tree: &'a LoopTree,
     postdom: &'a PostDominators,
@@ -344,9 +346,24 @@ impl Structurer<'_> {
             }
 
             if active.contains(&b) || !consumed.insert(b) {
+                let predecessors = self.cfg.preds_of(b).copied().collect::<Vec<_>>();
+                let successors = self.cfg.succs_of(b).copied().collect::<Vec<_>>();
+                let owner_loop = self.loop_tree.loop_of_block(b);
+                let owner_header = owner_loop.map(|lp| self.loop_tree.loop_header(lp));
+                let predecessor_headers = predecessors
+                    .iter()
+                    .map(|pred| {
+                        self.loop_tree
+                            .loop_of_block(*pred)
+                            .map(|lp| self.loop_tree.loop_header(lp))
+                    })
+                    .collect::<Vec<_>>();
                 return Err(format!(
                     "spirv structurize: cyclic or multiply consumed block {b:?} while building \
-                     sequence {start:?}..{stop:?}; active={active:?}"
+                     sequence {start:?}..{stop:?}; active={active:?}; \
+                     predecessors={predecessors:?}; successors={successors:?}; \
+                     owner_loop={owner_loop:?}; owner_header={owner_header:?}; \
+                     predecessor_headers={predecessor_headers:?}"
                 ));
             }
             active.insert(b);
