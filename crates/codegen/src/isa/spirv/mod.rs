@@ -2899,7 +2899,10 @@ fn structurize_error_with_block_ir(
         !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
     };
     let mut snippets = Vec::new();
-    for label in labels.into_iter().take(16) {
+    let mut label_index = 0;
+    while label_index < labels.len() && label_index < 32 {
+        let label = labels[label_index].clone();
+        label_index += 1;
         let Some(start) = lines.iter().position(|line| line.trim() == format!("{label}:")) else {
             snippets.push(format!("{label}: <unavailable>"));
             continue;
@@ -2911,6 +2914,21 @@ fn structurize_error_with_block_ir(
             .find_map(|(index, line)| is_block_label(line).then_some(index))
             .unwrap_or(lines.len());
         let body = &lines[start..end];
+        for line in body {
+            for token in line.split(|character: char| !character.is_ascii_alphanumeric()) {
+                let Some(number) = token.strip_prefix("block") else {
+                    continue;
+                };
+                if number.is_empty()
+                    || !number.chars().all(|character| character.is_ascii_digit())
+                {
+                    continue;
+                }
+                if !labels.iter().any(|known| known == token) {
+                    labels.push(token.to_string());
+                }
+            }
+        }
         let compact = if body.len() <= 16 {
             body.join(" | ")
         } else {
