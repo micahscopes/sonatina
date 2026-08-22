@@ -801,8 +801,16 @@ impl Structurer<'_> {
             if let Some(result) = memo.get(&block) {
                 return *result;
             }
-            if Some(block) == loop_header || !visiting.insert(block) {
+            if Some(block) == loop_header {
                 return false;
+            }
+            if !visiting.insert(block) {
+                // A backedge inside a nested SCC does not escape the proposed
+                // continuation. Treat the cycle as provisionally valid while
+                // the originating visit checks every actual exit. An exit
+                // that can avoid `target` still returns false through its own
+                // branch, while a nonterminating cycle needs no merge.
+                return true;
             }
             let result = match s.term(block) {
                 Term::Return | Term::Unreachable => true,
@@ -1507,6 +1515,67 @@ mod tests {
                 .count(),
             1,
             "nested loop header must be emitted exactly once: {:?}",
+            structured.regions,
+        );
+    }
+
+    /// A guarded path may cross a complete nested loop before it reaches the
+    /// loop header shared with its sibling. Backedges inside that corridor do
+    /// not escape the continuation and must not invalidate the shared merge.
+    #[test]
+    fn structurize_guarded_nested_loop_corridor_reaches_shared_loop() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("guarded_loop_corridor", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let direct = fb.append_block();
+        let guarded = fb.append_block();
+        let inner_header = fb.append_block();
+        let inner_body = fb.append_block();
+        let inner_exit = fb.append_block();
+        let shared_header = fb.append_block();
+        let shared_body = fb.append_block();
+        let trap = fb.append_block();
+        let exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.args()[0];
+        fb.insert_inst_no_result(Br::new(is, cond, direct, guarded));
+        fb.switch_to_block(direct);
+        fb.insert_inst_no_result(Jump::new(is, shared_header));
+        fb.switch_to_block(guarded);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, inner_header));
+        fb.switch_to_block(inner_header);
+        fb.insert_inst_no_result(Br::new(is, cond, inner_body, inner_exit));
+        fb.switch_to_block(inner_body);
+        fb.insert_inst_no_result(Jump::new(is, inner_header));
+        fb.switch_to_block(inner_exit);
+        fb.insert_inst_no_result(Jump::new(is, shared_header));
+        fb.switch_to_block(shared_header);
+        fb.insert_inst_no_result(Br::new(is, cond, shared_body, exit));
+        fb.switch_to_block(shared_body);
+        fb.insert_inst_no_result(Jump::new(is, shared_header));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert_eq!(
+            structured
+                .regions
+                .iter()
+                .filter(|region| matches!(
+                    region,
+                    Region::Loop { header, .. } if *header == shared_header
+                ))
+                .count(),
+            1,
+            "shared loop header must be emitted exactly once: {:?}",
             structured.regions,
         );
     }
