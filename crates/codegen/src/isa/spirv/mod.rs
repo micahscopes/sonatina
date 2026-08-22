@@ -2944,6 +2944,41 @@ fn structurize_error_with_block_ir(
     format!("{error}; implicated IR: {}", snippets.join(" || "))
 }
 
+#[cfg(feature = "spirv-backend")]
+fn instruction_ir_context(
+    func_ref: sonatina_ir::module::FuncRef,
+    function: &sonatina_ir::Function,
+    block: sonatina_ir::BlockId,
+    instruction: &str,
+) -> String {
+    let function_ir = FuncWriter::new(func_ref, function).dump_string();
+    let lines = function_ir.lines().collect::<Vec<_>>();
+    let block_label = format!("{block:?}:");
+    let Some(block_start) = lines.iter().position(|line| line.trim() == block_label) else {
+        return "<block unavailable>".to_string();
+    };
+    let block_end = lines
+        .iter()
+        .enumerate()
+        .skip(block_start + 1)
+        .find_map(|(index, line)| {
+            let trimmed = line.trim();
+            let name = trimmed.strip_suffix(':')?;
+            let number = name.strip_prefix("block")?;
+            (!number.is_empty() && number.chars().all(|character| character.is_ascii_digit()))
+                .then_some(index)
+        })
+        .unwrap_or(lines.len());
+    let instruction_index = lines[block_start..block_end]
+        .iter()
+        .position(|line| line.contains(instruction))
+        .map(|index| block_start + index)
+        .unwrap_or(block_end.saturating_sub(1));
+    let start = instruction_index.saturating_sub(10).max(block_start);
+    let end = (instruction_index + 4).min(block_end);
+    lines[start..end].join(" | ")
+}
+
 /// Under a u32 word, these signedness-sensitive ops have no correct signless
 /// lowering yet, so they fail closed. Returns the op's name if `inst_data` is one
 /// of them, else `None`. (Add/Sub/Mul are sign-agnostic under wrapping and stay
@@ -3380,20 +3415,30 @@ fn translate_to_naga(
                     if let Some(load) = <&sonatina_ir::inst::data::Mload as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
                         has_mem = true;
                         if *load.ty() != sonatina_ir::Type::I32 {
+                            let instruction = inst_data.as_text();
+                            let context = instruction_ir_context(
+                                first_func, f, bid, &instruction,
+                            );
                             return Err(format!(
                                 "spirv: Mload of type {:?} is unsupported (Mem ops admit \
-                                 I32 only, under the u32 word only). Fail closed.",
-                                load.ty()
+                                 I32 only, under the u32 word only) in `{}` at {bid:?}; \
+                                 instruction `{instruction}`; IR `{context}`. Fail closed.",
+                                load.ty(), sig.name(),
                             ));
                         }
                     }
                     if let Some(store) = <&sonatina_ir::inst::data::Mstore as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
                         has_mem = true;
                         if *store.ty() != sonatina_ir::Type::I32 {
+                            let instruction = inst_data.as_text();
+                            let context = instruction_ir_context(
+                                first_func, f, bid, &instruction,
+                            );
                             return Err(format!(
                                 "spirv: Mstore of type {:?} is unsupported (Mem ops admit \
-                                 I32 only, under the u32 word only). Fail closed.",
-                                store.ty()
+                                 I32 only, under the u32 word only) in `{}` at {bid:?}; \
+                                 instruction `{instruction}`; IR `{context}`. Fail closed.",
+                                store.ty(), sig.name(),
                             ));
                         }
                     }
