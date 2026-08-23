@@ -9,6 +9,7 @@ mod translate;
 use std::collections::HashMap;
 
 use sonatina_ir::Module;
+use waffle::FuncDecl;
 
 use crate::backend::Backend;
 
@@ -125,10 +126,106 @@ impl Backend for WasmBackend {
             )
                 .map_err(|e| vec![WasmError::Translation(e)])?;
 
+        trace_wasm_body_pressure(&wasm_module).map_err(|e| vec![WasmError::Translation(e)])?;
+
         let bytes = wasm_module
             .to_wasm_bytes()
             .map_err(|e| vec![WasmError::Translation(format!("WAFFLE emission: {e}"))])?;
 
         Ok(WasmArtifact { bytes, func_names })
+    }
+}
+
+fn trace_wasm_body_pressure(module: &waffle::Module<'_>) -> Result<(), String> {
+    if std::env::var_os("SONATINA_WASM_BODY_PRESSURE_TRACE").is_none() {
+        return Ok(());
+    }
+
+    let mut bodies = module
+        .funcs
+        .values()
+        .filter_map(|declaration| match declaration {
+            FuncDecl::Body(signature, name, body) => Some((
+                body.values.len(),
+                body.blocks.len(),
+                module.signatures[*signature].params.len(),
+                name,
+                body,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    bodies.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.3.cmp(right.3)));
+
+    for (values, blocks, parameters, name, body) in bodies.into_iter().take(32) {
+        if values < 10_000 {
+            break;
+        }
+        let raw = body
+            .compile()
+            .map_err(|error| format!("WAFFLE pressure probe for `{name}`: {error}"))?
+            .into_raw_body();
+        let locals = encoded_local_count(&raw).ok_or_else(|| {
+            format!("WAFFLE pressure probe for `{name}` emitted malformed locals")
+        })?;
+        eprintln!(
+            "sonatina wasm body pressure: function={name} parameters={parameters} locals={locals} values={values} blocks={blocks} body_bytes={}",
+            raw.len(),
+        );
+    }
+
+    Ok(())
+}
+
+fn encoded_local_count(bytes: &[u8]) -> Option<u64> {
+    let mut offset = 0;
+    let groups = read_unsigned_leb(bytes, &mut offset)?;
+    let mut locals = 0_u64;
+    for _ in 0..groups {
+        locals = locals.checked_add(read_unsigned_leb(bytes, &mut offset)?)?;
+        offset = offset.checked_add(1)?;
+        if offset > bytes.len() {
+            return None;
+        }
+    }
+    Some(locals)
+}
+
+fn read_unsigned_leb(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut value = 0_u64;
+    let mut shift = 0_u32;
+    loop {
+        let byte = *bytes.get(*offset)?;
+        *offset += 1;
+        value |= u64::from(byte & 0x7f).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift = shift.checked_add(7)?;
+        if shift >= 64 {
+            return None;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encoded_local_count;
+
+    #[test]
+    fn decodes_emitted_local_declaration_counts() {
+        assert_eq!(encoded_local_count(&[0]), Some(0));
+        assert_eq!(encoded_local_count(&[1, 1, 0x7f]), Some(1));
+        assert_eq!(encoded_local_count(&[1, 0x82, 0x01, 0x7f]), Some(130));
+        assert_eq!(
+            encoded_local_count(&[2, 1, 0x7f, 0x80, 0x01, 0x7e]),
+            Some(129)
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_local_declarations() {
+        assert_eq!(encoded_local_count(&[0x80]), None);
+        assert_eq!(encoded_local_count(&[1, 1]), None);
     }
 }
