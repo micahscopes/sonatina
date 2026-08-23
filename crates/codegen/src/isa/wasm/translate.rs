@@ -108,10 +108,14 @@ pub(super) fn translate_module(
     let mut wmod = WaffleModule::empty();
     let mut func_names = Vec::new();
 
-    // Add linear memory (1 page = 64KB, growable)
+    // Add linear memory (1 page = 64KB, growable). Do not impose an
+    // implementation-policy maximum on generated programs. The canonical
+    // allocator retains its wasm32 overflow checks and traps when the host
+    // rejects `memory.grow`, while valid workloads may grow beyond the former
+    // arbitrary 16 MiB ceiling.
     let memory = wmod.memories.push(waffle::MemoryData {
         initial_pages: 1,
-        maximum_pages: Some(256),
+        maximum_pages: None,
         segments: vec![],
     });
     wmod.exports.push(waffle::Export {

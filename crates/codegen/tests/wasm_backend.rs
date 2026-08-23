@@ -581,7 +581,12 @@ fn canonical_arena_is_opt_in_checked_growable_and_resettable() {
         assert!(alloc.call(&mut store, invalid).is_err());
         reset.call(&mut store, ()).unwrap();
     }
-    assert!(alloc.call(&mut store, (20_000_000, 1)).is_err());
+    reset.call(&mut store, ()).unwrap();
+    assert_eq!(alloc.call(&mut store, (20_000_000, 1)).unwrap(), 1024);
+    assert!(
+        memory.size(&store) > 256,
+        "valid canonical allocations must grow beyond the former 16 MiB module ceiling"
+    );
 }
 
 #[test]
