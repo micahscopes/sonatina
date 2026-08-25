@@ -48,13 +48,24 @@ pub struct WasmArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalStackMemoryManifest {
     pub post_return_exports: Vec<String>,
+    pub scoped_host_borrows: bool,
 }
 
 impl CanonicalStackMemoryManifest {
     pub fn new(post_return_exports: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             post_return_exports: post_return_exports.into_iter().map(Into::into).collect(),
+            scoped_host_borrows: false,
         }
+    }
+
+    /// Export opaque checkpoint and rewind operations for a generated host
+    /// adapter which invokes Wasm synchronously, copies every borrowed result,
+    /// and then restores the exact pre-invocation allocator state. The exports
+    /// remain disabled unless the frontend owns that complete protocol.
+    pub fn with_scoped_host_borrows(mut self) -> Self {
+        self.scoped_host_borrows = true;
+        self
     }
 }
 

@@ -648,6 +648,10 @@ fn synthesize_canonical_memory(
 
     let mut names = std::collections::HashSet::new();
     names.insert("cabi_realloc");
+    if manifest.scoped_host_borrows {
+        names.insert("fe_cabi_checkpoint");
+        names.insert("fe_cabi_rewind");
+    }
     for name in &manifest.post_return_exports {
         if name.is_empty() || !names.insert(name.as_str()) {
             return Err(format!("duplicate or empty canonical-memory export `{name}`"));
@@ -658,6 +662,15 @@ fn synthesize_canonical_memory(
     }
     if module.exports.iter().any(|export| export.name == "cabi_realloc") {
         return Err("canonical-memory export `cabi_realloc` collides with module export".into());
+    }
+    if manifest.scoped_host_borrows {
+        for name in ["fe_cabi_checkpoint", "fe_cabi_rewind"] {
+            if module.exports.iter().any(|export| export.name == name) {
+                return Err(format!(
+                    "canonical-memory export `{name}` collides with module export"
+                ));
+            }
+        }
     }
 
     let cursor = module.globals.push(GlobalData {
@@ -1030,6 +1043,16 @@ fn synthesize_canonical_memory(
     ));
     let checkpoint = synthesize_arena_checkpoint(module, cursor, func_names);
     let rewind = synthesize_arena_rewind(module, cursor, HEAP_BASE, func_names);
+    if manifest.scoped_host_borrows {
+        module.exports.push(waffle::Export {
+            name: "fe_cabi_checkpoint".to_string(),
+            kind: ExportKind::Func(checkpoint),
+        });
+        module.exports.push(waffle::Export {
+            name: "fe_cabi_rewind".to_string(),
+            kind: ExportKind::Func(rewind),
+        });
+    }
     Ok(CanonicalArenaFunctions {
         alloc,
         checkpoint,

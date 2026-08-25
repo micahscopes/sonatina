@@ -658,6 +658,49 @@ fn canonical_stack_memory_tracks_realloc_and_reverse_post_return() {
 }
 
 #[test]
+fn canonical_stack_memory_scopes_synchronous_host_borrows() {
+    use sonatina_codegen::isa::wasm::CanonicalStackMemoryManifest;
+
+    let artifact = WasmBackend::new()
+        .with_canonical_stack_memory(
+            CanonicalStackMemoryManifest::new(["cabi_post_echo"])
+                .with_scoped_host_borrows(),
+        )
+        .compile_module(&wasm32_module_builder().build())
+        .unwrap();
+    wasmparser::validate(&artifact.bytes).unwrap();
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let realloc = instance
+        .get_typed_func::<(i32, i32, i32, i32), i32>(&mut store, "cabi_realloc")
+        .unwrap();
+    let post = instance
+        .get_typed_func::<(i32, i32, i32), ()>(&mut store, "cabi_post_echo")
+        .unwrap();
+    let checkpoint = instance
+        .get_typed_func::<(), i32>(&mut store, "fe_cabi_checkpoint")
+        .unwrap();
+    let rewind = instance
+        .get_typed_func::<i32, ()>(&mut store, "fe_cabi_rewind")
+        .unwrap();
+
+    let borrowed = realloc.call(&mut store, (0, 0, 4, 9)).unwrap();
+    let scope = checkpoint.call(&mut store, ()).unwrap();
+    let transient = realloc.call(&mut store, (0, 0, 8, 17)).unwrap();
+    rewind.call(&mut store, scope).unwrap();
+    let reused = realloc.call(&mut store, (0, 0, 8, 17)).unwrap();
+    assert_eq!(reused, transient, "rewind must reclaim only the scoped suffix");
+    post.call(&mut store, (reused, 17, 8)).unwrap();
+    post.call(&mut store, (borrowed, 9, 4)).unwrap();
+
+    let current = checkpoint.call(&mut store, ()).unwrap();
+    assert!(rewind.call(&mut store, current + 1).is_err());
+    assert!(rewind.call(&mut store, 1023).is_err());
+}
+
+#[test]
 fn mem_alloc_dynamic_uses_the_opt_in_canonical_arena() {
     let error = match WasmBackend::new().compile_module(&dynamic_alloc_module()) {
         Ok(_) => panic!("mem.alloc_dynamic compiled without the canonical arena"),
