@@ -796,6 +796,71 @@ fn build_grid_nested_return_outer_phi_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+/// A phi produced by a nested diamond feeds one incoming edge of an outer
+/// merge. Its load must be emitted inside that exact edge before the outer phi
+/// snapshots it.
+fn build_grid_nested_phi_feeds_outer_phi_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_nested_phi_feeds_outer_phi", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let nested_header = fb.append_block();
+    let other_outer_arm = fb.append_block();
+    let nested_low = fb.append_block();
+    let nested_high = fb.append_block();
+    let nested_merge = fb.append_block();
+    let outer_merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let four = fb.make_imm_value(4i32);
+    let enter_nested = fb.insert_inst(cmp::Lt::new(is, px, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, enter_nested, nested_header, other_outer_arm));
+
+    fb.switch_to_block(nested_header);
+    let choose_low = fb.insert_inst(cmp::Lt::new(is, py, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, choose_low, nested_low, nested_high));
+
+    fb.switch_to_block(nested_low);
+    let low = fb.make_imm_value(11i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, nested_merge));
+
+    fb.switch_to_block(nested_high);
+    let high = fb.make_imm_value(22i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, nested_merge));
+
+    fb.switch_to_block(nested_merge);
+    let nested = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(low, nested_low), (high, nested_high)]),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_merge));
+
+    fb.switch_to_block(other_outer_arm);
+    let other = fb.make_imm_value(33i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_merge));
+
+    fb.switch_to_block(outer_merge);
+    let result = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(nested, nested_merge), (other, other_outer_arm)]),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 /// A diamond merge carrying a phi is itself the header of the next
 /// conditional. The phi Load must be emitted before that header consumes it.
 fn build_grid_phi_headed_conditional_module() -> sonatina_ir::Module {
@@ -2074,6 +2139,24 @@ fn grid_nested_return_guards_outer_merge_phi_edge_on_lavapipe() {
     for y in 0..8u32 {
         for x in 0..8u32 {
             let expected = if x < 4 && y < 4 { 777 } else if x < 4 { x + y } else { 22 };
+            assert_eq!(output[(y * 8 + x) as usize], expected, "({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn grid_nested_phi_feeds_outer_phi_on_lavapipe() {
+    let module = build_grid_nested_phi_feeds_outer_phi_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("nested phi feeding an outer phi should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let expected = if x < 4 { if y < 4 { 11 } else { 22 } } else { 33 };
             assert_eq!(output[(y * 8 + x) as usize], expected, "({x},{y})");
         }
     }

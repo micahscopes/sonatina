@@ -2092,8 +2092,35 @@ fn emit_exact_phi_edge(
         let [(value, _)] = phi.args().iter().filter(|(_, pred)| *pred == from).collect::<Vec<_>>().as_slice() else {
             return Err(format!("spirv structurize: edge {from:?}->{to:?} does not have exactly one input for phi {result:?}"));
         };
-        let value = resolve_naga_value(*value, function, word, value_map, phi_locals, func)
-            .ok_or_else(|| format!("spirv structurize: unresolved phi input on edge {from:?}->{to:?}"))?;
+        // A nested merge phi can feed an outer merge edge without appearing
+        // in this arm's expression map. Materialize its local load in the
+        // current edge block. Returning a bare Load expression here leaves it
+        // outside Naga scope when the following Store consumes it.
+        let value = if let Some(&value) = value_map.get(value) {
+            value
+        } else if let Some(&source_local) = phi_locals.get(value) {
+            let pointer = func.expressions.append(
+                naga::Expression::LocalVariable(source_local),
+                naga::Span::UNDEFINED,
+            );
+            let loaded = func.expressions.append(
+                naga::Expression::Load { pointer },
+                naga::Span::UNDEFINED,
+            );
+            target.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                naga::Span::UNDEFINED,
+            );
+            loaded
+        } else {
+            resolve_naga_value(*value, function, word, value_map, phi_locals, func).ok_or_else(
+                || {
+                    format!(
+                        "spirv structurize: unresolved phi input on edge {from:?}->{to:?}"
+                    )
+                },
+            )?
+        };
         let temp = func.local_variables.append(
             naga::LocalVariable {
                 name: Some(format!("edge_{}_{}_phi_{}", from.0, to.0, result.0)),
