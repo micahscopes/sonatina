@@ -115,6 +115,32 @@ impl WasmBackend {
         self.import_modules = import_modules;
         self
     }
+
+    /// Compile an owned module and release each Sonatina function body after
+    /// translating it to WAFFLE. This is semantically identical to the borrowed
+    /// backend entry, while bounding peak memory for large generated modules by
+    /// avoiding two complete body graphs in memory at once.
+    pub fn compile_owned_module(&self, module: Module) -> Result<WasmArtifact, Vec<WasmError>> {
+        self.validate_memory_configuration()?;
+        let (wasm_module, func_names) = translate::translate_owned_module(
+            module,
+            &self.import_modules,
+            self.canonical_arena,
+            self.canonical_memory.as_ref(),
+        )
+        .map_err(|error| vec![WasmError::Translation(error)])?;
+        finish_wasm_module(wasm_module, func_names)
+    }
+
+    fn validate_memory_configuration(&self) -> Result<(), Vec<WasmError>> {
+        if self.canonical_arena && self.canonical_memory.is_some() {
+            return Err(vec![WasmError::Translation(
+                "legacy canonical arena and canonical-memory manifest are mutually exclusive"
+                    .to_string(),
+            )]);
+        }
+        Ok(())
+    }
 }
 
 impl Backend for WasmBackend {
@@ -122,29 +148,29 @@ impl Backend for WasmBackend {
     type Error = WasmError;
 
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        if self.canonical_arena && self.canonical_memory.is_some() {
-            return Err(vec![WasmError::Translation(
-                "legacy canonical arena and canonical-memory manifest are mutually exclusive"
-                    .to_string(),
-            )]);
-        }
-        let (wasm_module, func_names) =
-            translate::translate_module(
-                module,
-                &self.import_modules,
-                self.canonical_arena,
-                self.canonical_memory.as_ref(),
-            )
-                .map_err(|e| vec![WasmError::Translation(e)])?;
-
-        trace_wasm_body_pressure(&wasm_module).map_err(|e| vec![WasmError::Translation(e)])?;
-
-        let bytes = wasm_module
-            .to_wasm_bytes()
-            .map_err(|e| vec![WasmError::Translation(format!("WAFFLE emission: {e}"))])?;
-
-        Ok(WasmArtifact { bytes, func_names })
+        self.validate_memory_configuration()?;
+        let (wasm_module, func_names) = translate::translate_module(
+            module,
+            &self.import_modules,
+            self.canonical_arena,
+            self.canonical_memory.as_ref(),
+        )
+        .map_err(|error| vec![WasmError::Translation(error)])?;
+        finish_wasm_module(wasm_module, func_names)
     }
+}
+
+fn finish_wasm_module(
+    wasm_module: waffle::Module<'static>,
+    func_names: Vec<String>,
+) -> Result<WasmArtifact, Vec<WasmError>> {
+    trace_wasm_body_pressure(&wasm_module).map_err(|error| vec![WasmError::Translation(error)])?;
+
+    let bytes = wasm_module
+        .to_wasm_bytes()
+        .map_err(|error| vec![WasmError::Translation(format!("WAFFLE emission: {error}"))])?;
+
+    Ok(WasmArtifact { bytes, func_names })
 }
 
 fn trace_wasm_body_pressure(module: &waffle::Module<'_>) -> Result<(), String> {
