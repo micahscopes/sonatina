@@ -7,7 +7,7 @@ use crate::{
     bitset::BitSet,
     inst::{
         SideEffect, control_flow,
-        data::{self, Memzero},
+        data::{self, Memcopy, Memzero},
         evm::{
             EvmAddress, EvmBalance, EvmBaseFee, EvmBlobBaseFee, EvmBlobHash, EvmBlockHash, EvmCall,
             EvmCallCode, EvmCallValue, EvmCalldataCopy, EvmCalldataLoad, EvmCalldataSize,
@@ -709,6 +709,12 @@ fn classify_inst_effects_with<S: EffectSink>(
 
     if let Some(memzero) = <&Memzero as InstDowncast>::downcast(is, inst) {
         sink.write_range(MEMORY, *memzero.dest(), *memzero.len());
+        return sink.finish();
+    }
+
+    if let Some(memcopy) = <&Memcopy as InstDowncast>::downcast(is, inst) {
+        sink.read_range(MEMORY, *memcopy.src(), *memcopy.len());
+        sink.write_range(MEMORY, *memcopy.dest(), *memcopy.len());
         return sink.finish();
     }
 

@@ -2795,6 +2795,33 @@ impl VerifyInst for data::Memzero {
     }
 }
 
+impl VerifyInst for data::Memcopy {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        let location = verifier.inst_location(inst_id);
+        for (role, value) in [("destination", self.dest()), ("source", self.src())] {
+            if let Some(ty) = verifier.value_ty(*value)
+                && !is_integral_or_pointer(verifier.ctx, ty)
+            {
+                verifier.emit(Diagnostic::error(
+                    DiagnosticCode::InstOperandTypeMismatch,
+                    format!("memcopy {role} must be integral or pointer"),
+                    location.clone(),
+                ));
+            }
+        }
+        if let Some(len_ty) = verifier.value_ty(*self.len())
+            && !len_ty.is_integral()
+        {
+            verifier.emit(Diagnostic::error(
+                DiagnosticCode::InstOperandTypeMismatch,
+                "memcopy length must be integral",
+                location.clone(),
+            ));
+        }
+        verifier.expect_no_result(inst_id, location);
+    }
+}
+
 impl VerifyInst for control_flow::Unreachable {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
         verifier.expect_no_result(inst_id, verifier.inst_location(inst_id));

@@ -86,6 +86,7 @@ define_inst_set_base! {
         data::Mload,
         data::Mstore,
         data::Memzero,
+        data::Memcopy,
         data::Gep,
         data::GetFunctionPtr,
         data::SymAddr,
