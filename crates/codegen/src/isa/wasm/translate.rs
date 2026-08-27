@@ -1862,6 +1862,29 @@ fn translate_function(
                         let zero = body.add_op(wb, Operator::I32Const { value: 0 }, &[], &[WType::I32]);
                         body.add_op(wb, Operator::MemoryFill { mem: memory }, &[dest, zero, len], &[]);
                     }
+                    // Memcopy has the exact WebAssembly memory.copy semantics,
+                    // including overlap-safe copying within the same memory.
+                    else if let Some(memcopy) =
+                        <&sonatina_ir::inst::data::Memcopy as InstDowncast>::downcast(
+                            inst_set, inst_data,
+                        )
+                    {
+                        let dest =
+                            resolve_value(function, *memcopy.dest(), &value_map, &mut body, wb)
+                                .ok_or("unresolved memcopy destination")?;
+                        let src =
+                            resolve_value(function, *memcopy.src(), &value_map, &mut body, wb)
+                                .ok_or("unresolved memcopy source")?;
+                        let len =
+                            resolve_value(function, *memcopy.len(), &value_map, &mut body, wb)
+                                .ok_or("unresolved memcopy length")?;
+                        body.add_op(
+                            wb,
+                            Operator::MemoryCopy { dst_mem: memory, src_mem: memory },
+                            &[dest, src, len],
+                            &[],
+                        );
+                    }
                     // ExtractValue — load at field offset from base address
                     else if let Some(extract) = <&sonatina_ir::inst::data::ExtractValue as InstDowncast>::downcast(inst_set, inst_data) {
                         if let Some(result) = function.dfg.inst_result(inst_id) {

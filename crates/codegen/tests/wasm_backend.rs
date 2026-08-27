@@ -812,7 +812,7 @@ fn mem_checkpoint_and_rewind_reuse_only_the_live_arena_prefix() {
 }
 
 #[test]
-fn wasm_scalar_memory_ops_and_memzero_are_byte_exact() {
+fn wasm_scalar_memory_ops_memzero_and_memcopy_are_byte_exact() {
     let isa = Wasm32::new(wasm32_triple());
     let is = isa.inst_set();
     let mb = wasm32_module_builder();
@@ -860,6 +860,26 @@ fn wasm_scalar_memory_ops_and_memzero_are_byte_exact() {
     fb.seal_all();
     fb.finish();
 
+    let copy_func = mb
+        .declare_function(Signature::new_unit(
+            "memcopy",
+            Linkage::Public,
+            &[Type::I32, Type::I32, Type::I32],
+        ))
+        .unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(copy_func);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    fb.insert_inst_no_result(data::Memcopy::new(
+        is,
+        fb.args()[0],
+        fb.args()[1],
+        fb.args()[2],
+    ));
+    fb.insert_inst_no_result(control_flow::Return::new(is, Default::default()));
+    fb.seal_all();
+    fb.finish();
+
     let artifact = WasmBackend::new().compile_module(&mb.build()).unwrap();
     wasmparser::validate(&artifact.bytes).unwrap();
     let engine = wasmtime::Engine::default();
@@ -894,6 +914,18 @@ fn wasm_scalar_memory_ops_and_memzero_are_byte_exact() {
     let memzero = instance.get_typed_func::<(i32, i32), ()>(&mut store, "memzero").unwrap();
     memzero.call(&mut store, (43, 5)).unwrap();
     assert_eq!(&memory.data(&store)[40..52], &[0xaa, 0xaa, 0xaa, 0, 0, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa]);
+
+    memory
+        .write(&mut store, 64, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+        .unwrap();
+    let memcopy = instance
+        .get_typed_func::<(i32, i32, i32), ()>(&mut store, "memcopy")
+        .unwrap();
+    memcopy.call(&mut store, (66, 64, 8)).unwrap();
+    assert_eq!(
+        &memory.data(&store)[64..74],
+        &[0, 1, 0, 1, 2, 3, 4, 5, 6, 7],
+    );
 }
 
 /// The minted `Wasm32` ISA drives the same WAFFLE backend end to end:
