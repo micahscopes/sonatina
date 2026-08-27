@@ -105,6 +105,41 @@ pub(super) fn translate_module(
     canonical_arena: bool,
     canonical_memory: Option<&CanonicalStackMemoryManifest>,
 ) -> Result<(WaffleModule<'static>, Vec<String>), String> {
+    translate_module_inner(
+        module,
+        import_modules,
+        canonical_arena,
+        canonical_memory,
+        false,
+    )
+}
+
+/// Translate an owned Sonatina module while releasing each source function
+/// after its WAFFLE body has been derived. Function declarations remain in the
+/// module context so later callers retain the same signatures and indexes, but
+/// the full source and target body graphs do not have to coexist.
+pub(super) fn translate_owned_module(
+    module: Module,
+    import_modules: &HashMap<String, String>,
+    canonical_arena: bool,
+    canonical_memory: Option<&CanonicalStackMemoryManifest>,
+) -> Result<(WaffleModule<'static>, Vec<String>), String> {
+    translate_module_inner(
+        &module,
+        import_modules,
+        canonical_arena,
+        canonical_memory,
+        true,
+    )
+}
+
+fn translate_module_inner(
+    module: &Module,
+    import_modules: &HashMap<String, String>,
+    canonical_arena: bool,
+    canonical_memory: Option<&CanonicalStackMemoryManifest>,
+    release_translated_bodies: bool,
+) -> Result<(WaffleModule<'static>, Vec<String>), String> {
     let mut wmod = WaffleModule::empty();
     let mut func_names = Vec::new();
 
@@ -382,6 +417,13 @@ pub(super) fn translate_module(
             &target_slots,
             &indirect_signatures,
         )?;
+        if release_translated_bodies {
+            let removed = module.func_store.remove(func_ref);
+            debug_assert!(
+                removed.is_some(),
+                "owned Wasm translation must consume each translated Sonatina body",
+            );
+        }
         wmod.funcs[wfunc] = FuncDecl::Body(wsig, name, body);
     }
 

@@ -119,6 +119,34 @@ fn wasm_mutable_scalar_global_persists_per_instance() {
 }
 
 #[test]
+fn wasm_owned_translation_is_byte_exact_and_executable() {
+    let borrowed_module = mutable_i32_global_module();
+    let owned_module = mutable_i32_global_module();
+    let borrowed = WasmBackend::new().compile_module(&borrowed_module).unwrap();
+    let owned = WasmBackend::new()
+        .compile_owned_module(owned_module)
+        .unwrap();
+
+    assert_eq!(owned.bytes, borrowed.bytes);
+    assert_eq!(owned.func_names, borrowed.func_names);
+    wasmparser::validate(&owned.bytes).unwrap();
+
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, &owned.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+    let get = instance
+        .get_typed_func::<(), i32>(&mut store, "get_counter")
+        .unwrap();
+    let set = instance
+        .get_typed_func::<i32, ()>(&mut store, "set_counter")
+        .unwrap();
+    assert_eq!(get.call(&mut store, ()).unwrap(), -7);
+    set.call(&mut store, 73).unwrap();
+    assert_eq!(get.call(&mut store, ()).unwrap(), 73);
+}
+
+#[test]
 fn wasm_scalar_global_support_does_not_perturb_default_bytes() {
     let bytes = WasmBackend::new()
         .compile_module(&wasm32_module_builder().build())
