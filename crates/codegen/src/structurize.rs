@@ -756,14 +756,23 @@ impl Structurer<'_> {
                         Ok(Some(nz))
                     }
                     _ => {
+                        // Prefer the closest live continuation over the
+                        // enclosing arm's stop. A nested trap or early return
+                        // removes the local join from strict post-dominance,
+                        // but does not make an outer continuation the semantic
+                        // merge of the remaining live paths. Choosing the
+                        // outer stop here would structure the local join once
+                        // inside each sibling arm. Phi-bearing joins cannot be
+                        // cloned, and their edge transport must remain owned by
+                        // one region.
+                        if let Some(merge) = self.nearest_nonterminal_merge(nz, z, cur_loop) {
+                            return Ok(Some(merge));
+                        }
                         if let Some(stop) = enclosing_stop
                             && self.reaches_before_loop_header(nz, stop, cur_loop)
                             && self.reaches_before_loop_header(z, stop, cur_loop)
                         {
                             return Ok(Some(stop));
-                        }
-                        if let Some(merge) = self.nearest_nonterminal_merge(nz, z, cur_loop) {
-                            return Ok(Some(merge));
                         }
                         Ok(None)
                     }
