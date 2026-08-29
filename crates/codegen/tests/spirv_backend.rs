@@ -4056,6 +4056,53 @@ func public %exit_phi(v0.i32, v1.i32) -> i32 {
     assert_eq!(output, vec![12; 4]);
 }
 
+#[test]
+fn spirv_nested_terminal_arm_selects_nearest_phi_merge() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %nearest_phi_merge(v0.i32) -> i32 {
+    block0:
+        v1.i1 = lt v0 100.i32;
+        br v1 block1 block8;
+    block1:
+        v2.i1 = lt v0 10.i32;
+        br v2 block2 block3;
+    block2:
+        v3.i1 = eq v0 5.i32;
+        br v3 block9 block4;
+    block3:
+        v4.i32 = add v0 20.i32;
+        jump block5;
+    block4:
+        v5.i32 = add v0 10.i32;
+        jump block5;
+    block5:
+        v6.i32 = phi (v4 block3) (v5 block4);
+        v7.i1 = lt v6 50.i32;
+        br v7 block6 block7;
+    block6:
+        v8.i32 = add v6 1.i32;
+        jump block8;
+    block7:
+        v9.i32 = add v6 2.i32;
+        jump block8;
+    block8:
+        v10.i32 = phi (0.i32 block0) (v8 block6) (v9 block7);
+        jump block10;
+    block10:
+        return v10;
+    block9:
+        unreachable;
+}
+"#;
+    let module = sonatina_parser::parse_module(source)
+        .expect("nearest-merge regression should parse")
+        .module;
+    SpirvBackend::new()
+        .compile_module(&module)
+        .expect("the nearest live phi merge should structure before the enclosing stop");
+}
+
 fn spirv_error(source: &str, backend: SpirvBackend) -> String {
     let module = sonatina_parser::parse_module(source).expect("regression source should parse").module;
     match backend.compile_module(&module) {
