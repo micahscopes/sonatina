@@ -1665,6 +1665,51 @@ fn build_unit_compute_loop_with_exit_store_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+fn build_unit_compute_early_return_with_sibling_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_ty = mb.declare_array_type(Type::I32, 1);
+    let array_ref_ty = mb.objref_type(array_ty);
+    let word_ref_ty = mb.objref_type(Type::I32);
+    let sig = Signature::new_unit(
+        "unit_compute_early_return_with_sibling",
+        Linkage::Public,
+        &[Type::I32, array_ref_ty],
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let early = fb.append_block();
+    let normal = fb.append_block();
+    let sibling = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let invocation = fb.args()[0];
+    let values = fb.args()[1];
+    let zero = fb.make_imm_value(0i32);
+    let return_early = fb.insert_inst(cmp::Eq::new(is, invocation, zero), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, return_early, early, normal));
+
+    fb.switch_to_block(early);
+    fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+
+    fb.switch_to_block(normal);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, sibling));
+
+    fb.switch_to_block(sibling);
+    let slot = fb.insert_inst(data::ObjIndex::new(is, values, zero), word_ref_ty);
+    let receipt = fb.make_imm_value(99i32);
+    fb.insert_inst_no_result(data::ObjStore::new(is, slot, receipt));
+    fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 fn build_compute_invocation_context_module() -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
         if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
@@ -2486,6 +2531,43 @@ fn explicit_unit_compute_loop_preserves_exit_block_side_effects() {
     )
     .validate(&reparsed)
     .expect("unit compute loop WGSL must validate under browser capabilities");
+}
+
+#[test]
+fn explicit_unit_compute_early_return_guards_post_branch_sibling() {
+    let resource = SpirvExternalResource {
+        arg_index: 1,
+        group: 0,
+        binding: 0,
+        name: "values".to_string(),
+        access: Access::ReadWrite,
+        element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+        stride: 4,
+        length: 1,
+    };
+    let artifact = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(2, 1, 1)
+        .with_builtin_argument(SpirvBuiltinArgument {
+            arg_index: 0,
+            source: SpirvBuiltinSource::LocalInvocationIdX,
+        })
+        .with_external_resource(resource)
+        .compile_module(&build_unit_compute_early_return_with_sibling_module())
+        .expect("unit early return and post-branch sibling should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    assert!(
+        wgsl.contains("values[i32(0u)] = 99u;"),
+        "the normal path must retain its sibling store:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("naga wgsl-in must reparse unit early-return WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("unit early-return WGSL must validate under browser capabilities");
 }
 
 #[test]
