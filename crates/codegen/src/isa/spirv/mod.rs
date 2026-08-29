@@ -1906,6 +1906,12 @@ fn emit_naga_regions(
                     )?;
                     let mut continuation = std::mem::replace(&mut func.body, saved_body);
                     if let Some(value) = continuation_result {
+                        if !loop_return.has_result {
+                            return Err(
+                                "spirv: unit structured return continuation produced a result"
+                                    .to_string(),
+                            );
+                        }
                         let pointer = func.expressions.append(
                             naga::Expression::LocalVariable(loop_return.result),
                             naga::Span::UNDEFINED,
@@ -1914,40 +1920,49 @@ fn emit_naga_regions(
                             naga::Statement::Store { pointer, value },
                             naga::Span::UNDEFINED,
                         );
+                    } else if loop_return.has_result && !continuation.is_empty() {
+                        return Err(
+                            "spirv: value structured return continuation has no result"
+                                .to_string(),
+                        );
                     }
-                    let returned_pointer = func.expressions.append(
-                        naga::Expression::LocalVariable(loop_return.did_return),
-                        naga::Span::UNDEFINED,
-                    );
-                    let returned = func.expressions.append(
-                        naga::Expression::Load { pointer: returned_pointer },
-                        naga::Span::UNDEFINED,
-                    );
-                    func.body.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(returned, returned)),
-                        naga::Span::UNDEFINED,
-                    );
-                    func.body.push(
-                        naga::Statement::If {
-                            condition: returned,
-                            accept: naga::Block::new(),
-                            reject: continuation,
-                        },
-                        naga::Span::UNDEFINED,
-                    );
-                    let result_pointer = func.expressions.append(
-                        naga::Expression::LocalVariable(loop_return.result),
-                        naga::Span::UNDEFINED,
-                    );
-                    let loaded = func.expressions.append(
-                        naga::Expression::Load { pointer: result_pointer },
-                        naga::Span::UNDEFINED,
-                    );
-                    func.body.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
-                        naga::Span::UNDEFINED,
-                    );
-                    *result_expr = Some(loaded);
+                    if !continuation.is_empty() {
+                        let returned_pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(loop_return.did_return),
+                            naga::Span::UNDEFINED,
+                        );
+                        let returned = func.expressions.append(
+                            naga::Expression::Load { pointer: returned_pointer },
+                            naga::Span::UNDEFINED,
+                        );
+                        func.body.push(
+                            naga::Statement::Emit(naga::Range::new_from_bounds(returned, returned)),
+                            naga::Span::UNDEFINED,
+                        );
+                        func.body.push(
+                            naga::Statement::If {
+                                condition: returned,
+                                accept: naga::Block::new(),
+                                reject: continuation,
+                            },
+                            naga::Span::UNDEFINED,
+                        );
+                    }
+                    if loop_return.has_result {
+                        let result_pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(loop_return.result),
+                            naga::Span::UNDEFINED,
+                        );
+                        let loaded = func.expressions.append(
+                            naga::Expression::Load { pointer: result_pointer },
+                            naga::Span::UNDEFINED,
+                        );
+                        func.body.push(
+                            naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                            naga::Span::UNDEFINED,
+                        );
+                        *result_expr = Some(loaded);
+                    }
                     return Ok(());
                 }
             }
@@ -1972,10 +1987,23 @@ fn emit_naga_regions(
                     )?;
                     let mut continuation = std::mem::replace(&mut func.body, saved_body);
                     if let Some(value) = continuation_result {
+                        if !transport.has_result {
+                            return Err(
+                                "spirv: unit structured return continuation produced a result"
+                                    .to_string(),
+                            );
+                        }
                         let pointer = func.expressions.append(
                             naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
                         );
                         continuation.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+                    } else if transport.has_result && !continuation.is_empty() {
+                        return Err(
+                            "spirv: value structured return continuation has no result"
+                                .to_string(),
+                        );
+                    }
+                    if !continuation.is_empty() {
                         let pointer = func.expressions.append(
                             naga::Expression::LocalVariable(transport.did_return), naga::Span::UNDEFINED,
                         );
@@ -1994,20 +2022,20 @@ fn emit_naga_regions(
                             },
                             naga::Span::UNDEFINED,
                         );
-                    } else if !continuation.is_empty() {
-                        return Err("spirv: structured return continuation has no result".to_string());
                     }
-                    let pointer = func.expressions.append(
-                        naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
-                    );
-                    let loaded = func.expressions.append(
-                        naga::Expression::Load { pointer }, naga::Span::UNDEFINED,
-                    );
-                    func.body.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
-                        naga::Span::UNDEFINED,
-                    );
-                    *result_expr = Some(loaded);
+                    if transport.has_result {
+                        let pointer = func.expressions.append(
+                            naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
+                        );
+                        let loaded = func.expressions.append(
+                            naga::Expression::Load { pointer }, naga::Span::UNDEFINED,
+                        );
+                        func.body.push(
+                            naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                            naga::Span::UNDEFINED,
+                        );
+                        *result_expr = Some(loaded);
+                    }
                     return Ok(());
                 }
             }
@@ -2473,6 +2501,7 @@ enum RegionOutcome {
 struct StructuredReturnTransport {
     result: naga::Handle<naga::LocalVariable>,
     did_return: naga::Handle<naga::LocalVariable>,
+    has_result: bool,
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -2508,7 +2537,11 @@ fn allocate_return_transport(
         },
         naga::Span::UNDEFINED,
     );
-    Ok(StructuredReturnTransport { result, did_return })
+    Ok(StructuredReturnTransport {
+        result,
+        did_return,
+        has_result: return_ty.is_some(),
+    })
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -2983,6 +3016,7 @@ fn emit_recursive_loop_region(
     Ok(may_return.then_some(StructuredReturnTransport {
         result: return_local,
         did_return: did_return_local,
+        has_result: return_ty.is_some(),
     }))
 }
 
