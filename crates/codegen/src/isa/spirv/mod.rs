@@ -745,19 +745,14 @@ fn mark_trapped_always(func: &mut naga::Function, target: &mut naga::Block, mem_
     target.push(naga::Statement::Store { pointer: ptr, value: one }, naga::Span::UNDEFINED);
 }
 
-/// Compute the guarded, clamped `fe_heap` element pointer for a Mem access at
+/// Compute the guarded, clamped `fe_heap` word pointer for a Mem access at
 /// byte address `addr` (already resolved to a naga u32 expression). Emits,
 /// in order:
-///  1. Codex bug 2 (silent misaligned-access miscompile): `addr & 3 != 0` is
-///     computed and OR'd into `mem_ctx.trapped`. The naive `addr >> 2` a
-///     translator could do without this check silently discards the low
-///     bits and aliases any non-4-aligned address onto the word it happens
-///     to fall in; here that same aliased read/write still happens (SPIR-V
-///     has no sub-word access to a `var<function> array<u32>`) but is now
-///     FLAGGED, not silently trusted. Fe's own array codegen always
-///     produces 8-aligned bases/strides (`layout_utils.rs`), so this guard
-///     is not expected to fire for accepted Fe programs; it exists so the
-///     translator does not merely ASSUME that invariant.
+///  1. When `require_word_alignment` is true, `addr & 3 != 0` is computed and
+///     OR'd into `mem_ctx.trapped`. An I32 access requires this check because
+///     shifting the address would otherwise silently alias a neighboring word.
+///     I1 accesses deliberately pass false: they use the low address bits to
+///     select one byte inside the containing word.
 ///  2. Codex bug 1 (heap-exhaustion aliasing), the per-access half: the word
 ///     index is `Min`-clamped into `[0, heap_words)` via `Select` so a bad or
 ///     wrapped address can only ever produce an in-range `OpAccessChain`
@@ -769,12 +764,15 @@ fn emit_mem_access(
     target: &mut naga::Block,
     mem_ctx: MemCtx,
     addr: naga::Handle<naga::Expression>,
+    require_word_alignment: bool,
 ) -> naga::Handle<naga::Expression> {
-    let three = lit_u32(func, 3);
-    let low_bits = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::And, left: addr, right: three });
-    let zero = lit_u32(func, 0);
-    let misaligned = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::NotEqual, left: low_bits, right: zero });
-    mark_trapped_if(func, target, mem_ctx, misaligned);
+    if require_word_alignment {
+        let three = lit_u32(func, 3);
+        let low_bits = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::And, left: addr, right: three });
+        let zero = lit_u32(func, 0);
+        let misaligned = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::NotEqual, left: low_bits, right: zero });
+        mark_trapped_if(func, target, mem_ctx, misaligned);
+    }
 
     let heap_ctx = mem_ctx.heap();
     let two = lit_u32(func, 2);
@@ -1296,6 +1294,34 @@ fn emit_single_inst(
             value_map.insert(result, converted);
             return true;
         }
+    } else if let Some(trunc) =
+        <&sonatina_ir::inst::cast::Trunc as InstDowncast>::downcast(inst_set, inst_data)
+    {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let from = resolve_naga_value(
+                *trunc.from(),
+                function,
+                word,
+                value_map,
+                phi_locals,
+                func,
+            )
+            .unwrap();
+            let one = lit_u32(func, 1);
+            let low_bit = emit_expr(func, target, naga::Expression::Binary {
+                op: naga::BinaryOperator::And,
+                left: from,
+                right: one,
+            });
+            let zero = lit_u32(func, 0);
+            let value = emit_expr(func, target, naga::Expression::Binary {
+                op: naga::BinaryOperator::NotEqual,
+                left: low_bit,
+                right: zero,
+            });
+            value_map.insert(result, value);
+            return true;
+        }
     } else if let Some(bitcast) =
         <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(inst_set, inst_data)
     {
@@ -1733,8 +1759,54 @@ fn emit_single_inst(
                 ));
                 return false;
             };
-            let elem = emit_mem_access(func, target, mem_ctx, addr);
-            let loaded = emit_expr(func, target, naga::Expression::Load { pointer: elem });
+            let elem = emit_mem_access(
+                func,
+                target,
+                mem_ctx,
+                addr,
+                *load.ty() == sonatina_ir::Type::I32,
+            );
+            let loaded_word = emit_expr(func, target, naga::Expression::Load { pointer: elem });
+            let loaded = if *load.ty() == sonatina_ir::Type::I1 {
+                let three = lit_u32(func, 3);
+                let byte_lane = emit_expr(func, target, naga::Expression::Binary {
+                    op: naga::BinaryOperator::And,
+                    left: addr,
+                    right: three,
+                });
+                let eight = lit_u32(func, 8);
+                let shift = emit_expr(func, target, naga::Expression::Binary {
+                    op: naga::BinaryOperator::Multiply,
+                    left: byte_lane,
+                    right: eight,
+                });
+                let shifted = emit_expr(func, target, naga::Expression::Binary {
+                    op: naga::BinaryOperator::ShiftRight,
+                    left: loaded_word,
+                    right: shift,
+                });
+                let byte_mask = lit_u32(func, 0xff);
+                let byte = emit_expr(func, target, naga::Expression::Binary {
+                    op: naga::BinaryOperator::And,
+                    left: shifted,
+                    right: byte_mask,
+                });
+                if function.dfg.value_ty(result) == sonatina_ir::Type::I1 {
+                    let zero = lit_u32(func, 0);
+                    emit_expr(func, target, naga::Expression::Binary {
+                        op: naga::BinaryOperator::NotEqual,
+                        left: byte,
+                        right: zero,
+                    })
+                } else {
+                    // Narrow memory loads use the backend's I32 register
+                    // carrier. A following Sonatina `trunc i1` recovers the
+                    // logical boolean, matching Wasm's `i32.load8_u` shape.
+                    byte
+                }
+            } else {
+                loaded_word
+            };
             value_map.insert(result, loaded);
             return true;
         }
@@ -1756,8 +1828,66 @@ fn emit_single_inst(
             ));
             return false;
         };
-        let elem = emit_mem_access(func, target, mem_ctx, addr);
-        target.push(naga::Statement::Store { pointer: elem, value }, naga::Span::UNDEFINED);
+        let elem = emit_mem_access(
+            func,
+            target,
+            mem_ctx,
+            addr,
+            *store.ty() == sonatina_ir::Type::I32,
+        );
+        if *store.ty() == sonatina_ir::Type::I1 {
+            let old_word = emit_expr(func, target, naga::Expression::Load { pointer: elem });
+            let three = lit_u32(func, 3);
+            let byte_lane = emit_expr(func, target, naga::Expression::Binary {
+                op: naga::BinaryOperator::And,
+                left: addr,
+                right: three,
+            });
+            let eight = lit_u32(func, 8);
+            let shift = emit_expr(func, target, naga::Expression::Binary {
+                op: naga::BinaryOperator::Multiply,
+                left: byte_lane,
+                right: eight,
+            });
+            let byte_mask = lit_u32(func, 0xff);
+            let shifted_mask = emit_expr(func, target, naga::Expression::Binary {
+                op: naga::BinaryOperator::ShiftLeft,
+                left: byte_mask,
+                right: shift,
+            });
+            let inverse_mask = emit_expr(func, target, naga::Expression::Unary {
+                op: naga::UnaryOperator::BitwiseNot,
+                expr: shifted_mask,
+            });
+            let cleared_word = emit_expr(func, target, naga::Expression::Binary {
+                op: naga::BinaryOperator::And,
+                left: old_word,
+                right: inverse_mask,
+            });
+            let one = lit_u32(func, 1);
+            let zero = lit_u32(func, 0);
+            let bool_word = emit_expr(func, target, naga::Expression::Select {
+                condition: value,
+                accept: one,
+                reject: zero,
+            });
+            let shifted_value = emit_expr(func, target, naga::Expression::Binary {
+                op: naga::BinaryOperator::ShiftLeft,
+                left: bool_word,
+                right: shift,
+            });
+            let updated_word = emit_expr(func, target, naga::Expression::Binary {
+                op: naga::BinaryOperator::InclusiveOr,
+                left: cleared_word,
+                right: shifted_value,
+            });
+            target.push(
+                naga::Statement::Store { pointer: elem, value: updated_word },
+                naga::Span::UNDEFINED,
+            );
+        } else {
+            target.push(naga::Statement::Store { pointer: elem, value }, naga::Span::UNDEFINED);
+        }
         return true;
     } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(&val_id) = ret.args().as_slice().first() {
@@ -2939,7 +3069,7 @@ fn emit_recursive_loop_region(
         if let RegionOutcome::Fallthrough(resume) = body_outcome && resume != header {
             return Err(format!(
                 "spirv structurize: loop {header:?} body falls through to {resume:?} \
-                 instead of terminating"
+                 instead of terminating; canonical exit={exit:?}; body regions={body_regions:?}"
             ));
         }
     }
@@ -3250,6 +3380,7 @@ fn spirv_instruction_is_lowered(
         || <&sonatina_ir::inst::cast::U32ToF32 as InstDowncast>::downcast(is, inst).is_some()
         || <&sonatina_ir::inst::cast::F32ToI32 as InstDowncast>::downcast(is, inst).is_some()
         || <&sonatina_ir::inst::cast::F32ToU32 as InstDowncast>::downcast(is, inst).is_some()
+        || <&sonatina_ir::inst::cast::Trunc as InstDowncast>::downcast(is, inst).is_some()
         || <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAlloc as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
@@ -3636,10 +3767,38 @@ fn translate_to_naga(
                         }
                     }
                     if !spirv_instruction_is_lowered(is, inst_data) {
+                        let instruction = inst_data.as_text();
+                        let context = instruction_ir_context(
+                            first_func, f, bid, &instruction,
+                        );
                         return Err(format!(
-                            "spirv: instruction `{}` is unsupported by the SPIR-V translator",
-                            inst_data.as_text()
+                            "spirv: instruction `{instruction}` is unsupported by the SPIR-V \
+                             translator in `{}` at {bid:?}; IR `{context}`",
+                            sig.name(),
                         ));
+                    }
+                    if let Some(trunc) =
+                        <&sonatina_ir::inst::cast::Trunc as sonatina_ir::InstDowncast>::downcast(
+                            is, inst_data,
+                        )
+                    {
+                        let from_ty = f.dfg.value_ty(*trunc.from());
+                        let to_ty = *trunc.ty();
+                        if word != WordKind::U32
+                            || from_ty != sonatina_ir::Type::I32
+                            || to_ty != sonatina_ir::Type::I1
+                        {
+                            let instruction = inst_data.as_text();
+                            let context = instruction_ir_context(
+                                first_func, f, bid, &instruction,
+                            );
+                            return Err(format!(
+                                "spirv: Trunc supports exactly i32 -> i1 under the u32 browser \
+                                 word; got {from_ty:?} -> {to_ty:?} in `{}` at {bid:?}; \
+                                 instruction `{instruction}`; IR `{context}`. Fail closed.",
+                                sig.name(),
+                            ));
+                        }
                     }
                     if let Some(bitcast) =
                         <&sonatina_ir::inst::cast::Bitcast as sonatina_ir::InstDowncast>::downcast(
@@ -3711,14 +3870,25 @@ fn translate_to_naga(
                     }
                     if let Some(load) = <&sonatina_ir::inst::data::Mload as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
                         has_mem = true;
-                        if *load.ty() != sonatina_ir::Type::I32 {
+                        let result_ty = f
+                            .dfg
+                            .inst_result(iid)
+                            .map(|result| f.dfg.value_ty(result));
+                        let admitted = word == WordKind::U32
+                            && matches!(
+                                (load.ty(), result_ty),
+                                (sonatina_ir::Type::I1, Some(sonatina_ir::Type::I1))
+                                    | (sonatina_ir::Type::I1, Some(sonatina_ir::Type::I32))
+                                    | (sonatina_ir::Type::I32, Some(sonatina_ir::Type::I32))
+                            );
+                        if !admitted {
                             let instruction = inst_data.as_text();
                             let context = instruction_ir_context(
                                 first_func, f, bid, &instruction,
                             );
                             return Err(format!(
-                                "spirv: Mload of type {:?} is unsupported (Mem ops admit \
-                                 I32 only, under the u32 word only) in `{}` at {bid:?}; \
+                                "spirv: Mload memory/result types {:?}/{result_ty:?} are unsupported \
+                                 (u32 admits I1 -> I1 or I32 and I32 -> I32) in `{}` at {bid:?}; \
                                  instruction `{instruction}`; IR `{context}`. Fail closed.",
                                 load.ty(), sig.name(),
                             ));
@@ -3726,14 +3896,21 @@ fn translate_to_naga(
                     }
                     if let Some(store) = <&sonatina_ir::inst::data::Mstore as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
                         has_mem = true;
-                        if *store.ty() != sonatina_ir::Type::I32 {
+                        let value_ty = f.dfg.value_ty(*store.value());
+                        let admitted = word == WordKind::U32
+                            && matches!(
+                                (store.ty(), value_ty),
+                                (sonatina_ir::Type::I1, sonatina_ir::Type::I1)
+                                    | (sonatina_ir::Type::I32, sonatina_ir::Type::I32)
+                            );
+                        if !admitted {
                             let instruction = inst_data.as_text();
                             let context = instruction_ir_context(
                                 first_func, f, bid, &instruction,
                             );
                             return Err(format!(
-                                "spirv: Mstore of type {:?} is unsupported (Mem ops admit \
-                                 I32 only, under the u32 word only) in `{}` at {bid:?}; \
+                                "spirv: Mstore memory/value types {:?}/{value_ty:?} are unsupported \
+                                 (u32 admits matching I1 or I32 values) in `{}` at {bid:?}; \
                                  instruction `{instruction}`; IR `{context}`. Fail closed.",
                                 store.ty(), sig.name(),
                             ));
@@ -4200,7 +4377,9 @@ fn translate_to_naga(
                 &mut ignored_result,
                 mem_ctx,
             ) {
-                body_error = Some(error);
+                body_error = Some(structurize_error_with_block_ir(
+                    error, first_func, function,
+                ));
             }
         });
         if let Some(error) = body_error {
@@ -4647,7 +4826,9 @@ fn translate_to_naga(
                     // there is never a heap/trap context here.
                     None,
                 ) {
-                    body_error = Some(err);
+                    body_error = Some(structurize_error_with_block_ir(
+                        err, first_func, function,
+                    ));
                 }
             });
         }
@@ -4906,16 +5087,6 @@ fn translate_to_naga(
     };
 
     // u32 vec3 type for global_invocation_id
-    let u32_type = naga_mod.types.insert(
-        naga::Type {
-            name: None,
-            inner: naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Uint,
-                width: 4,
-            }),
-        },
-        naga::Span::UNDEFINED,
-    );
     let vec3_u32_type = naga_mod.types.insert(
         naga::Type {
             name: None,
@@ -5185,7 +5356,9 @@ fn translate_to_naga(
                 function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
                 &mut func, &mut value_map, &mut phi_locals, &mut result_expr, mem_ctx,
             ) {
-                body_error = Some(err);
+                body_error = Some(structurize_error_with_block_ir(
+                    err, first_func, function,
+                ));
             }
         });
     }

@@ -4824,14 +4824,11 @@ fn spirv_mem_alloc_inside_loop_fails_closed() {
     eprintln!("loop-carried allocation correctly fails closed: {msg}");
 }
 
-/// Design section 2: Mem ops admit the I32 element type ONLY. A `Mload` of
-/// any other type must fail closed (never silently truncate/widen through
-/// the u32 heap word). I1 is used here specifically because it is the one
-/// integral type the pre-scan's generic narrow/mixed-carrier-type check does
-/// NOT already reject on its own, so this test is known to exercise the
-/// Mem-specific type gate rather than a different, earlier check.
+/// I1 memory uses Wasm-compatible byte addressing over the private u32 heap.
+/// The deliberately unaligned `base + 1` access must select the second byte,
+/// preserve its neighboring bytes, and remain valid SPIR-V/WGSL.
 #[test]
-fn spirv_mem_non_i32_type_fails_closed() {
+fn spirv_i1_mem_uses_byte_exact_packed_heap() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
     ));
@@ -4841,27 +4838,42 @@ fn spirv_mem_non_i32_type_fails_closed() {
     let func_ref = mb.declare_function(sig).unwrap();
     let mut fb = mb.func_builder::<InstInserter>(func_ref);
     let entry = fb.append_block();
+    let is_true = fb.append_block();
+    let is_false = fb.append_block();
+
     fb.switch_to_block(entry);
-    let size = fb.make_imm_value(16i32);
+    let size = fb.make_imm_value(4i32);
     let base = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
-    let flag = fb.insert_inst(data::Mload::new(is, base, Type::I1), Type::I1);
-    let widened = fb.insert_inst(cast::Zext::new(is, flag, Type::I32), Type::I32);
-    fb.insert_inst_no_result(control_flow::Return::new_single(is, widened));
+    let original = fb.make_imm_value(0x5a5a_5a5ai32);
+    fb.insert_inst_no_result(data::Mstore::new(is, base, original, Type::I32));
+    let one = fb.make_imm_value(1i32);
+    let byte_one = fb.insert_inst(arith::Add::new(is, base, one), Type::I32);
+    let value = fb.make_imm_value(true);
+    fb.insert_inst_no_result(data::Mstore::new(is, byte_one, value, Type::I1));
+    let loaded_byte = fb.insert_inst(data::Mload::new(is, byte_one, Type::I1), Type::I32);
+    let flag = fb.insert_inst(cast::Trunc::new(is, loaded_byte, Type::I1), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, flag, is_true, is_false));
+
+    fb.switch_to_block(is_true);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, one));
+
+    fb.switch_to_block(is_false);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, zero));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = SpirvBackend::new();
-    let errors = match backend.compile_module(&module) {
-        Ok(_) => panic!("an I1-typed Mload must fail closed (Mem ops admit I32 only)"),
-        Err(errors) => errors,
-    };
-    let msg = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+    let artifact = SpirvBackend::new()
+        .compile_module(&module)
+        .expect("I1 byte-lane memory must compile to validated SPIR-V");
+    assert_eq!(artifact.words[0], 0x0723_0203, "valid SPIR-V magic");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(wgsl.contains("fe_heap"), "private heap must appear in WGSL:\n{wgsl}");
     assert!(
-        msg.contains("Mload of type") && msg.contains("I32 only"),
-        "expected the named Mem-element-type rejection, got: {msg}"
+        wgsl.contains("255u") && wgsl.contains("<<") && wgsl.contains(">>"),
+        "I1 memory must use a byte mask and lane shifts over the u32 heap:\n{wgsl}"
     );
-    eprintln!("non-I32 Mem access correctly fails closed: {msg}");
 }
 
 /// Design section 2: Mem ops are supported under the u32 (browser) word
