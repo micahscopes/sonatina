@@ -277,6 +277,101 @@ impl Structurer<'_> {
         visit(self, start, lp, &mut HashSet::new(), &mut HashMap::new())
     }
 
+    /// Whether every control-flow exit from `start` reaches the loop's
+    /// canonical fallthrough block without returning to the outer header. A
+    /// corridor may contain a compiler-recognized nested loop, so a reducible
+    /// backedge is valid as long as at least one path leaves that loop and all
+    /// such exits continue to the canonical fallthrough. These blocks belong
+    /// inside the structured break arm because they compute values consumed by
+    /// exit phis.
+    fn is_loop_exit_corridor(&self, start: BlockId, lp: Loop) -> bool {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Reach {
+            Invalid,
+            BackedgeOnly,
+            Canonical,
+        }
+
+        fn combine(left: Reach, right: Reach) -> Reach {
+            match (left, right) {
+                (Reach::Invalid, _) | (_, Reach::Invalid) => Reach::Invalid,
+                (Reach::Canonical, _) | (_, Reach::Canonical) => Reach::Canonical,
+                (Reach::BackedgeOnly, Reach::BackedgeOnly) => Reach::BackedgeOnly,
+            }
+        }
+
+        fn visit(
+            s: &Structurer<'_>,
+            block: BlockId,
+            lp: Loop,
+            canonical: BlockId,
+            visiting: &mut HashSet<BlockId>,
+            memo: &mut HashMap<BlockId, Reach>,
+        ) -> Reach {
+            if block == canonical {
+                return Reach::Canonical;
+            }
+            // Loop-tree membership is too coarse here: an exit-arm tail may be
+            // assigned to the outer loop even though it cannot reach the
+            // backedge. Reaching the header itself is the semantic continue
+            // boundary that a break corridor must never cross.
+            if block == s.loop_tree.loop_header(lp) {
+                return Reach::Invalid;
+            }
+            if let Some(&result) = memo.get(&block) {
+                return result;
+            }
+            if visiting.contains(&block) {
+                return match s.loop_tree.loop_of_block(block) {
+                    Some(nested)
+                        if nested != lp && s.loop_tree.loop_header(nested) == block =>
+                    {
+                        Reach::BackedgeOnly
+                    }
+                    _ => Reach::Invalid,
+                };
+            }
+            visiting.insert(block);
+            let result = match s.term(block) {
+                Term::Jump(target) => visit(s, target, lp, canonical, visiting, memo),
+                Term::Br(nz, z) => combine(
+                    visit(s, nz, lp, canonical, visiting, memo),
+                    visit(s, z, lp, canonical, visiting, memo),
+                ),
+                Term::Return | Term::Unreachable | Term::Other => Reach::Invalid,
+            };
+            visiting.remove(&block);
+            memo.insert(block, result);
+            if std::env::var_os("SONATINA_STRUCTURIZE_TRACE").is_some() {
+                eprintln!(
+                    "[spirv structurize] corridor block={block:?}, owner={:?}, result={result:?}",
+                    s.loop_tree.loop_of_block(block),
+                );
+            }
+            result
+        }
+
+        let header = self.loop_tree.loop_header(lp);
+        let Some(canonical) = self.loop_direct_exit(header, lp) else {
+            return false;
+        };
+        let result = start != canonical
+            && visit(
+                self,
+                start,
+                lp,
+                canonical,
+                &mut HashSet::new(),
+                &mut HashMap::new(),
+            ) == Reach::Canonical;
+        if std::env::var_os("SONATINA_STRUCTURIZE_TRACE").is_some() {
+            eprintln!(
+                "[spirv structurize] corridor start={start:?}, outer={lp:?}, canonical={canonical:?}, result={result}"
+            );
+        }
+        result
+    }
+
     fn in_loop(&self, b: BlockId, lp: Loop) -> bool {
         self.loop_tree.is_in_loop(b, lp)
     }
@@ -338,6 +433,8 @@ impl Structurer<'_> {
         let mut cloning = clone_shared_subtree;
         let allow_return_corridor = cur_loop
             .is_some_and(|lp| !self.in_loop(start, lp) && self.is_return_corridor(start, lp));
+        let allow_loop_exit_corridor = cur_loop
+            .is_some_and(|lp| !self.in_loop(start, lp) && self.is_loop_exit_corridor(start, lp));
 
         while let Some(b) = cur {
             if Some(b) == stop {
@@ -350,7 +447,11 @@ impl Structurer<'_> {
                 }
                 // A fallthrough exit (a non-return block outside the loop) is
                 // resumed by the caller, not structured inside the loop.
-                if !self.in_loop(b, lp) && b != start && !self.returns(b) && !allow_return_corridor
+                if !self.in_loop(b, lp)
+                    && b != start
+                    && !self.returns(b)
+                    && !allow_return_corridor
+                    && !allow_loop_exit_corridor
                 {
                     break;
                 }
@@ -439,9 +540,11 @@ impl Structurer<'_> {
                 Term::Jump(t) => {
                     regions.push(Region::Block(b));
                     if let Some(lp) = cur_loop
-                        && !self.in_loop(t, lp)
-                        && (self.is_canonical_loop_exit(lp, t) || !self.returns(t))
-                        && !self.is_return_corridor(t, lp)
+                        && (self.is_canonical_loop_exit(lp, t)
+                            || (!allow_loop_exit_corridor
+                                && !self.in_loop(t, lp)
+                                && !self.returns(t)
+                                && !self.is_return_corridor(t, lp)))
                     {
                         self.validate_loop_exit_target(lp, b, t)?;
                         regions.push(Region::LoopExit { from: b, target: t });
@@ -484,7 +587,13 @@ impl Structurer<'_> {
                         else_branch,
                         merge,
                     });
-                    cur = merge;
+                    cur = if let (Some(lp), Some(merge)) = (cur_loop, merge)
+                        && self.is_canonical_loop_exit(lp, merge)
+                    {
+                        None
+                    } else {
+                        merge
+                    };
                 }
                 Term::Other => {
                     return Err(format!(
@@ -510,13 +619,18 @@ impl Structurer<'_> {
         active: &mut HashSet<BlockId>,
         consumed: &mut HashSet<BlockId>,
     ) -> Result<Vec<Region>, String> {
-        if Some(target) == merge {
-            return Ok(Vec::new());
-        }
         if let Some(lp) = cur_loop
             && target == self.loop_tree.loop_header(lp)
         {
             return Ok(vec![Region::LoopContinue { from, target }]);
+        }
+        if let Some(lp) = cur_loop
+            && self.is_canonical_loop_exit(lp, target)
+        {
+            return Ok(vec![Region::LoopExit { from, target }]);
+        }
+        if Some(target) == merge {
+            return Ok(Vec::new());
         }
         if let Some(merge) = merge
             && self.is_direct_merge_arm(target, merge)
@@ -528,6 +642,19 @@ impl Structurer<'_> {
             // while each emitted copy has its own branch-local value map.
             consumed.insert(target);
             return Ok(vec![Region::Block(target)]);
+        }
+        if let Some(lp) = cur_loop
+            && !self.in_loop(target, lp)
+            && self.is_loop_exit_corridor(target, lp)
+        {
+            return self.build_seq(
+                target,
+                merge,
+                cur_loop,
+                clone_shared_subtree,
+                active,
+                consumed,
+            );
         }
         if let Some(lp) = cur_loop
             && !self.in_loop(target, lp)
@@ -2258,9 +2385,14 @@ mod tests {
     }
 
     #[test]
-    fn nonreturning_noncanonical_loop_exit_fails_closed_by_name() {
+    fn conditional_loop_exit_corridor_reaches_canonical_break() {
         let (mb, is) = native_builder();
-        let sig = Signature::new_unit("noncanonical_loop_exit", Linkage::Public, &[]);
+        let sig = Signature::new_single(
+            "conditional_loop_exit_corridor",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        );
         let fr = mb.declare_function(sig).unwrap();
         let mut fb = mb.func_builder::<InstInserter>(fr);
         let entry = fb.append_block();
@@ -2268,7 +2400,95 @@ mod tests {
         let body = fb.append_block();
         let latch = fb.append_block();
         let canonical_exit = fb.append_block();
-        let other_exit = fb.append_block();
+        let corridor_decision = fb.append_block();
+        let corridor_value = fb.append_block();
+        let corridor_merge = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.make_imm_value(true);
+        let header_value = fb.make_imm_value(7i32);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, cond, body, canonical_exit));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Br::new(is, cond, corridor_decision, latch));
+        fb.switch_to_block(latch);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(corridor_decision);
+        let direct_value = fb.make_imm_value(11i32);
+        fb.insert_inst_no_result(Br::new(is, cond, corridor_value, corridor_merge));
+        fb.switch_to_block(corridor_value);
+        let arm_value = fb.make_imm_value(22i32);
+        fb.insert_inst_no_result(Jump::new(is, corridor_merge));
+        fb.switch_to_block(corridor_merge);
+        let selected = fb.insert_inst(
+            Phi::new(
+                is,
+                vec![
+                    (direct_value, corridor_decision),
+                    (arm_value, corridor_value),
+                ],
+            ),
+            Type::I32,
+        );
+        fb.switch_to_block(canonical_exit);
+        let result = fb.insert_inst(
+            Phi::new(
+                is,
+                vec![(header_value, header), (selected, corridor_merge)],
+            ),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(Return::new_single(is, result));
+        fb.switch_to_block(corridor_merge);
+        fb.insert_inst_no_result(Jump::new(is, canonical_exit));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = module
+            .func_store
+            .view(fr, |func| structurize_function(func))
+            .expect("an outside-SCC corridor to the canonical break should structure");
+
+        fn contains_exit(regions: &[Region], from: BlockId, target: BlockId) -> bool {
+            regions.iter().any(|region| match region {
+                Region::LoopExit {
+                    from: actual_from,
+                    target: actual_target,
+                } => *actual_from == from && *actual_target == target,
+                Region::Loop { body, .. } => contains_exit(body, from, target),
+                Region::IfThenElse {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    contains_exit(then_branch, from, target)
+                        || contains_exit(else_branch, from, target)
+                }
+                Region::Block(_) | Region::LoopContinue { .. } => false,
+            })
+        }
+        assert!(
+            contains_exit(&structured.regions, corridor_merge, canonical_exit),
+            "the conditional phi corridor must retain the exact exit predecessor: {:?}",
+            structured.regions,
+        );
+    }
+
+    #[test]
+    fn mixed_break_and_return_corridor_fails_closed() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("mixed_break_return", Linkage::Public, &[]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let body = fb.append_block();
+        let latch = fb.append_block();
+        let canonical_exit = fb.append_block();
+        let mixed_exit = fb.append_block();
+        let early_return = fb.append_block();
 
         fb.switch_to_block(entry);
         let cond = fb.make_imm_value(true);
@@ -2276,24 +2496,137 @@ mod tests {
         fb.switch_to_block(header);
         fb.insert_inst_no_result(Br::new(is, cond, body, canonical_exit));
         fb.switch_to_block(body);
-        fb.insert_inst_no_result(Br::new(is, cond, other_exit, latch));
+        fb.insert_inst_no_result(Br::new(is, cond, mixed_exit, latch));
         fb.switch_to_block(latch);
         fb.insert_inst_no_result(Jump::new(is, header));
-        fb.switch_to_block(other_exit);
-        fb.insert_inst_no_result(Br::new(is, cond, canonical_exit, canonical_exit));
+        fb.switch_to_block(mixed_exit);
+        fb.insert_inst_no_result(Br::new(is, cond, canonical_exit, early_return));
         fb.switch_to_block(canonical_exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(early_return);
         fb.insert_inst_no_result(Return::new_unit(is));
         fb.seal_all();
         fb.finish();
 
         let module = mb.build();
-        let result = module
+        let error = module
             .func_store
-            .view(fr, |func| structurize_function(func));
-        let error = result.expect_err("a noncanonical break must fail closed");
+            .view(fr, |func| structurize_function(func))
+            .expect_err("a mixed break/return corridor must remain fail-closed");
         assert!(
             error.contains("noncanonical exit") && error.contains("expected the header exit"),
-            "expected a named noncanonical-exit error, got: {error}"
+            "expected a named noncanonical-exit error, got: {error}",
+        );
+    }
+
+    #[test]
+    fn nested_loop_exit_corridor_reaches_outer_canonical_break() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_single(
+            "nested_loop_exit_corridor",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let outer_header = fb.append_block();
+        let outer_body = fb.append_block();
+        let outer_latch = fb.append_block();
+        let canonical_exit = fb.append_block();
+        let corridor_entry = fb.append_block();
+        let inner_header = fb.append_block();
+        let inner_body = fb.append_block();
+        let corridor_exit = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let cond = fb.make_imm_value(true);
+        let zero = fb.make_imm_value(0i32);
+        let two = fb.make_imm_value(2i32);
+        let header_value = fb.make_imm_value(7i32);
+        fb.insert_inst_no_result(Jump::new(is, outer_header));
+        fb.switch_to_block(outer_header);
+        fb.insert_inst_no_result(Br::new(is, cond, outer_body, canonical_exit));
+        fb.switch_to_block(outer_body);
+        fb.insert_inst_no_result(Br::new(is, cond, corridor_entry, outer_latch));
+        fb.switch_to_block(outer_latch);
+        fb.insert_inst_no_result(Jump::new(is, outer_header));
+        fb.switch_to_block(corridor_entry);
+        fb.insert_inst_no_result(Jump::new(is, inner_header));
+        fb.switch_to_block(inner_header);
+        let i = fb.insert_inst(Phi::new(is, vec![(zero, corridor_entry)]), Type::I32);
+        let inner_cond = fb.insert_inst(cmp::Lt::new(is, i, two), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, inner_cond, inner_body, corridor_exit));
+        fb.switch_to_block(inner_body);
+        let one = fb.make_imm_value(1i32);
+        let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+        fb.append_phi_arg(i, next_i, inner_body);
+        fb.insert_inst_no_result(Jump::new(is, inner_header));
+        fb.switch_to_block(corridor_exit);
+        let selected = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, canonical_exit));
+        fb.switch_to_block(canonical_exit);
+        let result = fb.insert_inst(
+            Phi::new(
+                is,
+                vec![(header_value, outer_header), (selected, corridor_exit)],
+            ),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = module
+            .func_store
+            .view(fr, |func| structurize_function(func))
+            .expect("a reducible nested loop may compute an outer break value");
+
+        fn contains_loop_and_exit(
+            regions: &[Region],
+            inner_header: BlockId,
+            from: BlockId,
+            target: BlockId,
+        ) -> (bool, bool) {
+            regions.iter().fold((false, false), |found, region| {
+                let nested = match region {
+                    Region::Loop { header, body } => {
+                        let child = contains_loop_and_exit(body, inner_header, from, target);
+                        (*header == inner_header || child.0, child.1)
+                    }
+                    Region::IfThenElse {
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        let then_found =
+                            contains_loop_and_exit(then_branch, inner_header, from, target);
+                        let else_found =
+                            contains_loop_and_exit(else_branch, inner_header, from, target);
+                        (then_found.0 || else_found.0, then_found.1 || else_found.1)
+                    }
+                    Region::LoopExit {
+                        from: actual_from,
+                        target: actual_target,
+                    } => (false, *actual_from == from && *actual_target == target),
+                    Region::Block(_) | Region::LoopContinue { .. } => (false, false),
+                };
+                (found.0 || nested.0, found.1 || nested.1)
+            })
+        }
+
+        let found = contains_loop_and_exit(
+            &structured.regions,
+            inner_header,
+            corridor_exit,
+            canonical_exit,
+        );
+        assert!(
+            found == (true, true),
+            "expected the nested loop and exact outer break edge: {:?}",
+            structured.regions,
         );
     }
 }
