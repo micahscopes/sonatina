@@ -2956,13 +2956,40 @@ fn emit_recursive_loop_region(
     region_blocks(body_regions, &mut loop_blocks);
     ensure_phi_locals(function, inst_set, header, word_type, f32_type, bool_type, func, phi_locals);
 
-    let outside_pred = function.layout.iter_inst(header).find_map(|iid| {
-        let phi = <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, function.dfg.inst(iid))?;
-        phi.args().iter().find_map(|(_, pred)| (!loop_blocks.contains(pred)).then_some(*pred))
-    });
-    if let Some(outside_pred) = outside_pred {
+    let mut outside_preds = Vec::new();
+    for iid in function.layout.iter_inst(header) {
+        let Some(phi) = <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(
+            inst_set,
+            function.dfg.inst(iid),
+        ) else {
+            break;
+        };
+        for (_, pred) in phi.args() {
+            if !loop_blocks.contains(pred) && !outside_preds.contains(pred) {
+                outside_preds.push(*pred);
+            }
+        }
+    }
+    // A conventional preheader is the sole owner of loop initialization, so
+    // materialize its phi edge here. With several outside predecessors, the
+    // loop header is also the merge of preceding structured control flow. Its
+    // branch arms have already materialized their exact phi edges. Selecting
+    // one predecessor here would overwrite the path-dependent initialization
+    // after the branch, making every invocation observe whichever edge was
+    // encountered first.
+    if let [outside_pred] = outside_preds.as_slice() {
         let mut init = naga::Block::new();
-        emit_exact_phi_edge(function, inst_set, word, outside_pred, header, func, &mut init, value_map, phi_locals)?;
+        emit_exact_phi_edge(
+            function,
+            inst_set,
+            word,
+            *outside_pred,
+            header,
+            func,
+            &mut init,
+            value_map,
+            phi_locals,
+        )?;
         target.extend_block(init);
     }
 
