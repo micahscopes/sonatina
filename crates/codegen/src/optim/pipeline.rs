@@ -577,6 +577,25 @@ impl Default for Pipeline {
     }
 }
 
+/// Run an ordered pass sequence on only the selected functions.
+///
+/// Module analyses needed by a selected pass still observe the complete module,
+/// while IR mutation and per-function analysis allocation are restricted to
+/// `funcs`. Backends can use this after entry-rooted transforms without paying
+/// to normalize helper bodies that will not be emitted.
+pub fn run_function_passes_on(module: &Module, funcs: &[FuncRef], passes: &[Pass]) {
+    let mut func_behavior_dirty = true;
+    run_function_pass_round(
+        module,
+        passes,
+        &mut func_behavior_dirty,
+        FuncPassOverrides {
+            funcs: Some(funcs),
+            ..FuncPassOverrides::default()
+        },
+    );
+}
+
 #[derive(Default, Clone, Copy)]
 pub(crate) struct FuncPassOverrides<'a> {
     pub(crate) funcs: Option<&'a [FuncRef]>,
@@ -2602,6 +2621,149 @@ func public %caller(v0.i1, v1.i32) -> i32 {
             assert!(
                 dumped.contains("call %pure"),
                 "multi-block pure callee should remain as a call after helper splicing:\n{dumped}"
+            );
+        });
+    }
+
+    #[test]
+    fn root_inlining_flattens_only_selected_entries() {
+        let source = r#"
+target = "evm-ethereum-london"
+
+func private %leaf(v0.i1, v1.i32) -> i32 {
+    block0:
+        br v0 block1 block2;
+
+    block1:
+        return v1;
+
+    block2:
+        v2.i32 = add v1 2.i32;
+        return v2;
+}
+
+func private %helper(v0.i1, v1.i32) -> i32 {
+    block0:
+        v2.i32 = call %leaf v0 v1;
+        v3.i32 = add v2 1.i32;
+        return v3;
+}
+
+func public %entry(v0.i1, v1.i32) -> i32 {
+    block0:
+        v2.i32 = call %helper v0 v1;
+        return v2;
+}
+
+func public %other(v0.i1, v1.i32) -> i32 {
+    block0:
+        v2.i32 = call %helper v0 v1;
+        return v2;
+}
+"#;
+
+        let mut module = parse_module(source).expect("parse should succeed").module;
+        let named = |name: &str| {
+            module
+                .funcs()
+                .into_iter()
+                .find(|&func_ref| module.ctx.func_sig(func_ref, |sig| sig.name() == name))
+                .unwrap_or_else(|| panic!("{name} should exist"))
+        };
+        let entry = named("entry");
+        let helper = named("helper");
+        let other = named("other");
+        let mut inliner = Inliner::new(InlinerConfig {
+            enable_full_inliner: true,
+            max_inline_depth: 0,
+            inline_threshold: i32::MAX,
+            inline_threshold_cold: i32::MAX,
+            ..InlinerConfig::default()
+        });
+
+        let frontier = inliner.run_one_frontier_from_roots(&mut module, &[entry]);
+
+        assert!(frontier.changed);
+        module.func_store.view(entry, |func| {
+            let dumped = FuncWriter::new(entry, func).dump_string();
+            assert!(
+                !dumped.contains("call %helper") && dumped.contains("call %leaf"),
+                "one frontier should expose, but not yet expand, the nested call:\n{dumped}"
+            );
+        });
+
+        let stats = inliner.run_from_roots(&mut module, &[entry]);
+
+        assert!(stats.changed);
+        module.func_store.view(entry, |func| {
+            let dumped = FuncWriter::new(entry, func).dump_string();
+            assert!(
+                !dumped.contains("call %"),
+                "entry should be call-free:\n{dumped}"
+            );
+        });
+        module.func_store.view(helper, |func| {
+            let dumped = FuncWriter::new(helper, func).dump_string();
+            assert!(
+                dumped.contains("call %leaf"),
+                "callee body should remain an unexpanded inline source:\n{dumped}"
+            );
+        });
+        module.func_store.view(other, |func| {
+            let dumped = FuncWriter::new(other, func).dump_string();
+            assert!(
+                dumped.contains("call %helper"),
+                "unselected entry should retain its call graph:\n{dumped}"
+            );
+        });
+    }
+
+    #[test]
+    fn selected_function_passes_leave_unselected_helpers_unchanged() {
+        let source = r#"
+target = "evm-ethereum-london"
+
+func private %helper(v0.i32) -> i32 {
+    block0:
+        v1.i32 = mul v0 8.i32;
+        return v1;
+}
+
+func public %entry(v0.i32) -> i32 {
+    block0:
+        v1.i32 = mul v0 8.i32;
+        return v1;
+}
+"#;
+
+        let module = parse_module(source).expect("parse should succeed").module;
+        let named = |name: &str| {
+            module
+                .funcs()
+                .into_iter()
+                .find(|&func_ref| module.ctx.func_sig(func_ref, |sig| sig.name() == name))
+                .unwrap_or_else(|| panic!("{name} should exist"))
+        };
+        let entry = named("entry");
+        let helper = named("helper");
+        let before_helper = module
+            .func_store
+            .view(helper, |func| FuncWriter::new(helper, func).dump_string());
+
+        run_function_passes_on(&module, &[entry], &[Pass::ScalarCanonicalize]);
+
+        module.func_store.view(entry, |func| {
+            let dumped = FuncWriter::new(entry, func).dump_string();
+            assert!(
+                !dumped.contains("mul v0 8.i32") && dumped.contains("shl"),
+                "selected entry should be canonicalized:\n{dumped}"
+            );
+        });
+        module.func_store.view(helper, |func| {
+            let dumped = FuncWriter::new(helper, func).dump_string();
+            assert_eq!(
+                dumped, before_helper,
+                "unselected helper must remain unchanged"
             );
         });
     }

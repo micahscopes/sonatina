@@ -25,4 +25,4 @@ pub(crate) mod signature_rewrite;
 mod simplify_expr;
 pub(crate) mod uniform_const_arg;
 
-pub use pipeline::{Pass, Pipeline, Step};
+pub use pipeline::{Pass, Pipeline, Step, run_function_passes_on};

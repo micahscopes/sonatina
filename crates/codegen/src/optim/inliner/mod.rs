@@ -153,7 +153,42 @@ impl Inliner {
     }
 
     pub fn run(&mut self, module: &mut Module) -> InlineStats {
-        const MAX_ITERS: usize = 8;
+        self.run_with_caller_roots(module, None, 8)
+    }
+
+    /// Inline only call sites that occur in `roots`.
+    ///
+    /// Calls introduced into a root by an inline are considered on the next
+    /// iteration, so this flattens the dependency graph outward from each root
+    /// without first expanding and retaining every intermediate helper body.
+    /// Callee bodies remain available as immutable inline sources. This is
+    /// useful for backends that require selected entry points to be call-free
+    /// but do not require the rest of the module to be flattened.
+    pub fn run_from_roots(&mut self, module: &mut Module, roots: &[FuncRef]) -> InlineStats {
+        let roots = roots.iter().copied().collect::<FxHashSet<_>>();
+        self.run_with_caller_roots(module, Some(&roots), 8)
+    }
+
+    /// Inline one dependency frontier into `roots`.
+    ///
+    /// Backends can alternate this operation with their required cleanup
+    /// passes, preventing a deep unnormalized control-flow graph from being
+    /// materialized before simplification.
+    pub fn run_one_frontier_from_roots(
+        &mut self,
+        module: &mut Module,
+        roots: &[FuncRef],
+    ) -> InlineStats {
+        let roots = roots.iter().copied().collect::<FxHashSet<_>>();
+        self.run_with_caller_roots(module, Some(&roots), 1)
+    }
+
+    fn run_with_caller_roots(
+        &mut self,
+        module: &mut Module,
+        caller_roots: Option<&FxHashSet<FuncRef>>,
+        max_iters: usize,
+    ) -> InlineStats {
         let mut stats = InlineStats::default();
         let mut any_changed = false;
 
@@ -163,7 +198,7 @@ impl Inliner {
         let mut forced_recursive_callers: FxHashSet<FuncRef> = FxHashSet::default();
 
         let mut iter = 0;
-        while iter < MAX_ITERS {
+        while iter < max_iters {
             let funcs = module.funcs();
             let (sites_by_caller, call_counts) = collect_iteration_call_data(module, &funcs);
             let analysis = module_analysis::analyze_module(module);
@@ -174,7 +209,10 @@ impl Inliner {
             let local_object_args = object_effects
                 .as_ref()
                 .map(|effects| collect_local_object_arg_info_with_effects(module, effects));
-            let caller_order = caller_order_bottom_up_scc(&funcs, &analysis);
+            let mut caller_order = caller_order_bottom_up_scc(&funcs, &analysis);
+            if let Some(caller_roots) = caller_roots {
+                caller_order.retain(|caller| caller_roots.contains(caller));
+            }
             let recursive_snapshots = collect_recursive_snapshots(module, &funcs, &analysis);
             let depth_at_iter_start = inline_depth_by_func.clone();
             let mut inlinee_summaries: FxHashMap<cost::SummaryKey, cost::InlineeSummary> =
