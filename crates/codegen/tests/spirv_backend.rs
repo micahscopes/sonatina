@@ -4057,6 +4057,63 @@ func public %exit_phi(v0.i32, v1.i32) -> i32 {
 }
 
 #[test]
+fn grid_conditional_direct_edge_does_not_override_sibling_loop_exit_phi() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %conditional_loop_phi(v0.i32, v1.i32) -> i32 {
+    block0:
+        v2.i1 = lt v0 1.i32;
+        br v2 block5 block2;
+    block2:
+        jump block3;
+    block3:
+        v3.i32 = phi (5.i32 block2) (v6 block4);
+        v4.i32 = phi (0.i32 block2) (v7 block4);
+        v5.i1 = lt v4 3.i32;
+        br v5 block4 block5;
+    block4:
+        v6.i32 = add v3 v3;
+        v7.i32 = add v4 1.i32;
+        jump block3;
+    block5:
+        v8.i32 = phi (0.i32 block0) (v3 block3) (v14 block6);
+        v9.i32 = phi (1.i32 block0) (1.i32 block3) (v13 block6);
+        v10.i32 = phi (v0 block0) (v0 block3) (v15 block6);
+        v11.i1 = eq v10 0.i32;
+        br v11 block7 block6;
+    block6:
+        v13.i32 = mul v9 v8;
+        v14.i32 = mul v8 v8;
+        v15.i32 = sub v10 1.i32;
+        jump block5;
+    block7:
+        return v9;
+}
+"#;
+    let module = sonatina_parser::parse_module(source)
+        .expect("conditional loop-phi probe should parse")
+        .module;
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(4, 1, 1)
+        .compile_module(&module)
+        .expect("conditional loop-phi probe should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    assert!(
+        !wgsl.contains("edge_0_5_phi_8_1"),
+        "the direct outside edge must not be emitted again after its sibling loop:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("conditional loop-phi WGSL should reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("conditional loop-phi WGSL should validate");
+}
+
+#[test]
 fn spirv_nested_terminal_arm_selects_nearest_phi_merge() {
     let source = r#"
 target = "wasm32-unknown-native"
