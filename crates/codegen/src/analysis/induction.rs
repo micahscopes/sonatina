@@ -6,7 +6,8 @@ use sonatina_ir::{
     inst::{
         arith::{Add, Mul, Sub},
         cast::{Bitcast, IntToPtr, PtrToInt},
-        control_flow::Phi,
+        cmp,
+        control_flow::{Br, Phi},
         data::Gep,
     },
     types::CompoundType,
@@ -105,6 +106,156 @@ impl InductionAnalysis {
             .get(&loop_id.as_u32())
             .map(SmallVec::as_slice)
             .unwrap_or(&[])
+    }
+}
+
+/// Prove an upper bound on the number of times a canonical unsigned `i32`
+/// loop can execute its body.
+///
+/// The proof deliberately recognizes only a narrow, structural shape: one
+/// basic induction variable, a constant initial value and step, and a loop
+/// header branch comparing that variable with a constant bound. Arithmetic
+/// wrapping before the first failing comparison rejects the proof. Early loop
+/// exits remain safe because they can only reduce the number of iterations.
+pub fn u32_loop_iteration_upper_bound(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    lpt: &LoopTree,
+    loop_id: LoopId,
+) -> Option<u64> {
+    detect_basic_ivs_for_loop(func, loop_id, cfg, lpt)
+        .iter()
+        .filter_map(|biv| u32_biv_iteration_upper_bound(func, lpt, biv))
+        .min()
+}
+
+#[derive(Clone, Copy)]
+enum UnsignedRelation {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl UnsignedRelation {
+    fn reverse(self) -> Self {
+        match self {
+            Self::Lt => Self::Gt,
+            Self::Le => Self::Ge,
+            Self::Gt => Self::Lt,
+            Self::Ge => Self::Le,
+        }
+    }
+
+    fn invert(self) -> Self {
+        match self {
+            Self::Lt => Self::Ge,
+            Self::Le => Self::Gt,
+            Self::Gt => Self::Le,
+            Self::Ge => Self::Lt,
+        }
+    }
+}
+
+fn u32_biv_iteration_upper_bound(
+    func: &Function,
+    lpt: &LoopTree,
+    biv: &BasicInductionVar,
+) -> Option<u64> {
+    if func.dfg.value_ty(biv.phi) != Type::I32 {
+        return None;
+    }
+
+    let term = func.layout.last_inst_of(biv.header)?;
+    let branch = <&Br as InstDowncast>::downcast(func.inst_set(), func.dfg.inst(term))?;
+    let nz_inside = lpt.is_in_loop(*branch.nz_dest(), biv.loop_id);
+    let z_inside = lpt.is_in_loop(*branch.z_dest(), biv.loop_id);
+    let continue_when_true = match (nz_inside, z_inside) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => return None,
+    };
+
+    let cond_inst = func.dfg.value_inst(*branch.cond())?;
+    let cond = func.dfg.inst(cond_inst);
+    let is = func.inst_set();
+    let (mut relation, lhs, rhs) =
+        if let Some(compare) = <&cmp::Lt as InstDowncast>::downcast(is, cond) {
+            (UnsignedRelation::Lt, *compare.lhs(), *compare.rhs())
+        } else if let Some(compare) = <&cmp::Le as InstDowncast>::downcast(is, cond) {
+            (UnsignedRelation::Le, *compare.lhs(), *compare.rhs())
+        } else if let Some(compare) = <&cmp::Gt as InstDowncast>::downcast(is, cond) {
+            (UnsignedRelation::Gt, *compare.lhs(), *compare.rhs())
+        } else if let Some(compare) = <&cmp::Ge as InstDowncast>::downcast(is, cond) {
+            (UnsignedRelation::Ge, *compare.lhs(), *compare.rhs())
+        } else {
+            return None;
+        };
+
+    let bound_value = if lhs == biv.phi {
+        rhs
+    } else if rhs == biv.phi {
+        relation = relation.reverse();
+        lhs
+    } else {
+        return None;
+    };
+    if !continue_when_true {
+        relation = relation.invert();
+    }
+
+    let init = immediate_u32(func.dfg.value_imm(biv.init)?)? as u64;
+    let bound = immediate_u32(func.dfg.value_imm(bound_value)?)? as u64;
+    let step = biv.step.signed_step_i64()?;
+    let iterations = match (step.cmp(&0), relation) {
+        (std::cmp::Ordering::Greater, UnsignedRelation::Lt) => {
+            let step = step as u64;
+            if init < bound {
+                (bound - init).div_ceil(step)
+            } else {
+                0
+            }
+        }
+        (std::cmp::Ordering::Greater, UnsignedRelation::Le) => {
+            let step = step as u64;
+            if init <= bound {
+                (bound - init) / step + 1
+            } else {
+                0
+            }
+        }
+        (std::cmp::Ordering::Less, UnsignedRelation::Gt) => {
+            let step = step.unsigned_abs();
+            if init > bound {
+                (init - bound).div_ceil(step)
+            } else {
+                0
+            }
+        }
+        (std::cmp::Ordering::Less, UnsignedRelation::Ge) => {
+            let step = step.unsigned_abs();
+            if init >= bound {
+                (init - bound) / step + 1
+            } else {
+                0
+            }
+        }
+        _ => return None,
+    };
+
+    if step > 0 {
+        let final_value = init.checked_add(iterations.checked_mul(step as u64)?)?;
+        (final_value <= u32::MAX as u64).then_some(iterations)
+    } else {
+        let distance = iterations.checked_mul(step.unsigned_abs())?;
+        (distance <= init).then_some(iterations)
+    }
+}
+
+fn immediate_u32(imm: Immediate) -> Option<u32> {
+    match imm {
+        Immediate::I32(value) => Some(value as u32),
+        _ => None,
     }
 }
 
