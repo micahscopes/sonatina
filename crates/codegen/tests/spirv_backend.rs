@@ -111,7 +111,7 @@ fn spirv_constant_return_valid() {
             assert!(output.status.success(), "spirv-val validation failed");
         }
         Err(_) => {
-            eprintln!("spirv-val not found — skipping validation (structural check passed)");
+            eprintln!("spirv-val not found, skipping validation (structural check passed)");
         }
     }
     let _ = std::fs::remove_file(&tmp);
@@ -4677,7 +4677,7 @@ fn spirv_f32_rounding_lowering_is_exact_and_branch_free() {
 // `fe_bump` emulation (RUNG3_SPIRV_ARRAYS_DESIGN.md). Hand-built Sonatina IR
 // (no Fe compiler in this crate), mirroring this file's existing style.
 //
-// Each test names the specific Codex adversarial-review finding it guards
+// Each test names the specific adversarial-review finding it guards
 // against (heap-exhaustion aliasing, misaligned-access miscompile,
 // poison-sentinel collision, wrong-value-on-unconditional-trap).
 // ===========================================================================
@@ -4749,10 +4749,10 @@ fn spirv_array_probe_compiles_naga_valid_with_heap_and_trap_channel() {
     assert!(wgsl.contains("fe_bump"), "bump pointer local must appear in WGSL:\n{wgsl}");
     assert!(
         wgsl.contains("fe_trapped"),
-        "trap-status local must appear in WGSL (Codex bugs 1/2/3/4's shared channel):\n{wgsl}"
+        "trap-status local must appear in WGSL (review findings 1/2/3/4's shared channel):\n{wgsl}"
     );
 
-    // Codex bug 3 (poison-sentinel collision): the trap channel is a real,
+    // Review finding 3 (poison-sentinel collision): the trap channel is a real,
     // separate binding stated in the layout, not folded into the result.
     assert!(
         artifact.layout.trap.is_some(),
@@ -4783,7 +4783,7 @@ fn spirv_array_probe_compiles_naga_valid_with_heap_and_trap_channel() {
     );
 }
 
-/// Codex bug 1 (heap-exhaustion aliasing): a single allocation whose constant
+/// Review finding 1 (heap-exhaustion aliasing): a single allocation whose constant
 /// size exceeds the declared private-heap capacity (default 8192 words =
 /// 32768 bytes) must fail the compile OUTRIGHT, never silently clamp the
 /// bump pointer and let two logically distinct arrays alias the same heap
@@ -4823,11 +4823,9 @@ fn spirv_mem_alloc_exceeding_heap_capacity_fails_closed_at_compile_time() {
     eprintln!("heap overflow correctly fails closed at compile time: {msg}");
 }
 
-/// Codex bug 1's loop-carried corollary: a `MemAllocDynamic` inside a loop
-/// body has a total byte cost that depends on the runtime trip count, which
-/// the compile-time capacity proof cannot bound. Must fail closed rather than
-/// silently summing only the per-iteration size (which would UNDER-count the
-/// true total and let the same aliasing bug through at runtime).
+/// A `MemAllocDynamic` inside a loop whose bound is supplied at runtime has a
+/// total byte cost that the compile-time capacity proof cannot bound. It must
+/// fail closed rather than silently summing only one iteration.
 #[test]
 fn spirv_mem_alloc_inside_loop_fails_closed() {
     let isa = Native::new(TargetTriple::new(
@@ -4835,9 +4833,10 @@ fn spirv_mem_alloc_inside_loop_fails_closed() {
     ));
     let is = isa.inst_set();
     let mb = native_module_builder();
-    let sig = Signature::new_single("loop_alloc", Linkage::Public, &[], Type::I32);
+    let sig = Signature::new_single("loop_alloc", Linkage::Public, &[Type::I32], Type::I32);
     let func_ref = mb.declare_function(sig).unwrap();
     let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let runtime_limit = fb.args()[0];
 
     let entry = fb.append_block();
     let header = fb.append_block();
@@ -4850,8 +4849,7 @@ fn spirv_mem_alloc_inside_loop_fails_closed() {
 
     fb.switch_to_block(header);
     let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
-    let three = fb.make_imm_value(3i32);
-    let cond = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
+    let cond = fb.insert_inst(cmp::Lt::new(is, i, runtime_limit), Type::I1);
     fb.insert_inst_no_result(control_flow::Br::new(is, cond, body, exit));
 
     fb.switch_to_block(body);
@@ -4879,6 +4877,191 @@ fn spirv_mem_alloc_inside_loop_fails_closed() {
         "expected the loop-carried-allocation error, got: {msg}"
     );
     eprintln!("loop-carried allocation correctly fails closed: {msg}");
+}
+
+/// A canonical constant-bounded induction loop has a compiler-proven maximum
+/// allocation count. The private heap includes every iteration rather than
+/// treating the allocation site as if it executed once.
+#[test]
+fn spirv_statically_bounded_mem_alloc_inside_loop_compiles() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("bounded_loop_alloc", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let three = fb.make_imm_value(3i32);
+    let cond = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, body, exit));
+
+    fb.switch_to_block(body);
+    let alloc_size = fb.make_imm_value(16i32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    fb.insert_inst_no_result(data::Mstore::new(is, base, i, Type::I32));
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let artifact = SpirvBackend::new()
+        .compile_module(&module)
+        .expect("a statically bounded loop allocation must compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.contains("array<u32, 12>"),
+        "three 16-byte allocations need twelve private words:\n{wgsl}"
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl).expect("naga must reparse bounded-loop WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation must accept bounded-loop WGSL");
+}
+
+/// A compiler-proven arena frame changes the loop allocation bound from
+/// runtime-trip-count-dependent to one statically known iteration footprint.
+/// The backend independently checks the checkpoint stack at every CFG join and
+/// lowers the rewind into a guarded restoration of `fe_bump`.
+#[test]
+fn spirv_scoped_mem_alloc_inside_loop_compiles() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("scoped_loop_alloc", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let three = fb.make_imm_value(3i32);
+    let cond = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, cond, body, exit));
+
+    fb.switch_to_block(body);
+    let checkpoint = fb.insert_inst(data::MemCheckpoint::new(is), Type::I32);
+    let alloc_size = fb.make_imm_value(16i32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    fb.insert_inst_no_result(data::Mstore::new(is, base, i, Type::I32));
+    let loaded = fb.insert_inst(data::Mload::new(is, base, Type::I32), Type::I32);
+    fb.insert_inst_no_result(data::MemRewind::new(is, checkpoint));
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, loaded, one), Type::I32);
+    fb.append_phi_arg(i, next_i, body);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let artifact = SpirvBackend::new()
+        .compile_module(&module)
+        .expect("a balanced scoped loop allocation must compile");
+    assert_eq!(artifact.words[0], 0x0723_0203, "valid SPIR-V magic");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.contains("array<u32, 4>"),
+        "one scoped 16-byte allocation needs exactly four private words:\n{wgsl}"
+    );
+    assert!(
+        wgsl.matches("fe_bump").count() >= 4,
+        "checkpoint, allocation, and rewind must all operate on fe_bump:\n{wgsl}"
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl).expect("naga must reparse scoped-arena WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation must accept scoped-arena WGSL");
+}
+
+/// Memcopy carries WebAssembly memory.copy semantics, including unaligned and
+/// overlapping ranges. The SPIR-V path emits a bounded byte loop and chooses
+/// the safe direction at runtime instead of silently treating it as memcpy.
+#[test]
+fn spirv_memcopy_is_bounded_overlap_safe_memmove() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("overlap_copy", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let alloc_size = fb.make_imm_value(32i32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    let one = fb.make_imm_value(1i32);
+    let destination = fb.insert_inst(arith::Add::new(is, base, one), Type::I32);
+    let len = fb.make_imm_value(7i32);
+    fb.insert_inst_no_result(data::Memcopy::new(is, destination, base, len));
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, base));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let artifact = SpirvBackend::new()
+        .compile_module(&module)
+        .expect("bounded unaligned overlapping Memcopy must compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.contains("fe_memcopy_index"),
+        "Memcopy must retain its compact bounded loop index:\n{wgsl}"
+    );
+    assert!(
+        wgsl.contains("loop"),
+        "Memcopy must lower to a loop rather than byte-count-sized shader text:\n{wgsl}"
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl).expect("naga must reparse Memcopy WGSL");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&reparsed)
+    .expect("browser-profile validation must accept Memcopy WGSL");
 }
 
 /// I1 memory uses Wasm-compatible byte addressing over the private u32 heap.
@@ -4982,7 +5165,7 @@ fn spirv_mem_op_under_i64_word_fails_closed() {
 /// function fails to structurize ("cyclic or multiply consumed block") --
 /// this was found live against `field_mul_bn254_fr_loop.fe` (Rung 3's own
 /// target fixture has ~dozens of dynamically-indexed accesses in one
-/// function) and is NOT one of the 4 originally-reported Codex findings, but
+/// function) and is not one of the four originally reported findings, but
 /// is the same class of defect: a real kernel silently could not reach the
 /// SPIR-V backend at all.
 #[test]
@@ -5066,7 +5249,7 @@ fn spirv_two_bounds_checks_sharing_one_trap_block_compiles() {
 /// shape -- `fn(k): Br(Lt(k,8), ok, trap); ok: Return 42; trap: Unreachable`
 /// -- compiled and naga-validated with the trap arm silently falling through
 /// to a zero/uninitialized result and `layout.trap == None`: byte-for-byte
-/// the original Codex bug 4 failure mode, reopened on the has_mem==false
+/// the original review finding 4 failure mode, reopened on the has_mem==false
 /// side (this is fe-reachable without arrays via `RTerminator::Trap` and
 /// `lower_checked_usize_arith`'s `trap_if`, wasm_lower.rs). At the pin
 /// (22a95696) this same input hard-errored in the structurizer
@@ -5132,7 +5315,7 @@ fn spirv_no_mem_trap_raises_trap_channel_not_silent_zero() {
                 wgsl.contains("fe_trapped"),
                 "Finding A regression: a no-Mem trapping function compiled WITHOUT raising a \
                  trap channel -- the trap arm silently falls through to a zero/uninitialized \
-                 result exactly like the original Codex bug 4. WGSL:\n{wgsl}"
+                 result exactly like the original review finding 4. WGSL:\n{wgsl}"
             );
             assert!(
                 artifact.layout.trap.is_some(),
