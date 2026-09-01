@@ -404,6 +404,8 @@ impl Backend for SpirvBackend {
 
     #[cfg(feature = "spirv-backend")]
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
+        let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
+        let started = std::time::Instant::now();
         let (naga_mod, layout) = translate_to_naga(
             module,
             self.workgroup_size,
@@ -417,13 +419,26 @@ impl Backend for SpirvBackend {
             self.heap_words,
         )
         .map_err(|e| vec![SpirvError::Translation(e)])?;
+        if trace {
+            eprintln!(
+                "sonatina spirv: translated to naga, elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+        }
 
+        let phase = std::time::Instant::now();
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
         )
         .validate(&naga_mod)
         .map_err(|e| vec![SpirvError::Validation(format!("{e:?}"))])?;
+        if trace {
+            eprintln!(
+                "sonatina spirv: validated naga, elapsed_ms={}",
+                phase.elapsed().as_millis()
+            );
+        }
 
         let options = naga::back::spv::Options {
             lang_version: (1, 5),
@@ -431,13 +446,30 @@ impl Backend for SpirvBackend {
             ..Default::default()
         };
 
+        let phase = std::time::Instant::now();
         let words = naga::back::spv::write_vec(&naga_mod, &info, &options, None)
             .map_err(|e| vec![SpirvError::Translation(format!("{e}"))])?;
+        if trace {
+            eprintln!(
+                "sonatina spirv: emitted spirv, words={}, elapsed_ms={}",
+                words.len(),
+                phase.elapsed().as_millis()
+            );
+        }
 
         // Also emit WGSL for wgpu execution
+        let phase = std::time::Instant::now();
         let wgsl = naga::back::wgsl::write_string(
             &naga_mod, &info, naga::back::wgsl::WriterFlags::empty()
         ).ok();
+        if trace {
+            eprintln!(
+                "sonatina spirv: emitted wgsl, bytes={}, elapsed_ms={}, total_elapsed_ms={}",
+                wgsl.as_ref().map_or(0, String::len),
+                phase.elapsed().as_millis(),
+                started.elapsed().as_millis()
+            );
+        }
 
         Ok(SpirvArtifact { words, wgsl, layout })
     }
@@ -4000,6 +4032,8 @@ fn translate_to_naga(
     heap_words: u32,
 ) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
+    let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
+    let started = std::time::Instant::now();
 
     if let Some(raster) = authored_raster {
         if grid || render || compute {
@@ -4238,6 +4272,7 @@ fn translate_to_naga(
     // div|mod): Sonatina integers are signless, so u32 is exact for wrapping
     // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
     // silently emit the signed WGSL operator.
+    let phase = std::time::Instant::now();
     let (param_count, has_obj_alloc, has_mem, has_unreachable, mem_heap_bytes) = module
         .func_store
         .try_view(first_func, |f| -> Result<(usize, bool, bool, bool, u64), String> {
@@ -4601,6 +4636,15 @@ fn translate_to_naga(
             Ok((pc, has_alloc, has_mem, has_unreachable, mem_heap_bytes))
         })
         .ok_or_else(|| "spirv: first function body is unavailable".to_string())??;
+    if trace {
+        eprintln!(
+            "sonatina spirv: pre-scan complete, function={}, heap_bytes={}, elapsed_ms={}, total_elapsed_ms={}",
+            sig.name(),
+            mem_heap_bytes,
+            phase.elapsed().as_millis(),
+            started.elapsed().as_millis()
+        );
+    }
 
     // `heap_words` is a fail-closed capacity, not an allocation request. The
     // pre-scan above has already proved the exact static upper bound for this
@@ -4985,6 +5029,7 @@ fn translate_to_naga(
                     value_map.insert(function.arg_values[*arg_index], loaded);
                 }
             }
+            let phase = std::time::Instant::now();
             let scfg = match crate::structurize::structurize_function(function) {
                 Ok(scfg) => scfg,
                 Err(error) => {
@@ -4994,7 +5039,16 @@ fn translate_to_naga(
                     return;
                 }
             };
+            if trace {
+                eprintln!(
+                    "sonatina spirv: structurized compute entry, regions={}, elapsed_ms={}, total_elapsed_ms={}",
+                    scfg.regions.len(),
+                    phase.elapsed().as_millis(),
+                    started.elapsed().as_millis()
+                );
+            }
             let mut ignored_result = None;
+            let phase = std::time::Instant::now();
             if let Err(error) = emit_naga_regions(
                 function,
                 inst_set,
@@ -5012,6 +5066,14 @@ fn translate_to_naga(
                 body_error = Some(structurize_error_with_block_ir(
                     error, first_func, function,
                 ));
+            }
+            if trace {
+                eprintln!(
+                    "sonatina spirv: emitted compute entry regions, expressions={}, elapsed_ms={}, total_elapsed_ms={}",
+                    func.expressions.len(),
+                    phase.elapsed().as_millis(),
+                    started.elapsed().as_millis()
+                );
             }
         });
         if let Some(error) = body_error {
