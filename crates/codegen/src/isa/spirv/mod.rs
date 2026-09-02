@@ -2535,17 +2535,27 @@ fn emit_single_inst(
         );
         return true;
     } else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(inst_set, inst_data) {
-        let Some(&callee) = naga_functions.get(call.callee()) else {
+        let Some(callee) = naga_functions.get(call.callee()) else {
             *mem_error = Some(format!(
                 "spirv: reachable callee {:?} has no lowered Naga function. Fail closed.",
                 call.callee()
             ));
             return false;
         };
-        let mut arguments = Vec::with_capacity(call.args().len());
-        for &argument in call.args() {
+        if call.args().len() != callee.argument_abi.len() {
+            *mem_error = Some(format!(
+                "spirv: helper call to {:?} has {} logical arguments but {} ABI entries. Fail closed.",
+                call.callee(),
+                call.args().len(),
+                callee.argument_abi.len(),
+            ));
+            return false;
+        }
+        let mut arguments = Vec::new();
+        let mut logical_arguments = Vec::with_capacity(call.args().len());
+        for (&logical_argument, source) in call.args().iter().zip(&callee.argument_abi) {
             let Some(argument) = resolve_naga_value(
-                argument,
+                logical_argument,
                 function,
                 word,
                 value_map,
@@ -2553,11 +2563,21 @@ fn emit_single_inst(
                 func,
             ) else {
                 *mem_error = Some(format!(
-                    "spirv: call argument {argument:?} could not be resolved. Fail closed."
+                    "spirv: call argument {logical_argument:?} could not be resolved. Fail closed."
                 ));
                 return false;
             };
-            arguments.push(argument);
+            logical_arguments.push(argument);
+            if let NagaArgumentSource::Physical(physical_index) = source {
+                if *physical_index as usize != arguments.len() {
+                    *mem_error = Some(format!(
+                        "spirv: helper call to {:?} has a noncanonical physical argument index {physical_index}. Fail closed.",
+                        call.callee(),
+                    ));
+                    return false;
+                }
+                arguments.push(argument);
+            }
         }
         if callee.memory_abi.heap {
             let Some(heap) = mem_ctx.and_then(|context| context.heap) else {
@@ -2581,15 +2601,15 @@ fn emit_single_inst(
             arguments.push(context.trapped);
         }
         let results = function.dfg.inst_results(inst_id);
-        if results.len() != callee.result_arity {
+        if results.len() != callee.result_abi.logical.len() {
             *mem_error = Some(format!(
                 "spirv: helper call produces {} values but its lowered callee returns {}. Fail closed.",
                 results.len(),
-                callee.result_arity,
+                callee.result_abi.logical.len(),
             ));
             return false;
         }
-        let result = (!results.is_empty()).then(|| {
+        let result = (callee.result_abi.physical_arity != 0).then(|| {
             let expression = func.expressions.append(
                 naga::Expression::CallResult(callee.handle),
                 naga::Span::UNDEFINED,
@@ -2604,43 +2624,50 @@ fn emit_single_inst(
             },
             naga::Span::UNDEFINED,
         );
-        match (results, result) {
-            ([], None) => {}
-            ([value], Some(expression)) => {
-                value_map.insert(*value, expression);
-            }
-            (values, Some(tuple)) => {
-                let mut first = None;
-                let mut last = None;
-                for (index, &value) in values.iter().enumerate() {
-                    let component = func.expressions.append(
-                        naga::Expression::AccessIndex {
-                            base: tuple,
-                            index: index as u32,
-                        },
-                        naga::Span::UNDEFINED,
-                    );
-                    value_map.insert(value, component);
-                    first.get_or_insert(component);
-                    last = Some(component);
+        let mut first_component = None;
+        let mut last_component = None;
+        for (&value, source) in results.iter().zip(&callee.result_abi.logical) {
+            let expression = match *source {
+                NagaResultSource::Physical(physical_index) => {
+                    let Some(physical_result) = result else {
+                        *mem_error = Some(
+                            "spirv: helper physical result has no call-result expression. Fail closed."
+                                .to_string(),
+                        );
+                        return false;
+                    };
+                    if callee.result_abi.physical_arity == 1 {
+                        physical_result
+                    } else {
+                        let component = func.expressions.append(
+                            naga::Expression::AccessIndex {
+                                base: physical_result,
+                                index: physical_index,
+                            },
+                            naga::Span::UNDEFINED,
+                        );
+                        first_component.get_or_insert(component);
+                        last_component = Some(component);
+                        component
+                    }
                 }
-                if let (Some(first), Some(last)) = (first, last) {
-                    target.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(
-                            first,
-                            last,
-                        )),
-                        naga::Span::UNDEFINED,
-                    );
+                NagaResultSource::PassthroughArgument(argument_index) => {
+                    let Some(&argument) = logical_arguments.get(argument_index as usize) else {
+                        *mem_error = Some(format!(
+                            "spirv: helper passthrough result refers to missing argument {argument_index}. Fail closed."
+                        ));
+                        return false;
+                    };
+                    argument
                 }
-            }
-            _ => {
-                *mem_error = Some(
-                    "spirv: helper call result shape was internally inconsistent. Fail closed."
-                        .to_string(),
-                );
-                return false;
-            }
+            };
+            value_map.insert(value, expression);
+        }
+        if let (Some(first), Some(last)) = (first_component, last_component) {
+            target.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(first, last)),
+                naga::Span::UNDEFINED,
+            );
         }
         return true;
     } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst_data) {
@@ -4224,11 +4251,34 @@ fn spirv_instruction_is_lowered(
 }
 
 #[cfg(feature = "spirv-backend")]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct NagaFunctionInfo {
     handle: naga::Handle<naga::Function>,
-    result_arity: usize,
+    argument_abi: Vec<NagaArgumentSource>,
+    result_abi: NagaResultAbi,
     memory_abi: NagaMemoryAbi,
+}
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy)]
+enum NagaArgumentSource {
+    Physical(u32),
+    ImplicitResource(naga::Handle<naga::GlobalVariable>),
+}
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy)]
+enum NagaResultSource {
+    Physical(u32),
+    PassthroughArgument(u32),
+}
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone)]
+struct NagaResultAbi {
+    logical: Vec<NagaResultSource>,
+    physical_type: Option<naga::Handle<naga::Type>>,
+    physical_arity: usize,
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -4249,6 +4299,17 @@ struct NagaMemoryAbiTypes {
 #[cfg(feature = "spirv-backend")]
 type NagaFunctionMap =
     std::collections::HashMap<sonatina_ir::module::FuncRef, NagaFunctionInfo>;
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy)]
+enum NagaResourceCapability {
+    Unique(naga::Handle<naga::GlobalVariable>),
+    Ambiguous,
+}
+
+#[cfg(feature = "spirv-backend")]
+type NagaResourceCapabilities =
+    std::collections::HashMap<sonatina_ir::Type, NagaResourceCapability>;
 
 /// Return the direct-call closure rooted at `entry`, with every callee before
 /// its callers. Naga permits calls only to module functions, so this order lets
@@ -4353,7 +4414,10 @@ fn helper_private_memory_abis(
                 for block in function.layout.iter_block() {
                     for instruction in function.layout.iter_inst(block) {
                         let instruction_data = function.dfg.inst(instruction);
-                        if let Some(call) = function.dfg.call_info(instruction) {
+                        if let Some(call) = <&control_flow::Call as InstDowncast>::downcast(
+                            inst_set,
+                            function.dfg.inst(instruction),
+                        ) {
                             let callee = abis.get(&call.callee()).copied().ok_or_else(|| {
                                 format!(
                                     "spirv: helper {function_ref:?} reaches callee {:?} before its private-memory ABI is available. Fail closed.",
@@ -4417,6 +4481,331 @@ fn helper_naga_type(
 }
 
 #[cfg(feature = "spirv-backend")]
+fn helper_naga_argument_abi(
+    signature: &sonatina_ir::Signature,
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    resource_capabilities: &NagaResourceCapabilities,
+) -> Result<Vec<NagaArgumentSource>, String> {
+    let mut physical_index = 0u32;
+    signature
+        .args()
+        .iter()
+        .copied()
+        .map(|ty| {
+            match resource_capabilities.get(&ty) {
+                Some(NagaResourceCapability::Unique(global)) => {
+                    Ok(NagaArgumentSource::ImplicitResource(*global))
+                }
+                Some(NagaResourceCapability::Ambiguous) => Err(format!(
+                    "spirv: helper ABI type {ty:?} names more than one external resource; helper specialization is required. Fail closed."
+                )),
+                None => {
+                    helper_naga_type(ty, word, word_type, f32_type, bool_type)?;
+                    let source = NagaArgumentSource::Physical(physical_index);
+                    physical_index += 1;
+                    Ok(source)
+                }
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "spirv-backend")]
+fn helper_resource_capabilities(
+    module: &Module,
+    entry_signature: &sonatina_ir::Signature,
+    external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
+) -> Result<NagaResourceCapabilities, String> {
+    let mut capabilities = NagaResourceCapabilities::new();
+    for &(argument_index, global_handle) in external_roots {
+        let logical_type = *entry_signature
+            .args()
+            .get(argument_index as usize)
+            .ok_or_else(|| {
+                format!(
+                    "spirv: external resource argument {argument_index} disappeared while deriving helper capabilities. Fail closed."
+                )
+            })?;
+        let Some(sonatina_ir::types::CompoundType::ObjRef(referent)) =
+            logical_type.resolve_compound(&module.ctx)
+        else {
+            return Err(format!(
+                "spirv: external resource argument {argument_index} has non-object type {logical_type:?}. Fail closed."
+            ));
+        };
+        if !matches!(
+            referent.resolve_compound(&module.ctx),
+            Some(sonatina_ir::types::CompoundType::Array { .. })
+        ) {
+            return Err(format!(
+                "spirv: external resource argument {argument_index} must root an object array, got {logical_type:?}. Fail closed."
+            ));
+        }
+        match capabilities.entry(logical_type) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(NagaResourceCapability::Unique(global_handle));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if !matches!(
+                    entry.get(),
+                    NagaResourceCapability::Unique(previous) if *previous == global_handle
+                ) {
+                    entry.insert(NagaResourceCapability::Ambiguous);
+                }
+            }
+        }
+    }
+    Ok(capabilities)
+}
+
+#[cfg(feature = "spirv-backend")]
+fn helper_naga_result_abi(
+    module: &Module,
+    function_ref: sonatina_ir::module::FuncRef,
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    resource_capabilities: &NagaResourceCapabilities,
+    naga_functions: &NagaFunctionMap,
+    naga_types: &mut naga::UniqueArena<naga::Type>,
+) -> Result<NagaResultAbi, String> {
+    use sonatina_ir::{InstDowncast, inst::control_flow};
+
+    let signature = module
+        .ctx
+        .get_sig(function_ref)
+        .ok_or_else(|| format!("spirv: helper {function_ref:?} has no signature"))?;
+    let physical_types = signature
+        .ret_tys()
+        .iter()
+        .copied()
+        .filter(|ty| !resource_capabilities.contains_key(ty))
+        .collect::<Vec<_>>();
+    for &ty in &physical_types {
+        helper_naga_type(ty, word, word_type, f32_type, bool_type)?;
+    }
+    let physical_type = helper_naga_result_type(
+        signature.name(),
+        &physical_types,
+        word,
+        word_type,
+        f32_type,
+        bool_type,
+        naga_types,
+    )?;
+
+    let mut logical = signature
+        .ret_tys()
+        .iter()
+        .scan(0u32, |physical, ty| {
+            if resource_capabilities.contains_key(ty) {
+                Some(None)
+            } else {
+                let source = NagaResultSource::Physical(*physical);
+                *physical += 1;
+                Some(Some(source))
+            }
+        })
+        .collect::<Vec<_>>();
+    if logical.iter().all(Option::is_some) {
+        return Ok(NagaResultAbi {
+            logical: logical.into_iter().flatten().collect(),
+            physical_type,
+            physical_arity: physical_types.len(),
+        });
+    }
+
+    let sources = module
+        .func_store
+        .try_view(function_ref, |function| -> Result<Vec<u32>, String> {
+            let inst_set = function.inst_set();
+            let mut provenance = std::collections::HashMap::<
+                sonatina_ir::ValueId,
+                u32,
+            >::new();
+            for (argument_index, (&value, &ty)) in function
+                .arg_values
+                .iter()
+                .zip(signature.args())
+                .enumerate()
+            {
+                if resource_capabilities.contains_key(&ty) {
+                    provenance.insert(value, argument_index as u32);
+                }
+            }
+
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for block in function.layout.iter_block() {
+                    for instruction in function.layout.iter_inst(block) {
+                        if let Some(call) = function.dfg.call_info(instruction) {
+                            let concrete_call = <&control_flow::Call as InstDowncast>::downcast(
+                                inst_set,
+                                function.dfg.inst(instruction),
+                            )
+                            .ok_or_else(|| {
+                                format!(
+                                    "spirv: helper `{}` contains a call form whose arguments are unavailable. Fail closed.",
+                                    signature.name(),
+                                )
+                            })?;
+                            let callee = naga_functions.get(&call.callee()).ok_or_else(|| {
+                                format!(
+                                    "spirv: helper `{}` reaches {:?} before its result ABI is available. Fail closed.",
+                                    signature.name(),
+                                    call.callee(),
+                                )
+                            })?;
+                            for (&result, source) in function
+                                .dfg
+                                .inst_results(instruction)
+                                .iter()
+                                .zip(&callee.result_abi.logical)
+                            {
+                                let NagaResultSource::PassthroughArgument(argument_index) = source
+                                else {
+                                    continue;
+                                };
+                                let argument = *concrete_call
+                                    .args()
+                                    .get(*argument_index as usize)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "spirv: helper call to {:?} has no passthrough argument {argument_index}. Fail closed.",
+                                            call.callee(),
+                                        )
+                                    })?;
+                                if let Some(&source) = provenance.get(&argument) {
+                                    match provenance.entry(result) {
+                                        std::collections::hash_map::Entry::Vacant(entry) => {
+                                            entry.insert(source);
+                                            changed = true;
+                                        }
+                                        std::collections::hash_map::Entry::Occupied(entry)
+                                            if *entry.get() != source =>
+                                        {
+                                            return Err(format!(
+                                                "spirv: helper `{}` gives {result:?} conflicting resource identities. Fail closed.",
+                                                signature.name(),
+                                            ));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        if let Some(phi) = <&control_flow::Phi as InstDowncast>::downcast(
+                            inst_set,
+                            function.dfg.inst(instruction),
+                        ) {
+                            let mut incoming = phi
+                                .args()
+                                .iter()
+                                .filter_map(|(value, _)| provenance.get(value).copied());
+                            let Some(source) = incoming.next() else {
+                                continue;
+                            };
+                            if incoming.all(|candidate| candidate == source)
+                                && phi
+                                    .args()
+                                    .iter()
+                                    .all(|(value, _)| provenance.contains_key(value))
+                                && let Some(result) = function.dfg.inst_result(instruction)
+                            {
+                                match provenance.entry(result) {
+                                    std::collections::hash_map::Entry::Vacant(entry) => {
+                                        entry.insert(source);
+                                        changed = true;
+                                    }
+                                    std::collections::hash_map::Entry::Occupied(entry)
+                                        if *entry.get() != source =>
+                                    {
+                                        return Err(format!(
+                                            "spirv: helper `{}` gives phi result {result:?} conflicting resource identities. Fail closed.",
+                                            signature.name(),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let return_sites = function
+                .layout
+                .iter_block()
+                .flat_map(|block| function.layout.iter_inst(block))
+                .filter_map(|instruction| {
+                    <&control_flow::Return as InstDowncast>::downcast(
+                        inst_set,
+                        function.dfg.inst(instruction),
+                    )
+                    .map(|return_| return_.args().as_slice().to_vec())
+                })
+                .collect::<Vec<_>>();
+            let [return_values] = return_sites.as_slice() else {
+                return Err(format!(
+                    "spirv: resource-carrying helper `{}` has {} return sites; resource identity requires one canonical return. Fail closed.",
+                    signature.name(),
+                    return_sites.len(),
+                ));
+            };
+            if return_values.len() != signature.ret_tys().len() {
+                return Err(format!(
+                    "spirv: resource-carrying helper `{}` returns {} values but declares {}. Fail closed.",
+                    signature.name(),
+                    return_values.len(),
+                    signature.ret_tys().len(),
+                ));
+            }
+            signature
+                .ret_tys()
+                .iter()
+                .zip(return_values)
+                .filter_map(|(ty, value)| {
+                    resource_capabilities
+                        .contains_key(ty)
+                        .then_some(*value)
+                })
+                .map(|value| {
+                    provenance.get(&value).copied().ok_or_else(|| {
+                        format!(
+                            "spirv: resource-carrying helper `{}` returns {value:?} without a proven entry-resource identity. Fail closed.",
+                            signature.name(),
+                        )
+                    })
+                })
+                .collect()
+        })
+        .ok_or_else(|| {
+            format!(
+                "spirv: resource-carrying helper {function_ref:?} has no body. Fail closed."
+            )
+        })??;
+    let mut sources = sources.into_iter();
+    for source in &mut logical {
+        if source.is_none() {
+            *source = Some(NagaResultSource::PassthroughArgument(
+                sources.next().expect("one source per resource result"),
+            ));
+        }
+    }
+    Ok(NagaResultAbi {
+        logical: logical.into_iter().flatten().collect(),
+        physical_type,
+        physical_arity: physical_types.len(),
+    })
+}
+
+#[cfg(feature = "spirv-backend")]
 fn align_helper_offset(offset: u32, alignment: u32) -> u32 {
     offset.div_ceil(alignment) * alignment
 }
@@ -4476,9 +4865,12 @@ fn helper_naga_result_type(
     )))
 }
 
-/// Lower one ordinary scalar helper. Aggregate/object and arena-backed helper
-/// ABIs remain deliberately closed until they have an explicit shared-memory
-/// model. This is a real Naga function, not source expansion or an inliner.
+/// Lower one admitted helper as a real Naga function. External resources and
+/// the private arena cross calls only through compiler-derived capabilities.
+/// WGSL module resources are implicit helper capabilities because storage
+/// pointers are not legal function arguments. Resource identity results are
+/// erased only after the result ABI proves that they pass through an input
+/// unchanged.
 #[cfg(feature = "spirv-backend")]
 fn lower_naga_helper(
     module: &Module,
@@ -4487,7 +4879,8 @@ fn lower_naga_helper(
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
-    result_type: Option<naga::Handle<naga::Type>>,
+    argument_abi: &[NagaArgumentSource],
+    result_abi: &NagaResultAbi,
     memory_abi: NagaMemoryAbi,
     memory_types: NagaMemoryAbiTypes,
     heap_words: u32,
@@ -4497,18 +4890,32 @@ fn lower_naga_helper(
         .ctx
         .get_sig(function_ref)
         .ok_or_else(|| format!("spirv: helper {function_ref:?} has no signature"))?;
-    let mut arguments = signature
-        .args()
-        .iter()
-        .enumerate()
-        .map(|(index, &ty)| {
-            Ok(naga::FunctionArgument {
-                name: Some(format!("a{index}")),
-                ty: helper_naga_type(ty, word, word_type, f32_type, bool_type)?,
-                binding: None,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    if argument_abi.len() != signature.args().len() {
+        return Err(format!(
+            "spirv: helper `{}` has {} logical arguments but {} ABI entries. Fail closed.",
+            signature.name(),
+            signature.args().len(),
+            argument_abi.len(),
+        ));
+    }
+    let mut arguments = Vec::new();
+    for (logical_index, (&ty, source)) in signature.args().iter().zip(argument_abi).enumerate() {
+        let NagaArgumentSource::Physical(physical_index) = source else {
+            continue;
+        };
+        if *physical_index as usize != arguments.len() {
+            return Err(format!(
+                "spirv: helper `{}` has a noncanonical physical argument index {physical_index}. Fail closed.",
+                signature.name(),
+            ));
+        }
+        arguments.push(naga::FunctionArgument {
+            name: Some(format!("a{logical_index}")),
+            ty: helper_naga_type(ty, word, word_type, f32_type, bool_type)?,
+            binding: None,
+        });
+    }
+    let physical_argument_count = arguments.len() as u32;
     if memory_abi.heap {
         arguments.push(naga::FunctionArgument {
             name: Some("fe_heap".to_string()),
@@ -4536,7 +4943,9 @@ fn lower_naga_helper(
             binding: None,
         });
     }
-    let result = result_type.map(|ty| naga::FunctionResult { ty, binding: None });
+    let result = result_abi
+        .physical_type
+        .map(|ty| naga::FunctionResult { ty, binding: None });
     let mut naga_function = naga::Function {
         name: Some(signature.name().to_string()),
         arguments,
@@ -4567,12 +4976,9 @@ fn lower_naga_helper(
                     || <&sonatina_ir::inst::data::MemRewind as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                     || <&sonatina_ir::inst::data::Memcopy as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                     || <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::ObjLoad as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::ObjStore as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::ObjIndex as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                 {
                     lowering_error = Some(format!(
-                        "spirv: helper `{}` changes arena lifetime or uses an object operation whose cross-call model is not lowered yet. Fail closed.",
+                        "spirv: helper `{}` changes arena lifetime or object lifetime across a call. Fail closed.",
                         signature.name(),
                     ));
                     return;
@@ -4581,14 +4987,21 @@ fn lower_naga_helper(
         }
 
         let mut value_map = std::collections::HashMap::new();
-        for (index, &argument) in function.arg_values.iter().enumerate() {
+        for (&argument, source) in function.arg_values.iter().zip(argument_abi) {
             let expression = naga_function.expressions.append(
-                naga::Expression::FunctionArgument(index as u32),
+                match *source {
+                    NagaArgumentSource::Physical(index) => {
+                        naga::Expression::FunctionArgument(index)
+                    }
+                    NagaArgumentSource::ImplicitResource(global) => {
+                        naga::Expression::GlobalVariable(global)
+                    }
+                },
                 naga::Span::UNDEFINED,
             );
             value_map.insert(argument, expression);
         }
-        let mut memory_argument = signature.args().len() as u32;
+        let mut memory_argument = physical_argument_count;
         let heap = if memory_abi.heap {
             let heap = naga_function.expressions.append(
                 naga::Expression::FunctionArgument(memory_argument),
@@ -4653,12 +5066,12 @@ fn lower_naga_helper(
             ));
             return;
         }
-        if signature.returns_unit() {
+        if result_abi.physical_arity == 0 {
             naga_function.body.push(
                 naga::Statement::Return { value: None },
                 naga::Span::UNDEFINED,
             );
-        } else if signature.ret_tys().len() == 1 {
+        } else if signature.ret_tys().len() == 1 && result_abi.physical_arity == 1 {
             let Some(value) = result_expression else {
                 lowering_error = Some(format!(
                     "spirv: helper `{}` produced no return value. Fail closed.",
@@ -4700,8 +5113,17 @@ fn lower_naga_helper(
                 ));
                 return;
             }
-            let mut components = Vec::with_capacity(return_values.len());
-            for &value in return_values {
+            let physical_results = result_abi
+                .logical
+                .iter()
+                .enumerate()
+                .filter_map(|(logical_index, source)| {
+                    matches!(source, NagaResultSource::Physical(_))
+                        .then_some(return_values[logical_index])
+                })
+                .collect::<Vec<_>>();
+            let mut components = Vec::with_capacity(physical_results.len());
+            for value in physical_results {
                 let was_cached = value_map.contains_key(&value);
                 let Some(component) = resolve_naga_value(
                     value,
@@ -4733,26 +5155,31 @@ fn lower_naga_helper(
                 }
                 components.push(component);
             }
-            let Some(result_type) = result_type else {
+            let Some(result_type) = result_abi.physical_type else {
                 lowering_error = Some(format!(
-                    "spirv: multi-result helper `{}` has no lowered result struct. Fail closed.",
+                    "spirv: helper `{}` has physical results but no lowered result type. Fail closed.",
                     signature.name(),
                 ));
                 return;
             };
-            let tuple = naga_function.expressions.append(
-                naga::Expression::Compose {
-                    ty: result_type,
-                    components,
-                },
-                naga::Span::UNDEFINED,
-            );
+            let value = if let [component] = components.as_slice() {
+                *component
+            } else {
+                let tuple = naga_function.expressions.append(
+                    naga::Expression::Compose {
+                        ty: result_type,
+                        components,
+                    },
+                    naga::Span::UNDEFINED,
+                );
+                naga_function.body.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(tuple, tuple)),
+                    naga::Span::UNDEFINED,
+                );
+                tuple
+            };
             naga_function.body.push(
-                naga::Statement::Emit(naga::Range::new_from_bounds(tuple, tuple)),
-                naga::Span::UNDEFINED,
-            );
-            naga_function.body.push(
-                naga::Statement::Return { value: Some(tuple) },
+                naga::Statement::Return { value: Some(value) },
                 naga::Span::UNDEFINED,
             );
         }
@@ -5458,6 +5885,17 @@ fn translate_to_naga(
         0
     };
 
+    let (external_roots, external_layout_bindings) = append_external_resources(
+        &mut naga_mod,
+        external_resources,
+        word,
+        word_type,
+    )?;
+    let helper_resource_capabilities = helper_resource_capabilities(
+        module,
+        &sig,
+        &external_roots,
+    )?;
     let helper_memory_abis = helper_private_memory_abis(module, &call_order, first_func)?;
     let helper_memory = helper_memory_abis.values().any(|abi| abi.heap);
     let helper_trap = helper_memory_abis.values().any(|abi| abi.trap);
@@ -5541,17 +5979,27 @@ fn translate_to_naga(
                 "spirv: helper {helper_ref:?} has no derived private-memory ABI. Fail closed."
             )
         })?;
-        let signature = module
+        let helper_signature = module
             .ctx
             .get_sig(helper_ref)
             .ok_or_else(|| format!("spirv: helper {helper_ref:?} has no signature"))?;
-        let result_type = helper_naga_result_type(
-            signature.name(),
-            signature.ret_tys(),
+        let argument_abi = helper_naga_argument_abi(
+            &helper_signature,
             word,
             word_type,
             f32_type,
             bool_type,
+            &helper_resource_capabilities,
+        )?;
+        let result_abi = helper_naga_result_abi(
+            module,
+            helper_ref,
+            word,
+            word_type,
+            f32_type,
+            bool_type,
+            &helper_resource_capabilities,
+            &naga_functions,
             &mut naga_mod.types,
         )?;
         let helper = lower_naga_helper(
@@ -5561,7 +6009,8 @@ fn translate_to_naga(
             word_type,
             f32_type,
             bool_type,
-            result_type,
+            &argument_abi,
+            &result_abi,
             helper_memory_abi,
             helper_memory_types,
             private_heap_words,
@@ -5572,7 +6021,8 @@ fn translate_to_naga(
             helper_ref,
             NagaFunctionInfo {
                 handle,
-                result_arity: signature.ret_tys().len(),
+                argument_abi,
+                result_abi,
                 memory_abi: helper_memory_abi,
             },
         );
@@ -5615,13 +6065,6 @@ fn translate_to_naga(
                 .to_string(),
         );
     }
-
-    let (external_roots, external_layout_bindings) = append_external_resources(
-        &mut naga_mod,
-        external_resources,
-        word,
-        word_type,
-    )?;
 
     // ======================================================================
     // Explicit compute mode. The stage returns unit and communicates only via

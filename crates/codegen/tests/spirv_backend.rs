@@ -488,6 +488,247 @@ fn spirv_private_arena_helper_cannot_own_an_unaccounted_allocation() {
 }
 
 #[test]
+fn spirv_external_resource_identity_threads_through_helper_calls() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_type = mb.declare_array_type(Type::I32, 8);
+    let array_ref_type = mb.objref_type(array_type);
+    let word_ref_type = mb.objref_type(Type::I32);
+    let result_types = [array_ref_type, Type::I32];
+
+    let entry_ref = mb
+        .declare_function(Signature::new_unit(
+            "resource_helper_entry",
+            Linkage::Public,
+            &[array_ref_type, Type::I32, Type::I32],
+        ))
+        .unwrap();
+    let forwarder_ref = mb
+        .declare_function(Signature::new(
+            "resource_helper_forwarder",
+            Linkage::Private,
+            &[array_ref_type, Type::I32, Type::I32],
+            &result_types,
+        ))
+        .unwrap();
+    let leaf_ref = mb
+        .declare_function(Signature::new(
+            "resource_helper_leaf",
+            Linkage::Private,
+            &[array_ref_type, Type::I32, Type::I32],
+            &result_types,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(leaf_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let resource = fb.args()[0];
+        let index = fb.args()[1];
+        let value = fb.args()[2];
+        let slot = fb.insert_inst(
+            data::ObjIndex::new(is, resource, index),
+            word_ref_type,
+        );
+        fb.insert_inst_no_result(data::ObjStore::new(is, slot, value));
+        let one = fb.make_imm_value(1i32);
+        let incremented = fb.insert_inst(arith::Add::new(is, value, one), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [resource, incremented]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(forwarder_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let results = fb.insert_inst_results(
+            control_flow::Call::new(is, leaf_ref, fb.args().iter().copied().collect()),
+            &result_types,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            results
+                .iter()
+                .copied()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let index = fb.args()[1];
+        let results = fb.insert_inst_results(
+            control_flow::Call::new(
+                is,
+                forwarder_ref,
+                fb.args().iter().copied().collect(),
+            ),
+            &result_types,
+        );
+        let one = fb.make_imm_value(1i32);
+        let next_index = fb.insert_inst(arith::Add::new(is, index, one), Type::I32);
+        let slot = fb.insert_inst(
+            data::ObjIndex::new(is, results[0], next_index),
+            word_ref_type,
+        );
+        fb.insert_inst_no_result(data::ObjStore::new(is, slot, results[1]));
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(1, 1, 1)
+        .with_external_resource(SpirvExternalResource {
+            arg_index: 0,
+            group: 0,
+            binding: 0,
+            name: "values".to_string(),
+            access: Access::ReadWrite,
+            element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+            stride: 4,
+            length: 8,
+        })
+        .compile_module(&mb.build())
+        .expect("resource identity should cross helpers without entering a result struct");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.matches("resource_helper_leaf(").count() >= 2
+            && wgsl.matches("resource_helper_forwarder(").count() >= 2,
+        "both resource helpers must remain definitions and calls:\n{wgsl}",
+    );
+    assert!(
+        wgsl.contains("var<storage, read_write> values: array<u32>;")
+            && !wgsl.contains("ptr<storage"),
+        "resource helpers must use the entry-rooted module capability without an illegal storage-pointer parameter:\n{wgsl}",
+    );
+    assert!(
+        !wgsl.contains("resource_helper_leaf_result")
+            && !wgsl.contains("resource_helper_forwarder_result"),
+        "an identity resource result must be erased rather than packed into a WGSL struct:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with implicit resource helper capabilities must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("implicit resource helper capabilities must validate for browsers");
+}
+
+#[test]
+fn spirv_external_resource_helper_fails_closed_on_ambiguous_capability() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_type = mb.declare_array_type(Type::I32, 8);
+    let array_ref_type = mb.objref_type(array_type);
+    let word_ref_type = mb.objref_type(Type::I32);
+
+    let entry_ref = mb
+        .declare_function(Signature::new_unit(
+            "ambiguous_resource_entry",
+            Linkage::Public,
+            &[array_ref_type, array_ref_type, Type::I32],
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_unit(
+            "ambiguous_resource_helper",
+            Linkage::Private,
+            &[array_ref_type, Type::I32],
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let slot = fb.insert_inst(
+            data::ObjIndex::new(is, fb.args()[0], fb.args()[1]),
+            word_ref_type,
+        );
+        fb.insert_inst_no_result(data::ObjStore::new(is, slot, fb.args()[1]));
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(control_flow::Call::new(
+            is,
+            helper_ref,
+            [fb.args()[0], fb.args()[2]].into_iter().collect(),
+        ));
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let errors = match SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(1, 1, 1)
+        .with_external_resource(SpirvExternalResource {
+            arg_index: 0,
+            group: 0,
+            binding: 0,
+            name: "left_values".to_string(),
+            access: Access::ReadWrite,
+            element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+            stride: 4,
+            length: 8,
+        })
+        .with_external_resource(SpirvExternalResource {
+            arg_index: 1,
+            group: 0,
+            binding: 1,
+            name: "right_values".to_string(),
+            access: Access::ReadWrite,
+            element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+            stride: 4,
+            length: 8,
+        })
+        .compile_module(&mb.build())
+    {
+        Ok(_) => panic!("an ambiguous helper resource capability must fail closed"),
+        Err(errors) => errors,
+    };
+    let message = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        message.contains("helper specialization is required"),
+        "the ambiguity must fail at the named helper-capability boundary: {message}",
+    );
+}
+
+#[test]
 fn spirv_four_word_helper_result_survives_as_a_valid_wgsl_struct() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
