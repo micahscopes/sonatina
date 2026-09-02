@@ -397,10 +397,11 @@ fn lower_vertex(
         load_state(function, 1, state_var, &mut output, &mut values);
         let scfg = crate::structurize::structurize_function(function)?;
         let mut ignored = None;
+        let naga_functions = super::NagaFunctionMap::new();
         emit_naga_regions(
             function, function.inst_set(), WordKind::U32, &scfg.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
-            &mut ignored, None,
+            &mut ignored, &naga_functions, None,
         )?;
         let leaves = source_return_values(function, &values, &phis, &mut output)?;
         if leaves.len() != 4 + varying_count {
@@ -472,10 +473,11 @@ fn lower_fragment(
         load_state(function, varying_count, state_var, &mut output, &mut values);
         let scfg = crate::structurize::structurize_function(function)?;
         let mut result = None;
+        let naga_functions = super::NagaFunctionMap::new();
         emit_naga_regions(
             function, function.inst_set(), WordKind::U32, &scfg.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
-            &mut result, None,
+            &mut result, &naga_functions, None,
         )?;
         let packed = result.ok_or_else(|| "spirv raster: fragment produced no result".to_string())?;
         let color = output.expressions.append(
