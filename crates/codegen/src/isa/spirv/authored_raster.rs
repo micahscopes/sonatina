@@ -5,7 +5,7 @@ use sonatina_ir::{InstDowncast, Module, Type};
 use super::{
     Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinInput,
     SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
-    SpirvScalarKind, WordKind, emit_naga_regions, resolve_naga_value,
+    SpirvScalarKind, WordKind, append_external_resources, emit_naga_regions, resolve_naga_value,
     spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
 };
 
@@ -17,9 +17,6 @@ pub(super) fn translate(
     pipeline: &SpirvRasterPipeline,
     external_resources: &[SpirvExternalResource],
 ) -> Result<(naga::Module, SpirvLayout), String> {
-    if !external_resources.is_empty() {
-        return Err("spirv raster: authored resources are not wired into both stages yet; fail closed".to_string());
-    }
     if pipeline.vertex_entry == pipeline.fragment_entry {
         return Err("spirv raster: vertex and fragment entries must be distinct".to_string());
     }
@@ -72,12 +69,53 @@ pub(super) fn translate(
             vertex_state, fragment_state,
         ));
     }
-    if vertex_state.iter().any(|ty| !matches!(ty, Type::I32 | Type::F32)) {
-        return Err("spirv raster: actor state admits only i32/u32 and f32 leaves".to_string());
+    // `arg_index` names the vertex-entry argument. Both authored entries carry
+    // the same actor-state suffix, so the corresponding fragment argument is
+    // derived from that suffix position instead of guessed from scalar types.
+    let mut resource_state_positions = Vec::with_capacity(external_resources.len());
+    for resource in external_resources {
+        if resource.access != Access::Read {
+            return Err(format!(
+                "spirv raster: external resource {} must be read-only",
+                resource.name,
+            ));
+        }
+        let Some(state_position) = resource.arg_index.checked_sub(1).map(|index| index as usize)
+        else {
+            return Err(format!(
+                "spirv raster: external resource {} cannot replace vertex-index arg 0",
+                resource.name,
+            ));
+        };
+        if state_position >= vertex_state.len() {
+            return Err(format!(
+                "spirv raster: external resource {} names absent vertex arg {}",
+                resource.name, resource.arg_index,
+            ));
+        }
+        if resource_state_positions.contains(&state_position) {
+            return Err(format!(
+                "spirv raster: multiple external resources replace actor-state slot {state_position}",
+            ));
+        }
+        resource_state_positions.push(state_position);
+    }
+    let scalar_state = vertex_state
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, _)| !resource_state_positions.contains(index))
+        .collect::<Vec<_>>();
+    if scalar_state.iter().any(|(_, ty)| !matches!(ty, Type::I32 | Type::F32)) {
+        return Err(
+            "spirv raster: non-resource actor state admits only i32/u32 and f32 leaves"
+                .to_string(),
+        );
     }
 
-    // Calls have already been inlined by Fe. Object/memory/trap operations do
-    // not yet have a stage-paired transport, so refuse them explicitly.
+    // Calls have already been inlined by Fe. Object indexing/projection/load
+    // resolves through the shared external globals. Allocation, private memory
+    // and traps still have no stage-paired channel.
     for (stage, func_ref) in [("vertex", vertex_ref), ("fragment", fragment_ref)] {
         module.func_store.try_view(func_ref, |function| -> Result<(), String> {
             let inst_set = function.inst_set();
@@ -92,17 +130,23 @@ pub(super) fn translate(
                     }
                     let has_untransported_effect =
                         <&sonatina_ir::inst::data::ObjAlloc as InstDowncast>::downcast(inst_set, data).is_some()
-                        || <&sonatina_ir::inst::data::ObjLoad as InstDowncast>::downcast(inst_set, data).is_some()
-                        || <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, data).is_some()
-                        || <&sonatina_ir::inst::data::ObjIndex as InstDowncast>::downcast(inst_set, data).is_some()
-                        || <&sonatina_ir::inst::data::ObjProj as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::MemAllocDynamic as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::control_flow::Unreachable as InstDowncast>::downcast(inst_set, data).is_some();
                     if has_untransported_effect {
                         return Err(format!(
-                            "spirv raster: {stage} body uses object/memory/trap operations that have no raster-stage channel; fail closed",
+                            "spirv raster: {stage} body uses allocation/private-memory/trap operations that have no raster-stage channel; fail closed",
+                        ));
+                    }
+                    let has_external_object_effect =
+                        <&sonatina_ir::inst::data::ObjLoad as InstDowncast>::downcast(inst_set, data).is_some()
+                        || <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, data).is_some()
+                        || <&sonatina_ir::inst::data::ObjIndex as InstDowncast>::downcast(inst_set, data).is_some()
+                        || <&sonatina_ir::inst::data::ObjProj as InstDowncast>::downcast(inst_set, data).is_some();
+                    if has_external_object_effect && external_resources.is_empty() {
+                        return Err(format!(
+                            "spirv raster: {stage} body uses object operations without an external resource root; fail closed",
                         ));
                     }
                     if let Some(op) = unsupported_signed_op_under_u32(inst_set, data) {
@@ -149,17 +193,30 @@ pub(super) fn translate(
         naga::Span::UNDEFINED,
     );
 
+    let (external_roots, mut bindings) = append_external_resources(
+        &mut naga_mod,
+        external_resources,
+        WordKind::U32,
+        u32_type,
+        f32_type,
+    )?;
+
     let (state_var, state_span, layout_members) = append_state_binding(
-        &mut naga_mod, vertex_state, u32_type, f32_type, varying_count,
+        &mut naga_mod,
+        &scalar_state,
+        u32_type,
+        f32_type,
+        varying_count,
+        external_resources.len() as u32,
     );
     let output_type = append_vertex_output_type(&mut naga_mod, f32_type, vec4f, varying_count);
 
     let vertex = lower_vertex(
-        module, vertex_ref, pipeline, state_var, varying_count,
+        module, vertex_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
         u32_type, f32_type, bool_type, vec4f, output_type,
     )?;
     let fragment = lower_fragment(
-        module, fragment_ref, pipeline, state_var, varying_count,
+        module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
         u32_type, f32_type, bool_type, vec4f,
     )?;
 
@@ -170,19 +227,21 @@ pub(super) fn translate(
         pipeline.fragment_entry.clone(), naga::ShaderStage::Fragment, fragment,
     ));
 
-    let bindings = state_var.map(|_| vec![SpirvBinding {
-        group: 0,
-        binding: 0,
-        name: "state".to_string(),
-        access: Access::Read,
-        role: Role::Input,
-        stride: state_span,
-        span: state_span,
-        members: layout_members,
-        resource_element: None,
-        resource_length: None,
-        resource_arg_index: None,
-    }]).unwrap_or_default();
+    if state_var.is_some() {
+        bindings.push(SpirvBinding {
+            group: 0,
+            binding: external_resources.len() as u32,
+            name: "state".to_string(),
+            access: Access::Read,
+            role: Role::Input,
+            stride: state_span,
+            span: state_span,
+            members: layout_members,
+            resource_element: None,
+            resource_length: None,
+            resource_arg_index: None,
+        });
+    }
 
     Ok((naga_mod, SpirvLayout {
         entry_point: pipeline.fragment_entry.clone(),
@@ -216,16 +275,17 @@ fn scalar_type(
 
 fn append_state_binding(
     module: &mut naga::Module,
-    state: &[Type],
+    state: &[(usize, Type)],
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     fragment_prefix: usize,
+    binding: u32,
 ) -> (Option<naga::Handle<naga::GlobalVariable>>, u32, Vec<SpirvBindingMember>) {
     if state.is_empty() {
         return (None, 0, Vec::new());
     }
     let mut layout = Vec::with_capacity(state.len());
-    let members = state.iter().enumerate().map(|(index, ty)| {
+    let members = state.iter().enumerate().map(|(index, (state_index, ty))| {
         let (naga_ty, scalar) = match ty {
             Type::I32 => (u32_type, SpirvScalarKind::I32),
             Type::F32 => (f32_type, SpirvScalarKind::F32),
@@ -233,13 +293,13 @@ fn append_state_binding(
         };
         let offset = index as u32 * 4;
         layout.push(SpirvBindingMember {
-            arg_index: (fragment_prefix + index) as u32,
+            arg_index: (fragment_prefix + *state_index) as u32,
             offset,
             width: 4,
             scalar,
         });
         naga::StructMember {
-            name: Some(format!("p{}", fragment_prefix + index)),
+            name: Some(format!("p{}", fragment_prefix + *state_index)),
             ty: naga_ty,
             binding: None,
             offset,
@@ -257,7 +317,7 @@ fn append_state_binding(
         naga::GlobalVariable {
             name: Some("state".into()),
             space: naga::AddressSpace::Storage { access: naga::StorageAccess::LOAD },
-            binding: Some(naga::ResourceBinding { group: 0, binding: 0 }),
+            binding: Some(naga::ResourceBinding { group: 0, binding }),
             ty,
             init: None,
             memory_decorations: naga::ir::MemoryDecorations::empty(),
@@ -310,6 +370,7 @@ fn append_vertex_output_type(
 fn load_state(
     function: &sonatina_ir::Function,
     first_arg: usize,
+    state_fields: &[(usize, Type)],
     state_var: Option<naga::Handle<naga::GlobalVariable>>,
     naga_func: &mut naga::Function,
     values: &mut HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
@@ -318,7 +379,8 @@ fn load_state(
     let state = naga_func.expressions.append(
         naga::Expression::GlobalVariable(state_var), naga::Span::UNDEFINED,
     );
-    for (member, arg) in function.arg_values.iter().copied().skip(first_arg).enumerate() {
+    for (member, (state_index, _)) in state_fields.iter().enumerate() {
+        let arg = function.arg_values[first_arg + *state_index];
         let pointer = naga_func.expressions.append(
             naga::Expression::AccessIndex { base: state, index: member as u32 },
             naga::Span::UNDEFINED,
@@ -366,6 +428,8 @@ fn lower_vertex(
     func_ref: sonatina_ir::module::FuncRef,
     pipeline: &SpirvRasterPipeline,
     state_var: Option<naga::Handle<naga::GlobalVariable>>,
+    state_fields: &[(usize, Type)],
+    external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
     varying_count: usize,
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
@@ -394,7 +458,15 @@ fn lower_vertex(
             naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED,
         );
         values.insert(function.arg_values[0], index);
-        load_state(function, 1, state_var, &mut output, &mut values);
+        for &(arg_index, global) in external_roots {
+            let arg = function.arg_values[arg_index as usize];
+            let root = output.expressions.append(
+                naga::Expression::GlobalVariable(global),
+                naga::Span::UNDEFINED,
+            );
+            values.insert(arg, root);
+        }
+        load_state(function, 1, state_fields, state_var, &mut output, &mut values);
         let scfg = crate::structurize::structurize_function(function)?;
         let mut ignored = None;
         let naga_functions = super::NagaFunctionMap::new();
@@ -441,6 +513,8 @@ fn lower_fragment(
     func_ref: sonatina_ir::module::FuncRef,
     pipeline: &SpirvRasterPipeline,
     state_var: Option<naga::Handle<naga::GlobalVariable>>,
+    state_fields: &[(usize, Type)],
+    external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
     varying_count: usize,
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
@@ -470,7 +544,17 @@ fn lower_fragment(
             );
             values.insert(arg, value);
         }
-        load_state(function, varying_count, state_var, &mut output, &mut values);
+        for &(vertex_arg_index, global) in external_roots {
+            let state_index = vertex_arg_index as usize - 1;
+            let fragment_arg_index = varying_count + state_index;
+            let arg = function.arg_values[fragment_arg_index];
+            let root = output.expressions.append(
+                naga::Expression::GlobalVariable(global),
+                naga::Span::UNDEFINED,
+            );
+            values.insert(arg, root);
+        }
+        load_state(function, varying_count, state_fields, state_var, &mut output, &mut values);
         let scfg = crate::structurize::structurize_function(function)?;
         let mut result = None;
         let naga_functions = super::NagaFunctionMap::new();
