@@ -550,6 +550,7 @@ fn append_external_resources(
     resources: &[SpirvExternalResource],
     word: WordKind,
     word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
 ) -> Result<
     (
         Vec<(u32, naga::Handle<naga::GlobalVariable>)>,
@@ -567,11 +568,13 @@ fn append_external_resources(
     fn admitted_scalar(
         scalar: SpirvScalarKind,
         word_type: naga::Handle<naga::Type>,
+        f32_type: naga::Handle<naga::Type>,
     ) -> Result<naga::Handle<naga::Type>, String> {
         match scalar {
-            SpirvScalarKind::I32 | SpirvScalarKind::U32 => Ok(word_type),
+            SpirvScalarKind::U32 => Ok(word_type),
+            SpirvScalarKind::F32 => Ok(f32_type),
             other => Err(format!(
-                "spirv: external storage scalar {other:?} is unsupported; B4 v1 admits u32 browser words only"
+                "spirv: external storage scalar {other:?} is unsupported; portable resources admit u32 and f32"
             )),
         }
     }
@@ -595,7 +598,7 @@ fn append_external_resources(
 
         let (element_type, element_span) = match &resource.element {
             SpirvResourceElement::Scalar(scalar) => {
-                (admitted_scalar(*scalar, word_type)?, 4)
+                (admitted_scalar(*scalar, word_type, f32_type)?, 4)
             }
             SpirvResourceElement::Record { fields, span } => {
                 if fields.is_empty() || *span == 0 || *span % 4 != 0 {
@@ -621,7 +624,7 @@ fn append_external_resources(
                     }
                     naga_fields.push(naga::StructMember {
                         name: Some(field.name.clone()),
-                        ty: admitted_scalar(field.scalar, word_type)?,
+                        ty: admitted_scalar(field.scalar, word_type, f32_type)?,
                         binding: None,
                         offset: field.offset,
                     });
@@ -4683,24 +4686,6 @@ fn translate_to_naga(
                         .to_string(),
                 );
             }
-            // Diagnose unsupported f32 object storage before the general lowering
-            // whitelist. Address construction such as `obj.proj` may itself be
-            // outside that whitelist, but must not mask the more specific error.
-            for bid in f.layout.iter_block() {
-                for iid in f.layout.iter_inst(bid) {
-                    let inst_data = f.dfg.inst(iid);
-                    if let Some(store) = <&sonatina_ir::inst::data::ObjStore as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
-                        if f.dfg.value_ty(*store.value()) == sonatina_ir::Type::F32 {
-                            return Err("spirv: f32 object storage is unsupported".to_string());
-                        }
-                    }
-                    if <&sonatina_ir::inst::data::ObjLoad as sonatina_ir::InstDowncast>::downcast(is, inst_data).is_some()
-                        && f.dfg.inst_result(iid).is_some_and(|value| f.dfg.value_ty(value) == sonatina_ir::Type::F32)
-                    {
-                        return Err("spirv: f32 object storage is unsupported".to_string());
-                    }
-                }
-            }
             for bid in f.layout.iter_block() {
                 for iid in f.layout.iter_inst(bid) {
                     let inst_data = f.dfg.inst(iid);
@@ -5069,6 +5054,7 @@ fn translate_to_naga(
         external_resources,
         word,
         word_type,
+        f32_type,
     )?;
 
     // ======================================================================
