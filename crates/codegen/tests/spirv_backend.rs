@@ -4395,6 +4395,16 @@ func public %conditional_loop_phi(v0.i32, v1.i32) -> i32 {
         !wgsl.contains("edge_0_5_phi_8_1"),
         "the direct outside edge must not be emitted again after its sibling loop:\n{wgsl}",
     );
+    assert!(
+        !wgsl.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("var phi_")
+                || line.starts_with("var edge_")
+                || line.starts_with("var structured_result")
+                || line.starts_with("var structured_did_return")
+        }),
+        "compiler-internal control transport names must stay compact:\n{wgsl}",
+    );
     let reparsed = naga::front::wgsl::parse_str(wgsl)
         .expect("conditional loop-phi WGSL should reparse");
     naga::valid::Validator::new(
