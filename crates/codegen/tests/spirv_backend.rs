@@ -5122,6 +5122,11 @@ fn spirv_mem_alloc_exceeding_heap_capacity_fails_closed_at_compile_time() {
         msg.contains("exceeds the private heap capacity"),
         "expected a named heap-capacity error, got: {msg}"
     );
+    assert!(
+        msg.contains("Largest contributors: 40000 bytes total = 40000 bytes x 1")
+            && msg.contains("instruction `mem.alloc_dynamic`"),
+        "expected the static allocation census to identify the oversized allocation, got: {msg}"
+    );
     eprintln!("heap overflow correctly fails closed at compile time: {msg}");
 }
 

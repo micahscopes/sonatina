@@ -4869,6 +4869,7 @@ fn translate_to_naga(
             // runtime overflow check in the translator's MemAllocDynamic arm
             // unreachable for accepted modules, rather than the only defense.
             let mut mem_heap_bytes: u64 = 0;
+            let mut mem_alloc_census = Vec::new();
             let mut cfg = sonatina_ir::cfg::ControlFlowGraph::default();
             cfg.compute(f);
             let mut domtree = crate::domtree::DomTree::new();
@@ -5096,6 +5097,13 @@ fn translate_to_naga(
                                 containing_loop = loop_tree.parent_loop(loop_id);
                             }
                         }
+                        mem_alloc_census.push((
+                            size_bytes.saturating_mul(executions),
+                            size_bytes,
+                            executions,
+                            bid,
+                            inst_data.as_text(),
+                        ));
                         mem_heap_bytes = mem_heap_bytes
                             .saturating_add(size_bytes.saturating_mul(executions));
                     }
@@ -5189,11 +5197,23 @@ fn translate_to_naga(
             if has_mem {
                 let heap_capacity_bytes = (heap_words as u64) * 4;
                 if mem_heap_bytes > heap_capacity_bytes {
+                    mem_alloc_census.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+                    let largest = mem_alloc_census
+                        .iter()
+                        .take(8)
+                        .map(|(total, size, executions, block, instruction)| {
+                            format!(
+                                "{total} bytes total = {size} bytes x {executions} at \
+                                 {block:?}, instruction `{instruction}`"
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
                     return Err(format!(
                         "spirv: MemAllocDynamic static allocation total ({mem_heap_bytes} \
                          bytes) exceeds the private heap capacity ({heap_capacity_bytes} \
                          bytes = {heap_words} words); increase with_private_heap_words or \
-                         reduce array usage. Fail closed."
+                         reduce array usage. Largest contributors: {largest}. Fail closed."
                     ));
                 }
             }
