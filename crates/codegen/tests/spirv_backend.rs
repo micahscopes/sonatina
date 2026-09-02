@@ -147,6 +147,118 @@ fn spirv_arithmetic_return_valid() {
 }
 
 #[test]
+fn spirv_scalar_helper_call_survives_as_a_valid_wgsl_function() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    // Declaration order keeps the public entry as the backend root. The
+    // private helper is intentionally ordinary Sonatina IR, not an intrinsic
+    // or source annotation.
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "scalar_helper_entry",
+            Linkage::Public,
+            &[Type::I32, Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_single(
+            "scalar_helper",
+            Linkage::Private,
+            &[Type::I32, Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let leaf_ref = mb
+        .declare_function(Signature::new_single(
+            "scalar_leaf",
+            Linkage::Private,
+            &[Type::I32, Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(leaf_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let lhs = fb.args()[0];
+        let rhs = fb.args()[1];
+        let sum = fb.insert_inst(arith::Add::new(is, lhs, rhs), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let lhs = fb.args()[0];
+        let rhs = fb.args()[1];
+        let sum = fb.insert_inst(
+            control_flow::Call::new(
+                is,
+                leaf_ref,
+                [lhs, rhs].into_iter().collect(),
+            ),
+            Type::I32,
+        );
+        let seven = fb.make_imm_value(7i32);
+        let result = fb.insert_inst(arith::Mul::new(is, sum, seven), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let lhs = fb.args()[0];
+        let rhs = fb.args()[1];
+        let call = fb.insert_inst(
+            control_flow::Call::new(
+                is,
+                helper_ref,
+                [lhs, rhs].into_iter().collect(),
+            ),
+            Type::I32,
+        );
+        let three = fb.make_imm_value(3i32);
+        let result = fb.insert_inst(arith::Add::new(is, call, three), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("ordinary scalar helper call should lower without inlining");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.matches("scalar_helper(").count() >= 2,
+        "helper must appear as one definition and at least one call:\n{wgsl}"
+    );
+    assert!(
+        wgsl.matches("scalar_leaf(").count() >= 2,
+        "callee-before-caller lowering must preserve the nested leaf call:\n{wgsl}"
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with an ordinary helper call must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("WGSL with an ordinary scalar helper must validate for browser capabilities");
+}
+
+#[test]
 fn spirv_poseidon_sigma_valid() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
