@@ -427,12 +427,55 @@ impl Backend for SpirvBackend {
         }
 
         let phase = std::time::Instant::now();
-        let info = naga::valid::Validator::new(
+        let validation = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
         )
-        .validate(&naga_mod)
-        .map_err(|e| vec![SpirvError::Validation(format!("{e:?}"))])?;
+        .validate(&naga_mod);
+        let info = match validation {
+            Ok(info) => info,
+            Err(error) => {
+                if trace {
+                    eprintln!("sonatina spirv: naga validation failed: {error:?}");
+                    for entry in &naga_mod.entry_points {
+                        let expression_count = entry.function.expressions.len();
+                        let invalid_expression = match error.as_inner() {
+                            naga::valid::ValidationError::EntryPoint {
+                                name,
+                                source:
+                                    naga::valid::EntryPointError::Function(
+                                        naga::valid::FunctionError::Expression { handle, .. },
+                                    ),
+                                ..
+                            } if name == &entry.name => Some(handle.index()),
+                            _ => None,
+                        };
+                        let (first, end) = invalid_expression.map_or_else(
+                            || (expression_count.saturating_sub(128), expression_count),
+                            |index| {
+                                (
+                                    index.saturating_sub(32),
+                                    index.saturating_add(33).min(expression_count),
+                                )
+                            },
+                        );
+                        eprintln!(
+                            "sonatina spirv: entry={} expression_window={}..{} invalid={invalid_expression:?}",
+                            entry.name, first, end,
+                        );
+                        for (handle, expression) in entry.function.expressions.iter() {
+                            if (first..end).contains(&handle.index()) {
+                                eprintln!(
+                                    "sonatina spirv: entry={} expression={handle:?} value={expression:?}",
+                                    entry.name,
+                                );
+                            }
+                        }
+                    }
+                }
+                return Err(vec![SpirvError::Validation(format!("{error:?}"))]);
+            }
+        };
         if trace {
             eprintln!(
                 "sonatina spirv: validated naga, elapsed_ms={}",
@@ -3003,17 +3046,29 @@ fn ensure_phi_locals(
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
+    value_map: &std::collections::HashMap<
+        sonatina_ir::ValueId,
+        naga::Handle<naga::Expression>,
+    >,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
-) {
+) -> Result<(), String> {
     use sonatina_ir::InstDowncast;
     for inst_id in function.layout.iter_inst(block) {
         let inst = function.dfg.inst(inst_id);
         if <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst).is_none() { break }
         let Some(result) = function.dfg.inst_result(inst_id) else { continue };
+        if value_map.contains_key(&result) {
+            continue;
+        }
         let ty = match function.dfg.value_ty(result) {
             sonatina_ir::Type::F32 => f32_type,
             sonatina_ir::Type::I1 => bool_type,
-            _ => word_type,
+            sonatina_ir::Type::I32 => word_type,
+            other => {
+                return Err(format!(
+                    "spirv structurize: phi {result:?} has non-scalar type {other:?} without one proven resource identity. Fail closed."
+                ));
+            }
         };
         // Control transport is compiler-internal. Keep its physical WGSL name
         // compact while Sonatina value IDs remain available in diagnostics.
@@ -3022,6 +3077,7 @@ fn ensure_phi_locals(
             naga::Span::UNDEFINED,
         ));
     }
+    Ok(())
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -3062,7 +3118,12 @@ fn emit_exact_phi_edge(
         let inst = function.dfg.inst(inst_id);
         let Some(phi) = <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst) else { break };
         let result = function.dfg.inst_result(inst_id).ok_or_else(|| "spirv structurize: phi has no result".to_string())?;
-        let local = *phi_locals.get(&result).ok_or_else(|| format!("spirv structurize: phi {result:?} has no local"))?;
+        let Some(&local) = phi_locals.get(&result) else {
+            if value_map.contains_key(&result) {
+                continue;
+            }
+            return Err(format!("spirv structurize: phi {result:?} has no local"));
+        };
         let [(value, _)] = phi.args().iter().filter(|(_, pred)| *pred == from).collect::<Vec<_>>().as_slice() else {
             return Err(format!("spirv structurize: edge {from:?}->{to:?} does not have exactly one input for phi {result:?}"));
         };
@@ -3149,7 +3210,10 @@ fn emit_if_region(
         return Err("spirv structurize: expected if region".to_string());
     };
     if let Some(merge) = merge {
-        ensure_phi_locals(function, inst_set, *merge, word_type, f32_type, bool_type, func, phi_locals);
+        ensure_phi_locals(
+            function, inst_set, *merge, word_type, f32_type, bool_type, func, value_map,
+            phi_locals,
+        )?;
     }
     emit_phi_loads_for_block(
         function, inst_set, *header, func, target, value_map, phi_locals,
@@ -3587,7 +3651,10 @@ fn emit_regions_in_loop(
             }
             crate::structurize::Region::IfThenElse { header, then_branch, else_branch, merge } => {
                 if let Some(merge) = merge {
-                    ensure_phi_locals(function, inst_set, *merge, word_type, f32_type, bool_type, func, phi_locals);
+                    ensure_phi_locals(
+                        function, inst_set, *merge, word_type, f32_type, bool_type, func,
+                        value_map, phi_locals,
+                    )?;
                 }
                 emit_phi_loads_for_block(
                     function, inst_set, *header, func, target, value_map, phi_locals,
@@ -3689,8 +3756,9 @@ fn emit_regions_in_loop(
             }
             crate::structurize::Region::LoopExit { from, target: exit } => {
                 ensure_phi_locals(
-                    function, inst_set, *exit, word_type, f32_type, bool_type, func, phi_locals,
-                );
+                    function, inst_set, *exit, word_type, f32_type, bool_type, func, value_map,
+                    phi_locals,
+                )?;
                 emit_exact_phi_edge(
                     function, inst_set, word, *from, *exit, func, target, value_map, phi_locals,
                 )?;
@@ -3781,7 +3849,10 @@ fn emit_recursive_loop_region(
     let mut loop_blocks = std::collections::HashSet::new();
     loop_blocks.insert(header);
     region_blocks(body_regions, &mut loop_blocks);
-    ensure_phi_locals(function, inst_set, header, word_type, f32_type, bool_type, func, phi_locals);
+    ensure_phi_locals(
+        function, inst_set, header, word_type, f32_type, bool_type, func, value_map,
+        phi_locals,
+    )?;
 
     let mut outside_preds = Vec::new();
     for iid in function.layout.iter_inst(header) {
@@ -3896,7 +3967,10 @@ fn emit_recursive_loop_region(
         return Err(format!("spirv: loop {header:?} must have exactly one in-loop successor"));
     }
     let exit = if nz_in { *branch.z_dest() } else { *branch.nz_dest() };
-    ensure_phi_locals(function, inst_set, exit, word_type, f32_type, bool_type, func, phi_locals);
+    ensure_phi_locals(
+        function, inst_set, exit, word_type, f32_type, bool_type, func, value_map,
+        phi_locals,
+    )?;
     let mut continue_arm = naga::Block::new();
     let mut continue_values = value_map.clone();
     let mut may_return = false;
@@ -4310,6 +4384,137 @@ enum NagaResourceCapability {
 #[cfg(feature = "spirv-backend")]
 type NagaResourceCapabilities =
     std::collections::HashMap<sonatina_ir::Type, NagaResourceCapability>;
+
+#[cfg(feature = "spirv-backend")]
+fn bind_resource_identity_aliases(
+    function: &sonatina_ir::Function,
+    seeds: impl IntoIterator<Item = sonatina_ir::ValueId>,
+    naga_functions: &NagaFunctionMap,
+    value_map: &mut std::collections::HashMap<
+        sonatina_ir::ValueId,
+        naga::Handle<naga::Expression>,
+    >,
+) -> Result<(), String> {
+    use sonatina_ir::{
+        InstDowncast,
+        inst::control_flow::{Call, Phi},
+    };
+
+    let inst_set = function.inst_set();
+    let mut provenance = seeds
+        .into_iter()
+        .map(|seed| (seed, seed))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in function.layout.iter_block() {
+            for instruction in function.layout.iter_inst(block) {
+                if let Some(call_info) = function.dfg.call_info(instruction) {
+                    let call = <&Call as InstDowncast>::downcast(
+                        inst_set,
+                        function.dfg.inst(instruction),
+                    )
+                    .ok_or_else(|| {
+                        "spirv: resource provenance reached a call form without arguments. Fail closed."
+                            .to_string()
+                    })?;
+                    let callee = naga_functions.get(&call_info.callee()).ok_or_else(|| {
+                        format!(
+                            "spirv: resource provenance reached {:?} before its helper ABI was available. Fail closed.",
+                            call_info.callee(),
+                        )
+                    })?;
+                    for (&result, source) in function
+                        .dfg
+                        .inst_results(instruction)
+                        .iter()
+                        .zip(&callee.result_abi.logical)
+                    {
+                        let NagaResultSource::PassthroughArgument(argument_index) = source else {
+                            continue;
+                        };
+                        let argument = *call.args().get(*argument_index as usize).ok_or_else(|| {
+                            format!(
+                                "spirv: resource result from {:?} refers to missing argument {argument_index}. Fail closed.",
+                                call_info.callee(),
+                            )
+                        })?;
+                        let Some(&root) = provenance.get(&argument) else {
+                            continue;
+                        };
+                        match provenance.entry(result) {
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(root);
+                                changed = true;
+                            }
+                            std::collections::hash_map::Entry::Occupied(entry)
+                                if *entry.get() != root =>
+                            {
+                                return Err(format!(
+                                    "spirv: resource result {result:?} has conflicting identities. Fail closed."
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+                let Some(phi) = <&Phi as InstDowncast>::downcast(
+                    inst_set,
+                    function.dfg.inst(instruction),
+                ) else {
+                    continue;
+                };
+                let mut incoming = phi
+                    .args()
+                    .iter()
+                    .filter_map(|(value, _)| provenance.get(value).copied());
+                let Some(root) = incoming.next() else {
+                    continue;
+                };
+                if !incoming.all(|candidate| candidate == root)
+                    || !phi
+                        .args()
+                        .iter()
+                        .all(|(value, _)| provenance.contains_key(value))
+                {
+                    continue;
+                }
+                let Some(result) = function.dfg.inst_result(instruction) else {
+                    continue;
+                };
+                match provenance.entry(result) {
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(root);
+                        changed = true;
+                    }
+                    std::collections::hash_map::Entry::Occupied(entry)
+                        if *entry.get() != root =>
+                    {
+                        return Err(format!(
+                            "spirv: resource phi {result:?} has conflicting identities. Fail closed."
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    for (value, root) in provenance {
+        if value == root {
+            continue;
+        }
+        let expression = *value_map.get(&root).ok_or_else(|| {
+            format!(
+                "spirv: resource identity root {root:?} has no physical Naga capability. Fail closed."
+            )
+        })?;
+        value_map.insert(value, expression);
+    }
+    Ok(())
+}
 
 /// Return the direct-call closure rooted at `entry`, with every callee before
 /// its callers. Naga permits calls only to module functions, so this order lets
@@ -5000,6 +5205,23 @@ fn lower_naga_helper(
                 naga::Span::UNDEFINED,
             );
             value_map.insert(argument, expression);
+        }
+        let resource_seeds = function
+            .arg_values
+            .iter()
+            .zip(argument_abi)
+            .filter_map(|(&argument, source)| {
+                matches!(source, NagaArgumentSource::ImplicitResource(_)).then_some(argument)
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = bind_resource_identity_aliases(
+            function,
+            resource_seeds,
+            naga_functions,
+            &mut value_map,
+        ) {
+            lowering_error = Some(error);
+            return;
         }
         let mut memory_argument = physical_argument_count;
         let heap = if memory_abi.heap {
@@ -6358,6 +6580,21 @@ fn translate_to_naga(
                 );
                 value_map.insert(arg_value, root);
             }
+            let resource_seeds = external_roots
+                .iter()
+                .filter_map(|(arg_index, _)| {
+                    function.arg_values.get(*arg_index as usize).copied()
+                })
+                .collect::<Vec<_>>();
+            if let Err(error) = bind_resource_identity_aliases(
+                function,
+                resource_seeds,
+                &naga_functions,
+                &mut value_map,
+            ) {
+                body_error = Some(error);
+                return;
+            }
             if let Some(parameter_var) = parameter_var {
                 let params = func.expressions.append(
                     naga::Expression::GlobalVariable(parameter_var),
@@ -6790,6 +7027,21 @@ fn translate_to_naga(
                         naga::Span::UNDEFINED,
                     );
                     value_map.insert(arg_value, root);
+                }
+                let resource_seeds = external_roots
+                    .iter()
+                    .filter_map(|(arg_index, _)| {
+                        function.arg_values.get(*arg_index as usize).copied()
+                    })
+                    .collect::<Vec<_>>();
+                if let Err(error) = bind_resource_identity_aliases(
+                    function,
+                    resource_seeds,
+                    &naga_functions,
+                    &mut value_map,
+                ) {
+                    body_error = Some(error);
+                    return;
                 }
 
                 let input_expr = input_var.map(|input_var| {
