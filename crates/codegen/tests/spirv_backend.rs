@@ -5130,6 +5130,100 @@ fn spirv_mem_alloc_exceeding_heap_capacity_fails_closed_at_compile_time() {
     eprintln!("heap overflow correctly fails closed at compile time: {msg}");
 }
 
+/// Two verified sibling arena scopes cannot be live simultaneously. Their
+/// private words are therefore reused after rewind instead of being charged as
+/// one monolithic allocation sum.
+#[test]
+fn spirv_sequential_arena_scopes_reuse_private_heap_capacity() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("sequential_scopes", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let size = fb.make_imm_value(24_000i32);
+    let first_checkpoint = fb.insert_inst(data::MemCheckpoint::new(is), Type::I32);
+    let first = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let seven = fb.make_imm_value(7i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, first, seven, Type::I32));
+    let carried = fb.insert_inst(data::Mload::new(is, first, Type::I32), Type::I32);
+    fb.insert_inst_no_result(data::MemRewind::new(is, first_checkpoint));
+
+    let second_checkpoint = fb.insert_inst(data::MemCheckpoint::new(is), Type::I32);
+    let second = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    fb.insert_inst_no_result(data::Mstore::new(is, second, carried, Type::I32));
+    let result = fb.insert_inst(data::Mload::new(is, second, Type::I32), Type::I32);
+    fb.insert_inst_no_result(data::MemRewind::new(is, second_checkpoint));
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let artifact = SpirvBackend::new()
+        .compile_module(&module)
+        .expect("sequential verified scopes must reuse private heap words");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.contains("array<u32, 6000>"),
+        "two sequential 24 KB scopes need one 24 KB private heap:\n{wgsl}",
+    );
+}
+
+/// Nested scopes overlap their parent's live allocation. They must add rather
+/// than reuse capacity, preserving the fail-closed heap bound.
+#[test]
+fn spirv_nested_arena_scopes_add_private_heap_capacity() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single("nested_scopes", Linkage::Public, &[], Type::I32);
+    let func_ref = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(func_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+
+    let size = fb.make_imm_value(20_000i32);
+    let outer_checkpoint = fb.insert_inst(data::MemCheckpoint::new(is), Type::I32);
+    let outer = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let seven = fb.make_imm_value(7i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, outer, seven, Type::I32));
+    let inner_checkpoint = fb.insert_inst(data::MemCheckpoint::new(is), Type::I32);
+    let inner = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    fb.insert_inst_no_result(data::Mstore::new(is, inner, seven, Type::I32));
+    let result = fb.insert_inst(data::Mload::new(is, inner, Type::I32), Type::I32);
+    fb.insert_inst_no_result(data::MemRewind::new(is, inner_checkpoint));
+    fb.insert_inst_no_result(data::MemRewind::new(is, outer_checkpoint));
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let module = mb.build();
+    let errors = match SpirvBackend::new().compile_module(&module) {
+        Ok(_) => panic!("nested 20 KB scopes must exceed the 32 KB private heap"),
+        Err(errors) => errors,
+    };
+    let message = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        message.contains("static allocation high-water (40000 bytes)"),
+        "nested scopes must retain a 40 KB high-water bound: {message}",
+    );
+}
+
 /// A `MemAllocDynamic` inside a loop whose bound is supplied at runtime has a
 /// total byte cost that the compile-time capacity proof cannot bound. It must
 /// fail closed rather than silently summing only one iteration.

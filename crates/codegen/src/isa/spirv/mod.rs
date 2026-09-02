@@ -759,20 +759,88 @@ impl MemCtx {
 /// rewound. An allocation in a loop is admitted only when its live stack is
 /// deeper than the stack at the innermost loop header.
 #[cfg(feature = "spirv-backend")]
+struct ArenaScopeAnalysis {
+    scoped_loop_allocations: std::collections::HashSet<sonatina_ir::InstId>,
+    allocation_scopes:
+        std::collections::HashMap<sonatina_ir::InstId, Option<sonatina_ir::ValueId>>,
+    checkpoint_parents:
+        std::collections::HashMap<sonatina_ir::ValueId, Option<sonatina_ir::ValueId>>,
+}
+
+#[cfg(feature = "spirv-backend")]
+impl ArenaScopeAnalysis {
+    /// Conservative high-water bound for the verified arena tree. Direct
+    /// allocations in one scope accumulate. Nested scopes overlap their
+    /// parent, while sibling scopes cannot overlap because each must rewind
+    /// before the next sibling is opened.
+    fn high_water_bytes(
+        &self,
+        allocations: impl IntoIterator<Item = (sonatina_ir::InstId, u64)>,
+    ) -> u64 {
+        use std::collections::HashMap;
+
+        let mut direct = HashMap::<Option<sonatina_ir::ValueId>, u64>::new();
+        direct.insert(None, 0);
+        for (instruction, bytes) in allocations {
+            let scope = self
+                .allocation_scopes
+                .get(&instruction)
+                .copied()
+                .flatten();
+            let total = direct.entry(scope).or_default();
+            *total = total.saturating_add(bytes);
+        }
+
+        let mut children =
+            HashMap::<Option<sonatina_ir::ValueId>, Vec<sonatina_ir::ValueId>>::new();
+        for (&checkpoint, &parent) in &self.checkpoint_parents {
+            children.entry(parent).or_default().push(checkpoint);
+        }
+
+        fn visit(
+            scope: Option<sonatina_ir::ValueId>,
+            direct: &HashMap<Option<sonatina_ir::ValueId>, u64>,
+            children: &HashMap<Option<sonatina_ir::ValueId>, Vec<sonatina_ir::ValueId>>,
+        ) -> u64 {
+            let child_high_water = children
+                .get(&scope)
+                .into_iter()
+                .flatten()
+                .map(|&child| visit(Some(child), direct, children))
+                .max()
+                .unwrap_or(0);
+            direct
+                .get(&scope)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(child_high_water)
+        }
+
+        visit(None, &direct, &children)
+    }
+}
+
+#[cfg(feature = "spirv-backend")]
 fn verify_arena_scopes(
     function: &sonatina_ir::Function,
     cfg: &sonatina_ir::ControlFlowGraph,
     loop_tree: &crate::loop_analysis::LoopTree,
-) -> Result<std::collections::HashSet<sonatina_ir::InstId>, String> {
+) -> Result<ArenaScopeAnalysis, String> {
     use sonatina_ir::{InstDowncast, inst::data};
     use std::collections::{HashMap, HashSet, VecDeque};
 
     let Some(entry) = function.layout.entry_block() else {
-        return Ok(HashSet::new());
+        return Ok(ArenaScopeAnalysis {
+            scoped_loop_allocations: HashSet::new(),
+            allocation_scopes: HashMap::new(),
+            checkpoint_parents: HashMap::new(),
+        });
     };
     let inst_set = function.inst_set();
     let mut incoming = HashMap::<sonatina_ir::BlockId, Vec<sonatina_ir::ValueId>>::new();
     let mut allocation_stacks = HashMap::<sonatina_ir::InstId, Vec<sonatina_ir::ValueId>>::new();
+    let mut checkpoint_parents =
+        HashMap::<sonatina_ir::ValueId, Option<sonatina_ir::ValueId>>::new();
     let mut worklist = VecDeque::from([entry]);
     incoming.insert(entry, Vec::new());
 
@@ -787,6 +855,7 @@ fn verify_arena_scopes(
                 let checkpoint = function.dfg.inst_result(inst).ok_or_else(|| {
                     format!("spirv: mem.checkpoint in {block:?} has no SSA result. Fail closed.")
                 })?;
+                checkpoint_parents.insert(checkpoint, stack.last().copied());
                 stack.push(checkpoint);
             } else if let Some(rewind) =
                 <&data::MemRewind as InstDowncast>::downcast(inst_set, inst_data)
@@ -826,7 +895,7 @@ fn verify_arena_scopes(
     }
 
     let mut scoped_loop_allocations = HashSet::new();
-    for (inst, stack) in allocation_stacks {
+    for (&inst, stack) in &allocation_stacks {
         let block = function.layout.inst_block(inst);
         let Some(loop_id) = loop_tree.loop_of_block(block) else {
             continue;
@@ -842,7 +911,15 @@ fn verify_arena_scopes(
         }
     }
 
-    Ok(scoped_loop_allocations)
+    let allocation_scopes = allocation_stacks
+        .into_iter()
+        .map(|(instruction, stack)| (instruction, stack.last().copied()))
+        .collect();
+    Ok(ArenaScopeAnalysis {
+        scoped_loop_allocations,
+        allocation_scopes,
+        checkpoint_parents,
+    })
 }
 
 /// OR-accumulate `mem_ctx.trapped` with a freshly computed boolean condition
@@ -2050,8 +2127,8 @@ fn emit_single_inst(
         // 2): fe_bump is a monotone bump pointer into fe_heap.
         //
         // Guards review finding 1 (silent heap-exhaustion aliasing). The pre-scan in
-        // `translate_to_naga` already PROVES, at compile time, that the sum of
-        // every MemAllocDynamic's constant `size` in this function is <=
+        // `translate_to_naga` already PROVES, at compile time, that the scoped
+        // high-water bound of every MemAllocDynamic in this function is <=
         // heap_ctx.heap_words*4. Loop allocations are admitted only when an
         // independently verified MemCheckpoint/MemRewind scope proves that
         // each iteration restores the arena before its backedge. So the
@@ -4860,23 +4937,23 @@ fn translate_to_naga(
             // but whose trap survives still needs the channel.
             let mut has_unreachable = false;
             // Review finding 1 (heap-exhaustion aliasing), the compile-time half:
-            // the conservative sum of every MemAllocDynamic instruction's
-            // constant size in this function. A loop allocation is counted
-            // once only after `verify_arena_scopes` proves that every iteration
-            // rewinds its compiler-authored frame before the backedge. The sum
-            // can overestimate mutually exclusive or sequential scopes, but it
-            // cannot underestimate simultaneously live storage. This makes the
+            // a conservative high-water bound over every MemAllocDynamic
+            // instruction's constant size in this function. A loop allocation
+            // is counted once only after `verify_arena_scopes` proves that every
+            // iteration rewinds its compiler-authored frame before the
+            // backedge. Verified sibling scopes reuse storage after rewind;
+            // nested scopes add to their parent's live storage. This makes the
             // runtime overflow check in the translator's MemAllocDynamic arm
             // unreachable for accepted modules, rather than the only defense.
-            let mut mem_heap_bytes: u64 = 0;
             let mut mem_alloc_census = Vec::new();
+            let mut bounded_allocations = Vec::new();
             let mut cfg = sonatina_ir::cfg::ControlFlowGraph::default();
             cfg.compute(f);
             let mut domtree = crate::domtree::DomTree::new();
             domtree.compute(&cfg);
             let mut loop_tree = crate::loop_analysis::LoopTree::new();
             loop_tree.compute(&cfg, &domtree);
-            let scoped_loop_allocations = verify_arena_scopes(f, &cfg, &loop_tree)?;
+            let arena_scopes = verify_arena_scopes(f, &cfg, &loop_tree)?;
             if word == WordKind::I64
                 && f.dfg
                     .value_ids()
@@ -5070,7 +5147,7 @@ fn translate_to_naga(
                             }
                         };
                         let mut executions = 1_u64;
-                        if !scoped_loop_allocations.contains(&iid) {
+                        if !arena_scopes.scoped_loop_allocations.contains(&iid) {
                             let mut containing_loop = loop_tree.loop_of_block(bid);
                             while let Some(loop_id) = containing_loop {
                                 let Some(iterations) = crate::analysis::induction::u32_loop_iteration_upper_bound(
@@ -5104,8 +5181,8 @@ fn translate_to_naga(
                             bid,
                             inst_data.as_text(),
                         ));
-                        mem_heap_bytes = mem_heap_bytes
-                            .saturating_add(size_bytes.saturating_mul(executions));
+                        bounded_allocations
+                            .push((iid, size_bytes.saturating_mul(executions)));
                     }
                     if let Some(load) = <&sonatina_ir::inst::data::Mload as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
                         has_mem = true;
@@ -5186,6 +5263,7 @@ fn translate_to_naga(
                     }
                 }
             }
+            let mem_heap_bytes = arena_scopes.high_water_bytes(bounded_allocations);
             if has_mem && word == WordKind::I64 {
                 return Err(
                     "spirv i64: MemAllocDynamic/Memcopy/Mload/Mstore (function-local arrays) are \
@@ -5210,7 +5288,7 @@ fn translate_to_naga(
                         .collect::<Vec<_>>()
                         .join("; ");
                     return Err(format!(
-                        "spirv: MemAllocDynamic static allocation total ({mem_heap_bytes} \
+                        "spirv: MemAllocDynamic static allocation high-water ({mem_heap_bytes} \
                          bytes) exceeds the private heap capacity ({heap_capacity_bytes} \
                          bytes = {heap_words} words); increase with_private_heap_words or \
                          reduce array usage. Largest contributors: {largest}. Fail closed."
