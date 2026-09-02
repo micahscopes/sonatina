@@ -26,6 +26,17 @@ fn native_module_builder() -> ModuleBuilder {
     ModuleBuilder::new(ctx)
 }
 
+fn spirv_rejection(module: &sonatina_ir::Module, expectation: &str) -> String {
+    match SpirvBackend::new().compile_module(module) {
+        Ok(_) => panic!("{expectation}"),
+        Err(errors) => errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 fn assert_layout_metadata_invariants(layout: &SpirvLayout, arg_count: usize) {
     let mut seen = vec![false; arg_count];
     for builtin in &layout.builtin_inputs {
@@ -256,6 +267,292 @@ fn spirv_scalar_helper_call_survives_as_a_valid_wgsl_function() {
     )
     .validate(&reparsed)
     .expect("WGSL with an ordinary scalar helper must validate for browser capabilities");
+}
+
+#[test]
+fn spirv_fixed_struct_local_survives_inside_scalar_helper() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty =
+        mb.declare_struct_type("FixedLocalPair", &[Type::I32, Type::I32], false);
+    let pair_ptr_ty = mb.ptr_type(pair_ty);
+    let word_ptr_ty = mb.ptr_type(Type::I32);
+
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "fixed_struct_local_entry",
+            Linkage::Public,
+            &[Type::I32, Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_single(
+            "fixed_struct_local_helper",
+            Linkage::Private,
+            &[Type::I32, Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let lhs = fb.args()[0];
+        let rhs = fb.args()[1];
+        let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+        let zero = fb.make_imm_value(0i32);
+        let first_index = fb.make_imm_value(0i32);
+        let second_index = fb.make_imm_value(1i32);
+        let first = fb.insert_inst(
+            data::Gep::new(is, [slot, zero, first_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        let second = fb.insert_inst(
+            data::Gep::new(is, [slot, zero, second_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        fb.insert_inst_no_result(data::Mstore::new(is, first, lhs, Type::I32));
+        fb.insert_inst_no_result(data::Mstore::new(is, second, rhs, Type::I32));
+        let loaded_lhs =
+            fb.insert_inst(data::Mload::new(is, first, Type::I32), Type::I32);
+        let loaded_rhs =
+            fb.insert_inst(data::Mload::new(is, second, Type::I32), Type::I32);
+        let sum = fb.insert_inst(arith::Add::new(is, loaded_lhs, loaded_rhs), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let lhs = fb.args()[0];
+        let rhs = fb.args()[1];
+        let result = fb.insert_inst(
+            control_flow::Call::new(is, helper_ref, [lhs, rhs].into_iter().collect()),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("a fixed typed local should lower without the byte arena");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.matches("fixed_struct_local_helper(").count() >= 2,
+        "the scalar helper must remain one definition and one call:\n{wgsl}",
+    );
+    assert!(
+        wgsl.contains("var fixed_local_"),
+        "the fixed aggregate must become one native function local:\n{wgsl}",
+    );
+    assert!(
+        !wgsl.contains("fe_heap") && !wgsl.contains("fe_bump"),
+        "the fixed aggregate must not use the byte arena:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with a fixed typed local must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("WGSL with a fixed typed local must validate for browser capabilities");
+}
+
+#[test]
+fn spirv_typed_local_rejects_pointer_to_integer_escape() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty =
+        mb.declare_struct_type("EscapingFixedLocalPair", &[Type::I32, Type::I32], false);
+    let pair_ptr_ty = mb.ptr_type(pair_ty);
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "typed_local_pointer_escape",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        ))
+        .unwrap();
+
+    let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+    let address = fb.insert_inst(cast::PtrToInt::new(is, slot, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, address));
+    fb.seal_all();
+    fb.finish();
+
+    let message = spirv_rejection(
+        &mb.build(),
+        "a typed private pointer must not become an integer",
+    );
+    assert!(
+        message.contains("typed-local pointer") && message.contains("Fail closed"),
+        "unexpected rejection: {message}",
+    );
+}
+
+#[test]
+fn spirv_typed_local_rejects_cross_call_pointer_escape() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty =
+        mb.declare_struct_type("BorrowedFixedLocalPair", &[Type::I32, Type::I32], false);
+    let pair_ptr_ty = mb.ptr_type(pair_ty);
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "typed_local_cross_call_entry",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_single(
+            "typed_local_cross_call_helper",
+            Linkage::Private,
+            &[pair_ptr_ty],
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let zero = fb.make_imm_value(0i32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, zero));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+        let result = fb.insert_inst(
+            control_flow::Call::new(is, helper_ref, [slot].into_iter().collect()),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let message = spirv_rejection(
+        &mb.build(),
+        "a typed private pointer must not cross a call boundary",
+    );
+    assert!(
+        message.contains("typed-local pointer") && message.contains("Fail closed"),
+        "unexpected rejection: {message}",
+    );
+}
+
+#[test]
+fn spirv_typed_local_rejects_bytewise_copy() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty =
+        mb.declare_struct_type("CopiedFixedLocalPair", &[Type::I32, Type::I32], false);
+    let pair_ptr_ty = mb.ptr_type(pair_ty);
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "typed_local_bytewise_copy",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        ))
+        .unwrap();
+
+    let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+    let byte_len = fb.make_imm_value(8i32);
+    fb.insert_inst_no_result(data::Memcopy::new(is, slot, slot, byte_len));
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, zero));
+    fb.seal_all();
+    fb.finish();
+
+    let message = spirv_rejection(
+        &mb.build(),
+        "typed private storage must not be observed bytewise",
+    );
+    assert!(
+        message.contains("typed-local pointer") && message.contains("Fail closed"),
+        "unexpected rejection: {message}",
+    );
+}
+
+#[test]
+fn spirv_typed_local_rejects_excessive_private_storage() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let oversized_ty = mb.declare_array_type(Type::I32, 4097);
+    let oversized_ptr_ty = mb.ptr_type(oversized_ty);
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "typed_local_private_budget",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        ))
+        .unwrap();
+
+    let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    fb.insert_inst(data::Alloca::new(is, oversized_ty), oversized_ptr_ty);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, zero));
+    fb.seal_all();
+    fb.finish();
+
+    let message = spirv_rejection(
+        &mb.build(),
+        "typed private storage must remain within its conservative budget",
+    );
+    assert!(
+        message.contains("typed private storage")
+            && message.contains("per-function budget")
+            && message.contains("Fail closed"),
+        "unexpected rejection: {message}",
+    );
 }
 
 #[test]
