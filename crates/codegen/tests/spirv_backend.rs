@@ -635,6 +635,122 @@ fn spirv_external_resource_identity_threads_through_helper_calls() {
 }
 
 #[test]
+fn spirv_external_resource_identity_survives_a_phi_join() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_type = mb.declare_array_type(Type::I32, 8);
+    let array_ref_type = mb.objref_type(array_type);
+    let word_ref_type = mb.objref_type(Type::I32);
+
+    let entry_ref = mb
+        .declare_function(Signature::new_unit(
+            "resource_phi_entry",
+            Linkage::Public,
+            &[array_ref_type, Type::I32],
+        ))
+        .unwrap();
+    let forwarder_ref = mb
+        .declare_function(Signature::new_single(
+            "resource_phi_forwarder",
+            Linkage::Private,
+            &[array_ref_type],
+            array_ref_type,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(forwarder_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, fb.args()[0]));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        let forwarded_arm = fb.append_block();
+        let direct_arm = fb.append_block();
+        let merge = fb.append_block();
+
+        fb.switch_to_block(entry);
+        let resource = fb.args()[0];
+        let index = fb.args()[1];
+        let zero = fb.make_imm_value(0i32);
+        let choose_forwarder = fb.insert_inst(cmp::Eq::new(is, index, zero), Type::I1);
+        fb.insert_inst_no_result(control_flow::Br::new(
+            is,
+            choose_forwarder,
+            forwarded_arm,
+            direct_arm,
+        ));
+
+        fb.switch_to_block(forwarded_arm);
+        let forwarded = fb.insert_inst_results(
+            control_flow::Call::new(is, forwarder_ref, smallvec::smallvec![resource]),
+            &[array_ref_type],
+        )[0];
+        fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+        fb.switch_to_block(direct_arm);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+        fb.switch_to_block(merge);
+        let selected = fb.insert_inst(
+            control_flow::Phi::new(
+                is,
+                vec![(forwarded, forwarded_arm), (resource, direct_arm)],
+            ),
+            array_ref_type,
+        );
+        let slot = fb.insert_inst(data::ObjIndex::new(is, selected, index), word_ref_type);
+        fb.insert_inst_no_result(data::ObjStore::new(is, slot, index));
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(1, 1, 1)
+        .with_external_resource(SpirvExternalResource {
+            arg_index: 0,
+            group: 0,
+            binding: 0,
+            name: "values".to_string(),
+            access: Access::ReadWrite,
+            element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+            stride: 4,
+            length: 8,
+        })
+        .compile_module(&mb.build())
+        .expect("one resource identity should survive helper passthrough and a phi join");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.matches("resource_phi_forwarder(").count() >= 2,
+        "the resource forwarder must remain a definition and a call:\n{wgsl}",
+    );
+    assert!(
+        wgsl.contains("var<storage, read_write> values: array<u32>;")
+            && !wgsl.contains("ptr<storage"),
+        "the joined resource must remain the entry-rooted module capability:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with a joined resource identity must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("a joined resource identity must validate for browsers");
+}
+
+#[test]
 fn spirv_external_resource_helper_fails_closed_on_ambiguous_capability() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
