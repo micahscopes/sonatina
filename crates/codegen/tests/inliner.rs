@@ -1022,6 +1022,7 @@ func public %self(v0.i1, v1.i1, v2.i32) -> i32 {
     cfg.max_inline_depth = 1;
     cfg.max_growth_per_caller = 12;
     cfg.max_total_growth = 64;
+    cfg.record_full_clone_ids = true;
 
     let mut inliner = Inliner::new(cfg);
     let stats = inliner.run(module);
@@ -1033,6 +1034,26 @@ func public %self(v0.i1, v1.i1, v2.i32) -> i32 {
         stats.full_insts_cloned, 12,
         "recursive self-call cloning should use the frozen iteration snapshot:\n{dumped}"
     );
+    assert_eq!(stats.full_clone_records.len(), 2);
+    assert_eq!(
+        stats
+            .full_clone_records
+            .iter()
+            .map(|record| record.instructions.len())
+            .sum::<usize>(),
+        stats.full_insts_cloned,
+    );
+    for record in &stats.full_clone_records {
+        assert_eq!(record.caller, record.callee);
+        module.func_store.view(record.caller, |function| {
+            assert!(
+                record
+                    .instructions
+                    .iter()
+                    .all(|&inst| function.layout.is_inst_inserted(inst)),
+            );
+        });
+    }
     assert!(
         dumped.contains("call %self"),
         "depth cap should leave the next recursive generation in place:\n{dumped}"

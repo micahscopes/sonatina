@@ -20,7 +20,7 @@ pub(super) enum FullInlineFail {
     MalformedCallee,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(super) struct FullInlineResult {
     pub blocks_cloned: usize,
     pub insts_cloned: usize,
@@ -28,6 +28,7 @@ pub(super) struct FullInlineResult {
     pub net_growth: usize,
     pub cont_block: BlockId,
     pub cont_reachable: bool,
+    pub cloned_insts: Vec<InstId>,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +150,7 @@ pub(super) fn try_inline_callsite_full(
     let mut phi_fixups = Vec::new();
     let mut returns = Vec::new();
     let mut inserted_insts = 0usize;
+    let mut cloned_insts = Vec::new();
 
     for old_block in rpo {
         let new_block = block_map[&old_block];
@@ -181,6 +183,9 @@ pub(super) fn try_inline_callsite_full(
             let (new_inst, new_results) =
                 editor.append_inst_with_results(new_block, cloned, result_tys.as_slice());
             inserted_insts += 1;
+            if _config.record_full_clone_ids {
+                cloned_insts.push(new_inst);
+            }
 
             assert_eq!(
                 old_results.len(),
@@ -217,8 +222,11 @@ pub(super) fn try_inline_callsite_full(
                 .unwrap_or_default();
 
             let jump = editor.func_mut().dfg.make_jump(cont_block);
-            editor.append_inst_with_result(new_block, Box::new(jump), None);
+            let (new_inst, _) = editor.append_inst_with_result(new_block, Box::new(jump), None);
             inserted_insts += 1;
+            if _config.record_full_clone_ids {
+                cloned_insts.push(new_inst);
+            }
 
             returns.push(ReturnSite {
                 from_block: new_block,
@@ -233,8 +241,11 @@ pub(super) fn try_inline_callsite_full(
                     .rewrite_inst_operands(term.as_mut(), false)
                     .expect("validated callee should be rewriteable");
             }
-            editor.append_inst_with_result(new_block, term, None);
+            let (new_inst, _) = editor.append_inst_with_result(new_block, term, None);
             inserted_insts += 1;
+            if _config.record_full_clone_ids {
+                cloned_insts.push(new_inst);
+            }
         }
     }
 
@@ -307,6 +318,9 @@ pub(super) fn try_inline_callsite_full(
                     func.dfg.attach_result(phi_inst, phi_value);
                     func.dfg.change_to_alias(call_result, phi_value);
                     inserted_insts += 1;
+                    if _config.record_full_clone_ids {
+                        cloned_insts.push(phi_inst);
+                    }
                 }
             }
         }
@@ -328,6 +342,7 @@ pub(super) fn try_inline_callsite_full(
         net_growth: inserted_insts.saturating_sub(1),
         cont_block,
         cont_reachable,
+        cloned_insts,
     })
 }
 

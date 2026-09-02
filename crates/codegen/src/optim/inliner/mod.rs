@@ -69,6 +69,11 @@ pub struct InlinerConfig {
     pub loop_penalty: i32,
     pub scalarization_bonus_cap: i32,
     pub scalarization_helper_cluster_bonus: i32,
+
+    /// Retain the physical instruction IDs cloned by each full-inline event.
+    /// This is disabled by default because it is observation-only metadata for
+    /// backend census tooling, never an optimization or legality input.
+    pub record_full_clone_ids: bool,
 }
 
 impl Default for InlinerConfig {
@@ -112,8 +117,17 @@ impl Default for InlinerConfig {
             loop_penalty: 20,
             scalarization_bonus_cap: 10,
             scalarization_helper_cluster_bonus: 4,
+
+            record_full_clone_ids: false,
         }
     }
+}
+
+#[derive(Debug)]
+pub struct FullInlineCloneRecord {
+    pub caller: FuncRef,
+    pub callee: FuncRef,
+    pub instructions: Vec<InstId>,
 }
 
 #[derive(Default)]
@@ -134,6 +148,7 @@ pub struct InlineStats {
     pub full_blocks_cloned: usize,
     pub full_insts_cloned: usize,
     pub full_phi_fixups: usize,
+    pub full_clone_records: Vec<FullInlineCloneRecord>,
     pub skipped_recursive_scc: usize,
     pub skipped_recursive_guard: usize,
     pub skipped_budget: usize,
@@ -426,6 +441,13 @@ impl Inliner {
                                 }
                             } else {
                                 reachable_blocks = None;
+                            }
+                            if self.config.record_full_clone_ids {
+                                stats.full_clone_records.push(FullInlineCloneRecord {
+                                    caller: caller_ref,
+                                    callee: site.callee,
+                                    instructions: result.cloned_insts,
+                                });
                             }
                         }
                         Err(full::FullInlineFail::SignatureMismatch) => {
