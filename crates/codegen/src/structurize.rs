@@ -992,10 +992,15 @@ impl Structurer<'_> {
     }
 
     fn is_local_merge_candidate(&self, block: BlockId, cur_loop: Option<Loop>) -> bool {
+        // A bare return or trap is a terminal leaf, but a terminal block that
+        // also owns a phi or other instructions is a real convergence point.
+        // Match lowering commonly produces exactly that shape: live arms join
+        // through a result phi and return, while the default arm traps.
+        let owns_join = !self.returns(block) || !self.is_shared_bare_terminal(block);
         let Some(lp) = cur_loop else {
-            return !self.returns(block);
+            return owns_join;
         };
-        block != self.loop_tree.loop_header(lp) && self.in_loop(block, lp) && !self.returns(block)
+        block != self.loop_tree.loop_header(lp) && self.in_loop(block, lp) && owns_join
     }
 
     /// Find the closest block reached by every nonterminal path from both
@@ -1396,6 +1401,88 @@ mod tests {
         let structured = structurize(&module, fr);
         assert!(structured.block_order.contains(&return_block));
         assert!(structured.block_order.contains(&trap_block));
+    }
+
+    /// A lowered match may send every valid arm to one phi-bearing return
+    /// while its default arm traps. The return block is the owned merge of the
+    /// live arms, not a clonable terminal leaf.
+    #[test]
+    fn match_arms_merge_at_phi_return_while_default_traps() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_single(
+            "match_with_trapping_default",
+            Linkage::Public,
+            &[Type::I32],
+            Type::I32,
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let check_one = fb.append_block();
+        let check_two = fb.append_block();
+        let check_three = fb.append_block();
+        let arm_zero = fb.append_block();
+        let arm_one = fb.append_block();
+        let arm_two = fb.append_block();
+        let arm_three = fb.append_block();
+        let merge = fb.append_block();
+        let trap = fb.append_block();
+
+        let selector = fb.args()[0];
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        let two = fb.make_imm_value(2i32);
+        let three = fb.make_imm_value(3i32);
+        let fallback = fb.make_imm_value(99i32);
+
+        fb.switch_to_block(entry);
+        let is_zero = fb.insert_inst(cmp::Eq::new(is, selector, zero), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_zero, arm_zero, check_one));
+        fb.switch_to_block(check_one);
+        let is_one = fb.insert_inst(cmp::Eq::new(is, selector, one), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_one, arm_one, check_two));
+        fb.switch_to_block(check_two);
+        let is_two = fb.insert_inst(cmp::Eq::new(is, selector, two), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_two, arm_two, check_three));
+        fb.switch_to_block(check_three);
+        let is_three = fb.insert_inst(cmp::Eq::new(is, selector, three), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_three, arm_three, trap));
+
+        for arm in [arm_zero, arm_one, arm_two, arm_three] {
+            fb.switch_to_block(arm);
+            fb.insert_inst_no_result(Jump::new(is, merge));
+        }
+        fb.switch_to_block(merge);
+        let result = fb.insert_inst(
+            Phi::new(
+                is,
+                vec![
+                    (zero, arm_zero),
+                    (one, arm_one),
+                    (two, arm_two),
+                    (fallback, arm_three),
+                ],
+            ),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(Return::new_single(is, result));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(matches!(
+            structured.regions.last(),
+            Some(Region::Block(block)) if *block == merge
+        ));
+        assert_eq!(
+            structured.stats().block_occurrences,
+            structured.stats().referenced_blocks,
+            "the phi-bearing merge must have one owner: {:?}",
+            structured.regions,
+        );
     }
 
     /// Nested terminal arms may share one phi-free cleanup block before its
