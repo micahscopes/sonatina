@@ -2894,8 +2894,10 @@ fn ensure_phi_locals(
             sonatina_ir::Type::I1 => bool_type,
             _ => word_type,
         };
+        // Control transport is compiler-internal. Keep its physical WGSL name
+        // compact while Sonatina value IDs remain available in diagnostics.
         phi_locals.entry(result).or_insert_with(|| func.local_variables.append(
-            naga::LocalVariable { name: Some(format!("phi_{}", result.0)), ty, init: None },
+            naga::LocalVariable { name: None, ty, init: None },
             naga::Span::UNDEFINED,
         ));
     }
@@ -2972,9 +2974,11 @@ fn emit_exact_phi_edge(
                 },
             )?
         };
+        // This snapshot local has no authored identity. Naga gives anonymous
+        // locals deterministic compact names in the serialized shader.
         let temp = func.local_variables.append(
             naga::LocalVariable {
-                name: Some(format!("edge_{}_{}_phi_{}", from.0, to.0, result.0)),
+                name: None,
                 ty: func.local_variables[local].ty,
                 init: None,
             },
@@ -3349,8 +3353,9 @@ fn allocate_return_transport(
         Some(sonatina_ir::Type::I1) => bool_type,
         Some(_) | None => word_type,
     };
+    // Structured return transport is likewise a physical lowering detail.
     let result = func.local_variables.append(
-        naga::LocalVariable { name: Some("structured_result".into()), ty: return_naga_ty, init: None },
+        naga::LocalVariable { name: None, ty: return_naga_ty, init: None },
         naga::Span::UNDEFINED,
     );
     let returned_false = func.expressions.append(
@@ -3359,7 +3364,7 @@ fn allocate_return_transport(
     );
     let did_return = func.local_variables.append(
         naga::LocalVariable {
-            name: Some("structured_did_return".into()),
+            name: None,
             ty: bool_type,
             init: Some(returned_false),
         },
