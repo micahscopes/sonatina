@@ -259,6 +259,186 @@ fn spirv_scalar_helper_call_survives_as_a_valid_wgsl_function() {
 }
 
 #[test]
+fn spirv_four_word_helper_result_survives_as_a_valid_wgsl_struct() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let result_types = [Type::I32; 4];
+
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "four_word_helper_entry",
+            Linkage::Public,
+            &[Type::I32, Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new(
+            "four_word_helper",
+            Linkage::Private,
+            &[Type::I32, Type::I32],
+            &result_types,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let lhs = fb.args()[0];
+        let rhs = fb.args()[1];
+        let sum = fb.insert_inst(arith::Add::new(is, lhs, rhs), Type::I32);
+        let difference = fb.insert_inst(arith::Sub::new(is, lhs, rhs), Type::I32);
+        let product = fb.insert_inst(arith::Mul::new(is, lhs, rhs), Type::I32);
+        let doubled = fb.insert_inst(arith::Add::new(is, sum, sum), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [sum, difference, product, doubled]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let results = fb.insert_inst_results(
+            control_flow::Call::new(
+                is,
+                helper_ref,
+                [fb.args()[0], fb.args()[1]].into_iter().collect(),
+            ),
+            &result_types,
+        );
+        let first = fb.insert_inst(arith::Add::new(is, results[0], results[1]), Type::I32);
+        let second = fb.insert_inst(arith::Add::new(is, results[2], results[3]), Type::I32);
+        let total = fb.insert_inst(arith::Add::new(is, first, second), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, total));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("ordinary four-word helper call should lower without inlining");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.matches("four_word_helper(").count() >= 2,
+        "four-word helper must appear as one definition and at least one call:\n{wgsl}"
+    );
+    assert!(
+        wgsl.contains("struct four_word_helper_result"),
+        "four-word helper should use one logical WGSL result struct:\n{wgsl}"
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with a four-word helper result must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("WGSL with a four-word helper result must validate for browser capabilities");
+}
+
+#[test]
+fn spirv_scalar_tuple_helper_with_multiple_returns_fails_closed() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let result_types = [Type::I32; 2];
+
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "tuple_return_boundary_entry",
+            Linkage::Public,
+            &[Type::I32, Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new(
+            "tuple_return_boundary",
+            Linkage::Private,
+            &[Type::I32, Type::I32],
+            &result_types,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        let equal = fb.append_block();
+        let different = fb.append_block();
+        fb.switch_to_block(entry);
+        let lhs = fb.args()[0];
+        let rhs = fb.args()[1];
+        let condition = fb.insert_inst(cmp::Eq::new(is, lhs, rhs), Type::I1);
+        fb.insert_inst_no_result(control_flow::Br::new(is, condition, equal, different));
+        fb.switch_to_block(equal);
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [lhs, rhs]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.switch_to_block(different);
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [rhs, lhs]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let results = fb.insert_inst_results(
+            control_flow::Call::new(
+                is,
+                helper_ref,
+                [fb.args()[0], fb.args()[1]].into_iter().collect(),
+            ),
+            &result_types,
+        );
+        let total = fb.insert_inst(arith::Add::new(is, results[0], results[1]), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, total));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let errors = match SpirvBackend::new().compile_module(&mb.build()) {
+        Ok(_) => panic!("multiple tuple-return sites must fail closed"),
+        Err(errors) => errors,
+    };
+    let message = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        message.contains("structured tuple-return transport is not lowered yet"),
+        "expected the named scalar tuple-return boundary, got: {message}"
+    );
+}
+
+#[test]
 fn spirv_poseidon_sigma_valid() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native
