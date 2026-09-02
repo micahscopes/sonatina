@@ -63,6 +63,83 @@ pub struct StructuredCfg {
     pub block_order: Vec<BlockId>,
 }
 
+/// Compact structural measurements for one reconstructed region tree.
+///
+/// `block_occurrences` counts every block body position in the tree, including
+/// loop and conditional headers. `duplicated_block_occurrences` therefore
+/// measures the exact CFG-to-tree cloning pressure introduced by structuring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructuredCfgStats {
+    pub region_nodes: usize,
+    pub reachable_blocks: usize,
+    pub referenced_blocks: usize,
+    pub block_occurrences: usize,
+    pub duplicated_block_occurrences: usize,
+    pub loops: usize,
+    pub conditionals: usize,
+    pub loop_exits: usize,
+    pub loop_continues: usize,
+}
+
+impl StructuredCfg {
+    pub fn stats(&self) -> StructuredCfgStats {
+        fn visit(
+            regions: &[Region],
+            stats: &mut StructuredCfgStats,
+            blocks: &mut HashSet<BlockId>,
+        ) {
+            for region in regions {
+                stats.region_nodes += 1;
+                match region {
+                    Region::Block(block) => {
+                        stats.block_occurrences += 1;
+                        blocks.insert(*block);
+                    }
+                    Region::Loop { header, body } => {
+                        stats.loops += 1;
+                        stats.block_occurrences += 1;
+                        blocks.insert(*header);
+                        visit(body, stats, blocks);
+                    }
+                    Region::IfThenElse {
+                        header,
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        stats.conditionals += 1;
+                        stats.block_occurrences += 1;
+                        blocks.insert(*header);
+                        visit(then_branch, stats, blocks);
+                        visit(else_branch, stats, blocks);
+                    }
+                    Region::LoopExit { .. } => stats.loop_exits += 1,
+                    Region::LoopContinue { .. } => stats.loop_continues += 1,
+                }
+            }
+        }
+
+        let mut stats = StructuredCfgStats {
+            region_nodes: 0,
+            reachable_blocks: self.block_order.len(),
+            referenced_blocks: 0,
+            block_occurrences: 0,
+            duplicated_block_occurrences: 0,
+            loops: 0,
+            conditionals: 0,
+            loop_exits: 0,
+            loop_continues: 0,
+        };
+        let mut blocks = HashSet::new();
+        visit(&self.regions, &mut stats, &mut blocks);
+        stats.referenced_blocks = blocks.len();
+        stats.duplicated_block_occurrences = stats
+            .block_occurrences
+            .saturating_sub(stats.referenced_blocks);
+        stats
+    }
+}
+
 /// Dense post-dominator sets for every reachable block. Merge discovery asks
 /// the same post-dominance question at every conditional, so computing these
 /// sets once avoids rebuilding a full reachability graph and fixed point for
@@ -1177,6 +1254,11 @@ mod tests {
         assert_eq!(structured.regions.len(), 2);
         assert!(matches!(structured.regions[0], Region::Block(_)));
         assert!(matches!(structured.regions[1], Region::Block(_)));
+        let stats = structured.stats();
+        assert_eq!(stats.reachable_blocks, 2);
+        assert_eq!(stats.referenced_blocks, 2);
+        assert_eq!(stats.block_occurrences, 2);
+        assert_eq!(stats.duplicated_block_occurrences, 0);
     }
 
     #[test]
@@ -1644,6 +1726,9 @@ mod tests {
 
         assert_eq!(count_headers(&structured.regions, shared_decision), 2);
         assert_eq!(count_headers(&structured.regions, corridor_merge), 2);
+        let stats = structured.stats();
+        assert!(stats.block_occurrences > stats.referenced_blocks);
+        assert!(stats.duplicated_block_occurrences >= 2);
     }
 
     /// Mutually exclusive loops may fall through to the same nonempty block
