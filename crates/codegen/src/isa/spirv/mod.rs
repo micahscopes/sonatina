@@ -545,7 +545,7 @@ fn lit_u32(func: &mut naga::Function, v: u32) -> naga::Handle<naga::Expression> 
 }
 
 #[cfg(feature = "spirv-backend")]
-fn append_external_resources(
+pub(super) fn append_external_resources(
     naga_mod: &mut naga::Module,
     resources: &[SpirvExternalResource],
     word: WordKind,
