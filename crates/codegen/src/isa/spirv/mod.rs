@@ -5040,9 +5040,19 @@ fn translate_to_naga(
                 }
             };
             if trace {
+                let stats = scfg.stats();
                 eprintln!(
-                    "sonatina spirv: structurized compute entry, regions={}, elapsed_ms={}, total_elapsed_ms={}",
+                    "sonatina spirv: structurized compute entry, top_regions={}, region_nodes={}, reachable_blocks={}, referenced_blocks={}, block_occurrences={}, duplicated_block_occurrences={}, loops={}, conditionals={}, loop_exits={}, loop_continues={}, elapsed_ms={}, total_elapsed_ms={}",
                     scfg.regions.len(),
+                    stats.region_nodes,
+                    stats.reachable_blocks,
+                    stats.referenced_blocks,
+                    stats.block_occurrences,
+                    stats.duplicated_block_occurrences,
+                    stats.loops,
+                    stats.conditionals,
+                    stats.loop_exits,
+                    stats.loop_continues,
                     phase.elapsed().as_millis(),
                     started.elapsed().as_millis()
                 );
