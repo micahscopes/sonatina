@@ -1618,6 +1618,59 @@ fn build_external_record_compute_module() -> sonatina_ir::Module {
     mb.build()
 }
 
+fn build_external_mixed_record_compute_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    // Sonatina's I32 lane is the signless browser-word carrier. The independent
+    // external schema below deliberately marks that middle field as WGSL u32.
+    let record_ty = mb.declare_struct_type("MixedSample", &[Type::F32, Type::I32, Type::F32], false);
+    let record_ref_ty = mb.objref_type(record_ty);
+    let float_ref_ty = mb.objref_type(Type::F32);
+    let word_ref_ty = mb.objref_type(Type::I32);
+    let array_ty = mb.declare_array_type(record_ty, 1);
+    let array_ref_ty = mb.objref_type(array_ty);
+    let sig = Signature::new_unit("write_external_mixed_record", Linkage::Public, &[array_ref_ty]);
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let samples = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    let two = fb.make_imm_value(2i32);
+    let sample = fb.insert_inst(data::ObjIndex::new(is, samples, zero), record_ref_ty);
+    let x = fb.insert_inst(
+        data::ObjProj::new(is, smallvec::smallvec![sample, zero]),
+        float_ref_ty,
+    );
+    let material = fb.insert_inst(
+        data::ObjProj::new(is, smallvec::smallvec![sample, one]),
+        word_ref_ty,
+    );
+    let y = fb.insert_inst(
+        data::ObjProj::new(is, smallvec::smallvec![sample, two]),
+        float_ref_ty,
+    );
+    let x_value = fb.make_imm_value(Immediate::F32(1.25f32.to_bits()));
+    let material_value = fb.make_imm_value(7i32);
+    let y_value = fb.make_imm_value(Immediate::F32((-2.5f32).to_bits()));
+    fb.insert_inst_no_result(data::ObjStore::new(is, x, x_value));
+    fb.insert_inst_no_result(data::ObjStore::new(is, material, material_value));
+    fb.insert_inst_no_result(data::ObjStore::new(is, y, y_value));
+    let loaded_x = fb.insert_inst(data::ObjLoad::new(is, x), Type::F32);
+    let loaded_y = fb.insert_inst(data::ObjLoad::new(is, y), Type::F32);
+    let sum = fb.insert_inst(arith::Fadd::new(is, loaded_x, loaded_y), Type::F32);
+    fb.insert_inst_no_result(data::ObjStore::new(is, x, sum));
+    fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 fn build_unit_compute_loop_with_exit_store_module() -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
         if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
@@ -1866,6 +1919,38 @@ fn external_complex_resource(arg_index: u32, access: Access) -> SpirvExternalRes
             span: 8,
         },
         stride: 8,
+        length: 1,
+    }
+}
+
+fn external_mixed_resource(arg_index: u32, access: Access) -> SpirvExternalResource {
+    SpirvExternalResource {
+        arg_index,
+        group: 0,
+        binding: 0,
+        name: "samples".to_string(),
+        access,
+        element: SpirvResourceElement::Record {
+            fields: vec![
+                SpirvResourceField {
+                    name: "x".to_string(),
+                    scalar: SpirvScalarKind::F32,
+                    offset: 0,
+                },
+                SpirvResourceField {
+                    name: "material".to_string(),
+                    scalar: SpirvScalarKind::U32,
+                    offset: 4,
+                },
+                SpirvResourceField {
+                    name: "y".to_string(),
+                    scalar: SpirvScalarKind::F32,
+                    offset: 8,
+                },
+            ],
+            span: 12,
+        },
+        stride: 12,
         length: 1,
     }
 }
@@ -2331,6 +2416,73 @@ fn explicit_compute_roots_external_record_and_emits_no_implicit_buffers() {
     )
     .validate(&reparsed)
     .expect("external-resource compute WGSL must validate under browser capabilities");
+}
+
+fn compile_mixed_f32_u32_object_storage() -> sonatina_codegen::isa::spirv::SpirvArtifact {
+    SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(1, 1, 1)
+        .with_external_resource(external_mixed_resource(0, Access::ReadWrite))
+        .compile_module(&build_external_mixed_record_compute_module())
+        .expect("mixed scalar external record should compile")
+}
+
+#[test]
+fn explicit_compute_lowers_mixed_f32_u32_object_storage() {
+    let artifact = compile_mixed_f32_u32_object_storage();
+    assert_eq!(artifact.layout.mode, LayoutMode::Compute);
+    assert_layout_metadata_invariants(&artifact.layout, 1);
+    assert_eq!(artifact.layout.bindings.len(), 1);
+    let samples = &artifact.layout.bindings[0];
+    assert_eq!((samples.span, samples.stride, samples.resource_length), (12, 12, Some(1)));
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    assert!(wgsl.contains("x: f32"), "f32 field must survive:\n{wgsl}");
+    assert!(wgsl.contains("material: u32"), "u32 field must survive:\n{wgsl}");
+    assert!(wgsl.contains("y: f32"), "second f32 field must survive:\n{wgsl}");
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("mixed scalar external-resource WGSL should reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("mixed scalar external-resource WGSL must validate for browsers");
+}
+
+#[test]
+fn explicit_compute_rejects_signed_external_storage_until_carrier_semantics_exist() {
+    let mut resource = external_complex_resource(0, Access::ReadWrite);
+    let SpirvResourceElement::Record { fields, .. } = &mut resource.element else {
+        unreachable!("the fixture is a record")
+    };
+    fields[0].scalar = SpirvScalarKind::I32;
+    let errors = match SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(1, 1, 1)
+        .with_external_resource(resource)
+        .compile_module(&build_external_record_compute_module())
+    {
+        Ok(_) => panic!("signed storage must fail closed until its carrier bitcasts are explicit"),
+        Err(errors) => errors,
+    };
+    let message = errors.iter().map(|error| error.to_string()).collect::<Vec<_>>().join("; ");
+    assert!(
+        message.contains("external storage scalar I32 is unsupported"),
+        "expected the signed-carrier boundary error, got: {message}"
+    );
+}
+
+#[test]
+fn explicit_compute_executes_mixed_f32_u32_object_storage() {
+    let artifact = compile_mixed_f32_u32_object_storage();
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    // Read the 12-byte record back as raw words. A logical width of three
+    // allocates those bytes, while wgx=3 submits one actual 1x1x1 workgroup so
+    // there is no cross-invocation race on the single record.
+    assert_eq!(
+        run_grid_u32(wgsl, 3, 1, 3, 1, &[]),
+        vec![(-1.25f32).to_bits(), 7, (-2.5f32).to_bits()],
+    );
 }
 
 #[test]
