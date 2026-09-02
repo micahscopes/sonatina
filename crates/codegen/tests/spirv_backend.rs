@@ -259,6 +259,235 @@ fn spirv_scalar_helper_call_survives_as_a_valid_wgsl_function() {
 }
 
 #[test]
+fn spirv_private_arena_helper_survives_through_an_explicit_pointer_abi() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "private_arena_helper_entry",
+            Linkage::Public,
+            &[Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_single(
+            "private_arena_helper",
+            Linkage::Private,
+            &[Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let forwarder_ref = mb
+        .declare_function(Signature::new_single(
+            "private_arena_forwarder",
+            Linkage::Private,
+            &[Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let pure_ref = mb
+        .declare_function(Signature::new_single(
+            "private_arena_pure",
+            Linkage::Private,
+            &[Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let address = fb.args()[0];
+        let value = fb.insert_inst(data::Mload::new(is, address, Type::I32), Type::I32);
+        let one = fb.make_imm_value(1i32);
+        let incremented = fb.insert_inst(arith::Add::new(is, value, one), Type::I32);
+        fb.insert_inst_no_result(data::Mstore::new(
+            is,
+            address,
+            incremented,
+            Type::I32,
+        ));
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, incremented));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(forwarder_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let address = fb.args()[0];
+        let result = fb.insert_inst(
+            control_flow::Call::new(is, helper_ref, [address].into_iter().collect()),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(pure_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let input = fb.args()[0];
+        let two = fb.make_imm_value(2i32);
+        let result = fb.insert_inst(arith::Add::new(is, input, two), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let input = fb.args()[0];
+        let prepared = fb.insert_inst(
+            control_flow::Call::new(is, pure_ref, [input].into_iter().collect()),
+            Type::I32,
+        );
+        let bytes = fb.make_imm_value(8i32);
+        let address = fb.insert_inst(data::MemAllocDynamic::new(is, bytes), Type::I32);
+        fb.insert_inst_no_result(data::Mstore::new(
+            is,
+            address,
+            prepared,
+            Type::I32,
+        ));
+        let result = fb.insert_inst(
+            control_flow::Call::new(is, forwarder_ref, [address].into_iter().collect()),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("a non-allocating helper should share the entry's proven private arena");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.matches("private_arena_helper(").count() >= 2,
+        "the private-arena helper must remain a definition and call:\n{wgsl}",
+    );
+    assert!(
+        wgsl.contains("ptr<function"),
+        "the helper must receive compiler-owned function pointers:\n{wgsl}",
+    );
+    assert!(
+        wgsl.contains("array<u32, 2>"),
+        "the entry's exact eight-byte high-water bound must remain authoritative:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with the private-arena helper must reparse");
+    let function_arg_count = |name: &str| {
+        reparsed
+            .functions
+            .iter()
+            .find_map(|(_, function)| {
+                (function.name.as_deref() == Some(name)).then_some(function.arguments.len())
+            })
+            .unwrap_or_else(|| panic!("missing helper `{name}` in generated WGSL"))
+    };
+    assert_eq!(
+        function_arg_count("private_arena_helper"),
+        4,
+        "the arena leaf needs value, heap, bump, and trap arguments",
+    );
+    assert_eq!(
+        function_arg_count("private_arena_forwarder"),
+        4,
+        "the forwarder must receive the arena capability transitively",
+    );
+    assert_eq!(
+        function_arg_count("private_arena_pure"),
+        1,
+        "a pure helper must not receive unused arena capability arguments",
+    );
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("the private-arena helper ABI must validate for browser capabilities");
+}
+
+#[test]
+fn spirv_private_arena_helper_cannot_own_an_unaccounted_allocation() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "allocating_helper_entry",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_single(
+            "allocating_helper",
+            Linkage::Private,
+            &[],
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let bytes = fb.make_imm_value(4i32);
+        let address = fb.insert_inst(data::MemAllocDynamic::new(is, bytes), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, address));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let bytes = fb.make_imm_value(4i32);
+        let _entry_allocation =
+            fb.insert_inst(data::MemAllocDynamic::new(is, bytes), Type::I32);
+        let result = fb.insert_inst(
+            control_flow::Call::new(is, helper_ref, [].into_iter().collect()),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let errors = match SpirvBackend::new().compile_module(&mb.build()) {
+        Ok(_) => panic!("an outlined helper allocation is outside the entry high-water proof"),
+        Err(errors) => errors,
+    };
+    let message = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    assert!(
+        message.contains("changes arena lifetime"),
+        "the allocation must fail at the named cross-call lifetime boundary: {message}",
+    );
+}
+
+#[test]
 fn spirv_four_word_helper_result_survives_as_a_valid_wgsl_struct() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,

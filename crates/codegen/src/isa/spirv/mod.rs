@@ -698,10 +698,13 @@ fn append_external_resources(
 #[cfg(feature = "spirv-backend")]
 #[derive(Clone, Copy)]
 struct HeapCtx {
-    /// `var<function> fe_heap: array<u32, heap_words>`, zero-initialized.
-    heap: naga::Handle<naga::LocalVariable>,
-    /// `var<function> fe_bump: u32`, the bump-pointer allocator, init 0.
-    bump: naga::Handle<naga::LocalVariable>,
+    /// Pointer to `var<function> fe_heap: array<u32, heap_words>`. Entry
+    /// functions create it locally; outlined helpers receive the same pointer
+    /// through their compiler-owned ABI suffix.
+    heap: naga::Handle<naga::Expression>,
+    /// Pointer to the shared `var<function> fe_bump: u32` allocator state.
+    bump: naga::Handle<naga::Expression>,
+    word_type: naga::Handle<naga::Type>,
     heap_words: u32,
 }
 
@@ -710,10 +713,10 @@ struct HeapCtx {
 /// arrays (`RUNG3_SPIRV_ARRAYS_DESIGN.md` section 2, `has_mem`), or they
 /// contain a Sonatina `Unreachable` trap with NO Mem ops at all (checked-usize
 /// arithmetic overflow, a generic MIR trap terminator, or Sccp/DCE eliminating
-/// every Mem op while the trap survives -- `has_unreachable`). Declared once
-/// per entry function whenever `has_mem || has_unreachable`, and threaded
-/// read-only through every region-emission function so both the array ops
-/// AND the trap-raising sites can be lowered no matter how deeply nested.
+/// every Mem op while the trap survives). Declared once per entry function
+/// whenever the entry or a reachable helper needs it. Compiler-owned pointer
+/// arguments let helpers mutate the same arena and trap state without creating
+/// another allocation or host-visible resource.
 ///
 /// Guards the has_mem==false shadow of review finding 4 (adversarial review
 /// Finding A, 2026-08-08): declaring `heap` as `Option<HeapCtx>` rather than
@@ -733,7 +736,7 @@ struct MemCtx {
     /// This is the externally-visible status channel that closes review finding 3
     /// (poison-sentinel collision): a consumer reads this flag instead of
     /// trying to infer failure from an in-band magic result value.
-    trapped: naga::Handle<naga::LocalVariable>,
+    trapped: naga::Handle<naga::Expression>,
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -933,11 +936,9 @@ fn mark_trapped_if(
     mem_ctx: MemCtx,
     cond: naga::Handle<naga::Expression>,
 ) {
-    let ptr = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.trapped), naga::Span::UNDEFINED);
-    let cur = emit_expr(func, target, naga::Expression::Load { pointer: ptr });
+    let cur = emit_expr(func, target, naga::Expression::Load { pointer: mem_ctx.trapped });
     let or = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::LogicalOr, left: cur, right: cond });
-    let ptr2 = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.trapped), naga::Span::UNDEFINED);
-    target.push(naga::Statement::Store { pointer: ptr2, value: or }, naga::Span::UNDEFINED);
+    target.push(naga::Statement::Store { pointer: mem_ctx.trapped, value: or }, naga::Span::UNDEFINED);
 }
 
 /// Unconditionally set `mem_ctx.trapped = true`. Used at Unreachable (trap)
@@ -947,8 +948,7 @@ fn mark_trapped_if(
 #[cfg(feature = "spirv-backend")]
 fn mark_trapped_always(func: &mut naga::Function, target: &mut naga::Block, mem_ctx: MemCtx) {
     let one = func.expressions.append(naga::Expression::Literal(naga::Literal::Bool(true)), naga::Span::UNDEFINED);
-    let ptr = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.trapped), naga::Span::UNDEFINED);
-    target.push(naga::Statement::Store { pointer: ptr, value: one }, naga::Span::UNDEFINED);
+    target.push(naga::Statement::Store { pointer: mem_ctx.trapped, value: one }, naga::Span::UNDEFINED);
 }
 
 /// Compute the guarded, clamped `fe_heap` word pointer for a Mem access at
@@ -997,10 +997,9 @@ fn emit_mem_access(
     let clamped = emit_expr(func, target, naga::Expression::Select { condition: in_range, accept: word_idx, reject: max_idx });
     let idx_i32 = emit_expr(func, target, naga::Expression::As { expr: clamped, kind: naga::ScalarKind::Sint, convert: Some(4) });
 
-    let heap_ptr = func.expressions.append(naga::Expression::LocalVariable(heap_ctx.heap), naga::Span::UNDEFINED);
     // Access returns a pointer -- no Emit needed (matches the existing
     // ObjIndex convention above).
-    func.expressions.append(naga::Expression::Access { base: heap_ptr, index: idx_i32 }, naga::Span::UNDEFINED)
+    func.expressions.append(naga::Expression::Access { base: heap_ctx.heap, index: idx_i32 }, naga::Span::UNDEFINED)
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -1157,8 +1156,7 @@ fn emit_trap_store(
     trap_var: naga::Handle<naga::GlobalVariable>,
     index: naga::Handle<naga::Expression>,
 ) {
-    let ptr = func.expressions.append(naga::Expression::LocalVariable(mem_ctx.trapped), naga::Span::UNDEFINED);
-    let trapped_bool = emit_expr(func, target, naga::Expression::Load { pointer: ptr });
+    let trapped_bool = emit_expr(func, target, naga::Expression::Load { pointer: mem_ctx.trapped });
     let trapped_u32 = emit_expr(func, target, naga::Expression::As { expr: trapped_bool, kind: naga::ScalarKind::Uint, convert: Some(4) });
     let trap_global = func.expressions.append(naga::Expression::GlobalVariable(trap_var), naga::Span::UNDEFINED);
     let trap_ptr = func.expressions.append(naga::Expression::Access { base: trap_global, index }, naga::Span::UNDEFINED);
@@ -2059,11 +2057,13 @@ fn emit_single_inst(
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let mem_ctx = mem_ctx.expect("MemCheckpoint requires mem_ctx (has_mem pre-scan gate)");
             let heap_ctx = mem_ctx.heap();
-            let bump_ptr = func.expressions.append(
-                naga::Expression::LocalVariable(heap_ctx.bump),
-                naga::Span::UNDEFINED,
+            let checkpoint = emit_expr(
+                func,
+                target,
+                naga::Expression::Load {
+                    pointer: heap_ctx.bump,
+                },
             );
-            let checkpoint = emit_expr(func, target, naga::Expression::Load { pointer: bump_ptr });
             value_map.insert(result, checkpoint);
             return true;
         }
@@ -2086,11 +2086,13 @@ fn emit_single_inst(
             ));
             return false;
         };
-        let bump_ptr = func.expressions.append(
-            naga::Expression::LocalVariable(heap_ctx.bump),
-            naga::Span::UNDEFINED,
+        let current = emit_expr(
+            func,
+            target,
+            naga::Expression::Load {
+                pointer: heap_ctx.bump,
+            },
         );
-        let current = emit_expr(func, target, naga::Expression::Load { pointer: bump_ptr });
         let invalid = emit_expr(
             func,
             target,
@@ -2110,13 +2112,9 @@ fn emit_single_inst(
                 reject: checkpoint,
             },
         );
-        let bump_ptr = func.expressions.append(
-            naga::Expression::LocalVariable(heap_ctx.bump),
-            naga::Span::UNDEFINED,
-        );
         target.push(
             naga::Statement::Store {
-                pointer: bump_ptr,
+                pointer: heap_ctx.bump,
                 value: rewound,
             },
             naga::Span::UNDEFINED,
@@ -2151,8 +2149,7 @@ fn emit_single_inst(
                 ));
                 return false;
             };
-            let bump_ptr = func.expressions.append(naga::Expression::LocalVariable(heap_ctx.bump), naga::Span::UNDEFINED);
-            let old_bump = emit_expr(func, target, naga::Expression::Load { pointer: bump_ptr });
+            let old_bump = emit_expr(func, target, naga::Expression::Load { pointer: heap_ctx.bump });
             let new_bump = emit_expr(func, target, naga::Expression::Binary { op: naga::BinaryOperator::Add, left: old_bump, right: size });
             // Unsigned wraparound check (new_bump < old_bump means size wrapped
             // the u32 add) OR new_bump exceeds the declared heap capacity.
@@ -2164,8 +2161,7 @@ fn emit_single_inst(
             // Freeze the bump pointer on overflow instead of advancing it past
             // capacity: keep_old = select(bad, old_bump, new_bump).
             let kept_bump = emit_expr(func, target, naga::Expression::Select { condition: bad, accept: old_bump, reject: new_bump });
-            let bump_ptr2 = func.expressions.append(naga::Expression::LocalVariable(heap_ctx.bump), naga::Span::UNDEFINED);
-            target.push(naga::Statement::Store { pointer: bump_ptr2, value: kept_bump }, naga::Span::UNDEFINED);
+            target.push(naga::Statement::Store { pointer: heap_ctx.bump, value: kept_bump }, naga::Span::UNDEFINED);
             value_map.insert(result, old_bump);
             return true;
         }
@@ -2421,7 +2417,7 @@ fn emit_single_inst(
         );
 
         let heap_ctx = mem_ctx.heap();
-        let index_ty = func.local_variables[heap_ctx.bump].ty;
+        let index_ty = heap_ctx.word_type;
         let zero = lit_u32(func, 0);
         let index_local = func.local_variables.append(
             naga::LocalVariable {
@@ -2562,6 +2558,27 @@ fn emit_single_inst(
                 return false;
             };
             arguments.push(argument);
+        }
+        if callee.memory_abi.heap {
+            let Some(heap) = mem_ctx.and_then(|context| context.heap) else {
+                *mem_error = Some(format!(
+                    "spirv: helper call to {:?} requires the caller's private arena, but no arena context is available. Fail closed.",
+                    call.callee()
+                ));
+                return false;
+            };
+            arguments.push(heap.heap);
+            arguments.push(heap.bump);
+        }
+        if callee.memory_abi.trap {
+            let Some(context) = mem_ctx else {
+                *mem_error = Some(format!(
+                    "spirv: helper call to {:?} requires the caller's trap channel, but no trap context is available. Fail closed.",
+                    call.callee()
+                ));
+                return false;
+            };
+            arguments.push(context.trapped);
         }
         let results = function.dfg.inst_results(inst_id);
         if results.len() != callee.result_arity {
@@ -4211,6 +4228,22 @@ fn spirv_instruction_is_lowered(
 struct NagaFunctionInfo {
     handle: naga::Handle<naga::Function>,
     result_arity: usize,
+    memory_abi: NagaMemoryAbi,
+}
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy, Default)]
+struct NagaMemoryAbi {
+    heap: bool,
+    trap: bool,
+}
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy, Default)]
+struct NagaMemoryAbiTypes {
+    heap: Option<naga::Handle<naga::Type>>,
+    word: Option<naga::Handle<naga::Type>>,
+    trap: Option<naga::Handle<naga::Type>>,
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -4285,6 +4318,83 @@ fn reachable_call_postorder(
     let mut order = Vec::new();
     visit(module, entry, &mut states, &mut order)?;
     Ok(order)
+}
+
+#[cfg(feature = "spirv-backend")]
+fn helper_private_memory_abis(
+    module: &Module,
+    call_order: &[sonatina_ir::module::FuncRef],
+    entry: sonatina_ir::module::FuncRef,
+) -> Result<
+    std::collections::HashMap<sonatina_ir::module::FuncRef, NagaMemoryAbi>,
+    String,
+> {
+    use sonatina_ir::{
+        InstDowncast,
+        inst::{control_flow, data},
+    };
+
+    // `call_order` is postorder, so every direct callee's ABI is known before
+    // its caller. A helper borrows only the capabilities it uses locally or
+    // must forward transitively. This keeps pure arithmetic helpers pure.
+    let mut abis = std::collections::HashMap::<
+        sonatina_ir::module::FuncRef,
+        NagaMemoryAbi,
+    >::new();
+    for &function_ref in call_order {
+        if function_ref == entry {
+            continue;
+        }
+        let abi = module
+            .func_store
+            .try_view(function_ref, |function| {
+                let inst_set = function.inst_set();
+                let mut abi = NagaMemoryAbi::default();
+                for block in function.layout.iter_block() {
+                    for instruction in function.layout.iter_inst(block) {
+                        let instruction_data = function.dfg.inst(instruction);
+                        if let Some(call) = function.dfg.call_info(instruction) {
+                            let callee = abis.get(&call.callee()).copied().ok_or_else(|| {
+                                format!(
+                                    "spirv: helper {function_ref:?} reaches callee {:?} before its private-memory ABI is available. Fail closed.",
+                                    call.callee(),
+                                )
+                            })?;
+                            abi.heap |= callee.heap;
+                            abi.trap |= callee.trap;
+                            continue;
+                        }
+                        if <&data::Mload as InstDowncast>::downcast(inst_set, instruction_data)
+                            .is_some()
+                            || <&data::Mstore as InstDowncast>::downcast(
+                                inst_set,
+                                instruction_data,
+                            )
+                            .is_some()
+                        {
+                            abi.heap = true;
+                            abi.trap = true;
+                        }
+                        if <&control_flow::Unreachable as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                        .is_some()
+                        {
+                            abi.trap = true;
+                        }
+                    }
+                }
+                Ok::<_, String>(abi)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "spirv: reachable helper {function_ref:?} has no body while deriving its private-memory ABI. Fail closed."
+                )
+            })??;
+        abis.insert(function_ref, abi);
+    }
+    Ok(abis)
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -4378,13 +4488,16 @@ fn lower_naga_helper(
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     result_type: Option<naga::Handle<naga::Type>>,
+    memory_abi: NagaMemoryAbi,
+    memory_types: NagaMemoryAbiTypes,
+    heap_words: u32,
     naga_functions: &NagaFunctionMap,
 ) -> Result<naga::Function, String> {
     let signature = module
         .ctx
         .get_sig(function_ref)
         .ok_or_else(|| format!("spirv: helper {function_ref:?} has no signature"))?;
-    let arguments = signature
+    let mut arguments = signature
         .args()
         .iter()
         .enumerate()
@@ -4396,6 +4509,33 @@ fn lower_naga_helper(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    if memory_abi.heap {
+        arguments.push(naga::FunctionArgument {
+            name: Some("fe_heap".to_string()),
+            ty: memory_types.heap.ok_or_else(|| {
+                "spirv: helper private-arena ABI has no heap pointer type. Fail closed."
+                    .to_string()
+            })?,
+            binding: None,
+        });
+        arguments.push(naga::FunctionArgument {
+            name: Some("fe_bump".to_string()),
+            ty: memory_types.word.ok_or_else(|| {
+                "spirv: helper private-arena ABI has no bump pointer type. Fail closed."
+                    .to_string()
+            })?,
+            binding: None,
+        });
+    }
+    if memory_abi.trap {
+        arguments.push(naga::FunctionArgument {
+            name: Some("fe_trapped".to_string()),
+            ty: memory_types.trap.ok_or_else(|| {
+                "spirv: helper trap ABI has no trap pointer type. Fail closed.".to_string()
+            })?,
+            binding: None,
+        });
+    }
     let result = result_type.map(|ty| naga::FunctionResult { ty, binding: None });
     let mut naga_function = naga::Function {
         name: Some(signature.name().to_string()),
@@ -4426,15 +4566,13 @@ fn lower_naga_helper(
                     || <&sonatina_ir::inst::data::MemCheckpoint as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                     || <&sonatina_ir::inst::data::MemRewind as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                     || <&sonatina_ir::inst::data::Memcopy as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::Mload as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::Mstore as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                     || <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                     || <&sonatina_ir::inst::data::ObjLoad as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                     || <&sonatina_ir::inst::data::ObjStore as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                     || <&sonatina_ir::inst::data::ObjIndex as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
                 {
                     lowering_error = Some(format!(
-                        "spirv: helper `{}` uses an arena or object operation whose cross-call memory model is not lowered yet. Fail closed.",
+                        "spirv: helper `{}` changes arena lifetime or uses an object operation whose cross-call model is not lowered yet. Fail closed.",
                         signature.name(),
                     ));
                     return;
@@ -4450,6 +4588,36 @@ fn lower_naga_helper(
             );
             value_map.insert(argument, expression);
         }
+        let mut memory_argument = signature.args().len() as u32;
+        let heap = if memory_abi.heap {
+            let heap = naga_function.expressions.append(
+                naga::Expression::FunctionArgument(memory_argument),
+                naga::Span::UNDEFINED,
+            );
+            memory_argument += 1;
+            let bump = naga_function.expressions.append(
+                naga::Expression::FunctionArgument(memory_argument),
+                naga::Span::UNDEFINED,
+            );
+            memory_argument += 1;
+            Some(HeapCtx {
+                heap,
+                bump,
+                word_type,
+                heap_words,
+            })
+        } else {
+            None
+        };
+        let mem_ctx = if memory_abi.trap {
+            let trapped = naga_function.expressions.append(
+                naga::Expression::FunctionArgument(memory_argument),
+                naga::Span::UNDEFINED,
+            );
+            Some(MemCtx { heap, trapped })
+        } else {
+            None
+        };
         let mut phi_locals = std::collections::HashMap::new();
         let structured = match crate::structurize::structurize_function(function) {
             Ok(structured) => structured,
@@ -4476,7 +4644,7 @@ fn lower_naga_helper(
             &mut phi_locals,
             &mut result_expression,
             naga_functions,
-            None,
+            mem_ctx,
         ) {
             lowering_error = Some(structurize_error_with_block_ir(
                 error,
@@ -4870,43 +5038,6 @@ fn translate_to_naga(
     );
 
     let call_order = reachable_call_postorder(module, first_func)?;
-    let mut naga_functions = NagaFunctionMap::new();
-    for helper_ref in call_order
-        .into_iter()
-        .filter(|function_ref| *function_ref != first_func)
-    {
-        let signature = module
-            .ctx
-            .get_sig(helper_ref)
-            .ok_or_else(|| format!("spirv: helper {helper_ref:?} has no signature"))?;
-        let result_type = helper_naga_result_type(
-            signature.name(),
-            signature.ret_tys(),
-            word,
-            word_type,
-            f32_type,
-            bool_type,
-            &mut naga_mod.types,
-        )?;
-        let helper = lower_naga_helper(
-            module,
-            helper_ref,
-            word,
-            word_type,
-            f32_type,
-            bool_type,
-            result_type,
-            &naga_functions,
-        )?;
-        let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
-        naga_functions.insert(
-            helper_ref,
-            NagaFunctionInfo {
-                handle,
-                result_arity: signature.ret_tys().len(),
-            },
-        );
-    }
 
     // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
     // fail closed on any signedness-sensitive op (Sar / signed compares / signed
@@ -5327,6 +5458,126 @@ fn translate_to_naga(
         0
     };
 
+    let helper_memory_abis = helper_private_memory_abis(module, &call_order, first_func)?;
+    let helper_memory = helper_memory_abis.values().any(|abi| abi.heap);
+    let helper_trap = helper_memory_abis.values().any(|abi| abi.trap);
+    if helper_memory && !has_mem {
+        return Err(
+            "spirv: a reachable helper accesses the private arena, but the entry function owns no proven arena allocation. Fail closed."
+                .to_string(),
+        );
+    }
+    let needs_trap_channel = has_mem || has_unreachable || helper_trap;
+    let private_heap_type = if has_mem {
+        let heap_len = std::num::NonZeroU32::new(private_heap_words)
+            .ok_or_else(|| "spirv: derived private heap must be nonzero".to_string())?;
+        Some(naga_mod.types.insert(
+            naga::Type {
+                name: Some("FeHeap".into()),
+                inner: naga::TypeInner::Array {
+                    base: word_type,
+                    size: naga::ArraySize::Constant(heap_len),
+                    stride: 4,
+                },
+            },
+            naga::Span::UNDEFINED,
+        ))
+    } else {
+        None
+    };
+    let helper_memory_types = NagaMemoryAbiTypes {
+        heap: if helper_memory {
+            Some(naga_mod.types.insert(
+                naga::Type {
+                    name: None,
+                    inner: naga::TypeInner::Pointer {
+                        base: private_heap_type.expect("helper memory requires an entry heap"),
+                        space: naga::AddressSpace::Function,
+                    },
+                },
+                naga::Span::UNDEFINED,
+            ))
+        } else {
+            None
+        },
+        word: if helper_memory {
+            Some(naga_mod.types.insert(
+                naga::Type {
+                    name: None,
+                    inner: naga::TypeInner::Pointer {
+                        base: word_type,
+                        space: naga::AddressSpace::Function,
+                    },
+                },
+                naga::Span::UNDEFINED,
+            ))
+        } else {
+            None
+        },
+        trap: if helper_trap {
+            Some(naga_mod.types.insert(
+                naga::Type {
+                    name: None,
+                    inner: naga::TypeInner::Pointer {
+                        base: bool_type,
+                        space: naga::AddressSpace::Function,
+                    },
+                },
+                naga::Span::UNDEFINED,
+            ))
+        } else {
+            None
+        },
+    };
+
+    let mut naga_functions = NagaFunctionMap::new();
+    for helper_ref in call_order
+        .iter()
+        .copied()
+        .filter(|function_ref| *function_ref != first_func)
+    {
+        let helper_memory_abi = helper_memory_abis.get(&helper_ref).copied().ok_or_else(|| {
+            format!(
+                "spirv: helper {helper_ref:?} has no derived private-memory ABI. Fail closed."
+            )
+        })?;
+        let signature = module
+            .ctx
+            .get_sig(helper_ref)
+            .ok_or_else(|| format!("spirv: helper {helper_ref:?} has no signature"))?;
+        let result_type = helper_naga_result_type(
+            signature.name(),
+            signature.ret_tys(),
+            word,
+            word_type,
+            f32_type,
+            bool_type,
+            &mut naga_mod.types,
+        )?;
+        let helper = lower_naga_helper(
+            module,
+            helper_ref,
+            word,
+            word_type,
+            f32_type,
+            bool_type,
+            result_type,
+            helper_memory_abi,
+            helper_memory_types,
+            private_heap_words,
+            &naga_functions,
+        )?;
+        let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
+        naga_functions.insert(
+            helper_ref,
+            NagaFunctionInfo {
+                handle,
+                result_arity: signature.ret_tys().len(),
+                memory_abi: helper_memory_abi,
+            },
+        );
+    }
+
     // Grid mode fail-closed checks. Grid is a driver-declared envelope fact: the
     // translator never guesses it, and when asked for it, every precondition is
     // enforced here so no wrong shader is ever emitted.
@@ -5457,7 +5708,6 @@ fn translate_to_naga(
             ))
         };
 
-        let needs_trap_channel = has_mem || has_unreachable;
         let trap_binding = parameter_binding + u32::from(parameter_var.is_some());
         let trap_var = if needs_trap_channel {
             let trap_len = std::num::NonZeroU32::new(compute_invocation_count)
@@ -5547,19 +5797,8 @@ fn translate_to_naga(
         };
         let mem_ctx = if needs_trap_channel {
             let heap = if has_mem {
-                let heap_len = std::num::NonZeroU32::new(private_heap_words)
-                    .ok_or_else(|| "spirv: derived private heap must be nonzero".to_string())?;
-                let heap_type = naga_mod.types.insert(
-                    naga::Type {
-                        name: Some("FeHeap".into()),
-                        inner: naga::TypeInner::Array {
-                            base: word_type,
-                            size: naga::ArraySize::Constant(heap_len),
-                            stride: 4,
-                        },
-                    },
-                    naga::Span::UNDEFINED,
-                );
+                let heap_type = private_heap_type
+                    .expect("has_mem establishes one shared private heap type");
                 let heap_zero = func.expressions.append(
                     naga::Expression::ZeroValue(heap_type),
                     naga::Span::UNDEFINED,
@@ -5584,9 +5823,18 @@ fn translate_to_naga(
                     },
                     naga::Span::UNDEFINED,
                 );
+                let heap = func.expressions.append(
+                    naga::Expression::LocalVariable(heap),
+                    naga::Span::UNDEFINED,
+                );
+                let bump = func.expressions.append(
+                    naga::Expression::LocalVariable(bump),
+                    naga::Span::UNDEFINED,
+                );
                 Some(HeapCtx {
                     heap,
                     bump,
+                    word_type,
                     heap_words: private_heap_words,
                 })
             } else {
@@ -5602,6 +5850,10 @@ fn translate_to_naga(
                     ty: bool_type,
                     init: Some(trapped_false),
                 },
+                naga::Span::UNDEFINED,
+            );
+            let trapped = func.expressions.append(
+                naga::Expression::LocalVariable(trapped),
                 naga::Span::UNDEFINED,
             );
             Some(MemCtx { heap, trapped })
@@ -6424,7 +6676,6 @@ fn translate_to_naga(
     // failure from an in-band magic result value -- it reads this word
     // instead. `0` = completed without a guard firing; `1` = `fe_trapped`
     // was set (heap exhaustion, a misaligned access, or ANY trap reached).
-    let needs_trap_channel = has_mem || has_unreachable;
     let trap_var = if needs_trap_channel {
         let trap_array_ty = naga_mod.types.insert(
             naga::Type {
@@ -6508,26 +6759,14 @@ fn translate_to_naga(
     // Private-storage heap emulation locals (RUNG3_SPIRV_ARRAYS_DESIGN.md
     // section 2). `fe_heap`/`fe_bump` are declared ONLY for has_mem kernels
     // so kernels with no Mem ops stay byte-identical to before this rung
-    // landed. `fe_trapped` is declared whenever `needs_trap_channel`
-    // (has_mem OR has_unreachable -- Finding A, 2026-08-08): a no-Mem
-    // trapping function needs the trap channel exactly as much as an array
-    // kernel does, or it silently falls through to a zero/uninitialized
-    // result the same way the original review finding 4 did.
+    // landed. `fe_trapped` is declared whenever `needs_trap_channel`: an
+    // entry or reachable helper that can trap needs the shared channel, or it
+    // silently falls through to a zero/uninitialized result the same way the
+    // original review finding 4 did.
     let mem_ctx = if needs_trap_channel {
         let heap = if has_mem {
-            let heap_len = std::num::NonZeroU32::new(private_heap_words)
-                .ok_or_else(|| "spirv: derived private heap must be nonzero".to_string())?;
-            let heap_ty = naga_mod.types.insert(
-                naga::Type {
-                    name: Some("FeHeap".into()),
-                    inner: naga::TypeInner::Array {
-                        base: word_type,
-                        size: naga::ArraySize::Constant(heap_len),
-                        stride: 4,
-                    },
-                },
-                naga::Span::UNDEFINED,
-            );
+            let heap_ty = private_heap_type
+                .expect("has_mem establishes one shared private heap type");
             // Explicit ZeroValue init is load-bearing: it matches wasm's
             // zero-initialized arena, and removes a WGSL/SPIR-V divergence --
             // WGSL zero-inits `var<function>` implicitly; SPIR-V without an
@@ -6542,9 +6781,18 @@ fn translate_to_naga(
                 naga::LocalVariable { name: Some("fe_bump".into()), ty: word_type, init: Some(bump_zero) },
                 naga::Span::UNDEFINED,
             );
+            let heap = func.expressions.append(
+                naga::Expression::LocalVariable(heap_local),
+                naga::Span::UNDEFINED,
+            );
+            let bump = func.expressions.append(
+                naga::Expression::LocalVariable(bump),
+                naga::Span::UNDEFINED,
+            );
             Some(HeapCtx {
-                heap: heap_local,
+                heap,
                 bump,
+                word_type,
                 heap_words: private_heap_words,
             })
         } else {
@@ -6553,6 +6801,10 @@ fn translate_to_naga(
         let trapped_false = func.expressions.append(naga::Expression::Literal(naga::Literal::Bool(false)), naga::Span::UNDEFINED);
         let trapped = func.local_variables.append(
             naga::LocalVariable { name: Some("fe_trapped".into()), ty: bool_type, init: Some(trapped_false) },
+            naga::Span::UNDEFINED,
+        );
+        let trapped = func.expressions.append(
+            naga::Expression::LocalVariable(trapped),
             naga::Span::UNDEFINED,
         );
         Some(MemCtx { heap, trapped })
