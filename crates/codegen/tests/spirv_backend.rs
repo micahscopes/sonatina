@@ -371,6 +371,56 @@ fn spirv_fixed_struct_local_survives_inside_scalar_helper() {
 }
 
 #[test]
+fn spirv_typed_local_zero_projection_bitcast_restores_structural_access() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_ty = mb.declare_array_type(Type::I32, 4);
+    let array_ptr_ty = mb.ptr_type(array_ty);
+    let word_ptr_ty = mb.ptr_type(Type::I32);
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "typed_local_zero_projection",
+            Linkage::Public,
+            &[],
+            Type::I32,
+        ))
+        .unwrap();
+
+    let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let array = fb.insert_inst(data::Alloca::new(is, array_ty), array_ptr_ty);
+    // SCCP uses this exact representation for `gep array, 0, 0`.
+    let first = fb.insert_inst(cast::Bitcast::new(is, array, word_ptr_ty), word_ptr_ty);
+    let value = fb.make_imm_value(37i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, first, value, Type::I32));
+    let loaded = fb.insert_inst(data::Mload::new(is, first, Type::I32), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
+    fb.seal_all();
+    fb.finish();
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("an all-zero typed Gep simplified to Bitcast must retain structural meaning");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(wgsl.contains("fixed_local_"), "typed local must remain native:\n{wgsl}");
+    assert!(!wgsl.contains("fe_heap"), "zero projection must not restore the byte arena:\n{wgsl}");
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("typed zero-projection WGSL must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("typed zero-projection WGSL must validate for browser capabilities");
+}
+
+#[test]
 fn spirv_typed_local_rejects_pointer_to_integer_escape() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,

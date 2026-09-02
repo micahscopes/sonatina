@@ -1399,6 +1399,37 @@ fn immediate_index_u32(
     }
 }
 
+/// SCCP represents an all-zero typed `Gep` as a pointer `Bitcast` when the
+/// source and projected pointer types differ. Naga has no pointer bitcast, but
+/// it does have the exact structural operation: one zero `AccessIndex` per
+/// leading array element or unpacked struct field. Admit only that derivable
+/// path, never a general pointer reinterpretation.
+#[cfg(feature = "spirv-backend")]
+fn typed_local_zero_projection_path(
+    ctx: &sonatina_ir::module::ModuleCtx,
+    from_ty: sonatina_ir::Type,
+    to_ty: sonatina_ir::Type,
+) -> Option<Vec<u32>> {
+    let sonatina_ir::types::CompoundType::Ptr(mut current) = from_ty.resolve_compound(ctx)? else {
+        return None;
+    };
+    let sonatina_ir::types::CompoundType::Ptr(target) = to_ty.resolve_compound(ctx)? else {
+        return None;
+    };
+    let mut path = Vec::new();
+    while current != target {
+        current = match current.resolve_compound(ctx)? {
+            sonatina_ir::types::CompoundType::Array { elem, len } if len > 0 => elem,
+            sonatina_ir::types::CompoundType::Struct(data) if !data.packed => {
+                *data.fields.first()?
+            }
+            _ => return None,
+        };
+        path.push(0);
+    }
+    Some(path)
+}
+
 /// Emit a single arithmetic/cmp instruction into the given target block.
 /// Returns the expression handle if an instruction was emitted, None otherwise.
 /// Skips Phi, Jump, Br, and Return instructions.
@@ -1737,6 +1768,36 @@ fn emit_single_inst(
         // not a numeric conversion. The browser word admits the exact 32-bit
         // scalar pair needed by storage records: i32 bits <-> f32.
         if let Some(result) = function.dfg.inst_result(inst_id) {
+            let from_ty = function.dfg.value_ty(*bitcast.from());
+            if let Some(path) =
+                typed_local_zero_projection_path(function.ctx(), from_ty, *bitcast.ty())
+            {
+                let Some(mut projected) = resolve_naga_value(
+                    *bitcast.from(),
+                    function,
+                    word,
+                    value_map,
+                    phi_locals,
+                    func,
+                ) else {
+                    *mem_error = Some(format!(
+                        "spirv: typed-local zero projection source {:?} is unresolved. Fail closed.",
+                        bitcast.from(),
+                    ));
+                    return false;
+                };
+                for index in path {
+                    projected = func.expressions.append(
+                        naga::Expression::AccessIndex {
+                            base: projected,
+                            index,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                }
+                value_map.insert(result, projected);
+                return true;
+            }
             let from = resolve_naga_value(
                 *bitcast.from(),
                 function,
@@ -5024,12 +5085,34 @@ fn verify_naga_typed_local_use_closure(
                 let mut changed = false;
                 for block in function.layout.iter_block() {
                     for instruction in function.layout.iter_inst(block) {
+                        let instruction_data = function.dfg.inst(instruction);
                         let Some(gep) =
                             <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(
                                 inst_set,
-                                function.dfg.inst(instruction),
+                                instruction_data,
                             )
                         else {
+                            if let Some(bitcast) =
+                                <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(
+                                    inst_set,
+                                    instruction_data,
+                                )
+                                && local_pointers.contains(bitcast.from())
+                                && typed_local_zero_projection_path(
+                                    function.ctx(),
+                                    function.dfg.value_ty(*bitcast.from()),
+                                    *bitcast.ty(),
+                                )
+                                .is_some()
+                            {
+                                let Some(result) = function.dfg.inst_result(instruction) else {
+                                    return Err(
+                                        "spirv: typed-local structural Bitcast has no result. Fail closed."
+                                            .to_string(),
+                                    );
+                                };
+                                changed |= local_pointers.insert(result);
+                            }
                             continue;
                         };
                         let Some(&base) = gep.values().first() else {
@@ -5081,6 +5164,30 @@ fn verify_naga_typed_local_use_closure(
                             );
                         }
                         continue;
+                    }
+
+                    if let Some(bitcast) =
+                        <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                    {
+                        let source_is_local = local_pointers.contains(bitcast.from());
+                        let structural = typed_local_zero_projection_path(
+                            function.ctx(),
+                            function.dfg.value_ty(*bitcast.from()),
+                            *bitcast.ty(),
+                        )
+                        .is_some();
+                        if source_is_local != structural {
+                            return Err(format!(
+                                "spirv: typed-local pointer Bitcast {:?} is not an exact zero projection. Fail closed.",
+                                bitcast.from(),
+                            ));
+                        }
+                        if source_is_local {
+                            continue;
+                        }
                     }
 
                     if let Some(load) =
@@ -6508,15 +6615,19 @@ fn translate_to_naga(
                     {
                         let from_ty = f.dfg.value_ty(*bitcast.from());
                         let to_ty = *bitcast.ty();
-                        let admitted = word == WordKind::U32
-                            && matches!(
-                                (from_ty, to_ty),
-                                (sonatina_ir::Type::I32, sonatina_ir::Type::F32)
-                                    | (sonatina_ir::Type::F32, sonatina_ir::Type::I32)
-                            );
+                        let admitted = typed_local_zero_projection_path(
+                            f.ctx(), from_ty, to_ty,
+                        )
+                        .is_some()
+                            || (word == WordKind::U32
+                                && matches!(
+                                    (from_ty, to_ty),
+                                    (sonatina_ir::Type::I32, sonatina_ir::Type::F32)
+                                        | (sonatina_ir::Type::F32, sonatina_ir::Type::I32)
+                                ));
                         if !admitted {
                             return Err(format!(
-                                "spirv: Bitcast supports exactly i32 <-> f32 under the u32 browser word; got {from_ty:?} -> {to_ty:?}"
+                                "spirv: Bitcast supports exactly i32 <-> f32 under the u32 browser word or a typed-local zero projection; got {from_ty:?} -> {to_ty:?}"
                             ));
                         }
                     }
