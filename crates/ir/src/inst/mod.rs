@@ -34,6 +34,15 @@ cranelift_entity::entity_impl!(InstId);
 pub trait Inst:
     inst_set::sealed::Registered + DynClone + Any + Send + Sync + Visitable + VisitableMut
 {
+    /// Returns this instruction as [`Any`] for exact dynamic type inspection.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Compares every authored field after confirming the concrete instruction type.
+    ///
+    /// Callers that need identity-independent comparison must first clone and
+    /// normalize referenced values, blocks, functions, and other IR entities.
+    fn structurally_eq(&self, other: &dyn Inst) -> bool;
+
     fn declared_effect_hint(&self) -> SideEffect;
     fn arity(&self) -> InstArity;
     fn as_text(&self) -> &'static str;

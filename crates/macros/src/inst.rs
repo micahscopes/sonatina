@@ -402,7 +402,7 @@ impl InstStruct {
             }
 
             #[allow(clippy::too_many_arguments)]
-            #[deprecated(note = "use `new` instead — it now accepts &dyn InstSetBase")]
+            #[deprecated(note = "use `new` instead; it now accepts &dyn InstSetBase")]
             pub fn new_unchecked(isb: &dyn crate::InstSetBase, #(#ctor_args),*) -> Self {
                 Self::new(isb, #(#field_names),*)
             }
@@ -497,6 +497,17 @@ impl InstStruct {
         let kind = self.kind.to_tokens();
         quote! {
             impl crate::Inst for #struct_name {
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+
+                fn structurally_eq(&self, other: &dyn crate::Inst) -> bool {
+                    other
+                        .as_any()
+                        .downcast_ref::<Self>()
+                        .is_some_and(|other| self == other)
+                }
+
                 fn declared_effect_hint(&self) -> crate::inst::SideEffect {
                     #side_effect
                 }
