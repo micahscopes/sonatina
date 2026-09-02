@@ -2487,29 +2487,67 @@ fn emit_single_inst(
             arguments.push(argument);
         }
         let results = function.dfg.inst_results(inst_id);
-        if results.len() > 1 {
+        if results.len() != callee.result_arity {
             *mem_error = Some(format!(
-                "spirv: helper call produces {} values; multi-result calls are unsupported. Fail closed.",
-                results.len()
+                "spirv: helper call produces {} values but its lowered callee returns {}. Fail closed.",
+                results.len(),
+                callee.result_arity,
             ));
             return false;
         }
-        let result = results.first().map(|&value| {
+        let result = (!results.is_empty()).then(|| {
             let expression = func.expressions.append(
-                naga::Expression::CallResult(callee),
+                naga::Expression::CallResult(callee.handle),
                 naga::Span::UNDEFINED,
             );
-            value_map.insert(value, expression);
             expression
         });
         target.push(
             naga::Statement::Call {
-                function: callee,
+                function: callee.handle,
                 arguments,
                 result,
             },
             naga::Span::UNDEFINED,
         );
+        match (results, result) {
+            ([], None) => {}
+            ([value], Some(expression)) => {
+                value_map.insert(*value, expression);
+            }
+            (values, Some(tuple)) => {
+                let mut first = None;
+                let mut last = None;
+                for (index, &value) in values.iter().enumerate() {
+                    let component = func.expressions.append(
+                        naga::Expression::AccessIndex {
+                            base: tuple,
+                            index: index as u32,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    value_map.insert(value, component);
+                    first.get_or_insert(component);
+                    last = Some(component);
+                }
+                if let (Some(first), Some(last)) = (first, last) {
+                    target.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(
+                            first,
+                            last,
+                        )),
+                        naga::Span::UNDEFINED,
+                    );
+                }
+            }
+            _ => {
+                *mem_error = Some(
+                    "spirv: helper call result shape was internally inconsistent. Fail closed."
+                        .to_string(),
+                );
+                return false;
+            }
+        }
         return true;
     } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(&val_id) = ret.args().as_slice().first() {
@@ -4087,8 +4125,15 @@ fn spirv_instruction_is_lowered(
 }
 
 #[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy)]
+struct NagaFunctionInfo {
+    handle: naga::Handle<naga::Function>,
+    result_arity: usize,
+}
+
+#[cfg(feature = "spirv-backend")]
 type NagaFunctionMap =
-    std::collections::HashMap<sonatina_ir::module::FuncRef, naga::Handle<naga::Function>>;
+    std::collections::HashMap<sonatina_ir::module::FuncRef, NagaFunctionInfo>;
 
 /// Return the direct-call closure rooted at `entry`, with every callee before
 /// its callers. Naga permits calls only to module functions, so this order lets
@@ -4179,6 +4224,66 @@ fn helper_naga_type(
     }
 }
 
+#[cfg(feature = "spirv-backend")]
+fn align_helper_offset(offset: u32, alignment: u32) -> u32 {
+    offset.div_ceil(alignment) * alignment
+}
+
+/// Represent a scalar multi-result helper as one logical WGSL result struct.
+/// The struct is function-local ABI only: it never crosses a storage, uniform,
+/// arena, or host boundary.
+#[cfg(feature = "spirv-backend")]
+fn helper_naga_result_type(
+    name: &str,
+    return_types: &[sonatina_ir::Type],
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    types: &mut naga::UniqueArena<naga::Type>,
+) -> Result<Option<naga::Handle<naga::Type>>, String> {
+    if return_types.is_empty() {
+        return Ok(None);
+    }
+    if let [ty] = return_types {
+        return helper_naga_type(*ty, word, word_type, f32_type, bool_type).map(Some);
+    }
+
+    let mut members = Vec::with_capacity(return_types.len());
+    let mut offset = 0u32;
+    let mut struct_alignment = 1u32;
+    for (index, &ty) in return_types.iter().enumerate() {
+        let (alignment, size) = match ty {
+            sonatina_ir::Type::I1 => (1, 1),
+            sonatina_ir::Type::I32 | sonatina_ir::Type::F32
+                if word == WordKind::U32 => (4, 4),
+            sonatina_ir::Type::I64 if word == WordKind::I64 => (8, 8),
+            other => {
+                return Err(format!(
+                    "spirv: helper `{name}` has unsupported multi-result ABI type {other:?}. Fail closed."
+                ));
+            }
+        };
+        offset = align_helper_offset(offset, alignment);
+        members.push(naga::StructMember {
+            name: Some(format!("r{index}")),
+            ty: helper_naga_type(ty, word, word_type, f32_type, bool_type)?,
+            binding: None,
+            offset,
+        });
+        offset += size;
+        struct_alignment = struct_alignment.max(alignment);
+    }
+    let span = align_helper_offset(offset, struct_alignment);
+    Ok(Some(types.insert(
+        naga::Type {
+            name: Some(format!("{name}_result")),
+            inner: naga::TypeInner::Struct { members, span },
+        },
+        naga::Span::UNDEFINED,
+    )))
+}
+
 /// Lower one ordinary scalar helper. Aggregate/object and arena-backed helper
 /// ABIs remain deliberately closed until they have an explicit shared-memory
 /// model. This is a real Naga function, not source expansion or an inliner.
@@ -4190,19 +4295,13 @@ fn lower_naga_helper(
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
+    result_type: Option<naga::Handle<naga::Type>>,
     naga_functions: &NagaFunctionMap,
 ) -> Result<naga::Function, String> {
     let signature = module
         .ctx
         .get_sig(function_ref)
         .ok_or_else(|| format!("spirv: helper {function_ref:?} has no signature"))?;
-    if signature.ret_tys().len() > 1 {
-        return Err(format!(
-            "spirv: helper `{}` returns {} values; multi-result helper calls are not lowered yet. Fail closed.",
-            signature.name(),
-            signature.ret_tys().len(),
-        ));
-    }
     let arguments = signature
         .args()
         .iter()
@@ -4215,15 +4314,7 @@ fn lower_naga_helper(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let result = signature
-        .single_ret_ty()
-        .map(|ty| -> Result<naga::FunctionResult, String> {
-            Ok(naga::FunctionResult {
-                ty: helper_naga_type(ty, word, word_type, f32_type, bool_type)?,
-                binding: None,
-            })
-        })
-        .transpose()?;
+    let result = result_type.map(|ty| naga::FunctionResult { ty, binding: None });
     let mut naga_function = naga::Function {
         name: Some(signature.name().to_string()),
         arguments,
@@ -4317,16 +4408,103 @@ fn lower_naga_helper(
                 naga::Statement::Return { value: None },
                 naga::Span::UNDEFINED,
             );
-        } else if let Some(value) = result_expression {
+        } else if signature.ret_tys().len() == 1 {
+            let Some(value) = result_expression else {
+                lowering_error = Some(format!(
+                    "spirv: helper `{}` produced no return value. Fail closed.",
+                    signature.name(),
+                ));
+                return;
+            };
             naga_function.body.push(
                 naga::Statement::Return { value: Some(value) },
                 naga::Span::UNDEFINED,
             );
         } else {
-            lowering_error = Some(format!(
-                "spirv: helper `{}` produced no return value. Fail closed.",
-                signature.name(),
-            ));
+            let return_sites = function
+                .layout
+                .iter_block()
+                .flat_map(|block| function.layout.iter_inst(block))
+                .filter_map(|instruction| {
+                    <&sonatina_ir::inst::control_flow::Return as sonatina_ir::InstDowncast>::downcast(
+                        inst_set,
+                        function.dfg.inst(instruction),
+                    )
+                    .map(|ret| ret.args().as_slice().to_vec())
+                })
+                .collect::<Vec<_>>();
+            let [return_values] = return_sites.as_slice() else {
+                lowering_error = Some(format!(
+                    "spirv: multi-result helper `{}` has {} return sites; structured tuple-return transport is not lowered yet. Fail closed.",
+                    signature.name(),
+                    return_sites.len(),
+                ));
+                return;
+            };
+            if return_values.len() != signature.ret_tys().len() {
+                lowering_error = Some(format!(
+                    "spirv: multi-result helper `{}` returns {} values at its canonical return site but declares {}. Fail closed.",
+                    signature.name(),
+                    return_values.len(),
+                    signature.ret_tys().len(),
+                ));
+                return;
+            }
+            let mut components = Vec::with_capacity(return_values.len());
+            for &value in return_values {
+                let was_cached = value_map.contains_key(&value);
+                let Some(component) = resolve_naga_value(
+                    value,
+                    function,
+                    word,
+                    &mut value_map,
+                    &phi_locals,
+                    &mut naga_function,
+                ) else {
+                    lowering_error = Some(format!(
+                        "spirv: multi-result helper `{}` could not resolve return component {value:?}. Fail closed.",
+                        signature.name(),
+                    ));
+                    return;
+                };
+                if !was_cached
+                    && matches!(
+                        naga_function.expressions[component],
+                        naga::Expression::Load { .. }
+                    )
+                {
+                    naga_function.body.push(
+                        naga::Statement::Emit(naga::Range::new_from_bounds(
+                            component,
+                            component,
+                        )),
+                        naga::Span::UNDEFINED,
+                    );
+                }
+                components.push(component);
+            }
+            let Some(result_type) = result_type else {
+                lowering_error = Some(format!(
+                    "spirv: multi-result helper `{}` has no lowered result struct. Fail closed.",
+                    signature.name(),
+                ));
+                return;
+            };
+            let tuple = naga_function.expressions.append(
+                naga::Expression::Compose {
+                    ty: result_type,
+                    components,
+                },
+                naga::Span::UNDEFINED,
+            );
+            naga_function.body.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(tuple, tuple)),
+                naga::Span::UNDEFINED,
+            );
+            naga_function.body.push(
+                naga::Statement::Return { value: Some(tuple) },
+                naga::Span::UNDEFINED,
+            );
         }
     });
     if let Some(error) = lowering_error {
@@ -4615,6 +4793,19 @@ fn translate_to_naga(
         .into_iter()
         .filter(|function_ref| *function_ref != first_func)
     {
+        let signature = module
+            .ctx
+            .get_sig(helper_ref)
+            .ok_or_else(|| format!("spirv: helper {helper_ref:?} has no signature"))?;
+        let result_type = helper_naga_result_type(
+            signature.name(),
+            signature.ret_tys(),
+            word,
+            word_type,
+            f32_type,
+            bool_type,
+            &mut naga_mod.types,
+        )?;
         let helper = lower_naga_helper(
             module,
             helper_ref,
@@ -4622,10 +4813,17 @@ fn translate_to_naga(
             word_type,
             f32_type,
             bool_type,
+            result_type,
             &naga_functions,
         )?;
         let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
-        naga_functions.insert(helper_ref, handle);
+        naga_functions.insert(
+            helper_ref,
+            NagaFunctionInfo {
+                handle,
+                result_arity: signature.ret_tys().len(),
+            },
+        );
     }
 
     // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
@@ -4704,7 +4902,7 @@ fn translate_to_naga(
             for bid in f.layout.iter_block() {
                 for iid in f.layout.iter_inst(bid) {
                     let inst_data = f.dfg.inst(iid);
-                    if let Some(result) = f.dfg.inst_result(iid) {
+                    for &result in f.dfg.inst_results(iid) {
                         let result_ty = f.dfg.value_ty(result);
                         let carrier_ty = match word {
                             WordKind::U32 => sonatina_ir::Type::I32,
