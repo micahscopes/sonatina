@@ -34,7 +34,7 @@ struct CallSite {
     continuation_may_commit: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CallChanges {
     removed: SmallVec<[FuncRef; 1]>,
     added: SmallVec<[FuncRef; 1]>,
