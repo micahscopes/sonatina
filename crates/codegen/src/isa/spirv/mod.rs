@@ -1382,6 +1382,20 @@ fn emit_exact_fminmax(
     emit_expr(func, target, naga::Expression::As { expr: result_u, kind: naga::ScalarKind::Float, convert: None })
 }
 
+#[cfg(feature = "spirv-backend")]
+fn immediate_index_u32(
+    function: &sonatina_ir::Function,
+    value: sonatina_ir::ValueId,
+) -> Option<u32> {
+    match function.dfg.value_imm(value)? {
+        sonatina_ir::Immediate::I1(value) => Some(u32::from(value)),
+        sonatina_ir::Immediate::I8(value) => u32::try_from(value).ok(),
+        sonatina_ir::Immediate::I32(value) => u32::try_from(value).ok(),
+        sonatina_ir::Immediate::I64(value) => u32::try_from(value).ok(),
+        _ => None,
+    }
+}
+
 /// Emit a single arithmetic/cmp instruction into the given target block.
 /// Returns the expression handle if an instruction was emitted, None otherwise.
 /// Skips Phi, Jump, Br, and Return instructions.
@@ -1996,6 +2010,175 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some(alloca) =
+        <&sonatina_ir::inst::data::Alloca as InstDowncast>::downcast(inst_set, inst_data)
+    {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let Some(local_ty) = naga_functions.typed_local_type(*alloca.ty()) else {
+                *mem_error = Some(format!(
+                    "spirv: Alloca type {:?} has no prevalidated Naga function-local representation. Fail closed.",
+                    alloca.ty(),
+                ));
+                return false;
+            };
+            let zero = func.expressions.append(
+                naga::Expression::ZeroValue(local_ty.handle),
+                naga::Span::UNDEFINED,
+            );
+            let local = func.local_variables.append(
+                naga::LocalVariable {
+                    name: Some(format!("fixed_local_{}", result.0)),
+                    ty: local_ty.handle,
+                    init: Some(zero),
+                },
+                naga::Span::UNDEFINED,
+            );
+            let pointer = func.expressions.append(
+                naga::Expression::LocalVariable(local),
+                naga::Span::UNDEFINED,
+            );
+            value_map.insert(result, pointer);
+            return true;
+        }
+    } else if let Some(gep) =
+        <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(inst_set, inst_data)
+    {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let Some((&base_value, indices)) = gep.values().split_first() else {
+                *mem_error = Some("spirv: Gep has no base pointer. Fail closed.".to_string());
+                return false;
+            };
+            let Some((&leading_index, indices)) = indices.split_first() else {
+                *mem_error = Some(
+                    "spirv: typed-local Gep requires a leading object index. Fail closed."
+                        .to_string(),
+                );
+                return false;
+            };
+            if immediate_index_u32(function, leading_index) != Some(0) {
+                *mem_error = Some(
+                    "spirv: typed-local Gep requires a zero leading object index. Fail closed."
+                        .to_string(),
+                );
+                return false;
+            }
+            let Some(mut base) = resolve_naga_value(
+                base_value,
+                function,
+                word,
+                value_map,
+                phi_locals,
+                func,
+            ) else {
+                *mem_error = Some(format!(
+                    "spirv: Gep base pointer {base_value:?} is unresolved. Fail closed."
+                ));
+                return false;
+            };
+            let base_ty = function.dfg.value_ty(base_value);
+            let Some(sonatina_ir::types::CompoundType::Ptr(mut pointee)) =
+                base_ty.resolve_compound(function.ctx())
+            else {
+                *mem_error = Some(format!(
+                    "spirv: Gep base {base_value:?} has non-pointer type {base_ty:?}. Fail closed."
+                ));
+                return false;
+            };
+
+            for &index in indices {
+                match pointee.resolve_compound(function.ctx()) {
+                    Some(sonatina_ir::types::CompoundType::Struct(data)) if !data.packed => {
+                        let Some(field) = immediate_index_u32(function, index) else {
+                            *mem_error = Some(
+                                "spirv: typed-local struct Gep requires a constant field index. Fail closed."
+                                    .to_string(),
+                            );
+                            return false;
+                        };
+                        let Some(&field_ty) = data.fields.get(field as usize) else {
+                            *mem_error = Some(format!(
+                                "spirv: typed-local struct Gep field {field} is out of bounds. Fail closed."
+                            ));
+                            return false;
+                        };
+                        base = func.expressions.append(
+                            naga::Expression::AccessIndex { base, index: field },
+                            naga::Span::UNDEFINED,
+                        );
+                        pointee = field_ty;
+                    }
+                    Some(sonatina_ir::types::CompoundType::Array { elem, len }) => {
+                        if let Some(constant) = immediate_index_u32(function, index) {
+                            if constant as usize >= len {
+                                *mem_error = Some(format!(
+                                    "spirv: typed-local array Gep index {constant} is out of bounds for length {len}. Fail closed."
+                                ));
+                                return false;
+                            }
+                            base = func.expressions.append(
+                                naga::Expression::AccessIndex {
+                                    base,
+                                    index: constant,
+                                },
+                                naga::Span::UNDEFINED,
+                            );
+                        } else {
+                            if word != WordKind::U32 {
+                                *mem_error = Some(
+                                    "spirv: dynamic typed-local array Gep requires the u32 browser word. Fail closed."
+                                        .to_string(),
+                                );
+                                return false;
+                            }
+                            let Some(index) = resolve_naga_value(
+                                index,
+                                function,
+                                word,
+                                value_map,
+                                phi_locals,
+                                func,
+                            ) else {
+                                *mem_error = Some(
+                                    "spirv: typed-local array Gep index is unresolved. Fail closed."
+                                        .to_string(),
+                                );
+                                return false;
+                            };
+                            base = func.expressions.append(
+                                naga::Expression::Access { base, index },
+                                naga::Span::UNDEFINED,
+                            );
+                        }
+                        pointee = elem;
+                    }
+                    _ => {
+                        *mem_error = Some(format!(
+                            "spirv: typed-local Gep cannot project through {pointee:?}. Fail closed."
+                        ));
+                        return false;
+                    }
+                }
+            }
+
+            let result_ty = function.dfg.value_ty(result);
+            let result_pointee = match result_ty.resolve_compound(function.ctx()) {
+                Some(sonatina_ir::types::CompoundType::Ptr(result_pointee)) => result_pointee,
+                _ => {
+                    *mem_error = Some(format!(
+                        "spirv: Gep result has non-pointer type {result_ty:?}. Fail closed."
+                    ));
+                    return false;
+                }
+            };
+            if result_pointee != pointee {
+                *mem_error = Some(format!(
+                    "spirv: Gep result pointee {result_pointee:?} does not match projected type {pointee:?}. Fail closed."
+                ));
+                return false;
+            }
+            value_map.insert(result, base);
+            return true;
+        }
     } else if <&sonatina_ir::inst::data::ObjAlloc as InstDowncast>::downcast(inst_set, inst_data).is_some() {
         // ObjAlloc in SPIR-V: the output storage buffer IS the allocation.
         // Map the result to the output buffer global variable expression.
@@ -2210,7 +2393,6 @@ fn emit_single_inst(
         }
     } else if let Some(load) = <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
-            let mem_ctx = mem_ctx.expect("Mload requires mem_ctx (has_mem pre-scan gate)");
             let Some(addr) = resolve_naga_value(*load.addr(), function, word, value_map, phi_locals, func) else {
                 *mem_error = Some(format!(
                     "spirv: Mload addr operand {:?} is unresolved (compiler invariant \
@@ -2219,6 +2401,19 @@ fn emit_single_inst(
                 ));
                 return false;
             };
+            if function.dfg.value_ty(*load.addr()).is_pointer(function.ctx()) {
+                let loaded = func.expressions.append(
+                    naga::Expression::Load { pointer: addr },
+                    naga::Span::UNDEFINED,
+                );
+                target.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
+                    naga::Span::UNDEFINED,
+                );
+                value_map.insert(result, loaded);
+                return true;
+            }
+            let mem_ctx = mem_ctx.expect("byte-arena Mload requires mem_ctx");
             let elem = emit_mem_access(
                 func,
                 target,
@@ -2271,7 +2466,6 @@ fn emit_single_inst(
             return true;
         }
     } else if let Some(store) = <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(inst_set, inst_data) {
-        let mem_ctx = mem_ctx.expect("Mstore requires mem_ctx (has_mem pre-scan gate)");
         let Some(addr) = resolve_naga_value(*store.addr(), function, word, value_map, phi_locals, func) else {
             *mem_error = Some(format!(
                 "spirv: Mstore addr operand {:?} is unresolved (compiler invariant violation: \
@@ -2288,6 +2482,17 @@ fn emit_single_inst(
             ));
             return false;
         };
+        if function.dfg.value_ty(*store.addr()).is_pointer(function.ctx()) {
+            target.push(
+                naga::Statement::Store {
+                    pointer: addr,
+                    value,
+                },
+                naga::Span::UNDEFINED,
+            );
+            return true;
+        }
+        let mem_ctx = mem_ctx.expect("byte-arena Mstore requires mem_ctx");
         let elem = emit_mem_access(
             func,
             target,
@@ -4311,6 +4516,8 @@ fn spirv_instruction_is_lowered(
         || <&sonatina_ir::inst::cast::F32ToU32 as InstDowncast>::downcast(is, inst).is_some()
         || <&sonatina_ir::inst::cast::Trunc as InstDowncast>::downcast(is, inst).is_some()
         || <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::Alloca as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::Gep as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAlloc as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjLoad as InstDowncast>::downcast(is, inst).is_some()
@@ -4371,8 +4578,68 @@ struct NagaMemoryAbiTypes {
 }
 
 #[cfg(feature = "spirv-backend")]
-type NagaFunctionMap =
-    std::collections::HashMap<sonatina_ir::module::FuncRef, NagaFunctionInfo>;
+#[derive(Clone, Copy)]
+struct NagaTypedLocalType {
+    handle: naga::Handle<naga::Type>,
+    alignment: u32,
+    size: u32,
+}
+
+// This is a conservative compiler policy, not a WebGPU hardware limit. It keeps
+// the first typed-local slice from silently moving a large arena into private
+// storage for every invocation. Device-tuned limits can replace it later.
+#[cfg(feature = "spirv-backend")]
+const MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION: u32 = 16 * 1024;
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Default)]
+struct NagaFunctionMap {
+    functions:
+        std::collections::HashMap<sonatina_ir::module::FuncRef, NagaFunctionInfo>,
+    typed_local_types:
+        std::collections::HashMap<sonatina_ir::Type, NagaTypedLocalType>,
+}
+
+#[cfg(feature = "spirv-backend")]
+impl NagaFunctionMap {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_typed_local_types(
+        typed_local_types: std::collections::HashMap<
+            sonatina_ir::Type,
+            NagaTypedLocalType,
+        >,
+    ) -> Self {
+        Self {
+            functions: std::collections::HashMap::new(),
+            typed_local_types,
+        }
+    }
+
+    fn get(
+        &self,
+        function: &sonatina_ir::module::FuncRef,
+    ) -> Option<&NagaFunctionInfo> {
+        self.functions.get(function)
+    }
+
+    fn insert(
+        &mut self,
+        function: sonatina_ir::module::FuncRef,
+        info: NagaFunctionInfo,
+    ) -> Option<NagaFunctionInfo> {
+        self.functions.insert(function, info)
+    }
+
+    fn typed_local_type(
+        &self,
+        ty: sonatina_ir::Type,
+    ) -> Option<NagaTypedLocalType> {
+        self.typed_local_types.get(&ty).copied()
+    }
+}
 
 #[cfg(feature = "spirv-backend")]
 #[derive(Clone, Copy)]
@@ -4633,14 +4900,26 @@ fn helper_private_memory_abis(
                             abi.trap |= callee.trap;
                             continue;
                         }
-                        if <&data::Mload as InstDowncast>::downcast(inst_set, instruction_data)
-                            .is_some()
-                            || <&data::Mstore as InstDowncast>::downcast(
-                                inst_set,
-                                instruction_data,
-                            )
-                            .is_some()
-                        {
+                        let byte_arena_access = <&data::Mload as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                        .is_some_and(|load| {
+                            !function
+                                .dfg
+                                .value_ty(*load.addr())
+                                .is_pointer(&module.ctx)
+                        }) || <&data::Mstore as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                        .is_some_and(|store| {
+                            !function
+                                .dfg
+                                .value_ty(*store.addr())
+                                .is_pointer(&module.ctx)
+                        });
+                        if byte_arena_access {
                             abi.heap = true;
                             abi.trap = true;
                         }
@@ -4683,6 +4962,367 @@ fn helper_naga_type(
             "spirv: helper ABI type {other:?} is unsupported under the {word:?} word. Fail closed."
         )),
     }
+}
+
+#[cfg(feature = "spirv-backend")]
+fn verify_naga_typed_local_use_closure(
+    module: &Module,
+    function_ref: sonatina_ir::module::FuncRef,
+) -> Result<Vec<sonatina_ir::Type>, String> {
+    module
+        .func_store
+        .try_view(function_ref, |function| {
+            use sonatina_ir::InstDowncast;
+
+            let inst_set = function.inst_set();
+            let mut local_types = Vec::new();
+            let mut local_pointers = std::collections::HashSet::new();
+
+            for block in function.layout.iter_block() {
+                for instruction in function.layout.iter_inst(block) {
+                    let instruction_data = function.dfg.inst(instruction);
+                    let Some(alloca) =
+                        <&sonatina_ir::inst::data::Alloca as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                    else {
+                        continue;
+                    };
+                    let Some(result) = function.dfg.inst_result(instruction) else {
+                        return Err(
+                            "spirv: typed-local Alloca has no result. Fail closed."
+                                .to_string(),
+                        );
+                    };
+                    let result_ty = function.dfg.value_ty(result);
+                    let result_pointee = match result_ty.resolve_compound(function.ctx()) {
+                        Some(sonatina_ir::types::CompoundType::Ptr(pointee)) => pointee,
+                        _ => {
+                            return Err(format!(
+                                "spirv: typed-local Alloca result has non-pointer type {result_ty:?}. Fail closed."
+                            ));
+                        }
+                    };
+                    if result_pointee != *alloca.ty() {
+                        return Err(format!(
+                            "spirv: typed-local Alloca result points to {result_pointee:?}, not its declared type {:?}. Fail closed.",
+                            alloca.ty(),
+                        ));
+                    }
+                    local_types.push(*alloca.ty());
+                    local_pointers.insert(result);
+                }
+            }
+
+            // Discover the complete projection closure before validating uses,
+            // so layout order does not affect legality.
+            loop {
+                let mut changed = false;
+                for block in function.layout.iter_block() {
+                    for instruction in function.layout.iter_inst(block) {
+                        let Some(gep) =
+                            <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(
+                                inst_set,
+                                function.dfg.inst(instruction),
+                            )
+                        else {
+                            continue;
+                        };
+                        let Some(&base) = gep.values().first() else {
+                            continue;
+                        };
+                        if local_pointers.contains(&base) {
+                            let Some(result) = function.dfg.inst_result(instruction) else {
+                                return Err(
+                                    "spirv: typed-local Gep has no result. Fail closed."
+                                        .to_string(),
+                                );
+                            };
+                            changed |= local_pointers.insert(result);
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+
+            for block in function.layout.iter_block() {
+                for instruction in function.layout.iter_inst(block) {
+                    let instruction_data = function.dfg.inst(instruction);
+                    if let Some(gep) =
+                        <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                    {
+                        let Some((&base, indices)) = gep.values().split_first() else {
+                            return Err(
+                                "spirv: typed-local Gep has no base pointer. Fail closed."
+                                    .to_string(),
+                            );
+                        };
+                        if !local_pointers.contains(&base) {
+                            return Err(format!(
+                                "spirv: Gep base {base:?} is not rooted in typed private storage. Fail closed."
+                            ));
+                        }
+                        if indices
+                            .iter()
+                            .any(|index| local_pointers.contains(index))
+                        {
+                            return Err(
+                                "spirv: typed-local pointer used as a Gep index. Fail closed."
+                                    .to_string(),
+                            );
+                        }
+                        continue;
+                    }
+
+                    if let Some(load) =
+                        <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                    {
+                        if function.dfg.value_ty(*load.addr()).is_pointer(function.ctx())
+                            && !local_pointers.contains(load.addr())
+                        {
+                            return Err(format!(
+                                "spirv: Mload pointer {:?} is not rooted in typed private storage. Fail closed.",
+                                load.addr(),
+                            ));
+                        }
+                        continue;
+                    }
+
+                    if let Some(store) =
+                        <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                    {
+                        if function.dfg.value_ty(*store.addr()).is_pointer(function.ctx())
+                            && !local_pointers.contains(store.addr())
+                        {
+                            return Err(format!(
+                                "spirv: Mstore pointer {:?} is not rooted in typed private storage. Fail closed.",
+                                store.addr(),
+                            ));
+                        }
+                        if local_pointers.contains(store.value()) {
+                            return Err(
+                                "spirv: typed-local pointer stored as data. Fail closed."
+                                    .to_string(),
+                            );
+                        }
+                        continue;
+                    }
+
+                    if let Some(pointer) = instruction_data
+                        .collect_values()
+                        .into_iter()
+                        .find(|value| local_pointers.contains(value))
+                    {
+                        return Err(format!(
+                            "spirv: typed-local pointer {pointer:?} escapes through {}. Fail closed.",
+                            instruction_data.as_text(),
+                        ));
+                    }
+                }
+            }
+
+            Ok(local_types)
+        })
+        .ok_or_else(|| {
+            format!(
+                "spirv: reachable function {function_ref:?} has no body while verifying typed locals. Fail closed."
+            )
+        })?
+}
+
+#[cfg(feature = "spirv-backend")]
+fn intern_naga_typed_local_type(
+    module: &Module,
+    ty: sonatina_ir::Type,
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    types: &mut naga::UniqueArena<naga::Type>,
+    cache: &mut std::collections::HashMap<sonatina_ir::Type, NagaTypedLocalType>,
+) -> Result<NagaTypedLocalType, String> {
+    if let Some(&cached) = cache.get(&ty) {
+        return Ok(cached);
+    }
+
+    let mapped = match ty {
+        sonatina_ir::Type::I1 => NagaTypedLocalType {
+            handle: bool_type,
+            alignment: 4,
+            size: 4,
+        },
+        sonatina_ir::Type::I32 if word == WordKind::U32 => NagaTypedLocalType {
+            handle: word_type,
+            alignment: 4,
+            size: 4,
+        },
+        sonatina_ir::Type::I64 if word == WordKind::I64 => NagaTypedLocalType {
+            handle: word_type,
+            alignment: 8,
+            size: 8,
+        },
+        sonatina_ir::Type::F32 if word == WordKind::U32 => NagaTypedLocalType {
+            handle: f32_type,
+            alignment: 4,
+            size: 4,
+        },
+        sonatina_ir::Type::Compound(compound_ref) => {
+            let compound = module
+                .ctx
+                .with_ty_store(|store| store.resolve_compound(compound_ref).clone());
+            match compound {
+                sonatina_ir::types::CompoundType::Array { elem, len } => {
+                    let elem = intern_naga_typed_local_type(
+                        module, elem, word, word_type, f32_type, bool_type, types, cache,
+                    )?;
+                    let len = u32::try_from(len).map_err(|_| {
+                        format!(
+                            "spirv: typed local array length does not fit u32 for {ty:?}. Fail closed."
+                        )
+                    })?;
+                    let len = std::num::NonZeroU32::new(len).ok_or_else(|| {
+                        format!(
+                            "spirv: zero-length typed local array {ty:?} is unsupported. Fail closed."
+                        )
+                    })?;
+                    let stride = align_helper_offset(elem.size, elem.alignment);
+                    let size = stride.checked_mul(len.get()).ok_or_else(|| {
+                        format!(
+                            "spirv: typed local array size overflows u32 for {ty:?}. Fail closed."
+                        )
+                    })?;
+                    let handle = types.insert(
+                        naga::Type {
+                            name: None,
+                            inner: naga::TypeInner::Array {
+                                base: elem.handle,
+                                size: naga::ArraySize::Constant(len),
+                                stride,
+                            },
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    NagaTypedLocalType {
+                        handle,
+                        alignment: elem.alignment,
+                        size,
+                    }
+                }
+                sonatina_ir::types::CompoundType::Struct(data) if !data.packed => {
+                    let mut members = Vec::with_capacity(data.fields.len());
+                    let mut offset = 0u32;
+                    let mut alignment = 1u32;
+                    for (index, field_ty) in data.fields.iter().copied().enumerate() {
+                        let field = intern_naga_typed_local_type(
+                            module,
+                            field_ty,
+                            word,
+                            word_type,
+                            f32_type,
+                            bool_type,
+                            types,
+                            cache,
+                        )?;
+                        offset = align_helper_offset(offset, field.alignment);
+                        members.push(naga::StructMember {
+                            name: Some(format!("f{index}")),
+                            ty: field.handle,
+                            binding: None,
+                            offset,
+                        });
+                        offset = offset.checked_add(field.size).ok_or_else(|| {
+                            format!(
+                                "spirv: typed local struct size overflows u32 for {ty:?}. Fail closed."
+                            )
+                        })?;
+                        alignment = alignment.max(field.alignment);
+                    }
+                    let size = align_helper_offset(offset, alignment);
+                    let handle = types.insert(
+                        naga::Type {
+                            name: Some(format!("FeLocal_{}", data.name)),
+                            inner: naga::TypeInner::Struct {
+                                members,
+                                span: size,
+                            },
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    NagaTypedLocalType {
+                        handle,
+                        alignment,
+                        size,
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "spirv: typed local type {ty:?} has unsupported shape {other:?}. Fail closed."
+                    ));
+                }
+            }
+        }
+        other => {
+            return Err(format!(
+                "spirv: typed local type {other:?} is unsupported under the {word:?} word. Fail closed."
+            ));
+        }
+    };
+    cache.insert(ty, mapped);
+    Ok(mapped)
+}
+
+#[cfg(feature = "spirv-backend")]
+fn collect_naga_typed_local_types(
+    module: &Module,
+    call_order: &[sonatina_ir::module::FuncRef],
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    types: &mut naga::UniqueArena<naga::Type>,
+) -> Result<
+    std::collections::HashMap<sonatina_ir::Type, NagaTypedLocalType>,
+    String,
+> {
+    let mut cache = std::collections::HashMap::new();
+    for &function_ref in call_order {
+        let mut private_bytes = 0u32;
+        for ty in verify_naga_typed_local_use_closure(module, function_ref)? {
+            let local = intern_naga_typed_local_type(
+                module,
+                ty,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                types,
+                &mut cache,
+            )?;
+            private_bytes = private_bytes.checked_add(local.size).ok_or_else(|| {
+                format!(
+                    "spirv: typed private storage size overflows u32 in {function_ref:?}. Fail closed."
+                )
+            })?;
+            if private_bytes > MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION {
+                return Err(format!(
+                    "spirv: typed private storage in {function_ref:?} requires {private_bytes} bytes, over the conservative {MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION}-byte per-function budget. Fail closed."
+                ));
+            }
+        }
+    }
+    Ok(cache)
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -5687,6 +6327,15 @@ fn translate_to_naga(
     );
 
     let call_order = reachable_call_postorder(module, first_func)?;
+    let typed_local_types = collect_naga_typed_local_types(
+        module,
+        &call_order,
+        word,
+        word_type,
+        f32_type,
+        bool_type,
+        &mut naga_mod.types,
+    )?;
 
     // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
     // fail closed on any signedness-sensitive op (Sar / signed compares / signed
@@ -5965,7 +6614,10 @@ fn translate_to_naga(
                             .push((iid, size_bytes.saturating_mul(executions)));
                     }
                     if let Some(load) = <&sonatina_ir::inst::data::Mload as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
-                        has_mem = true;
+                        has_mem |= !f
+                            .dfg
+                            .value_ty(*load.addr())
+                            .is_pointer(&module.ctx);
                         let result_ty = f
                             .dfg
                             .inst_result(iid)
@@ -5991,7 +6643,10 @@ fn translate_to_naga(
                         }
                     }
                     if let Some(store) = <&sonatina_ir::inst::data::Mstore as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
-                        has_mem = true;
+                        has_mem |= !f
+                            .dfg
+                            .value_ty(*store.addr())
+                            .is_pointer(&module.ctx);
                         let value_ty = f.dfg.value_ty(*store.value());
                         let admitted = word == WordKind::U32
                             && matches!(
@@ -6190,7 +6845,8 @@ fn translate_to_naga(
         },
     };
 
-    let mut naga_functions = NagaFunctionMap::new();
+    let mut naga_functions =
+        NagaFunctionMap::with_typed_local_types(typed_local_types);
     for helper_ref in call_order
         .iter()
         .copied()
