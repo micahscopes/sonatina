@@ -4639,6 +4639,234 @@ fn explicit_compute_lowers_mixed_f32_u32_object_storage() {
 }
 
 #[test]
+fn explicit_compute_emits_only_transitively_live_external_resources() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_type = mb.declare_array_type(Type::I32, 8);
+    let array_ref_type = mb.objref_type(array_type);
+    let word_ref_type = mb.objref_type(Type::I32);
+
+    let entry_ref = mb
+        .declare_function(Signature::new_unit(
+            "resource_liveness_entry",
+            Linkage::Public,
+            &[array_ref_type, array_ref_type, Type::I32],
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_unit(
+            "store_live_resource",
+            Linkage::Private,
+            &[array_ref_type, Type::I32],
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let zero = fb.make_imm_value(0i32);
+        let slot = fb.insert_inst(
+            data::ObjIndex::new(is, fb.args()[0], zero),
+            word_ref_type,
+        );
+        fb.insert_inst_no_result(data::ObjStore::new(is, slot, fb.args()[1]));
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(control_flow::Call::new(
+            is,
+            helper_ref,
+            [fb.args()[1], fb.args()[2]].into_iter().collect(),
+        ));
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let resource = |arg_index: u32, binding: u32, name: &str| SpirvExternalResource {
+        arg_index,
+        group: 0,
+        binding,
+        name: name.to_string(),
+        access: Access::ReadWrite,
+        element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+        stride: 4,
+        length: 8,
+    };
+    let artifact = SpirvBackend::new()
+        .with_compute()
+        .with_workgroup_size(1, 1, 1)
+        .with_external_resource(resource(0, 0, "unused_values"))
+        .with_external_resource(resource(1, 1, "live_values"))
+        .compile_module(&mb.build())
+        .expect("dead resource arguments should not become physical bindings");
+
+    assert_eq!(artifact.layout.bindings.len(), 2);
+    let live = &artifact.layout.bindings[0];
+    assert_eq!((live.name.as_str(), live.binding), ("live_values", 0));
+    assert_eq!(live.resource_arg_index, Some(1));
+    let params = &artifact.layout.bindings[1];
+    assert_eq!((params.role, params.binding), (Role::Input, 1));
+    assert_eq!(params.members.len(), 1);
+    assert_eq!(params.members[0].arg_index, 2);
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(!wgsl.contains("unused_values"), "{wgsl}");
+    assert!(wgsl.contains("live_values"), "{wgsl}");
+}
+
+#[test]
+fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array_type = mb.declare_array_type(Type::I32, 4);
+    let array_ref_type = mb.objref_type(array_type);
+    let word_ref_type = mb.objref_type(Type::I32);
+    let state = [array_ref_type, array_ref_type, array_ref_type, Type::F32];
+    let vertex_args = [
+        Type::I32,
+        Type::I32,
+        state[0],
+        state[1],
+        state[2],
+        state[3],
+    ];
+    let vertex_results = [Type::F32; 5];
+    let fragment_args = [Type::F32, state[0], state[1], state[2], state[3]];
+
+    let vertex_ref = mb
+        .declare_function(Signature::new(
+            "vs_resource_identity",
+            Linkage::Public,
+            &vertex_args,
+            &vertex_results,
+        ))
+        .unwrap();
+    let fragment_ref = mb
+        .declare_function(Signature::new_single(
+            "fs_resource_identity",
+            Linkage::Public,
+            &fragment_args,
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(vertex_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let vertex_index = fb.args()[0];
+        let instance_index = fb.args()[1];
+        let vertex_values = fb.args()[2];
+        let scale = fb.args()[5];
+        let zero_index = fb.make_imm_value(0i32);
+        let slot = fb.insert_inst(
+            data::ObjIndex::new(is, vertex_values, zero_index),
+            word_ref_type,
+        );
+        let loaded = fb.insert_inst(data::ObjLoad::new(is, slot), Type::I32);
+        let loaded = fb.insert_inst(cast::I32ToF32::new(is, loaded), Type::F32);
+        let x = fb.insert_inst(arith::Fadd::new(is, loaded, scale), Type::F32);
+        let y = fb.insert_inst(cast::I32ToF32::new(is, instance_index), Type::F32);
+        let varying = fb.insert_inst(cast::I32ToF32::new(is, vertex_index), Type::F32);
+        let zero = fb.make_imm_value(Immediate::F32(0.0f32.to_bits()));
+        let one = fb.make_imm_value(Immediate::F32(1.0f32.to_bits()));
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [x, y, zero, one, varying]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(fragment_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let fragment_values = fb.args()[2];
+        let scale = fb.args()[4];
+        let zero_index = fb.make_imm_value(0i32);
+        let slot = fb.insert_inst(
+            data::ObjIndex::new(is, fragment_values, zero_index),
+            word_ref_type,
+        );
+        let color = fb.insert_inst(data::ObjLoad::new(is, slot), Type::I32);
+        let scale_word = fb.insert_inst(cast::F32ToI32::new(is, scale), Type::I32);
+        let color = fb.insert_inst(arith::Add::new(is, color, scale_word), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, color));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let resource = |arg_index: u32, binding: u32, name: &str| SpirvExternalResource {
+        arg_index,
+        group: 0,
+        binding,
+        name: name.to_string(),
+        access: Access::Read,
+        element: SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+        stride: 4,
+        length: 4,
+    };
+    let artifact = SpirvBackend::new()
+        .with_authored_raster("vs_resource_identity", "fs_resource_identity")
+        .with_builtin_argument(SpirvBuiltinArgument {
+            arg_index: 0,
+            source: SpirvBuiltinSource::VertexIndex,
+        })
+        .with_builtin_argument(SpirvBuiltinArgument {
+            arg_index: 1,
+            source: SpirvBuiltinSource::InstanceIndex,
+        })
+        .with_external_resource(resource(2, 0, "vertex_values"))
+        .with_external_resource(resource(3, 1, "fragment_values"))
+        .with_external_resource(resource(4, 2, "unused_values"))
+        .compile_module(&mb.build())
+        .expect("paired raster stages should share only their live resource union");
+
+    let bindings = artifact
+        .layout
+        .bindings
+        .iter()
+        .map(|binding| (binding.name.as_str(), binding.binding, binding.resource_arg_index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bindings,
+        vec![
+            ("vertex_values", 0, Some(2)),
+            ("fragment_values", 1, Some(3)),
+            ("state", 2, None),
+        ],
+    );
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(wgsl.contains("@builtin(instance_index)"), "{wgsl}");
+    assert!(!wgsl.contains("unused_values"), "{wgsl}");
+    let fragment = wgsl
+        .split("fn fs_resource_identity")
+        .nth(1)
+        .expect("named fragment entry");
+    assert!(fragment.contains("fragment_values"), "{fragment}");
+    assert!(!fragment.contains("vertex_values"), "{fragment}");
+}
+
+#[test]
 fn explicit_compute_rejects_signed_external_storage_until_carrier_semantics_exist() {
     let mut resource = external_complex_resource(0, Access::ReadWrite);
     let SpirvResourceElement::Record { fields, .. } = &mut resource.element else {

@@ -38,6 +38,27 @@ pub struct DeadArgElimStats {
     pub rounds: usize,
 }
 
+/// Computes the interprocedural live-argument mask for every defined function
+/// without rewriting any signature or call site.
+///
+/// Backends use this when a logical entry ABI must remain intact while its
+/// physical interface may omit arguments that cannot reach a result or an
+/// effect. In particular, shader resource arguments still have to be excluded
+/// from scalar parameter storage even when no physical binding is emitted.
+pub(crate) fn analyze_live_arguments(module: &Module) -> FxHashMap<FuncRef, Vec<bool>> {
+    func_behavior::analyze_module(module);
+    let candidate = collect_candidate_funcs(
+        module,
+        DeadArgElimConfig {
+            private_only: false,
+            require_higher_order_safe: false,
+        },
+    );
+    let call_graph = CallGraph::build_graph_subset(module, &candidate);
+    let reverse_callers = build_reverse_callers(&call_graph);
+    solve_live_arg_fixpoint(module, &candidate, &reverse_callers)
+}
+
 #[derive(Clone)]
 struct FuncPlan {
     keep_args: Vec<bool>,

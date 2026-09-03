@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use sonatina_ir::{InstDowncast, Module, Type};
 
+use crate::optim::dead_arg::analyze_live_arguments;
+
 use super::{
     Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinInput,
     SpirvBuiltinArgument, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout,
@@ -149,9 +151,40 @@ pub(super) fn translate(
     if scalar_state.iter().any(|(_, ty)| !matches!(ty, Type::I32 | Type::F32)) {
         return Err(
             "spirv raster: non-resource actor state admits only i32/u32 and f32 leaves"
-                .to_string(),
+            .to_string(),
         );
     }
+
+    // Vertex and fragment share one physical bind group but have distinct
+    // entry signatures. Retain the union of resources that can reach either
+    // stage, mapped through the common actor-state suffix. Every declared
+    // resource position remains excluded from scalar state above.
+    let live_arguments = analyze_live_arguments(module);
+    let vertex_live = live_arguments.get(&vertex_ref);
+    let fragment_live = live_arguments.get(&fragment_ref);
+    let emitted_external_resources = external_resources
+        .iter()
+        .zip(resource_state_positions.iter().copied())
+        .filter(|(resource, state_position)| {
+            let vertex_used = vertex_live
+                .and_then(|mask| mask.get(resource.arg_index as usize))
+                .copied()
+                .unwrap_or(true);
+            let fragment_arg = varying_count + *state_position;
+            let fragment_used = fragment_live
+                .and_then(|mask| mask.get(fragment_arg))
+                .copied()
+                .unwrap_or(true);
+            vertex_used || fragment_used
+        })
+        .map(|(resource, _)| resource.clone())
+        .enumerate()
+        .map(|(binding, mut resource)| {
+            resource.group = 0;
+            resource.binding = binding as u32;
+            resource
+        })
+        .collect::<Vec<_>>();
 
     // Calls have already been inlined by Fe. Object indexing/projection/load
     // resolves through the shared external globals. Allocation, private memory
@@ -184,7 +217,7 @@ pub(super) fn translate(
                         || <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjIndex as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjProj as InstDowncast>::downcast(inst_set, data).is_some();
-                    if has_external_object_effect && external_resources.is_empty() {
+                    if has_external_object_effect && emitted_external_resources.is_empty() {
                         return Err(format!(
                             "spirv raster: {stage} body uses object operations without an external resource root; fail closed",
                         ));
@@ -235,7 +268,7 @@ pub(super) fn translate(
 
     let (external_roots, mut bindings) = append_external_resources(
         &mut naga_mod,
-        external_resources,
+        &emitted_external_resources,
         WordKind::U32,
         u32_type,
         f32_type,
@@ -247,7 +280,7 @@ pub(super) fn translate(
         u32_type,
         f32_type,
         varying_count,
-        external_resources.len() as u32,
+        emitted_external_resources.len() as u32,
     );
     let output_type = append_vertex_output_type(&mut naga_mod, f32_type, vec4f, varying_count);
 
@@ -257,7 +290,7 @@ pub(super) fn translate(
     )?;
     let fragment = lower_fragment(
         module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
-        u32_type, f32_type, bool_type, vec4f,
+        context_count, u32_type, f32_type, bool_type, vec4f,
     )?;
 
     naga_mod.entry_points.push(entry_point(
@@ -270,7 +303,7 @@ pub(super) fn translate(
     if state_var.is_some() {
         bindings.push(SpirvBinding {
             group: 0,
-            binding: external_resources.len() as u32,
+            binding: emitted_external_resources.len() as u32,
             name: "state".to_string(),
             access: Access::Read,
             role: Role::Input,
@@ -585,6 +618,7 @@ fn lower_fragment(
     state_fields: &[(usize, Type)],
     external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
     varying_count: usize,
+    vertex_context_count: usize,
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
@@ -614,7 +648,7 @@ fn lower_fragment(
             values.insert(arg, value);
         }
         for &(vertex_arg_index, global) in external_roots {
-            let state_index = vertex_arg_index as usize - 1;
+            let state_index = vertex_arg_index as usize - vertex_context_count;
             let fragment_arg_index = varying_count + state_index;
             let arg = function.arg_values[fragment_arg_index];
             let root = output.expressions.append(

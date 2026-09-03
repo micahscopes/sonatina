@@ -11,6 +11,9 @@ use sonatina_ir::ir_writer::FuncWriter;
 use crate::backend::Backend;
 
 #[cfg(feature = "spirv-backend")]
+use crate::optim::dead_arg::analyze_live_arguments;
+
+#[cfg(feature = "spirv-backend")]
 mod authored_raster;
 
 #[derive(Debug)]
@@ -3396,6 +3399,10 @@ fn emit_single_inst(
         let mut arguments = Vec::new();
         let mut logical_arguments = Vec::with_capacity(call.args().len());
         for (&logical_argument, source) in call.args().iter().zip(&callee.argument_abi) {
+            if matches!(source, NagaArgumentSource::Dead) {
+                logical_arguments.push(None);
+                continue;
+            }
             let argument = match rematerialize_typed_pointer_projection(
                 logical_argument, function, word, value_map, phi_locals, func, target,
             ) {
@@ -3416,7 +3423,7 @@ fn emit_single_inst(
                     return false;
                 }
             };
-            logical_arguments.push(argument);
+            logical_arguments.push(Some(argument));
             if let NagaArgumentSource::Physical(physical_index) = source {
                 if *physical_index as usize != arguments.len() {
                     *mem_error = Some(format!(
@@ -3501,13 +3508,13 @@ fn emit_single_inst(
                     }
                 }
                 NagaResultSource::PassthroughArgument(argument_index) => {
-                    let Some(&argument) = logical_arguments.get(argument_index as usize) else {
+                    let Some(Some(argument)) = logical_arguments.get(argument_index as usize) else {
                         *mem_error = Some(format!(
-                            "spirv: helper passthrough result refers to missing argument {argument_index}. Fail closed."
+                            "spirv: helper passthrough result refers to missing or dead argument {argument_index}. Fail closed."
                         ));
                         return false;
                     };
-                    argument
+                    *argument
                 }
             };
             value_map.insert(value, expression);
@@ -5551,6 +5558,9 @@ struct NagaFunctionInfo {
 enum NagaArgumentSource {
     Physical(u32),
     ImplicitResource(naga::Handle<naga::GlobalVariable>),
+    /// A logical source argument proven unable to reach a result or effect.
+    /// It remains in Sonatina's stable signature but has no physical Naga ABI.
+    Dead,
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -5665,6 +5675,25 @@ type NagaLogicalResultAbis = std::collections::HashMap<
     sonatina_ir::module::FuncRef,
     Vec<NagaResultSource>,
 >;
+
+#[cfg(feature = "spirv-backend")]
+type NagaLiveArguments = rustc_hash::FxHashMap<
+    sonatina_ir::module::FuncRef,
+    Vec<bool>,
+>;
+
+#[cfg(feature = "spirv-backend")]
+fn naga_argument_is_live(
+    live_arguments: &NagaLiveArguments,
+    function: sonatina_ir::module::FuncRef,
+    argument_index: usize,
+) -> bool {
+    live_arguments
+        .get(&function)
+        .and_then(|mask| mask.get(argument_index))
+        .copied()
+        .unwrap_or(true)
+}
 
 #[cfg(feature = "spirv-backend")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -5971,6 +6000,7 @@ fn helper_resource_variants(
     external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
     resource_capabilities: &NagaResourceCapabilities,
     logical_result_abis: &NagaLogicalResultAbis,
+    live_arguments: &NagaLiveArguments,
 ) -> Result<NagaResourceVariants, String> {
     use sonatina_ir::{InstDowncast, inst::control_flow::Call};
 
@@ -6053,7 +6083,13 @@ fn helper_resource_variants(
                         .zip(function_bindings)
                         .enumerate()
                     {
-                        if !resource_capabilities.contains(&ty) {
+                        if !resource_capabilities.contains(&ty)
+                            || !naga_argument_is_live(
+                                live_arguments,
+                                function_ref,
+                                argument_index,
+                            )
+                        {
                             continue;
                         }
                         let global = binding.ok_or_else(|| {
@@ -6099,7 +6135,13 @@ fn helper_resource_variants(
                                 .zip(callee_bindings.iter_mut())
                                 .enumerate()
                             {
-                                if !resource_capabilities.contains(&ty) {
+                                if !resource_capabilities.contains(&ty)
+                                    || !naga_argument_is_live(
+                                        live_arguments,
+                                        *call.callee(),
+                                        argument_index,
+                                    )
+                                {
                                     continue;
                                 }
                                 let global = provenance.get(&argument).copied().ok_or_else(|| {
@@ -6817,6 +6859,7 @@ fn collect_naga_typed_local_types(
 #[cfg(feature = "spirv-backend")]
 fn helper_naga_argument_abi(
     module: &Module,
+    function_ref: sonatina_ir::module::FuncRef,
     signature: &sonatina_ir::Signature,
     word: WordKind,
     word_type: naga::Handle<naga::Type>,
@@ -6824,6 +6867,7 @@ fn helper_naga_argument_abi(
     bool_type: naga::Handle<naga::Type>,
     resource_capabilities: &NagaResourceCapabilities,
     resource_bindings: &[Option<naga::Handle<naga::GlobalVariable>>],
+    live_arguments: &NagaLiveArguments,
     naga_functions: &NagaFunctionMap,
 ) -> Result<Vec<NagaArgumentSource>, String> {
     if resource_bindings.len() != signature.args().len() {
@@ -6843,14 +6887,20 @@ fn helper_naga_argument_abi(
         .enumerate()
         .map(|(logical_index, (ty, binding))| {
             if resource_capabilities.contains(&ty) {
-                binding
-                    .map(|global| NagaArgumentSource::ImplicitResource(global))
-                    .ok_or_else(|| {
+                match binding {
+                    Some(global) => Ok(NagaArgumentSource::ImplicitResource(*global)),
+                    None if !naga_argument_is_live(
+                        live_arguments,
+                        function_ref,
+                        logical_index,
+                    ) => Ok(NagaArgumentSource::Dead),
+                    None => Err(
                         format!(
                             "spirv: helper `{}` resource argument {logical_index} has no call-graph identity. Fail closed.",
                             signature.name(),
                         )
-                    })
+                    ),
+                }
             } else {
                 helper_naga_type(
                     &module.ctx,
@@ -7306,17 +7356,18 @@ fn lower_naga_helper(
 
         let mut value_map = std::collections::HashMap::new();
         for (&argument, source) in function.arg_values.iter().zip(argument_abi) {
-            let expression = naga_function.expressions.append(
-                match *source {
-                    NagaArgumentSource::Physical(index) => {
-                        naga::Expression::FunctionArgument(index)
-                    }
-                    NagaArgumentSource::ImplicitResource(global) => {
-                        naga::Expression::GlobalVariable(global)
-                    }
-                },
-                naga::Span::UNDEFINED,
-            );
+            let expression = match *source {
+                NagaArgumentSource::Physical(index) => {
+                    naga::Expression::FunctionArgument(index)
+                }
+                NagaArgumentSource::ImplicitResource(global) => {
+                    naga::Expression::GlobalVariable(global)
+                }
+                NagaArgumentSource::Dead => continue,
+            };
+            let expression = naga_function
+                .expressions
+                .append(expression, naga::Span::UNDEFINED);
             value_map.insert(argument, expression);
         }
         let resource_seeds = function
@@ -7611,6 +7662,48 @@ fn translate_to_naga(
                 resource.arg_index
             ));
         }
+    }
+
+    // The source ABI keeps every declared resource argument so unused object
+    // references are never mistaken for scalar parameter storage. The physical
+    // shader interface, however, contains only resources that can reach the
+    // selected entry's results or effects. Compact bindings are safe because
+    // the layout preserves each resource's stable name and logical arg index.
+    let live_arguments = analyze_live_arguments(module);
+    let live_mask = live_arguments.get(&first_func).ok_or_else(|| {
+        format!(
+            "spirv: live-argument analysis has no entry for `{}`",
+            sig.name()
+        )
+    })?;
+    let emitted_external_resources = external_resources
+        .iter()
+        .filter(|resource| {
+            live_mask
+                .get(resource.arg_index as usize)
+                .copied()
+                .unwrap_or(true)
+        })
+        .cloned()
+        .enumerate()
+        .map(|(binding, mut resource)| {
+            resource.group = 0;
+            resource.binding = binding as u32;
+            resource
+        })
+        .collect::<Vec<_>>();
+    if trace && emitted_external_resources.len() != external_resources.len() {
+        eprintln!(
+            "sonatina spirv: pruned external resources, entry={}, declared={}, emitted={}, names=[{}]",
+            sig.name(),
+            external_resources.len(),
+            emitted_external_resources.len(),
+            emitted_external_resources
+                .iter()
+                .map(|resource| resource.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     }
 
     let mut builtin_arg_indices = std::collections::HashSet::new();
@@ -8182,7 +8275,7 @@ fn translate_to_naga(
 
     let (external_roots, external_layout_bindings) = append_external_resources(
         &mut naga_mod,
-        external_resources,
+        &emitted_external_resources,
         word,
         word_type,
         f32_type,
@@ -8205,6 +8298,7 @@ fn translate_to_naga(
         &external_roots,
         &helper_resource_capabilities,
         &helper_logical_result_abis,
+        &live_arguments,
     )?;
     let helper_memory_abis = helper_private_memory_abis(module, &call_order, first_func)?;
     let helper_memory = helper_memory_abis.values().any(|abi| abi.heap);
@@ -8334,6 +8428,7 @@ fn translate_to_naga(
             )?);
             let argument_abi = helper_naga_argument_abi(
                 module,
+                helper_ref,
                 &helper_signature,
                 word,
                 word_type,
@@ -8341,6 +8436,7 @@ fn translate_to_naga(
                 bool_type,
                 &helper_resource_capabilities,
                 resource_bindings,
+                &live_arguments,
                 &naga_functions,
             )?;
             let mut helper = lower_naga_helper(
@@ -8491,7 +8587,7 @@ fn translate_to_naga(
             parameter_align = parameter_align.max(width);
         }
         parameter_span = (parameter_span + parameter_align - 1) & !(parameter_align - 1);
-        let parameter_binding = external_resources.len() as u32;
+        let parameter_binding = emitted_external_resources.len() as u32;
         let parameter_var = if parameter_members.is_empty() {
             None
         } else {
@@ -8981,7 +9077,7 @@ fn translate_to_naga(
                 .to_string(),
             );
         }
-        if let Some(resource) = external_resources
+        if let Some(resource) = emitted_external_resources
             .iter()
             .find(|resource| resource.access != Access::Read)
         {
@@ -8990,7 +9086,7 @@ fn translate_to_naga(
                 resource.name
             ));
         }
-        if let Some(resource) = external_resources
+        if let Some(resource) = emitted_external_resources
             .iter()
             .find(|resource| resource.arg_index < 2)
         {
@@ -9021,7 +9117,8 @@ fn translate_to_naga(
             .skip(2)
             .filter(|(index, _)| !resource_arg_indices.contains(index))
             .collect::<Vec<_>>();
-        let emit_parameter_binding = external_resources.is_empty() || !parameter_args.is_empty();
+        let emit_parameter_binding =
+            external_resources.is_empty() || !parameter_args.is_empty();
         let effective_params = parameter_args.len().max(1);
         let mut input_members = Vec::with_capacity(effective_params);
         let mut layout_input_members = Vec::with_capacity(parameter_args.len());
@@ -9046,7 +9143,7 @@ fn translate_to_naga(
         let parameter_binding = if external_resources.is_empty() {
             1
         } else {
-            external_resources.len() as u32
+            emitted_external_resources.len() as u32
         };
         let input_var = if emit_parameter_binding {
             let input_struct = naga_mod.types.insert(
