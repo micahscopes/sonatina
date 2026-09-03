@@ -1936,6 +1936,60 @@ fn spirv_scalar_tuple_helper_with_multiple_returns_uses_one_result_struct() {
 }
 
 #[test]
+fn spirv_value_helper_accepts_a_guarded_trap_continuation() {
+    let source = r#"
+target = "wasm32-unknown-native"
+func public %guarded_trap_entry(v0.i32) -> i32 {
+    block0:
+        v1.i32 = call %guarded_trap_value v0;
+        return v1;
+}
+
+func private %guarded_trap_value(v0.i32) -> i32 {
+    block0:
+        v1.i1 = lt v0 4.i32;
+        br v1 block1 block6;
+    block1:
+        v2.i1 = lt v0 3.i32;
+        br v2 block2 block6;
+    block2:
+        v3.i1 = is_zero v0;
+        br v3 block3 block4;
+    block3:
+        v4.i32 = add v0 22.i32;
+        jump block5;
+    block4:
+        v5.i32 = add v0 33.i32;
+        jump block5;
+    block5:
+        v6.i32 = phi (v4 block3) (v5 block4);
+        return v6;
+    block6:
+        unreachable;
+}
+"#;
+    let module = sonatina_parser::parse_module(source)
+        .expect("guarded trap continuation probe should parse")
+        .module;
+    let artifact = SpirvBackend::new()
+        .compile_module(&module)
+        .expect("a trap-only continuation should not owe a value result");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.contains("fn guarded_trap_value"),
+        "the guarded value helper should remain outlined:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with a guarded trap continuation must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("a guarded trap continuation must validate for browsers");
+}
+
+#[test]
 fn spirv_poseidon_sigma_valid() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native

@@ -3699,6 +3699,58 @@ fn emit_phi_loads_for_block(
 }
 
 #[cfg(feature = "spirv-backend")]
+fn structured_regions_may_fall_through(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    regions: &[crate::structurize::Region],
+) -> bool {
+    use sonatina_ir::InstDowncast;
+
+    let block_may_fall_through = |block| {
+        !function.layout.iter_inst(block).any(|instruction| {
+            let instruction = function.dfg.inst(instruction);
+            <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(
+                inst_set,
+                instruction,
+            )
+            .is_some()
+                || <&sonatina_ir::inst::control_flow::Unreachable as InstDowncast>::downcast(
+                    inst_set,
+                    instruction,
+                )
+                .is_some()
+        })
+    };
+
+    for region in regions {
+        let may_fall_through = match region {
+            crate::structurize::Region::Block(block) => block_may_fall_through(*block),
+            crate::structurize::Region::IfThenElse {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_falls_through = then_branch.is_empty()
+                    || structured_regions_may_fall_through(function, inst_set, then_branch);
+                let else_falls_through = else_branch.is_empty()
+                    || structured_regions_may_fall_through(function, inst_set, else_branch);
+                then_falls_through || else_falls_through
+            }
+            // A canonical structured loop has one header edge to its sibling
+            // continuation. Return, trap, break, and continue paths inside the
+            // body do not remove that possible normal exit.
+            crate::structurize::Region::Loop { .. } => true,
+            crate::structurize::Region::LoopExit { .. }
+            | crate::structurize::Region::LoopContinue { .. } => false,
+        };
+        if !may_fall_through {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(feature = "spirv-backend")]
 fn emit_naga_regions(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
@@ -3782,7 +3834,14 @@ fn emit_naga_regions(
                             naga::Statement::Store { pointer, value },
                             naga::Span::UNDEFINED,
                         );
-                    } else if loop_return.has_result && !continuation.is_empty() {
+                    } else if loop_return.has_result
+                        && !continuation.is_empty()
+                        && structured_regions_may_fall_through(
+                            function,
+                            inst_set,
+                            &regions[region_idx..],
+                        )
+                    {
                         return Err(
                             "spirv: value structured return continuation has no result"
                                 .to_string(),
@@ -3861,7 +3920,14 @@ fn emit_naga_regions(
                             naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
                         );
                         continuation.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
-                    } else if transport.has_result && !continuation.is_empty() {
+                    } else if transport.has_result
+                        && !continuation.is_empty()
+                        && structured_regions_may_fall_through(
+                            function,
+                            inst_set,
+                            &regions[region_idx..],
+                        )
+                    {
                         return Err(
                             "spirv: value structured return continuation has no result"
                                 .to_string(),
