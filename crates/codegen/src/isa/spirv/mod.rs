@@ -3686,10 +3686,16 @@ fn ensure_phi_locals(
         };
         // Control transport is compiler-internal. Keep its physical WGSL name
         // compact while Sonatina value IDs remain available in diagnostics.
-        phi_locals.entry(result).or_insert_with(|| func.local_variables.append(
-            naga::LocalVariable { name: None, ty, init: None },
-            naga::Span::UNDEFINED,
-        ));
+        phi_locals.entry(result).or_insert_with(|| {
+            let zero = func.expressions.append(
+                naga::Expression::ZeroValue(ty),
+                naga::Span::UNDEFINED,
+            );
+            func.local_variables.append(
+                naga::LocalVariable { name: None, ty, init: Some(zero) },
+                naga::Span::UNDEFINED,
+            )
+        });
     }
     Ok(())
 }
@@ -3727,6 +3733,7 @@ fn emit_exact_phi_edge(
     phi_locals: &std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
 ) -> Result<(), String> {
     use sonatina_ir::InstDowncast;
+    let acyclic_merge = !block_is_in_cfg_cycle(function, to);
     let mut transfers = Vec::new();
     for inst_id in function.layout.iter_inst(to) {
         let inst = function.dfg.inst(inst_id);
@@ -3745,6 +3752,7 @@ fn emit_exact_phi_edge(
         // in this arm's expression map. Materialize its local load in the
         // current edge block. Returning a bare Load expression here leaves it
         // outside Naga scope when the following Store consumes it.
+        let source = *value;
         let value = if let Some(&value) = value_map.get(value) {
             value
         } else if let Some(&source_local) = phi_locals.get(value) {
@@ -3770,18 +3778,43 @@ fn emit_exact_phi_edge(
                 },
             )?
         };
-        transfers.push((local, value));
+        let already_initialized = acyclic_merge
+            && function.dfg.value_imm(source).is_some_and(immediate_is_shader_zero);
+        transfers.push((local, value, already_initialized));
     }
     // Every non-literal source above is already an emitted Naga SSA
     // expression in this edge's lexical scope. Store those values directly:
     // they retain parallel phi semantics even when destinations form a cycle,
     // while one temporary local per edge and phi merely re-materializes the
     // same already-snapshotted values.
-    for (local, value) in transfers {
+    for (local, value, already_initialized) in transfers {
+        if already_initialized {
+            continue;
+        }
         let pointer = func.expressions.append(naga::Expression::LocalVariable(local), naga::Span::UNDEFINED);
         target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
     }
     Ok(())
+}
+
+#[cfg(feature = "spirv-backend")]
+fn block_is_in_cfg_cycle(
+    function: &sonatina_ir::Function,
+    block: sonatina_ir::BlockId,
+) -> bool {
+    let mut cfg = sonatina_ir::ControlFlowGraph::default();
+    cfg.compute(function);
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = cfg.succs_of(block).copied().collect::<Vec<_>>();
+    while let Some(candidate) = pending.pop() {
+        if candidate == block {
+            return true;
+        }
+        if seen.insert(candidate) {
+            pending.extend(cfg.succs_of(candidate).copied());
+        }
+    }
+    false
 }
 
 #[cfg(feature = "spirv-backend")]
