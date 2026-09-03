@@ -3984,6 +3984,7 @@ fn emit_naga_regions(
 fn ensure_phi_locals(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
     block: sonatina_ir::BlockId,
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
@@ -4006,7 +4007,8 @@ fn ensure_phi_locals(
         let ty = match function.dfg.value_ty(result) {
             sonatina_ir::Type::F32 => f32_type,
             sonatina_ir::Type::I1 => bool_type,
-            sonatina_ir::Type::I32 => word_type,
+            sonatina_ir::Type::I32 if word == WordKind::U32 => word_type,
+            sonatina_ir::Type::I64 if word == WordKind::I64 => word_type,
             other => {
                 return Err(format!(
                     "spirv structurize: phi {result:?} in {block:?} has non-scalar type {other:?} without one proven resource identity. Fail closed."
@@ -4171,7 +4173,7 @@ fn emit_if_region(
     };
     if let Some(merge) = merge {
         ensure_phi_locals(
-            function, inst_set, *merge, word_type, f32_type, bool_type, func, value_map,
+            function, inst_set, word, *merge, word_type, f32_type, bool_type, func, value_map,
             phi_locals,
         )?;
     }
@@ -4796,7 +4798,7 @@ fn emit_regions_in_loop(
             crate::structurize::Region::IfThenElse { header, then_branch, else_branch, merge } => {
                 if let Some(merge) = merge {
                     ensure_phi_locals(
-                        function, inst_set, *merge, word_type, f32_type, bool_type, func,
+                        function, inst_set, word, *merge, word_type, f32_type, bool_type, func,
                         value_map, phi_locals,
                     )?;
                 }
@@ -4931,7 +4933,7 @@ fn emit_regions_in_loop(
             }
             crate::structurize::Region::LoopExit { from, target: exit } => {
                 ensure_phi_locals(
-                    function, inst_set, *exit, word_type, f32_type, bool_type, func, value_map,
+                    function, inst_set, word, *exit, word_type, f32_type, bool_type, func, value_map,
                     phi_locals,
                 )?;
                 emit_exact_phi_edge(
@@ -5022,7 +5024,7 @@ fn emit_recursive_loop_region(
     loop_blocks.insert(header);
     region_blocks(body_regions, &mut loop_blocks);
     ensure_phi_locals(
-        function, inst_set, header, word_type, f32_type, bool_type, func, value_map,
+        function, inst_set, word, header, word_type, f32_type, bool_type, func, value_map,
         phi_locals,
     )?;
 
@@ -5168,7 +5170,7 @@ fn emit_recursive_loop_region(
     }
     let exit = if nz_in { *branch.z_dest() } else { *branch.nz_dest() };
     ensure_phi_locals(
-        function, inst_set, exit, word_type, f32_type, bool_type, func, value_map,
+        function, inst_set, word, exit, word_type, f32_type, bool_type, func, value_map,
         phi_locals,
     )?;
     let mut continue_arm = naga::Block::new();
