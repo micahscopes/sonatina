@@ -95,6 +95,16 @@ pub enum Role {
     Resource,
 }
 
+/// Shader stages that can reach one physical binding. This is measured while
+/// lowering the same entry points that produce the binding, so downstream
+/// runtimes do not need to widen visibility from the enclosing pass kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpirvShaderStage {
+    Compute,
+    Vertex,
+    Fragment,
+}
+
 /// Logical Sonatina scalar type of one ABI value. This describes the source
 /// argument, not necessarily the shader expression's physical type: for
 /// example Grid coordinates are logically `I32` while
@@ -206,6 +216,8 @@ pub struct SpirvBinding {
     pub name: String,
     pub access: Access,
     pub role: Role,
+    /// Exact entry-point stages that can reach this physical binding.
+    pub stages: Vec<SpirvShaderStage>,
     /// Byte distance between consecutive binding elements. For the current
     /// structs this equals `span`; keeping it distinct makes array layout
     /// explicit if tail padding or a larger array stride is introduced later.
@@ -758,6 +770,7 @@ fn lit_u32(func: &mut naga::Function, v: u32) -> naga::Handle<naga::Expression> 
 pub(super) fn append_external_resources(
     naga_mod: &mut naga::Module,
     resources: &[SpirvExternalResource],
+    resource_stages: &[Vec<SpirvShaderStage>],
     word: WordKind,
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
@@ -768,6 +781,13 @@ pub(super) fn append_external_resources(
     ),
     String,
 > {
+    if resources.len() != resource_stages.len() {
+        return Err(format!(
+            "spirv: external resource/stage metadata length mismatch: {} resources, {} stage sets",
+            resources.len(),
+            resource_stages.len(),
+        ));
+    }
     if !resources.is_empty() && word != WordKind::U32 {
         return Err(
             "spirv: external resources currently require the u32 browser word"
@@ -792,7 +812,13 @@ pub(super) fn append_external_resources(
     let mut roots = Vec::with_capacity(resources.len());
     let mut bindings = Vec::with_capacity(resources.len());
     let mut names = std::collections::HashSet::new();
-    for resource in resources {
+    for (resource, stages) in resources.iter().zip(resource_stages) {
+        if stages.is_empty() {
+            return Err(format!(
+                "spirv: external resource {} has no reachable shader stage",
+                resource.name
+            ));
+        }
         if resource.name.is_empty() || !names.insert(resource.name.clone()) {
             return Err(format!(
                 "spirv: external resource names must be nonempty and unique; got {:?}",
@@ -895,6 +921,7 @@ pub(super) fn append_external_resources(
             name: resource.name.clone(),
             access: resource.access,
             role: Role::Resource,
+            stages: stages.clone(),
             stride: resource.stride,
             span: element_span,
             members: Vec::new(),
@@ -8273,9 +8300,18 @@ fn translate_to_naga(
         0
     };
 
+    let external_resource_stages = vec![
+        vec![if render {
+            SpirvShaderStage::Fragment
+        } else {
+            SpirvShaderStage::Compute
+        }];
+        emitted_external_resources.len()
+    ];
     let (external_roots, external_layout_bindings) = append_external_resources(
         &mut naga_mod,
         &emitted_external_resources,
+        &external_resource_stages,
         word,
         word_type,
         f32_type,
@@ -8969,6 +9005,7 @@ fn translate_to_naga(
                 name: "params".to_string(),
                 access: Access::Read,
                 role: Role::Input,
+                stages: vec![SpirvShaderStage::Compute],
                 stride: parameter_span,
                 span: parameter_span,
                 members: layout_parameter_members,
@@ -8984,6 +9021,7 @@ fn translate_to_naga(
                 name: "trap".to_string(),
                 access: Access::ReadWrite,
                 role: Role::Output,
+                stages: vec![SpirvShaderStage::Compute],
                 stride: 4,
                 span: compute_trap_span,
                 members: Vec::new(),
@@ -9464,6 +9502,7 @@ fn translate_to_naga(
                         name: "input".to_string(),
                         access: Access::Read,
                         role: Role::Input,
+                        stages: vec![SpirvShaderStage::Fragment],
                         stride: input_span,
                         span: input_span,
                         members: layout_input_members,
@@ -10097,6 +10136,7 @@ fn translate_to_naga(
                     name: "output".to_string(),
                     access: Access::ReadWrite,
                     role: Role::Output,
+                    stages: vec![SpirvShaderStage::Compute],
                     stride: word_width,
                     span: word_width,
                     members: Vec::new(),
@@ -10110,6 +10150,7 @@ fn translate_to_naga(
                     name: "input".to_string(),
                     access: Access::Read,
                     role: Role::Input,
+                    stages: vec![SpirvShaderStage::Compute],
                     stride: input_span,
                     span: input_span,
                     members: layout_input_members,
@@ -10125,6 +10166,7 @@ fn translate_to_naga(
                     name: "trap".to_string(),
                     access: Access::ReadWrite,
                     role: Role::Output,
+                    stages: vec![SpirvShaderStage::Compute],
                     stride: word_width,
                     span: word_width,
                     members: Vec::new(),
