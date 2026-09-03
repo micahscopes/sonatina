@@ -4755,7 +4755,13 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
     let array_type = mb.declare_array_type(Type::I32, 4);
     let array_ref_type = mb.objref_type(array_type);
     let word_ref_type = mb.objref_type(Type::I32);
-    let state = [array_ref_type, array_ref_type, array_ref_type, Type::F32];
+    let state = [
+        array_ref_type,
+        array_ref_type,
+        array_ref_type,
+        Type::F32,
+        Type::F32,
+    ];
     let vertex_args = [
         Type::I32,
         Type::I32,
@@ -4763,9 +4769,17 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         state[1],
         state[2],
         state[3],
+        state[4],
     ];
     let vertex_results = [Type::F32; 5];
-    let fragment_args = [Type::F32, state[0], state[1], state[2], state[3]];
+    let fragment_args = [
+        Type::F32,
+        state[0],
+        state[1],
+        state[2],
+        state[3],
+        state[4],
+    ];
 
     let vertex_ref = mb
         .declare_function(Signature::new(
@@ -4791,7 +4805,9 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         let vertex_index = fb.args()[0];
         let instance_index = fb.args()[1];
         let vertex_values = fb.args()[2];
-        let scale = fb.args()[5];
+        // State slot 3 is deliberately dormant. It must remain in the scalar
+        // actor-state record even though resource slots may be pruned.
+        let scale = fb.args()[6];
         let zero_index = fb.make_imm_value(0i32);
         let slot = fb.insert_inst(
             data::ObjIndex::new(is, vertex_values, zero_index),
@@ -4819,7 +4835,7 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         let entry = fb.append_block();
         fb.switch_to_block(entry);
         let fragment_values = fb.args()[2];
-        let scale = fb.args()[4];
+        let scale = fb.args()[5];
         let zero_index = fb.make_imm_value(0i32);
         let slot = fb.insert_inst(
             data::ObjIndex::new(is, fragment_values, zero_index),
@@ -4894,6 +4910,21 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
                 vec![SpirvShaderStage::Vertex, SpirvShaderStage::Fragment],
             ),
         ],
+    );
+    let state = artifact
+        .layout
+        .bindings
+        .iter()
+        .find(|binding| binding.name == "state")
+        .expect("complete scalar actor-state binding");
+    assert_eq!(
+        state
+            .members
+            .iter()
+            .map(|member| member.arg_index)
+            .collect::<Vec<_>>(),
+        vec![4, 5],
+        "a dormant scalar field remains in the stable actor-state ABI",
     );
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
     assert!(wgsl.contains("@builtin(instance_index)"), "{wgsl}");
