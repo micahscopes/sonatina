@@ -472,6 +472,9 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
     let pair_ty =
         mb.declare_struct_type("BorrowedFixedLocalPair", &[Type::I32, Type::I32], false);
     let pair_ptr_ty = mb.ptr_type(pair_ty);
+    let outer_ty =
+        mb.declare_struct_type("BorrowedFixedLocalOuter", &[Type::I32, pair_ty], false);
+    let outer_ptr_ty = mb.ptr_type(outer_ty);
     let word_ptr_ty = mb.ptr_type(Type::I32);
     let entry_ref = mb
         .declare_function(Signature::new_single(
@@ -517,16 +520,21 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
         let mut fb = mb.func_builder::<InstInserter>(entry_ref);
         let entry = fb.append_block();
         fb.switch_to_block(entry);
-        let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+        let slot = fb.insert_inst(data::Alloca::new(is, outer_ty), outer_ptr_ty);
         let zero = fb.make_imm_value(0i32);
+        let pair_index = fb.make_imm_value(1i32);
+        let pair = fb.insert_inst(
+            data::Gep::new(is, [slot, zero, pair_index].into_iter().collect()),
+            pair_ptr_ty,
+        );
         let first_index = fb.make_imm_value(0i32);
         let second_index = fb.make_imm_value(1i32);
         let first = fb.insert_inst(
-            data::Gep::new(is, [slot, zero, first_index].into_iter().collect()),
+            data::Gep::new(is, [pair, zero, first_index].into_iter().collect()),
             word_ptr_ty,
         );
         let second = fb.insert_inst(
-            data::Gep::new(is, [slot, zero, second_index].into_iter().collect()),
+            data::Gep::new(is, [pair, zero, second_index].into_iter().collect()),
             word_ptr_ty,
         );
         let first_value = fb.make_imm_value(19i32);
@@ -534,7 +542,7 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
         fb.insert_inst_no_result(data::Mstore::new(is, first, first_value, Type::I32));
         fb.insert_inst_no_result(data::Mstore::new(is, second, second_value, Type::I32));
         let result = fb.insert_inst(
-            control_flow::Call::new(is, helper_ref, [slot].into_iter().collect()),
+            control_flow::Call::new(is, helper_ref, [pair].into_iter().collect()),
             Type::I32,
         );
         fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
@@ -544,7 +552,7 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
 
     let artifact = SpirvBackend::new()
         .compile_module(&mb.build())
-        .expect("a typed private local should cross a certified private helper borrow");
+        .expect("a projected typed private local should cross a certified private helper borrow");
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
     assert!(
         wgsl.matches("typed_local_cross_call_helper(").count() >= 2,

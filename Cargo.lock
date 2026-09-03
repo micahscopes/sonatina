@@ -2407,8 +2407,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dd91265cc2454558f659b3b4b9640f0ddb8cc6521277f166b8a8c181c898079"
+source = "git+https://github.com/micahscopes/wgpu?rev=854ed576fa186d19b9f7d5a5bb5a1f2fa533dde1#854ed576fa186d19b9f7d5a5bb5a1f2fa533dde1"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",

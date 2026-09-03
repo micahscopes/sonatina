@@ -14,3 +14,6 @@ members = [
 
 [workspace.package]
 edition = "2024"
+
+[patch.crates-io]
+naga = { git = "https://github.com/micahscopes/wgpu", rev = "854ed576fa186d19b9f7d5a5bb5a1f2fa533dde1" }
