@@ -1482,11 +1482,106 @@ fn typed_local_projections_may_alias(left: &TypedLocalProjection, right: &TypedL
         && left.indices.iter().zip(&right.indices).all(|(left, right)| left == right)
 }
 
-/// Naga function locals are explicitly initialized with `ZeroValue`. An
-/// entry-block zero store to a constant, non-escaping typed projection is
-/// redundant while that projection still has its initial value. This scan is
-/// intentionally local and fail-closed. Dynamic projections, overlapping
-/// aggregate writes, and calls that borrow the allocation retain the store.
+/// Prove that no path from the typed allocation to `before` can have changed
+/// `target`. The allocation must live in the function entry block and the
+/// target block must be acyclic. Those restrictions keep this first analysis
+/// exact for compiler-authored initialization while loops, dynamic aliases,
+/// and borrowed calls continue to fail closed.
+#[cfg(feature = "spirv-backend")]
+fn typed_local_projection_is_pristine_before(
+    function: &sonatina_ir::Function,
+    target: &TypedLocalProjection,
+    before: sonatina_ir::InstId,
+) -> bool {
+    use sonatina_ir::InstDowncast;
+
+    let Some(entry) = function.layout.entry_block() else { return false };
+    if function.layout.inst_block(target.root) != entry {
+        return false;
+    }
+    let target_block = function.layout.inst_block(before);
+    if block_is_in_cfg_cycle(function, target_block) {
+        return false;
+    }
+
+    let mut cfg = sonatina_ir::ControlFlowGraph::default();
+    cfg.compute(function);
+
+    let mut reachable_from_entry = std::collections::HashSet::new();
+    let mut pending = vec![entry];
+    while let Some(block) = pending.pop() {
+        if reachable_from_entry.insert(block) {
+            pending.extend(cfg.succs_of(block).copied());
+        }
+    }
+
+    let mut can_reach_target = std::collections::HashSet::new();
+    pending.push(target_block);
+    while let Some(block) = pending.pop() {
+        if can_reach_target.insert(block) {
+            pending.extend(cfg.preds_of(block).copied());
+        }
+    }
+
+    if !reachable_from_entry.contains(&target_block) || !can_reach_target.contains(&entry) {
+        return false;
+    }
+
+    for block in reachable_from_entry.intersection(&can_reach_target).copied() {
+        let mut root_seen = block != entry;
+        for instruction in function.layout.iter_inst(block) {
+            if block == entry && instruction == target.root {
+                root_seen = true;
+                continue;
+            }
+            if !root_seen {
+                continue;
+            }
+            if block == target_block && instruction == before {
+                break;
+            }
+
+            let data = function.dfg.inst(instruction);
+            if let Some(previous) = <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(function.inst_set(), data)
+                && typed_local_alloca_root(function, *previous.addr()) == Some(target.root)
+            {
+                if typed_local_alloca_root(function, *previous.value()) == Some(target.root) {
+                    return false;
+                }
+                let Some(previous_projection) = typed_local_constant_projection(function, *previous.addr()) else {
+                    return false;
+                };
+                if typed_local_projections_may_alias(&previous_projection, target) {
+                    return false;
+                }
+                continue;
+            }
+            if let Some(call) = <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(function.inst_set(), data)
+                && call.args().iter().any(|&argument| typed_local_alloca_root(function, argument) == Some(target.root))
+            {
+                return false;
+            }
+            let consumes_rooted_pointer = data.collect_values().iter().any(|&value| {
+                typed_local_alloca_root(function, value) == Some(target.root)
+            });
+            if consumes_rooted_pointer
+                && <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(function.inst_set(), data).is_none()
+                && <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(function.inst_set(), data).is_none()
+                && <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(function.inst_set(), data).is_none()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Naga function locals are explicitly initialized with `ZeroValue`. A
+/// zero store to a constant, non-escaping typed projection is redundant while
+/// that projection still has its initial value. The exact CFG slice above
+/// admits compiler-authored initialization in acyclic child blocks. Dynamic
+/// projections, overlapping aggregate writes, loops, and borrowed calls retain
+/// the store.
 #[cfg(feature = "spirv-backend")]
 fn typed_local_zero_store_is_redundant(
     function: &sonatina_ir::Function,
@@ -1500,6 +1595,9 @@ fn typed_local_zero_store_is_redundant(
         return false;
     }
     let Some(target) = typed_local_constant_projection(function, *store.addr()) else { return false };
+    if typed_local_projection_is_pristine_before(function, &target, store_instruction) {
+        return true;
+    }
     let Some(entry) = function.layout.entry_block() else { return false };
     let mut root_seen = false;
     let mut target_is_zero = false;
