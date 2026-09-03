@@ -7210,6 +7210,20 @@ fn lower_naga_helper(
                 return;
             }
         };
+        if std::env::var("SONATINA_SPIRV_TRACE_BODY")
+            .is_ok_and(|needle| signature.name().contains(&needle))
+        {
+            eprintln!(
+                "sonatina spirv: selected helper IR, function={}\n{}",
+                signature.name(),
+                FuncWriter::new(function_ref, function).dump_string(),
+            );
+            eprintln!(
+                "sonatina spirv: selected helper regions, function={}, regions={:#?}",
+                signature.name(),
+                structured.regions,
+            );
+        }
         let mut result_expression = None;
         if let Err(error) = emit_naga_regions(
             function,
