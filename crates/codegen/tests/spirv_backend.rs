@@ -519,8 +519,14 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
     {
         let mut fb = mb.func_builder::<InstInserter>(entry_ref);
         let entry = fb.append_block();
+        let loop_header = fb.append_block();
+        let loop_body = fb.append_block();
+        let exit = fb.append_block();
         fb.switch_to_block(entry);
         let slot = fb.insert_inst(data::Alloca::new(is, outer_ty), outer_ptr_ty);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
+
+        fb.switch_to_block(loop_header);
         let zero = fb.make_imm_value(0i32);
         let pair_index = fb.make_imm_value(1i32);
         let pair = fb.insert_inst(
@@ -541,6 +547,13 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
         let second_value = fb.make_imm_value(23i32);
         fb.insert_inst_no_result(data::Mstore::new(is, first, first_value, Type::I32));
         fb.insert_inst_no_result(data::Mstore::new(is, second, second_value, Type::I32));
+        let keep_going = fb.make_imm_value(false);
+        fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, loop_body, exit));
+
+        fb.switch_to_block(loop_body);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
+
+        fb.switch_to_block(exit);
         let result = fb.insert_inst(
             control_flow::Call::new(is, helper_ref, [pair].into_iter().collect()),
             Type::I32,

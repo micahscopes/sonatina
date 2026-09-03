@@ -1430,6 +1430,118 @@ fn typed_local_zero_projection_path(
     Some(path)
 }
 
+/// Rebuild a typed private pointer projection in the lexical Naga block that
+/// consumes it. Sonatina SSA permits a pointer computed in a loop header to
+/// dominate a later exit block. Once that CFG is structurized, the original
+/// Naga `Access` expression lives inside the loop body and is not in scope at
+/// the later call. The allocation or parameter root remains in function
+/// scope, so replaying the exact typed projection is both equivalent and the
+/// natural WGSL representation.
+#[cfg(feature = "spirv-backend")]
+fn rematerialize_typed_pointer_projection(
+    value: sonatina_ir::ValueId,
+    function: &sonatina_ir::Function,
+    word: WordKind,
+    value_map: &std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
+    phi_locals: &std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+) -> Result<Option<naga::Handle<naga::Expression>>, String> {
+    use sonatina_ir::InstDowncast;
+
+    let Some(inst_id) = function.dfg.value_inst(value) else {
+        return Ok(None);
+    };
+    let inst_data = function.dfg.inst(inst_id);
+
+    if let Some(gep) = <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(
+        function.inst_set(), inst_data,
+    ) {
+        let Some((&base_value, indices)) = gep.values().split_first() else {
+            return Err("spirv: typed pointer rematerialization found a Gep with no base".to_string());
+        };
+        let Some((&leading_index, indices)) = indices.split_first() else {
+            return Err("spirv: typed pointer rematerialization requires a leading object index".to_string());
+        };
+        if immediate_index_u32(function, leading_index) != Some(0) {
+            return Err("spirv: typed pointer rematerialization requires a zero leading object index".to_string());
+        }
+        let mut base = if let Some(projected) = rematerialize_typed_pointer_projection(
+            base_value, function, word, value_map, phi_locals, func, target,
+        )? {
+            projected
+        } else {
+            resolve_naga_value(base_value, function, word, value_map, phi_locals, func)
+                .ok_or_else(|| format!("spirv: typed pointer rematerialization cannot resolve base {base_value:?}"))?
+        };
+        let base_ty = function.dfg.value_ty(base_value);
+        let Some(sonatina_ir::types::CompoundType::Ptr(mut pointee)) =
+            base_ty.resolve_compound(function.ctx())
+        else {
+            return Err(format!("spirv: typed pointer rematerialization found non-pointer base {base_ty:?}"));
+        };
+        for &index in indices {
+            match pointee.resolve_compound(function.ctx()) {
+                Some(sonatina_ir::types::CompoundType::Struct(data)) if !data.packed => {
+                    let field = immediate_index_u32(function, index).ok_or_else(|| {
+                        "spirv: rematerialized struct projection requires a constant field".to_string()
+                    })?;
+                    let &field_ty = data.fields.get(field as usize).ok_or_else(|| {
+                        format!("spirv: rematerialized struct field {field} is out of bounds")
+                    })?;
+                    base = emit_expr(func, target, naga::Expression::AccessIndex { base, index: field });
+                    pointee = field_ty;
+                }
+                Some(sonatina_ir::types::CompoundType::Array { elem, len }) => {
+                    if let Some(constant) = immediate_index_u32(function, index) {
+                        if constant as usize >= len {
+                            return Err(format!("spirv: rematerialized array index {constant} is out of bounds for length {len}"));
+                        }
+                        base = emit_expr(func, target, naga::Expression::AccessIndex { base, index: constant });
+                    } else {
+                        if word != WordKind::U32 {
+                            return Err("spirv: dynamic rematerialized array projection requires the u32 browser word".to_string());
+                        }
+                        let index = resolve_naga_value(
+                            index, function, word, value_map, phi_locals, func,
+                        ).ok_or_else(|| "spirv: rematerialized array projection index is unresolved".to_string())?;
+                        base = emit_expr(func, target, naga::Expression::Access { base, index });
+                    }
+                    pointee = elem;
+                }
+                _ => return Err(format!("spirv: typed pointer rematerialization cannot project through {pointee:?}")),
+            }
+        }
+        return Ok(Some(base));
+    }
+
+    if let Some(bitcast) = <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(
+        function.inst_set(), inst_data,
+    ) {
+        let from_ty = function.dfg.value_ty(*bitcast.from());
+        let Some(path) = typed_local_zero_projection_path(function.ctx(), from_ty, *bitcast.ty()) else {
+            return Ok(None);
+        };
+        let mut base = if let Some(projected) = rematerialize_typed_pointer_projection(
+            *bitcast.from(), function, word, value_map, phi_locals, func, target,
+        )? {
+            projected
+        } else {
+            resolve_naga_value(*bitcast.from(), function, word, value_map, phi_locals, func)
+                .ok_or_else(|| format!(
+                    "spirv: typed pointer rematerialization cannot resolve zero projection base {:?}",
+                    bitcast.from(),
+                ))?
+        };
+        for index in path {
+            base = emit_expr(func, target, naga::Expression::AccessIndex { base, index });
+        }
+        return Ok(Some(base));
+    }
+
+    Ok(None)
+}
+
 /// Emit a single arithmetic/cmp instruction into the given target block.
 /// Returns the expression handle if an instruction was emitted, None otherwise.
 /// Skips Phi, Jump, Br, and Return instructions.
@@ -2877,18 +2989,25 @@ fn emit_single_inst(
         let mut arguments = Vec::new();
         let mut logical_arguments = Vec::with_capacity(call.args().len());
         for (&logical_argument, source) in call.args().iter().zip(&callee.argument_abi) {
-            let Some(argument) = resolve_naga_value(
-                logical_argument,
-                function,
-                word,
-                value_map,
-                phi_locals,
-                func,
-            ) else {
-                *mem_error = Some(format!(
-                    "spirv: call argument {logical_argument:?} could not be resolved. Fail closed."
-                ));
-                return false;
+            let argument = match rematerialize_typed_pointer_projection(
+                logical_argument, function, word, value_map, phi_locals, func, target,
+            ) {
+                Ok(Some(projected)) => projected,
+                Ok(None) => {
+                    let Some(argument) = resolve_naga_value(
+                        logical_argument, function, word, value_map, phi_locals, func,
+                    ) else {
+                        *mem_error = Some(format!(
+                            "spirv: call argument {logical_argument:?} could not be resolved. Fail closed."
+                        ));
+                        return false;
+                    };
+                    argument
+                }
+                Err(error) => {
+                    *mem_error = Some(error);
+                    return false;
+                }
             };
             logical_arguments.push(argument);
             if let NagaArgumentSource::Physical(physical_index) = source {
@@ -4293,6 +4412,25 @@ fn emit_recursive_loop_region(
         }
         let Some(result) = function.dfg.inst_result(inst_id) else { continue };
         let result_ty = function.dfg.value_ty(result);
+        let rematerializable_pointer = result_ty.resolve_compound(function.ctx()).is_some_and(|ty| {
+            matches!(ty, sonatina_ir::types::CompoundType::Ptr(_))
+        }) && (
+            <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(
+                inst_set, function.dfg.inst(inst_id),
+            ).is_some()
+                || <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(
+                    inst_set, function.dfg.inst(inst_id),
+                ).is_some_and(|bitcast| {
+                    typed_local_zero_projection_path(
+                        function.ctx(),
+                        function.dfg.value_ty(*bitcast.from()),
+                        *bitcast.ty(),
+                    ).is_some()
+                })
+        );
+        if rematerializable_pointer {
+            continue;
+        }
         let ty = match result_ty {
             sonatina_ir::Type::F32 => f32_type,
             sonatina_ir::Type::I1 => bool_type,
