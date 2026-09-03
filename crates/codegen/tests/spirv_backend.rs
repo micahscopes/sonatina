@@ -472,12 +472,15 @@ fn spirv_typed_local_uses_implicit_zero_in_acyclic_child_block() {
     let mut fb = mb.func_builder::<InstInserter>(entry_ref);
     let entry = fb.append_block();
     let body = fb.append_block();
-    let merge = fb.append_block();
+    let early = fb.append_block();
     fb.switch_to_block(entry);
     let condition_word = fb.args()[0];
-    let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
     let zero_index = fb.make_imm_value(0i32);
     let condition = fb.insert_inst(cmp::Ne::new(is, condition_word, zero_index), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, condition, body, early));
+
+    fb.switch_to_block(body);
+    let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
     let first_index = fb.make_imm_value(0i32);
     let second_index = fb.make_imm_value(1i32);
     let first = fb.insert_inst(
@@ -488,21 +491,18 @@ fn spirv_typed_local_uses_implicit_zero_in_acyclic_child_block() {
         data::Gep::new(is, [slot, zero_index, second_index].into_iter().collect()),
         word_ptr_ty,
     );
-    fb.insert_inst_no_result(control_flow::Br::new(is, condition, body, merge));
-
-    fb.switch_to_block(body);
     let zero = fb.make_imm_value(0i32);
     let seven = fb.make_imm_value(7i32);
     fb.insert_inst_no_result(data::Mstore::new(is, first, zero, Type::I32));
     fb.insert_inst_no_result(data::Mstore::new(is, second, seven, Type::I32));
     fb.insert_inst_no_result(data::Mstore::new(is, second, zero, Type::I32));
-    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
-
-    fb.switch_to_block(merge);
     let loaded_first = fb.insert_inst(data::Mload::new(is, first, Type::I32), Type::I32);
     let loaded_second = fb.insert_inst(data::Mload::new(is, second, Type::I32), Type::I32);
     let sum = fb.insert_inst(arith::Add::new(is, loaded_first, loaded_second), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+
+    fb.switch_to_block(early);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, zero_index));
     fb.seal_all();
     fb.finish();
 
