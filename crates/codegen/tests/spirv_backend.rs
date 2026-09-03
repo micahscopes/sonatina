@@ -1611,7 +1611,14 @@ fn spirv_external_resource_identity_survives_a_phi_join() {
     .expect("a joined resource identity must validate for browsers");
 }
 
-fn ambiguous_resource_helper_module(call_both_resources: bool) -> sonatina_ir::Module {
+#[derive(Clone, Copy)]
+enum ResourceHelperCalls {
+    LeftOnly,
+    BothSeparate,
+    Joined,
+}
+
+fn ambiguous_resource_helper_module(calls: ResourceHelperCalls) -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
         Vendor::Unknown,
@@ -1654,20 +1661,68 @@ fn ambiguous_resource_helper_module(call_both_resources: bool) -> sonatina_ir::M
     {
         let mut fb = mb.func_builder::<InstInserter>(entry_ref);
         let entry = fb.append_block();
+        let joined_blocks = matches!(calls, ResourceHelperCalls::Joined).then(|| {
+            let left_arm = fb.append_block();
+            let right_arm = fb.append_block();
+            let merge = fb.append_block();
+            (left_arm, right_arm, merge)
+        });
         fb.switch_to_block(entry);
-        fb.insert_inst_no_result(control_flow::Call::new(
-            is,
-            helper_ref,
-            [fb.args()[0], fb.args()[2]].into_iter().collect(),
-        ));
-        if call_both_resources {
-            fb.insert_inst_no_result(control_flow::Call::new(
-                is,
-                helper_ref,
-                [fb.args()[1], fb.args()[2]].into_iter().collect(),
-            ));
+        match (calls, joined_blocks) {
+            (ResourceHelperCalls::LeftOnly, None) => {
+                fb.insert_inst_no_result(control_flow::Call::new(
+                    is,
+                    helper_ref,
+                    [fb.args()[0], fb.args()[2]].into_iter().collect(),
+                ));
+                fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+            }
+            (ResourceHelperCalls::BothSeparate, None) => {
+                fb.insert_inst_no_result(control_flow::Call::new(
+                    is,
+                    helper_ref,
+                    [fb.args()[0], fb.args()[2]].into_iter().collect(),
+                ));
+                fb.insert_inst_no_result(control_flow::Call::new(
+                    is,
+                    helper_ref,
+                    [fb.args()[1], fb.args()[2]].into_iter().collect(),
+                ));
+                fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+            }
+            (ResourceHelperCalls::Joined, Some((left_arm, right_arm, merge))) => {
+                let zero = fb.make_imm_value(0i32);
+                let choose_left = fb.insert_inst(
+                    cmp::Eq::new(is, fb.args()[2], zero),
+                    Type::I1,
+                );
+                fb.insert_inst_no_result(control_flow::Br::new(
+                    is,
+                    choose_left,
+                    left_arm,
+                    right_arm,
+                ));
+                fb.switch_to_block(left_arm);
+                fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+                fb.switch_to_block(right_arm);
+                fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+                fb.switch_to_block(merge);
+                let resource = fb.insert_inst(
+                    control_flow::Phi::new(
+                        is,
+                        vec![(fb.args()[0], left_arm), (fb.args()[1], right_arm)],
+                    ),
+                    array_ref_type,
+                );
+                fb.insert_inst_no_result(control_flow::Call::new(
+                    is,
+                    helper_ref,
+                    [resource, fb.args()[2]].into_iter().collect(),
+                ));
+                fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+            }
+            _ => unreachable!("resource helper test shape must match its blocks"),
         }
-        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
         fb.seal_all();
         fb.finish();
     }
@@ -1704,7 +1759,7 @@ fn ambiguous_resource_backend() -> SpirvBackend {
 #[test]
 fn spirv_external_resource_helper_resolves_contextual_capability() {
     let artifact = ambiguous_resource_backend()
-        .compile_module(&ambiguous_resource_helper_module(false))
+        .compile_module(&ambiguous_resource_helper_module(ResourceHelperCalls::LeftOnly))
         .expect("one call-graph resource identity should preserve the helper");
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
     let helper_start = wgsl
@@ -1729,11 +1784,60 @@ fn spirv_external_resource_helper_resolves_contextual_capability() {
 }
 
 #[test]
-fn spirv_external_resource_helper_fails_closed_when_multiple_variants_are_required() {
+fn spirv_external_resource_helper_derives_multiple_contextual_variants() {
+    let artifact = ambiguous_resource_backend()
+        .compile_module(&ambiguous_resource_helper_module(ResourceHelperCalls::BothSeparate))
+        .expect("one Fe helper should derive one backend placement per proven resource identity");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    let left_name = "ambiguous_resource_helper_resource_variant_0";
+    let right_name = "ambiguous_resource_helper_resource_variant_1";
+    let left_start = wgsl
+        .find(&format!("fn {left_name}"))
+        .expect("the left resource variant must remain outlined");
+    let right_start = wgsl
+        .find(&format!("fn {right_name}"))
+        .expect("the right resource variant must remain outlined");
+    let helper_end = |start: usize| {
+        wgsl[start + 1..]
+            .find("\nfn ")
+            .map_or(wgsl.len(), |offset| start + 1 + offset)
+    };
+    let left = &wgsl[left_start..helper_end(left_start)];
+    let right = &wgsl[right_start..helper_end(right_start)];
+    assert!(
+        left.contains("left_values") && !left.contains("right_values"),
+        "the first helper variant must bind only its proven resource:\n{left}",
+    );
+    assert!(
+        right.contains("right_values") && !right.contains("left_values"),
+        "the second helper variant must bind only its proven resource:\n{right}",
+    );
+    assert_eq!(
+        wgsl.matches(left_name).count(),
+        2,
+        "the left specialization must have one definition and one call:\n{wgsl}",
+    );
+    assert_eq!(
+        wgsl.matches(right_name).count(),
+        2,
+        "the right specialization must have one definition and one call:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with contextual resource specializations must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("contextual resource specializations must validate for browsers");
+}
+
+#[test]
+fn spirv_external_resource_helper_rejects_an_unresolved_resource_join() {
     let errors = match ambiguous_resource_backend()
-        .compile_module(&ambiguous_resource_helper_module(true))
+        .compile_module(&ambiguous_resource_helper_module(ResourceHelperCalls::Joined))
     {
-        Ok(_) => panic!("a helper reached by two resource identities must fail closed"),
+        Ok(_) => panic!("a runtime join of distinct resource identities must fail closed"),
         Err(errors) => errors,
     };
     let message = errors
@@ -1742,9 +1846,8 @@ fn spirv_external_resource_helper_fails_closed_when_multiple_variants_are_requir
         .collect::<Vec<_>>()
         .join("; ");
     assert!(
-        message.contains("helper `ambiguous_resource_helper` argument 0")
-            && message.contains("multiple resource-identity variants are required"),
-        "the unresolved multi-variant boundary must fail closed by helper and argument: {message}",
+        message.contains("resource aliases") && message.contains("conflicting identities"),
+        "the unresolved resource join must retain a named fail-closed diagnostic: {message}",
     );
 }
 
