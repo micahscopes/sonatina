@@ -7166,6 +7166,13 @@ fn translate_to_naga(
             )
         })?;
         let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
+        if trace {
+            eprintln!(
+                "sonatina spirv: lowered helper, naga_handle={}, sonatina_ref={helper_ref:?}, name={}",
+                handle.index(),
+                helper_signature.name(),
+            );
+        }
         naga_functions.insert(
             helper_ref,
             NagaFunctionInfo {
