@@ -1444,6 +1444,7 @@ fn emit_single_inst(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    return_abi: Option<&NagaResultAbi>,
     naga_functions: &NagaFunctionMap,
     mem_ctx: Option<MemCtx>,
     // Hygiene ask (adversarial review, 2026-08-08): the Mem-op arms below
@@ -2983,17 +2984,83 @@ fn emit_single_inst(
         }
         return true;
     } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst_data) {
-        if let Some(&val_id) = ret.args().as_slice().first() {
-            let was_cached = value_map.contains_key(&val_id);
-            let resolved = resolve_naga_value(val_id, function, word, value_map, phi_locals, func);
-            if let Some(h) = resolved {
-                if !was_cached && matches!(func.expressions[h], naga::Expression::Load { .. }) {
-                    target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
-                }
+        let logical_results = ret.args().as_slice();
+        let physical_results = if let Some(return_abi) = return_abi {
+            if logical_results.len() != return_abi.logical.len() {
+                *mem_error = Some(format!(
+                    "spirv: helper return has {} logical values but its lowered ABI has {}. Fail closed.",
+                    logical_results.len(),
+                    return_abi.logical.len(),
+                ));
+                return false;
             }
-            *result_expr = resolved;
-            return true;
+            let mut physical = Vec::with_capacity(return_abi.physical_arity as usize);
+            for (&value, source) in logical_results.iter().zip(&return_abi.logical) {
+                let NagaResultSource::Physical(index) = source else {
+                    continue;
+                };
+                if *index as usize != physical.len() {
+                    *mem_error = Some(format!(
+                        "spirv: helper return has noncanonical physical result index {index}. Fail closed."
+                    ));
+                    return false;
+                }
+                physical.push(value);
+            }
+            physical
+        } else {
+            logical_results.first().copied().into_iter().collect()
+        };
+        let mut components = Vec::with_capacity(physical_results.len());
+        for value in physical_results {
+            let was_cached = value_map.contains_key(&value);
+            let Some(component) = resolve_naga_value(
+                value,
+                function,
+                word,
+                value_map,
+                phi_locals,
+                func,
+            ) else {
+                *mem_error = Some(format!(
+                    "spirv: helper return component {value:?} could not be resolved. Fail closed."
+                ));
+                return false;
+            };
+            if !was_cached && matches!(func.expressions[component], naga::Expression::Load { .. }) {
+                target.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(component, component)),
+                    naga::Span::UNDEFINED,
+                );
+            }
+            components.push(component);
         }
+        *result_expr = match components.as_slice() {
+            [] => None,
+            [component] => Some(*component),
+            _ => {
+                let Some(result_type) = return_abi.and_then(|abi| abi.physical_type) else {
+                    *mem_error = Some(
+                        "spirv: multi-value return has no lowered result type. Fail closed."
+                            .to_string(),
+                    );
+                    return false;
+                };
+                let tuple = func.expressions.append(
+                    naga::Expression::Compose {
+                        ty: result_type,
+                        components,
+                    },
+                    naga::Span::UNDEFINED,
+                );
+                target.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(tuple, tuple)),
+                    naga::Span::UNDEFINED,
+                );
+                Some(tuple)
+            }
+        };
+        return true;
     }
     false
 }
@@ -3010,6 +3077,7 @@ fn emit_block_to_target(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    return_abi: Option<&NagaResultAbi>,
     naga_functions: &NagaFunctionMap,
     mem_ctx: Option<MemCtx>,
     mem_error: &mut Option<String>,
@@ -3025,6 +3093,7 @@ fn emit_block_to_target(
             value_map,
             phi_locals,
             result_expr,
+            return_abi,
             naga_functions,
             mem_ctx,
             mem_error,
@@ -3043,6 +3112,7 @@ fn emit_naga_block_instructions(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    return_abi: Option<&NagaResultAbi>,
     naga_functions: &NagaFunctionMap,
     mem_ctx: Option<MemCtx>,
     mem_error: &mut Option<String>,
@@ -3059,6 +3129,7 @@ fn emit_naga_block_instructions(
         value_map,
         phi_locals,
         result_expr,
+        return_abi,
         naga_functions,
         mem_ctx,
         mem_error,
@@ -3105,6 +3176,7 @@ fn emit_naga_regions(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    return_abi: Option<&NagaResultAbi>,
     naga_functions: &NagaFunctionMap,
     mem_ctx: Option<MemCtx>,
 ) -> Result<(), String> {
@@ -3116,7 +3188,7 @@ fn emit_naga_regions(
             crate::structurize::Region::Block(block_id) => {
                 emit_naga_block_instructions(
                     function, inst_set, word, *block_id, word_type,
-                    func, value_map, phi_locals, result_expr, naga_functions, mem_ctx,
+                    func, value_map, phi_locals, result_expr, return_abi, naga_functions, mem_ctx,
                     &mut mem_error,
                 );
                 if let Some(msg) = mem_error.take() {
@@ -3147,7 +3219,7 @@ fn emit_naga_regions(
                 let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
                     func, value_map, phi_locals, result_expr, &mut loop_target,
-                    naga_functions, mem_ctx,
+                    return_abi, naga_functions, mem_ctx,
                 )?;
                 func.body.extend_block(loop_target);
                 region_idx += 1;
@@ -3157,7 +3229,7 @@ fn emit_naga_regions(
                     emit_naga_regions(
                         function, inst_set, word, &regions[region_idx..], word_type, f32_type,
                         bool_type, func, value_map, phi_locals, &mut continuation_result,
-                        naga_functions, mem_ctx,
+                        return_abi, naga_functions, mem_ctx,
                     )?;
                     let mut continuation = std::mem::replace(&mut func.body, saved_body);
                     if let Some(value) = continuation_result {
@@ -3224,12 +3296,13 @@ fn emit_naga_regions(
             crate::structurize::Region::IfThenElse { .. } => {
                 let mut target = naga::Block::new();
                 let transport = allocate_return_transport(
-                    function, inst_set, word_type, f32_type, bool_type, func,
+                    function, inst_set, word_type, f32_type, bool_type, func, return_abi,
                 )?;
                 let mut may_return = false;
                 emit_if_region(
                     function, inst_set, word, region, word_type, f32_type, bool_type, func, &mut target,
-                    value_map, phi_locals, transport, &mut may_return, naga_functions, mem_ctx,
+                    value_map, phi_locals, transport, &mut may_return, return_abi,
+                    naga_functions, mem_ctx,
                 )?;
                 func.body.extend_block(target);
                 region_idx += 1;
@@ -3239,7 +3312,7 @@ fn emit_naga_regions(
                     emit_naga_regions(
                         function, inst_set, word, &regions[region_idx..], word_type, f32_type,
                         bool_type, func, value_map, phi_locals, &mut continuation_result,
-                        naga_functions, mem_ctx,
+                        return_abi, naga_functions, mem_ctx,
                     )?;
                     let mut continuation = std::mem::replace(&mut func.body, saved_body);
                     if let Some(value) = continuation_result {
@@ -3335,7 +3408,7 @@ fn ensure_phi_locals(
             sonatina_ir::Type::I32 => word_type,
             other => {
                 return Err(format!(
-                    "spirv structurize: phi {result:?} has non-scalar type {other:?} without one proven resource identity. Fail closed."
+                    "spirv structurize: phi {result:?} in {block:?} has non-scalar type {other:?} without one proven resource identity. Fail closed."
                 ));
             }
         };
@@ -3471,6 +3544,7 @@ fn emit_if_region(
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     transport: StructuredReturnTransport,
     may_return: &mut bool,
+    return_abi: Option<&NagaResultAbi>,
     naga_functions: &NagaFunctionMap,
     mem_ctx: Option<MemCtx>,
 ) -> Result<(), String> {
@@ -3489,7 +3563,7 @@ fn emit_if_region(
     );
     let mut ignored_result = None;
     let mut mem_error = None;
-    emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, &mut ignored_result, naga_functions, mem_ctx, &mut mem_error);
+    emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, &mut ignored_result, return_abi, naga_functions, mem_ctx, &mut mem_error);
     if let Some(msg) = mem_error.take() {
         return Err(msg);
     }
@@ -3510,8 +3584,8 @@ fn emit_if_region(
     let mut else_returns = false;
     let mut then_edge_emitted = false;
     let mut else_edge_emitted = false;
-    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, f32_type, bool_type, func, &mut accept, &mut then_values, phi_locals, transport, *merge, &mut then_returns, &mut then_edge_emitted, naga_functions, mem_ctx)?;
-    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, f32_type, bool_type, func, &mut reject, &mut else_values, phi_locals, transport, *merge, &mut else_returns, &mut else_edge_emitted, naga_functions, mem_ctx)?;
+    emit_non_loop_regions(function, inst_set, word, then_branch, word_type, f32_type, bool_type, func, &mut accept, &mut then_values, phi_locals, transport, *merge, &mut then_returns, &mut then_edge_emitted, return_abi, naga_functions, mem_ctx)?;
+    emit_non_loop_regions(function, inst_set, word, else_branch, word_type, f32_type, bool_type, func, &mut reject, &mut else_values, phi_locals, transport, *merge, &mut else_returns, &mut else_edge_emitted, return_abi, naga_functions, mem_ctx)?;
     *may_return |= then_returns || else_returns;
     let then_outcome = arm_outcome(function, inst_set, *header, then_branch);
     let else_outcome = arm_outcome(function, inst_set, *header, else_branch);
@@ -3639,6 +3713,7 @@ fn emit_non_loop_regions(
     fallthrough_merge: Option<sonatina_ir::BlockId>,
     may_return: &mut bool,
     edge_emitted: &mut bool,
+    return_abi: Option<&NagaResultAbi>,
     naga_functions: &NagaFunctionMap,
     mem_ctx: Option<MemCtx>,
 ) -> Result<(), String> {
@@ -3650,12 +3725,12 @@ fn emit_non_loop_regions(
                 emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
                 let mut block_result = None;
                 let mut mem_error = None;
-                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, &mut block_result, naga_functions, mem_ctx, &mut mem_error);
+                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, &mut block_result, return_abi, naga_functions, mem_ctx, &mut mem_error);
                 if let Some(msg) = mem_error.take() {
                     return Err(msg);
                 }
                 if block_has_return(*block, function, inst_set) {
-                    if find_block_return_value(*block, function, inst_set).is_some() {
+                    if transport.has_result {
                         let value = block_result.ok_or_else(|| format!("spirv: unresolved structured return in {block:?}"))?;
                         let pointer = func.expressions.append(
                             naga::Expression::LocalVariable(transport.result), naga::Span::UNDEFINED,
@@ -3690,7 +3765,7 @@ fn emit_non_loop_regions(
                 emit_if_region(
                     function, inst_set, word, region, word_type, f32_type, bool_type,
                     func, target, value_map, phi_locals, transport, &mut nested_returns,
-                    naga_functions, mem_ctx,
+                    return_abi, naga_functions, mem_ctx,
                 )?;
                 region_idx += 1;
                 if nested_returns {
@@ -3702,7 +3777,7 @@ fn emit_non_loop_regions(
                         f32_type, bool_type, func, &mut continuation, value_map,
                         phi_locals, transport, fallthrough_merge,
                         &mut continuation_returns, &mut continuation_edge_emitted,
-                        naga_functions, mem_ctx,
+                        return_abi, naga_functions, mem_ctx,
                     )?;
                     if regions[region_idx..].is_empty()
                         && *nested_merge == fallthrough_merge
@@ -3754,8 +3829,8 @@ fn emit_non_loop_regions(
                 let mut no_result = None;
                 let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
-                    func, value_map, phi_locals, &mut no_result, target, naga_functions,
-                    mem_ctx,
+                    func, value_map, phi_locals, &mut no_result, target, return_abi,
+                    naga_functions, mem_ctx,
                 )?;
                 if loop_return.is_some() {
                     return Err(format!(
@@ -3798,14 +3873,25 @@ fn allocate_return_transport(
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
+    return_abi: Option<&NagaResultAbi>,
 ) -> Result<StructuredReturnTransport, String> {
-    let return_ty = function.layout.iter_block().find_map(|block| {
-        find_block_return_value(block, function, inst_set).map(|value| function.dfg.value_ty(value))
+    let source_return_ty = function.layout.iter_block().find_map(|block| {
+        find_block_return_value(block, function, inst_set)
+            .map(|value| function.dfg.value_ty(value))
     });
-    let return_naga_ty = match return_ty {
-        Some(sonatina_ir::Type::F32) => f32_type,
-        Some(sonatina_ir::Type::I1) => bool_type,
-        Some(_) | None => word_type,
+    let (return_naga_ty, has_result) = match return_abi {
+        Some(return_abi) => (
+            return_abi.physical_type.unwrap_or(word_type),
+            return_abi.physical_arity != 0,
+        ),
+        None => (
+            match source_return_ty {
+                Some(sonatina_ir::Type::F32) => f32_type,
+                Some(sonatina_ir::Type::I1) => bool_type,
+                Some(_) | None => word_type,
+            },
+            source_return_ty.is_some(),
+        ),
     };
     // Structured return transport is likewise a physical lowering detail.
     let result = func.local_variables.append(
@@ -3827,7 +3913,7 @@ fn allocate_return_transport(
     Ok(StructuredReturnTransport {
         result,
         did_return,
-        has_result: return_ty.is_some(),
+        has_result,
     })
 }
 
@@ -3850,6 +3936,7 @@ fn emit_regions_in_loop(
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    return_abi: Option<&NagaResultAbi>,
     naga_functions: &NagaFunctionMap,
     mem_ctx: Option<MemCtx>,
 ) -> Result<RegionOutcome, String> {
@@ -3860,7 +3947,7 @@ fn emit_regions_in_loop(
             crate::structurize::Region::Block(block) => {
                 emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
                 let mut mem_error = None;
-                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, result_expr, naga_functions, mem_ctx, &mut mem_error);
+                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error);
                 if let Some(msg) = mem_error.take() {
                     return Err(msg);
                 }
@@ -3873,10 +3960,8 @@ fn emit_regions_in_loop(
                             target.push(naga::Statement::Continue, naga::Span::UNDEFINED);
                             return Ok(RegionOutcome::Terminal);
                         }
-                    } else if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst) {
-                        if let Some(value_id) = ret.args().as_slice().first() {
-                            let value = resolve_naga_value(*value_id, function, word, value_map, phi_locals, func)
-                                .ok_or_else(|| format!("spirv: unresolved return in {block:?}"))?;
+                    } else if <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst).is_some() {
+                        if let Some(value) = *result_expr {
                             let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
                             target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
                         }
@@ -3929,7 +4014,7 @@ fn emit_regions_in_loop(
                     function, inst_set, *header, func, target, value_map, phi_locals,
                 );
                 let mut mem_error = None;
-                emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr, naga_functions, mem_ctx, &mut mem_error);
+                emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error);
                 if let Some(msg) = mem_error.take() {
                     return Err(msg);
                 }
@@ -3943,10 +4028,10 @@ fn emit_regions_in_loop(
                 let mut accept_values = value_map.clone();
                 let mut reject_values = value_map.clone();
                 let then_outcome = if then_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
-                    emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, loop_exit, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut accept, &mut accept_values, phi_locals, result_expr, naga_functions, mem_ctx)?
+                    emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, loop_exit, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut accept, &mut accept_values, phi_locals, result_expr, return_abi, naga_functions, mem_ctx)?
                 };
                 let else_outcome = if else_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
-                    emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, loop_exit, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut reject, &mut reject_values, phi_locals, result_expr, naga_functions, mem_ctx)?
+                    emit_regions_in_loop(function, inst_set, word, else_branch, loop_header, loop_exit, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut reject, &mut reject_values, phi_locals, result_expr, return_abi, naga_functions, mem_ctx)?
                 };
                 if let Some(merge) = merge {
                     // `from == merge` means the arm already LANDED at the merge
@@ -4000,8 +4085,8 @@ fn emit_regions_in_loop(
                 let mut nested_result = None;
                 let inner_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
-                    func, value_map, phi_locals, &mut nested_result, target, naga_functions,
-                    mem_ctx,
+                    func, value_map, phi_locals, &mut nested_result, target, return_abi,
+                    naga_functions, mem_ctx,
                 )?;
                 if inner_return.is_some() {
                     return Err(format!(
@@ -4038,16 +4123,12 @@ fn emit_regions_in_loop(
                     let mut mem_error = None;
                     emit_block_to_target(
                         function, inst_set, word, *exit, func, target, value_map, phi_locals,
-                        result_expr, naga_functions, mem_ctx, &mut mem_error,
+                        result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error,
                     );
                     if let Some(msg) = mem_error.take() {
                         return Err(msg);
                     }
-                    if let Some(ret) = find_block_return_value(*exit, function, inst_set) {
-                        let value = resolve_naga_value(
-                            ret, function, word, value_map, phi_locals, func,
-                        )
-                        .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
+                    if let Some(value) = *result_expr {
                         let pointer = func.expressions.append(
                             naga::Expression::LocalVariable(return_local),
                             naga::Span::UNDEFINED,
@@ -4111,6 +4192,7 @@ fn emit_recursive_loop_region(
     // the arm rather than the function root. (`func.body` cannot be passed here
     // directly, it would alias the `&mut func` this fn also needs.)
     target: &mut naga::Block,
+    return_abi: Option<&NagaResultAbi>,
     naga_functions: &NagaFunctionMap,
     mem_ctx: Option<MemCtx>,
 ) -> Result<Option<StructuredReturnTransport>, String> {
@@ -4160,13 +4242,22 @@ fn emit_recursive_loop_region(
         target.extend_block(init);
     }
 
-    let return_ty = function.layout.iter_block().find_map(|block| {
+    let source_return_ty = function.layout.iter_block().find_map(|block| {
         find_block_return_value(block, function, inst_set).map(|value| function.dfg.value_ty(value))
     });
-    let return_naga_ty = match return_ty {
-        Some(sonatina_ir::Type::F32) => f32_type,
-        Some(sonatina_ir::Type::I1) => bool_type,
-        Some(_) | None => word_type,
+    let (return_naga_ty, has_result) = match return_abi {
+        Some(return_abi) => (
+            return_abi.physical_type.unwrap_or(word_type),
+            return_abi.physical_arity != 0,
+        ),
+        None => (
+            match source_return_ty {
+                Some(sonatina_ir::Type::F32) => f32_type,
+                Some(sonatina_ir::Type::I1) => bool_type,
+                Some(_) | None => word_type,
+            },
+            source_return_ty.is_some(),
+        ),
     };
     let return_local = func.local_variables.append(
         naga::LocalVariable { name: Some("loop_result".into()), ty: return_naga_ty, init: None },
@@ -4220,7 +4311,7 @@ fn emit_recursive_loop_region(
     let mut mem_error = None;
     emit_block_to_target(
         function, inst_set, word, header, func, &mut loop_body, value_map,
-        phi_locals, &mut nested_result_expr, naga_functions, mem_ctx, &mut mem_error,
+        phi_locals, &mut nested_result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error,
     );
     if let Some(msg) = mem_error.take() {
         return Err(msg);
@@ -4255,7 +4346,8 @@ fn emit_recursive_loop_region(
         let body_outcome = emit_regions_in_loop(
             function, inst_set, word, body_regions, header, exit, word_type, f32_type, bool_type,
             return_local, did_return_local, &mut may_return, func, &mut continue_arm,
-            &mut continue_values, phi_locals, &mut nested_result_expr, naga_functions, mem_ctx,
+            &mut continue_values, phi_locals, &mut nested_result_expr, return_abi,
+            naga_functions, mem_ctx,
         )?;
         // Fallthrough(header) is a trailing nested loop whose exit IS this
         // loop's back-edge: its exit arm already stored this header's phi
@@ -4282,14 +4374,13 @@ fn emit_recursive_loop_region(
         let mut mem_error = None;
         emit_block_to_target(
             function, inst_set, word, exit, func, &mut exit_arm, &mut exit_values,
-            phi_locals, &mut nested_result_expr, naga_functions, mem_ctx, &mut mem_error,
+            phi_locals, &mut nested_result_expr, return_abi, naga_functions, mem_ctx,
+            &mut mem_error,
         );
         if let Some(msg) = mem_error.take() {
             return Err(msg);
         }
-        if let Some(ret) = find_block_return_value(exit, function, inst_set) {
-            let value = resolve_naga_value(ret, function, word, &mut exit_values, phi_locals, func)
-                .ok_or_else(|| format!("spirv: unresolved loop exit return in {exit:?}"))?;
+        if let Some(value) = nested_result_expr {
             let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
             exit_arm.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
         }
@@ -4343,7 +4434,7 @@ fn emit_recursive_loop_region(
     Ok(may_return.then_some(StructuredReturnTransport {
         result: return_local,
         did_return: did_return_local,
-        has_result: return_ty.is_some(),
+        has_result,
     }))
 }
 
@@ -4717,131 +4808,149 @@ type NagaResourceCapabilities =
     std::collections::HashMap<sonatina_ir::Type, NagaResourceCapability>;
 
 #[cfg(feature = "spirv-backend")]
-fn bind_resource_identity_aliases(
+fn resource_identity_graph(
     function: &sonatina_ir::Function,
-    seeds: impl IntoIterator<Item = sonatina_ir::ValueId>,
+    resource_capabilities: &NagaResourceCapabilities,
     naga_functions: &NagaFunctionMap,
-    value_map: &mut std::collections::HashMap<
-        sonatina_ir::ValueId,
-        naga::Handle<naga::Expression>,
-    >,
-) -> Result<(), String> {
+) -> Result<
+    std::collections::HashMap<sonatina_ir::ValueId, Vec<sonatina_ir::ValueId>>,
+    String,
+> {
     use sonatina_ir::{
         InstDowncast,
         inst::control_flow::{Call, Phi},
     };
 
     let inst_set = function.inst_set();
-    let mut provenance = seeds
-        .into_iter()
-        .map(|seed| (seed, seed))
-        .collect::<std::collections::HashMap<_, _>>();
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for block in function.layout.iter_block() {
-            for instruction in function.layout.iter_inst(block) {
-                if let Some(call_info) = function.dfg.call_info(instruction) {
-                    let call = <&Call as InstDowncast>::downcast(
-                        inst_set,
-                        function.dfg.inst(instruction),
+    let mut graph = std::collections::HashMap::<_, Vec<_>>::new();
+    let mut connect = |left, right| {
+        graph.entry(left).or_default().push(right);
+        graph.entry(right).or_default().push(left);
+    };
+    for block in function.layout.iter_block() {
+        for instruction in function.layout.iter_inst(block) {
+            if let Some(call_info) = function.dfg.call_info(instruction) {
+                let call = <&Call as InstDowncast>::downcast(
+                    inst_set,
+                    function.dfg.inst(instruction),
+                )
+                .ok_or_else(|| {
+                    "spirv: resource provenance reached a call form without arguments. Fail closed."
+                        .to_string()
+                })?;
+                let callee = naga_functions.get(&call_info.callee()).ok_or_else(|| {
+                    format!(
+                        "spirv: resource provenance reached {:?} before its helper ABI was available. Fail closed.",
+                        call_info.callee(),
                     )
-                    .ok_or_else(|| {
-                        "spirv: resource provenance reached a call form without arguments. Fail closed."
-                            .to_string()
-                    })?;
-                    let callee = naga_functions.get(&call_info.callee()).ok_or_else(|| {
+                })?;
+                for (&result, source) in function
+                    .dfg
+                    .inst_results(instruction)
+                    .iter()
+                    .zip(&callee.result_abi.logical)
+                {
+                    let NagaResultSource::PassthroughArgument(argument_index) = source else {
+                        continue;
+                    };
+                    let argument = *call.args().get(*argument_index as usize).ok_or_else(|| {
                         format!(
-                            "spirv: resource provenance reached {:?} before its helper ABI was available. Fail closed.",
+                            "spirv: resource result from {:?} refers to missing argument {argument_index}. Fail closed.",
                             call_info.callee(),
                         )
                     })?;
-                    for (&result, source) in function
-                        .dfg
-                        .inst_results(instruction)
-                        .iter()
-                        .zip(&callee.result_abi.logical)
-                    {
-                        let NagaResultSource::PassthroughArgument(argument_index) = source else {
-                            continue;
-                        };
-                        let argument = *call.args().get(*argument_index as usize).ok_or_else(|| {
-                            format!(
-                                "spirv: resource result from {:?} refers to missing argument {argument_index}. Fail closed.",
-                                call_info.callee(),
-                            )
-                        })?;
-                        let Some(&root) = provenance.get(&argument) else {
-                            continue;
-                        };
-                        match provenance.entry(result) {
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                entry.insert(root);
-                                changed = true;
-                            }
-                            std::collections::hash_map::Entry::Occupied(entry)
-                                if *entry.get() != root =>
-                            {
-                                return Err(format!(
-                                    "spirv: resource result {result:?} has conflicting identities. Fail closed."
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                    continue;
+                    connect(result, argument);
                 }
-                let Some(phi) = <&Phi as InstDowncast>::downcast(
-                    inst_set,
-                    function.dfg.inst(instruction),
-                ) else {
-                    continue;
-                };
-                let mut incoming = phi
-                    .args()
-                    .iter()
-                    .filter_map(|(value, _)| provenance.get(value).copied());
-                let Some(root) = incoming.next() else {
-                    continue;
-                };
-                if !incoming.all(|candidate| candidate == root)
-                    || !phi
-                        .args()
-                        .iter()
-                        .all(|(value, _)| provenance.contains_key(value))
-                {
-                    continue;
-                }
-                let Some(result) = function.dfg.inst_result(instruction) else {
-                    continue;
-                };
-                match provenance.entry(result) {
-                    std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert(root);
-                        changed = true;
-                    }
-                    std::collections::hash_map::Entry::Occupied(entry)
-                        if *entry.get() != root =>
-                    {
-                        return Err(format!(
-                            "spirv: resource phi {result:?} has conflicting identities. Fail closed."
-                        ));
-                    }
-                    _ => {}
-                }
+                continue;
+            }
+            let Some(phi) = <&Phi as InstDowncast>::downcast(
+                inst_set,
+                function.dfg.inst(instruction),
+            ) else {
+                continue;
+            };
+            let Some(result) = function.dfg.inst_result(instruction) else {
+                continue;
+            };
+            if !resource_capabilities.contains_key(&function.dfg.value_ty(result)) {
+                continue;
+            }
+            for &(value, _) in phi.args() {
+                connect(result, value);
             }
         }
     }
+    Ok(graph)
+}
 
-    for (value, root) in provenance {
-        if value == root {
-            continue;
+#[cfg(feature = "spirv-backend")]
+fn propagate_resource_identities<Identity>(
+    graph: &std::collections::HashMap<sonatina_ir::ValueId, Vec<sonatina_ir::ValueId>>,
+    seeds: impl IntoIterator<Item = (sonatina_ir::ValueId, Identity)>,
+) -> Result<std::collections::HashMap<sonatina_ir::ValueId, Identity>, String>
+where
+    Identity: Copy + Eq + std::fmt::Debug,
+{
+    let mut provenance = std::collections::HashMap::new();
+    let mut pending = std::collections::VecDeque::new();
+    for (value, identity) in seeds {
+        match provenance.insert(value, identity) {
+            Some(previous) if previous != identity => {
+                return Err(format!(
+                    "spirv: resource seed {value:?} has conflicting identities {previous:?} and {identity:?}. Fail closed."
+                ));
+            }
+            Some(_) => {}
+            None => pending.push_back(value),
         }
-        let expression = *value_map.get(&root).ok_or_else(|| {
+    }
+    while let Some(value) = pending.pop_front() {
+        let identity = provenance[&value];
+        for &alias in graph.get(&value).into_iter().flatten() {
+            match provenance.entry(alias) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(identity);
+                    pending.push_back(alias);
+                }
+                std::collections::hash_map::Entry::Occupied(entry)
+                    if *entry.get() != identity =>
+                {
+                    return Err(format!(
+                        "spirv: resource aliases {value:?} and {alias:?} carry conflicting identities {identity:?} and {:?}. Fail closed.",
+                        entry.get(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(provenance)
+}
+
+#[cfg(feature = "spirv-backend")]
+fn bind_resource_identity_aliases(
+    function: &sonatina_ir::Function,
+    seeds: impl IntoIterator<Item = sonatina_ir::ValueId>,
+    resource_capabilities: &NagaResourceCapabilities,
+    naga_functions: &NagaFunctionMap,
+    value_map: &mut std::collections::HashMap<
+        sonatina_ir::ValueId,
+        naga::Handle<naga::Expression>,
+    >,
+) -> Result<(), String> {
+    let graph = resource_identity_graph(function, resource_capabilities, naga_functions)?;
+    let mut seed_expressions = Vec::new();
+    for seed in seeds {
+        let expression = *value_map.get(&seed).ok_or_else(|| {
             format!(
-                "spirv: resource identity root {root:?} has no physical Naga capability. Fail closed."
+                "spirv: resource seed {seed:?} has no physical Naga capability. Fail closed."
             )
         })?;
+        seed_expressions.push((seed, expression));
+    }
+    let provenance = propagate_resource_identities(&graph, seed_expressions)?;
+
+    for (value, expression) in provenance {
         value_map.insert(value, expression);
     }
     Ok(())
@@ -5578,121 +5687,22 @@ fn helper_naga_result_abi(
         .func_store
         .try_view(function_ref, |function| -> Result<Vec<u32>, String> {
             let inst_set = function.inst_set();
-            let mut provenance = std::collections::HashMap::<
-                sonatina_ir::ValueId,
-                u32,
-            >::new();
-            for (argument_index, (&value, &ty)) in function
+            let graph = resource_identity_graph(
+                function,
+                resource_capabilities,
+                naga_functions,
+            )?;
+            let seeds = function
                 .arg_values
                 .iter()
                 .zip(signature.args())
                 .enumerate()
-            {
-                if resource_capabilities.contains_key(&ty) {
-                    provenance.insert(value, argument_index as u32);
-                }
-            }
-
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for block in function.layout.iter_block() {
-                    for instruction in function.layout.iter_inst(block) {
-                        if let Some(call) = function.dfg.call_info(instruction) {
-                            let concrete_call = <&control_flow::Call as InstDowncast>::downcast(
-                                inst_set,
-                                function.dfg.inst(instruction),
-                            )
-                            .ok_or_else(|| {
-                                format!(
-                                    "spirv: helper `{}` contains a call form whose arguments are unavailable. Fail closed.",
-                                    signature.name(),
-                                )
-                            })?;
-                            let callee = naga_functions.get(&call.callee()).ok_or_else(|| {
-                                format!(
-                                    "spirv: helper `{}` reaches {:?} before its result ABI is available. Fail closed.",
-                                    signature.name(),
-                                    call.callee(),
-                                )
-                            })?;
-                            for (&result, source) in function
-                                .dfg
-                                .inst_results(instruction)
-                                .iter()
-                                .zip(&callee.result_abi.logical)
-                            {
-                                let NagaResultSource::PassthroughArgument(argument_index) = source
-                                else {
-                                    continue;
-                                };
-                                let argument = *concrete_call
-                                    .args()
-                                    .get(*argument_index as usize)
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "spirv: helper call to {:?} has no passthrough argument {argument_index}. Fail closed.",
-                                            call.callee(),
-                                        )
-                                    })?;
-                                if let Some(&source) = provenance.get(&argument) {
-                                    match provenance.entry(result) {
-                                        std::collections::hash_map::Entry::Vacant(entry) => {
-                                            entry.insert(source);
-                                            changed = true;
-                                        }
-                                        std::collections::hash_map::Entry::Occupied(entry)
-                                            if *entry.get() != source =>
-                                        {
-                                            return Err(format!(
-                                                "spirv: helper `{}` gives {result:?} conflicting resource identities. Fail closed.",
-                                                signature.name(),
-                                            ));
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        if let Some(phi) = <&control_flow::Phi as InstDowncast>::downcast(
-                            inst_set,
-                            function.dfg.inst(instruction),
-                        ) {
-                            let mut incoming = phi
-                                .args()
-                                .iter()
-                                .filter_map(|(value, _)| provenance.get(value).copied());
-                            let Some(source) = incoming.next() else {
-                                continue;
-                            };
-                            if incoming.all(|candidate| candidate == source)
-                                && phi
-                                    .args()
-                                    .iter()
-                                    .all(|(value, _)| provenance.contains_key(value))
-                                && let Some(result) = function.dfg.inst_result(instruction)
-                            {
-                                match provenance.entry(result) {
-                                    std::collections::hash_map::Entry::Vacant(entry) => {
-                                        entry.insert(source);
-                                        changed = true;
-                                    }
-                                    std::collections::hash_map::Entry::Occupied(entry)
-                                        if *entry.get() != source =>
-                                    {
-                                        return Err(format!(
-                                            "spirv: helper `{}` gives phi result {result:?} conflicting resource identities. Fail closed.",
-                                            signature.name(),
-                                        ));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+                .filter_map(|(argument_index, (&value, &ty))| {
+                    resource_capabilities
+                        .contains_key(&ty)
+                        .then_some((value, argument_index as u32))
+                });
+            let provenance = propagate_resource_identities(&graph, seeds)?;
 
             let return_sites = function
                 .layout
@@ -5706,34 +5716,51 @@ fn helper_naga_result_abi(
                     .map(|return_| return_.args().as_slice().to_vec())
                 })
                 .collect::<Vec<_>>();
-            let [return_values] = return_sites.as_slice() else {
+            if return_sites.is_empty() {
                 return Err(format!(
-                    "spirv: resource-carrying helper `{}` has {} return sites; resource identity requires one canonical return. Fail closed.",
+                    "spirv: resource-carrying helper `{}` has no return site. Fail closed.",
                     signature.name(),
-                    return_sites.len(),
                 ));
-            };
-            if return_values.len() != signature.ret_tys().len() {
-                return Err(format!(
-                    "spirv: resource-carrying helper `{}` returns {} values but declares {}. Fail closed.",
-                    signature.name(),
-                    return_values.len(),
-                    signature.ret_tys().len(),
-                ));
+            }
+            for return_values in &return_sites {
+                if return_values.len() != signature.ret_tys().len() {
+                    return Err(format!(
+                        "spirv: resource-carrying helper `{}` returns {} values at one exit but declares {}. Fail closed.",
+                        signature.name(),
+                        return_values.len(),
+                        signature.ret_tys().len(),
+                    ));
+                }
             }
             signature
                 .ret_tys()
                 .iter()
-                .zip(return_values)
-                .filter_map(|(ty, value)| {
-                    resource_capabilities
-                        .contains_key(ty)
-                        .then_some(*value)
-                })
-                .map(|value| {
-                    provenance.get(&value).copied().ok_or_else(|| {
+                .enumerate()
+                .filter(|(_, ty)| resource_capabilities.contains_key(ty))
+                .map(|(logical_index, _)| {
+                    let mut source = None;
+                    for return_values in &return_sites {
+                        let value = return_values[logical_index];
+                        let candidate = provenance.get(&value).copied().ok_or_else(|| {
+                            format!(
+                                "spirv: resource-carrying helper `{}` returns {value:?} without a proven entry-resource identity. Fail closed.",
+                                signature.name(),
+                            )
+                        })?;
+                        match source {
+                            None => source = Some(candidate),
+                            Some(previous) if previous == candidate => {}
+                            Some(previous) => {
+                                return Err(format!(
+                                    "spirv: resource-carrying helper `{}` returns different entry-resource identities {previous} and {candidate} across exits. Fail closed.",
+                                    signature.name(),
+                                ));
+                            }
+                        }
+                    }
+                    source.ok_or_else(|| {
                         format!(
-                            "spirv: resource-carrying helper `{}` returns {value:?} without a proven entry-resource identity. Fail closed.",
+                            "spirv: resource-carrying helper `{}` has no resource return evidence. Fail closed.",
                             signature.name(),
                         )
                     })
@@ -5839,6 +5866,7 @@ fn lower_naga_helper(
     memory_abi: NagaMemoryAbi,
     memory_types: NagaMemoryAbiTypes,
     heap_words: u32,
+    resource_capabilities: &NagaResourceCapabilities,
     naga_functions: &NagaFunctionMap,
 ) -> Result<naga::Function, String> {
     let signature = module
@@ -5967,6 +5995,7 @@ fn lower_naga_helper(
         if let Err(error) = bind_resource_identity_aliases(
             function,
             resource_seeds,
+            resource_capabilities,
             naga_functions,
             &mut value_map,
         ) {
@@ -6028,6 +6057,7 @@ fn lower_naga_helper(
             &mut value_map,
             &mut phi_locals,
             &mut result_expression,
+            Some(result_abi),
             naga_functions,
             mem_ctx,
         ) {
@@ -6043,112 +6073,13 @@ fn lower_naga_helper(
                 naga::Statement::Return { value: None },
                 naga::Span::UNDEFINED,
             );
-        } else if signature.ret_tys().len() == 1 && result_abi.physical_arity == 1 {
+        } else {
             let Some(value) = result_expression else {
                 lowering_error = Some(format!(
                     "spirv: helper `{}` produced no return value. Fail closed.",
                     signature.name(),
                 ));
                 return;
-            };
-            naga_function.body.push(
-                naga::Statement::Return { value: Some(value) },
-                naga::Span::UNDEFINED,
-            );
-        } else {
-            let return_sites = function
-                .layout
-                .iter_block()
-                .flat_map(|block| function.layout.iter_inst(block))
-                .filter_map(|instruction| {
-                    <&sonatina_ir::inst::control_flow::Return as sonatina_ir::InstDowncast>::downcast(
-                        inst_set,
-                        function.dfg.inst(instruction),
-                    )
-                    .map(|ret| ret.args().as_slice().to_vec())
-                })
-                .collect::<Vec<_>>();
-            let [return_values] = return_sites.as_slice() else {
-                lowering_error = Some(format!(
-                    "spirv: multi-result helper `{}` has {} return sites; structured tuple-return transport is not lowered yet. Fail closed.",
-                    signature.name(),
-                    return_sites.len(),
-                ));
-                return;
-            };
-            if return_values.len() != signature.ret_tys().len() {
-                lowering_error = Some(format!(
-                    "spirv: multi-result helper `{}` returns {} values at its canonical return site but declares {}. Fail closed.",
-                    signature.name(),
-                    return_values.len(),
-                    signature.ret_tys().len(),
-                ));
-                return;
-            }
-            let physical_results = result_abi
-                .logical
-                .iter()
-                .enumerate()
-                .filter_map(|(logical_index, source)| {
-                    matches!(source, NagaResultSource::Physical(_))
-                        .then_some(return_values[logical_index])
-                })
-                .collect::<Vec<_>>();
-            let mut components = Vec::with_capacity(physical_results.len());
-            for value in physical_results {
-                let was_cached = value_map.contains_key(&value);
-                let Some(component) = resolve_naga_value(
-                    value,
-                    function,
-                    word,
-                    &mut value_map,
-                    &phi_locals,
-                    &mut naga_function,
-                ) else {
-                    lowering_error = Some(format!(
-                        "spirv: multi-result helper `{}` could not resolve return component {value:?}. Fail closed.",
-                        signature.name(),
-                    ));
-                    return;
-                };
-                if !was_cached
-                    && matches!(
-                        naga_function.expressions[component],
-                        naga::Expression::Load { .. }
-                    )
-                {
-                    naga_function.body.push(
-                        naga::Statement::Emit(naga::Range::new_from_bounds(
-                            component,
-                            component,
-                        )),
-                        naga::Span::UNDEFINED,
-                    );
-                }
-                components.push(component);
-            }
-            let Some(result_type) = result_abi.physical_type else {
-                lowering_error = Some(format!(
-                    "spirv: helper `{}` has physical results but no lowered result type. Fail closed.",
-                    signature.name(),
-                ));
-                return;
-            };
-            let value = if let [component] = components.as_slice() {
-                *component
-            } else {
-                let tuple = naga_function.expressions.append(
-                    naga::Expression::Compose {
-                        ty: result_type,
-                        components,
-                    },
-                    naga::Span::UNDEFINED,
-                );
-                naga_function.body.push(
-                    naga::Statement::Emit(naga::Range::new_from_bounds(tuple, tuple)),
-                    naga::Span::UNDEFINED,
-                );
-                tuple
             };
             naga_function.body.push(
                 naga::Statement::Return { value: Some(value) },
@@ -7028,8 +6959,15 @@ fn translate_to_naga(
             helper_memory_abi,
             helper_memory_types,
             private_heap_words,
+            &helper_resource_capabilities,
             &naga_functions,
-        )?;
+        )
+        .map_err(|error| {
+            format!(
+                "spirv: helper `{}` lowering failed: {error}",
+                helper_signature.name(),
+            )
+        })?;
         let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
         naga_functions.insert(
             helper_ref,
@@ -7381,6 +7319,7 @@ fn translate_to_naga(
             if let Err(error) = bind_resource_identity_aliases(
                 function,
                 resource_seeds,
+                &helper_resource_capabilities,
                 &naga_functions,
                 &mut value_map,
             ) {
@@ -7457,6 +7396,7 @@ fn translate_to_naga(
                 &mut value_map,
                 &mut phi_locals,
                 &mut ignored_result,
+                None,
                 &naga_functions,
                 mem_ctx,
             ) {
@@ -7829,6 +7769,7 @@ fn translate_to_naga(
                 if let Err(error) = bind_resource_identity_aliases(
                     function,
                     resource_seeds,
+                    &helper_resource_capabilities,
                     &naga_functions,
                     &mut value_map,
                 ) {
@@ -7928,7 +7869,7 @@ fn translate_to_naga(
                 if let Err(err) = emit_naga_regions(
                     function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
                     &mut fs, &mut value_map, &mut phi_locals, &mut result_expr,
-                    &naga_functions,
+                    None, &naga_functions,
                     // Render mode fails closed on has_mem (checked above), so
                     // there is never a heap/trap context here.
                     None,
@@ -8462,7 +8403,7 @@ fn translate_to_naga(
             if let Err(err) = emit_naga_regions(
                 function, inst_set, word, &scfg.regions, word_type, f32_type, bool_type,
                 &mut func, &mut value_map, &mut phi_locals, &mut result_expr,
-                &naga_functions, mem_ctx,
+                None, &naga_functions, mem_ctx,
             ) {
                 body_error = Some(structurize_error_with_block_ir(
                     err, first_func, function,

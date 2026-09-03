@@ -927,10 +927,16 @@ impl Structurer<'_> {
                 // that continuation to be the structured merge. Keep an
                 // enclosing loop header or exit as an explicit continue/break
                 // edge, but otherwise resume at the live successor.
-                if self.returns(nz) && self.is_local_merge_candidate(z, cur_loop) {
+                if self.returns(nz)
+                    && !self.reaches_before_loop_header(z, nz, cur_loop)
+                    && self.is_local_merge_candidate(z, cur_loop)
+                {
                     return Ok(Some(z));
                 }
-                if self.returns(z) && self.is_local_merge_candidate(nz, cur_loop) {
+                if self.returns(z)
+                    && !self.reaches_before_loop_header(nz, z, cur_loop)
+                    && self.is_local_merge_candidate(nz, cur_loop)
+                {
                     return Ok(Some(nz));
                 }
                 // Search only within the current loop iteration so a later
@@ -1481,6 +1487,80 @@ mod tests {
             structured.stats().block_occurrences,
             structured.stats().referenced_blocks,
             "the phi-bearing merge must have one owner: {:?}",
+            structured.regions,
+        );
+    }
+
+    /// CFG cleanup removes the otherwise empty arm blocks from a lowered
+    /// match, leaving each successful comparison to branch directly to the
+    /// phi-bearing return. The return remains the one owned merge of all live
+    /// arms even though it is also an immediate successor of every decision.
+    #[test]
+    fn optimized_match_arms_merge_directly_at_phi_return_while_default_traps() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_single(
+            "optimized_match_with_trapping_default",
+            Linkage::Public,
+            &[Type::I32],
+            Type::I32,
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let merge = fb.append_block();
+        let trap = fb.append_block();
+        let check_one = fb.append_block();
+        let check_two = fb.append_block();
+        let check_three = fb.append_block();
+
+        let selector = fb.args()[0];
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        let two = fb.make_imm_value(2i32);
+        let three = fb.make_imm_value(3i32);
+        let fallback = fb.make_imm_value(99i32);
+
+        fb.switch_to_block(entry);
+        let is_zero = fb.insert_inst(cmp::Eq::new(is, selector, zero), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_zero, merge, check_one));
+        fb.switch_to_block(check_one);
+        let is_one = fb.insert_inst(cmp::Eq::new(is, selector, one), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_one, merge, check_two));
+        fb.switch_to_block(check_two);
+        let is_two = fb.insert_inst(cmp::Eq::new(is, selector, two), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_two, merge, check_three));
+        fb.switch_to_block(check_three);
+        let is_three = fb.insert_inst(cmp::Eq::new(is, selector, three), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_three, merge, trap));
+        fb.switch_to_block(merge);
+        let result = fb.insert_inst(
+            Phi::new(
+                is,
+                vec![
+                    (zero, entry),
+                    (one, check_one),
+                    (two, check_two),
+                    (fallback, check_three),
+                ],
+            ),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(Return::new_single(is, result));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(matches!(
+            structured.regions.last(),
+            Some(Region::Block(block)) if *block == merge
+        ));
+        assert_eq!(
+            structured.stats().block_occurrences,
+            structured.stats().referenced_blocks,
+            "the direct phi-bearing merge must have one owner: {:?}",
             structured.regions,
         );
     }
