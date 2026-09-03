@@ -1611,8 +1611,7 @@ fn spirv_external_resource_identity_survives_a_phi_join() {
     .expect("a joined resource identity must validate for browsers");
 }
 
-#[test]
-fn spirv_external_resource_helper_fails_closed_on_ambiguous_capability() {
+fn ambiguous_resource_helper_module(call_both_resources: bool) -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
         Vendor::Unknown,
@@ -1661,12 +1660,23 @@ fn spirv_external_resource_helper_fails_closed_on_ambiguous_capability() {
             helper_ref,
             [fb.args()[0], fb.args()[2]].into_iter().collect(),
         ));
+        if call_both_resources {
+            fb.insert_inst_no_result(control_flow::Call::new(
+                is,
+                helper_ref,
+                [fb.args()[1], fb.args()[2]].into_iter().collect(),
+            ));
+        }
         fb.insert_inst_no_result(control_flow::Return::new_unit(is));
         fb.seal_all();
         fb.finish();
     }
 
-    let errors = match SpirvBackend::new()
+    mb.build()
+}
+
+fn ambiguous_resource_backend() -> SpirvBackend {
+    SpirvBackend::new()
         .with_compute()
         .with_workgroup_size(1, 1, 1)
         .with_external_resource(SpirvExternalResource {
@@ -1689,9 +1699,41 @@ fn spirv_external_resource_helper_fails_closed_on_ambiguous_capability() {
             stride: 4,
             length: 8,
         })
-        .compile_module(&mb.build())
+}
+
+#[test]
+fn spirv_external_resource_helper_resolves_contextual_capability() {
+    let artifact = ambiguous_resource_backend()
+        .compile_module(&ambiguous_resource_helper_module(false))
+        .expect("one call-graph resource identity should preserve the helper");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    let helper_start = wgsl
+        .find("fn ambiguous_resource_helper")
+        .expect("the contextual resource helper must remain outlined");
+    let helper_end = wgsl[helper_start..]
+        .find("fn ambiguous_resource_entry")
+        .map_or(wgsl.len(), |offset| helper_start + offset);
+    let helper = &wgsl[helper_start..helper_end];
+    assert!(
+        helper.contains("left_values") && !helper.contains("right_values"),
+        "the helper must bind the resource identity proved by its call graph:\n{helper}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with a contextual helper resource must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("a contextual helper resource must validate for browsers");
+}
+
+#[test]
+fn spirv_external_resource_helper_fails_closed_when_multiple_variants_are_required() {
+    let errors = match ambiguous_resource_backend()
+        .compile_module(&ambiguous_resource_helper_module(true))
     {
-        Ok(_) => panic!("an ambiguous helper resource capability must fail closed"),
+        Ok(_) => panic!("a helper reached by two resource identities must fail closed"),
         Err(errors) => errors,
     };
     let message = errors
@@ -1701,8 +1743,8 @@ fn spirv_external_resource_helper_fails_closed_on_ambiguous_capability() {
         .join("; ");
     assert!(
         message.contains("helper `ambiguous_resource_helper` argument 0")
-            && message.contains("resource-identity specialization is required"),
-        "the ambiguity must fail at the named helper-capability boundary: {message}",
+            && message.contains("multiple resource-identity variants are required"),
+        "the unresolved multi-variant boundary must fail closed by helper and argument: {message}",
     );
 }
 
