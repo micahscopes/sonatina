@@ -2150,6 +2150,7 @@ fn emit_single_inst(
                 return false;
             };
 
+            let mut first_projection = None;
             for &index in indices {
                 match pointee.resolve_compound(function.ctx()) {
                     Some(sonatina_ir::types::CompoundType::Struct(data)) if !data.packed => {
@@ -2170,6 +2171,7 @@ fn emit_single_inst(
                             naga::Expression::AccessIndex { base, index: field },
                             naga::Span::UNDEFINED,
                         );
+                        first_projection.get_or_insert(base);
                         pointee = field_ty;
                     }
                     Some(sonatina_ir::types::CompoundType::Array { elem, len }) => {
@@ -2187,6 +2189,7 @@ fn emit_single_inst(
                                 },
                                 naga::Span::UNDEFINED,
                             );
+                            first_projection.get_or_insert(base);
                         } else {
                             if word != WordKind::U32 {
                                 *mem_error = Some(
@@ -2213,6 +2216,7 @@ fn emit_single_inst(
                                 naga::Expression::Access { base, index },
                                 naga::Span::UNDEFINED,
                             );
+                            first_projection.get_or_insert(base);
                         }
                         pointee = elem;
                     }
@@ -2240,6 +2244,12 @@ fn emit_single_inst(
                     "spirv: Gep result pointee {result_pointee:?} does not match projected type {pointee:?}. Fail closed."
                 ));
                 return false;
+            }
+            if let Some(first) = first_projection {
+                target.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(first, base)),
+                    naga::Span::UNDEFINED,
+                );
             }
             value_map.insert(result, base);
             return true;
