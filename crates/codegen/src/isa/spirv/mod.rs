@@ -391,6 +391,167 @@ impl SpirvBackend {
     }
 }
 
+#[cfg(feature = "spirv-backend")]
+fn naga_equality_case(
+    expressions: &naga::Arena<naga::Expression>,
+    condition: naga::Handle<naga::Expression>,
+) -> Option<(naga::Handle<naga::Expression>, naga::SwitchValue)> {
+    let naga::Expression::Binary {
+        op: naga::BinaryOperator::Equal,
+        left,
+        right,
+    } = expressions[condition]
+    else {
+        return None;
+    };
+    let literal = |expression| match expressions[expression] {
+        naga::Expression::Literal(naga::Literal::I32(value)) => {
+            Some(naga::SwitchValue::I32(value))
+        }
+        naga::Expression::Literal(naga::Literal::U32(value)) => {
+            Some(naga::SwitchValue::U32(value))
+        }
+        _ => None,
+    };
+    if let Some(value) = literal(right) {
+        return Some((left, value));
+    }
+    literal(left).map(|value| (right, value))
+}
+
+#[cfg(feature = "spirv-backend")]
+fn naga_reject_is_next_equality<'a>(
+    reject: &'a naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+    selector: naga::Handle<naga::Expression>,
+) -> Option<(
+    naga::SwitchValue,
+    &'a naga::Block,
+    &'a naga::Block,
+)> {
+    let [naga::Statement::Emit(range), naga::Statement::If { condition, accept, reject }] = &reject[..] else {
+        return None;
+    };
+    if range.first_and_last() != Some((*condition, *condition)) {
+        return None;
+    }
+    let (next_selector, value) = naga_equality_case(expressions, *condition)?;
+    (next_selector == selector).then_some((value, accept, reject))
+}
+
+/// Turn a compiler-generated `x == 0`, `x == 1`, ... rejection ladder into
+/// one native switch. Only a pure, singly emitted equality may sit between
+/// rungs, so authored work in a rejection block is never reordered or lost.
+#[cfg(feature = "spirv-backend")]
+fn compact_naga_equality_ladder(
+    statement: naga::Statement,
+    expressions: &naga::Arena<naga::Expression>,
+) -> (naga::Statement, bool) {
+    let naga::Statement::If { condition, accept, reject } = statement else {
+        return (statement, false);
+    };
+    let Some((selector, first_value)) = naga_equality_case(expressions, condition) else {
+        return (naga::Statement::If { condition, accept, reject }, false);
+    };
+
+    let mut values = std::collections::HashSet::from([first_value]);
+    let mut case_count = 1usize;
+    let mut cursor = &reject;
+    while let Some((value, _, next_reject)) =
+        naga_reject_is_next_equality(cursor, expressions, selector)
+    {
+        if !values.insert(value) {
+            break;
+        }
+        case_count += 1;
+        cursor = next_reject;
+    }
+    if case_count < 3 {
+        return (naga::Statement::If { condition, accept, reject }, false);
+    }
+
+    let mut cases = Vec::with_capacity(case_count + 1);
+    cases.push(naga::SwitchCase {
+        value: first_value,
+        body: accept,
+        fall_through: false,
+    });
+    let mut cursor = reject;
+    for _ in 1..case_count {
+        let mut entries = cursor.span_into_iter();
+        let Some((naga::Statement::Emit(_), _)) = entries.next() else {
+            unreachable!("validated equality ladder must retain its condition emit")
+        };
+        let Some((naga::Statement::If { condition, accept, reject }, _)) = entries.next() else {
+            unreachable!("validated equality ladder must retain its conditional")
+        };
+        let (case_selector, case_value) = naga_equality_case(expressions, condition)
+            .expect("validated equality ladder must retain its equality case");
+        debug_assert_eq!(case_selector, selector);
+        cases.push(naga::SwitchCase {
+            value: case_value,
+            body: accept,
+            fall_through: false,
+        });
+        cursor = reject;
+    }
+    cases.push(naga::SwitchCase {
+        value: naga::SwitchValue::Default,
+        body: cursor,
+        fall_through: false,
+    });
+    (naga::Statement::Switch { selector, cases }, true)
+}
+
+#[cfg(feature = "spirv-backend")]
+fn compact_naga_control_in_block(
+    block: &mut naga::Block,
+    expressions: &naga::Arena<naga::Expression>,
+) -> usize {
+    let original = std::mem::take(block);
+    let mut compacted = 0usize;
+    for (statement, span) in original.span_into_iter() {
+        let (mut statement, folded) = compact_naga_equality_ladder(statement, expressions);
+        compacted += usize::from(folded);
+        match &mut statement {
+            naga::Statement::Block(nested) => {
+                compacted += compact_naga_control_in_block(nested, expressions);
+            }
+            naga::Statement::If { accept, reject, .. } => {
+                compacted += compact_naga_control_in_block(accept, expressions);
+                compacted += compact_naga_control_in_block(reject, expressions);
+            }
+            naga::Statement::Switch { cases, .. } => {
+                for case in cases {
+                    compacted += compact_naga_control_in_block(&mut case.body, expressions);
+                }
+            }
+            naga::Statement::Loop { body, continuing, .. } => {
+                compacted += compact_naga_control_in_block(body, expressions);
+                compacted += compact_naga_control_in_block(continuing, expressions);
+            }
+            _ => {}
+        }
+        block.push(statement, span);
+    }
+    compacted
+}
+
+#[cfg(feature = "spirv-backend")]
+fn compact_naga_control(module: &mut naga::Module) -> usize {
+    let mut compacted = 0usize;
+    for (_, function) in module.functions.iter_mut() {
+        compacted += compact_naga_control_in_block(&mut function.body, &function.expressions);
+    }
+    for entry in &mut module.entry_points {
+        compacted += compact_naga_control_in_block(
+            &mut entry.function.body,
+            &entry.function.expressions,
+        );
+    }
+    compacted
+}
+
 impl Backend for SpirvBackend {
     type Artifact = SpirvArtifact;
     type Error = SpirvError;
@@ -406,7 +567,7 @@ impl Backend for SpirvBackend {
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
         let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
         let started = std::time::Instant::now();
-        let (naga_mod, layout) = translate_to_naga(
+        let (mut naga_mod, layout) = translate_to_naga(
             module,
             self.workgroup_size,
             self.grid,
@@ -419,9 +580,11 @@ impl Backend for SpirvBackend {
             self.heap_words,
         )
         .map_err(|e| vec![SpirvError::Translation(e)])?;
+        let compacted_equality_ladders = compact_naga_control(&mut naga_mod);
         if trace {
             eprintln!(
-                "sonatina spirv: translated to naga, elapsed_ms={}",
+                "sonatina spirv: translated to naga, compacted_equality_ladders={}, elapsed_ms={}",
+                compacted_equality_ladders,
                 started.elapsed().as_millis()
             );
         }
