@@ -981,6 +981,8 @@ fn spirv_typed_local_rejects_excessive_private_storage() {
     assert!(
         message.contains("typed private storage")
             && message.contains("per-function budget")
+            && message.contains("across 1 allocations")
+            && message.contains("largest allocations:")
             && message.contains("Fail closed"),
         "unexpected rejection: {message}",
     );
