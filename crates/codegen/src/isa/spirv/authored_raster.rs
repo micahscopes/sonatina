@@ -169,13 +169,12 @@ pub(super) fn translate(
             .copied()
             .unwrap_or(true)
     };
-    let scalar_state = declared_scalar_state
-        .into_iter()
-        .filter(|(state_position, _)| {
-            is_live(vertex_live, context_count + *state_position)
-                || is_live(fragment_live, varying_count + *state_position)
-        })
-        .collect::<Vec<_>>();
+    // The scalar record is the complete actor-state transport, not merely a
+    // shader-local optimization detail. Browser controls and resident Fe
+    // transitions preserve that record across frames, including fields that
+    // a particular raster pair does not read. Keep its semantic shape stable;
+    // only external GPU resources are eligible for physical liveness pruning.
+    let scalar_state = declared_scalar_state;
     let state_stages = [
         (
             SpirvShaderStage::Vertex,
