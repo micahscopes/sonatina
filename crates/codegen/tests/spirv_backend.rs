@@ -447,6 +447,65 @@ fn spirv_typed_local_uses_implicit_zero_but_keeps_later_zero_mutation() {
 }
 
 #[test]
+fn spirv_acyclic_zero_phi_uses_its_explicit_initializer() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let entry_ref = mb.declare_function(Signature::new_single(
+        "acyclic_zero_phi",
+        Linkage::Public,
+        &[Type::I32],
+        Type::I32,
+    )).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+    let entry = fb.append_block();
+    let zero_arm = fb.append_block();
+    let seven_arm = fb.append_block();
+    let merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let input = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let is_zero = fb.insert_inst(cmp::Eq::new(is, input, zero), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, is_zero, zero_arm, seven_arm));
+    fb.switch_to_block(zero_arm);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+    fb.switch_to_block(seven_arm);
+    let seven = fb.make_imm_value(7i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+    fb.switch_to_block(merge);
+    let result = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(zero, zero_arm), (seven, seven_arm)]),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("an acyclic zero phi should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert_eq!(
+        wgsl.lines().filter(|line| line.contains(" = 0u;")).count(),
+        0,
+        "the phi initializer should replace its acyclic zero edge transfer:\n{wgsl}",
+    );
+    assert!(
+        wgsl.lines().any(|line| line.trim_start().starts_with("var local") && line.contains(" = u32();")),
+        "the acyclic phi must be explicitly zero-initialized for SPIR-V parity:\n{wgsl}",
+    );
+    assert!(
+        wgsl.lines().any(|line| line.contains(" = 7u;")),
+        "the nonzero phi edge transfer must remain:\n{wgsl}",
+    );
+}
+
+#[test]
 fn spirv_typed_local_zero_projection_bitcast_restores_structural_access() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
@@ -3878,6 +3937,13 @@ fn grid_parallel_loop_phi_swap_executes_on_lavapipe() {
     assert_eq!(
         phi_local_count, 3,
         "three logical phis should not allocate per-edge snapshot locals:\n{wgsl}",
+    );
+    assert!(
+        wgsl.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("local_") && line.ends_with(" = 0u;")
+        }),
+        "the cyclic zero phi transfer must remain explicit after initialization:\n{wgsl}",
     );
 
     let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
