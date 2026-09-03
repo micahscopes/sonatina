@@ -12,6 +12,7 @@ pub mod dead_func;
 mod dead_malloc;
 pub mod dead_ret;
 pub mod dominator_cse;
+pub mod forwarded_ret;
 pub mod gvn;
 pub mod inliner;
 pub mod known_bits_simplify;
