@@ -6480,13 +6480,15 @@ fn helper_naga_argument_abi(
         .args()
         .iter()
         .copied()
-        .map(|ty| {
+        .enumerate()
+        .map(|(logical_index, ty)| {
             match resource_capabilities.get(&ty) {
                 Some(NagaResourceCapability::Unique(global)) => {
                     Ok(NagaArgumentSource::ImplicitResource(*global))
                 }
                 Some(NagaResourceCapability::Ambiguous) => Err(format!(
-                    "spirv: helper ABI type {ty:?} names more than one external resource; helper specialization is required. Fail closed."
+                    "spirv: helper `{}` argument {logical_index} has ABI type {ty:?}, which names more than one external resource; resource-identity specialization is required. Fail closed.",
+                    signature.name(),
                 )),
                 None => {
                     helper_naga_type(
