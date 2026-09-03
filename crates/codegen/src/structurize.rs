@@ -928,6 +928,21 @@ impl Structurer<'_> {
                 if Some(nz) == enclosing_stop && self.returns(z) {
                     return Ok(Some(nz));
                 }
+                // A nested bounds guard can reach the enclosing merge through
+                // a short live corridor while its other arm traps. Do this
+                // check before testing whether the live arm can eventually
+                // reach the shared trap through that merge. Mere downstream
+                // reachability of the trap must not erase the closer merge.
+                if let Some(stop) = enclosing_stop
+                    && self.is_local_merge_candidate(stop, cur_loop)
+                {
+                    if self.returns(z) && self.all_nonterminal_paths_reach(nz, stop, cur_loop) {
+                        return Ok(Some(stop));
+                    }
+                    if self.returns(nz) && self.all_nonterminal_paths_reach(z, stop, cur_loop) {
+                        return Ok(Some(stop));
+                    }
+                }
                 // A terminal arm does not need to reach the continuation for
                 // that continuation to be the structured merge. Keep an
                 // enclosing loop header or exit as an explicit continue/break
@@ -1312,6 +1327,97 @@ mod tests {
             has_loop,
             "expected a loop region in {:?}",
             structured.regions
+        );
+    }
+
+    /// Bounds checks inside one loop body may share a trap while two live
+    /// paths join at a phi-bearing latch. The latch is the inner branch merge,
+    /// even though one of its successors is the enclosing loop header.
+    #[test]
+    fn guarded_loop_paths_merge_at_phi_latch() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit(
+            "guarded_loop_phi_latch",
+            Linkage::Public,
+            &[Type::I1, Type::I1, Type::I1, Type::I1, Type::I1],
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let first_guard = fb.append_block();
+        let second_guard = fb.append_block();
+        let choose_update = fb.append_block();
+        let update_guard = fb.append_block();
+        let update = fb.append_block();
+        let latch = fb.append_block();
+        let exit = fb.append_block();
+        let trap = fb.append_block();
+
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        let conditions = fb.args().to_vec();
+
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, conditions[0], first_guard, exit));
+        fb.switch_to_block(first_guard);
+        fb.insert_inst_no_result(Br::new(is, conditions[1], second_guard, trap));
+        fb.switch_to_block(second_guard);
+        fb.insert_inst_no_result(Br::new(is, conditions[2], choose_update, trap));
+        fb.switch_to_block(choose_update);
+        fb.insert_inst_no_result(Br::new(is, conditions[3], update_guard, latch));
+        fb.switch_to_block(update_guard);
+        fb.insert_inst_no_result(Br::new(is, conditions[4], update, trap));
+        fb.switch_to_block(update);
+        let updated = fb.insert_inst(arith::Add::new(is, one, one), Type::I32);
+        fb.insert_inst_no_result(Jump::new(is, latch));
+        fb.switch_to_block(latch);
+        let carried = fb.insert_inst(
+            Phi::new(is, vec![(zero, choose_update), (updated, update)]),
+            Type::I32,
+        );
+        let keep_going = fb.insert_inst(cmp::Lt::new(is, zero, carried), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, keep_going, trap, header));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(structured.block_order.contains(&latch));
+        fn owned_occurrences(regions: &[Region], target: BlockId) -> usize {
+            regions
+                .iter()
+                .map(|region| match region {
+                    Region::Block(block) => usize::from(*block == target),
+                    Region::IfThenElse {
+                        header,
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        usize::from(*header == target)
+                            + owned_occurrences(then_branch, target)
+                            + owned_occurrences(else_branch, target)
+                    }
+                    Region::Loop { header, body } => {
+                        usize::from(*header == target) + owned_occurrences(body, target)
+                    }
+                    Region::LoopExit { .. } | Region::LoopContinue { .. } => 0,
+                })
+                .sum()
+        }
+        assert_eq!(
+            owned_occurrences(&structured.regions, latch),
+            1,
+            "the phi-bearing latch must have one owner: {:?}",
+            structured.regions,
         );
     }
 
