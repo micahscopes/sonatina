@@ -3627,31 +3627,14 @@ fn emit_exact_phi_edge(
                 },
             )?
         };
-        // This snapshot local has no authored identity. Naga gives anonymous
-        // locals deterministic compact names in the serialized shader.
-        let temp = func.local_variables.append(
-            naga::LocalVariable {
-                name: None,
-                ty: func.local_variables[local].ty,
-                init: None,
-            },
-            naga::Span::UNDEFINED,
-        );
-        transfers.push((local, temp, value));
+        transfers.push((local, value));
     }
-    // Snapshot every RHS before changing any destination phi local.
-    for (_, temp, value) in &transfers {
-        let pointer = func.expressions.append(naga::Expression::LocalVariable(*temp), naga::Span::UNDEFINED);
-        target.push(naga::Statement::Store { pointer, value: *value }, naga::Span::UNDEFINED);
-    }
-    let mut snapshots = Vec::with_capacity(transfers.len());
-    for (local, temp, _) in transfers {
-        let pointer = func.expressions.append(naga::Expression::LocalVariable(temp), naga::Span::UNDEFINED);
-        let loaded = func.expressions.append(naga::Expression::Load { pointer }, naga::Span::UNDEFINED);
-        target.push(naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)), naga::Span::UNDEFINED);
-        snapshots.push((local, loaded));
-    }
-    for (local, value) in snapshots {
+    // Every non-literal source above is already an emitted Naga SSA
+    // expression in this edge's lexical scope. Store those values directly:
+    // they retain parallel phi semantics even when destinations form a cycle,
+    // while one temporary local per edge and phi merely re-materializes the
+    // same already-snapshotted values.
+    for (local, value) in transfers {
         let pointer = func.expressions.append(naga::Expression::LocalVariable(local), naga::Span::UNDEFINED);
         target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
     }

@@ -3795,6 +3795,14 @@ fn grid_parallel_loop_phi_swap_executes_on_lavapipe() {
     )
     .validate(&reparsed)
     .expect("parallel loop-phi swap WGSL should validate");
+    let phi_local_count = wgsl
+        .lines()
+        .filter(|line| line.trim_start().starts_with("var local"))
+        .count();
+    assert_eq!(
+        phi_local_count, 3,
+        "three logical phis should not allocate per-edge snapshot locals:\n{wgsl}",
+    );
 
     let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
     assert_eq!(output, vec![2211; 64], "three parallel swaps must end at (22, 11)");
