@@ -1483,10 +1483,10 @@ fn typed_local_projections_may_alias(left: &TypedLocalProjection, right: &TypedL
 }
 
 /// Prove that no path from the typed allocation to `before` can have changed
-/// `target`. The allocation must live in the function entry block and the
-/// target block must be acyclic. Those restrictions keep this first analysis
-/// exact for compiler-authored initialization while loops, dynamic aliases,
-/// and borrowed calls continue to fail closed.
+/// `target`. The allocation must dominate the store and both blocks must be
+/// acyclic. Those restrictions keep this first analysis exact for
+/// compiler-authored initialization while loops, dynamic aliases, and borrowed
+/// calls continue to fail closed.
 #[cfg(feature = "spirv-backend")]
 fn typed_local_projection_is_pristine_before(
     function: &sonatina_ir::Function,
@@ -1495,22 +1495,24 @@ fn typed_local_projection_is_pristine_before(
 ) -> bool {
     use sonatina_ir::InstDowncast;
 
-    let Some(entry) = function.layout.entry_block() else { return false };
-    if function.layout.inst_block(target.root) != entry {
-        return false;
-    }
+    let root_block = function.layout.inst_block(target.root);
     let target_block = function.layout.inst_block(before);
-    if block_is_in_cfg_cycle(function, target_block) {
+    if block_is_in_cfg_cycle(function, root_block) || block_is_in_cfg_cycle(function, target_block) {
         return false;
     }
 
     let mut cfg = sonatina_ir::ControlFlowGraph::default();
     cfg.compute(function);
+    let mut domtree = crate::domtree::DomTree::new();
+    domtree.compute(&cfg);
+    if !domtree.dominates(root_block, target_block) {
+        return false;
+    }
 
-    let mut reachable_from_entry = std::collections::HashSet::new();
-    let mut pending = vec![entry];
+    let mut reachable_from_root = std::collections::HashSet::new();
+    let mut pending = vec![root_block];
     while let Some(block) = pending.pop() {
-        if reachable_from_entry.insert(block) {
+        if reachable_from_root.insert(block) {
             pending.extend(cfg.succs_of(block).copied());
         }
     }
@@ -1523,14 +1525,14 @@ fn typed_local_projection_is_pristine_before(
         }
     }
 
-    if !reachable_from_entry.contains(&target_block) || !can_reach_target.contains(&entry) {
+    if !reachable_from_root.contains(&target_block) || !can_reach_target.contains(&root_block) {
         return false;
     }
 
-    for block in reachable_from_entry.intersection(&can_reach_target).copied() {
-        let mut root_seen = block != entry;
+    for block in reachable_from_root.intersection(&can_reach_target).copied() {
+        let mut root_seen = block != root_block;
         for instruction in function.layout.iter_inst(block) {
-            if block == entry && instruction == target.root {
+            if block == root_block && instruction == target.root {
                 root_seen = true;
                 continue;
             }
