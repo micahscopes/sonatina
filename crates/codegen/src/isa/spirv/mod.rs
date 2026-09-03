@@ -173,6 +173,7 @@ pub enum SpirvBuiltinSource {
     FragmentPositionX,
     FragmentPositionY,
     VertexIndex,
+    InstanceIndex,
 }
 
 /// A source-language scalar argument supplied by one physical shader builtin.
@@ -7462,7 +7463,8 @@ fn compute_builtin_slot(source: SpirvBuiltinSource) -> Option<(usize, Option<u32
         SpirvBuiltinSource::LocalInvocationIndex => (4, None),
         SpirvBuiltinSource::FragmentPositionX
         | SpirvBuiltinSource::FragmentPositionY
-        | SpirvBuiltinSource::VertexIndex => return None,
+        | SpirvBuiltinSource::VertexIndex
+        | SpirvBuiltinSource::InstanceIndex => return None,
     })
 }
 
@@ -7487,13 +7489,15 @@ fn translate_to_naga(
         if grid || render || compute {
             return Err("spirv raster: authored raster, grid, fullscreen render, and compute modes are mutually exclusive".to_string());
         }
-        if !builtin_arguments.is_empty() {
-            return Err("spirv raster: authored raster does not accept compute builtin arguments".to_string());
-        }
         if dispatch_grid != [1, 1, 1] {
             return Err("spirv raster: a fixed dispatch grid is invalid for authored raster".to_string());
         }
-        return authored_raster::translate(module, raster, external_resources);
+        return authored_raster::translate(
+            module,
+            raster,
+            external_resources,
+            builtin_arguments,
+        );
     }
 
     // Content-derived word scalar: the kernel's own Sonatina return type is the

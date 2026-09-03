@@ -4,9 +4,10 @@ use sonatina_ir::{InstDowncast, Module, Type};
 
 use super::{
     Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinInput,
-    SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
-    SpirvScalarKind, WordKind, append_external_resources, emit_naga_regions, resolve_naga_value,
-    spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
+    SpirvBuiltinArgument, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout,
+    SpirvRasterPipeline, SpirvScalarKind, WordKind, append_external_resources,
+    emit_naga_regions, resolve_naga_value, spirv_instruction_is_lowered,
+    unsupported_signed_op_under_u32,
 };
 
 /// Lower the narrow first authored-raster ABI. Keeping it separate from the
@@ -16,6 +17,7 @@ pub(super) fn translate(
     module: &Module,
     pipeline: &SpirvRasterPipeline,
     external_resources: &[SpirvExternalResource],
+    builtin_arguments: &[SpirvBuiltinArgument],
 ) -> Result<(naga::Module, SpirvLayout), String> {
     if pipeline.vertex_entry == pipeline.fragment_entry {
         return Err("spirv raster: vertex and fragment entries must be distinct".to_string());
@@ -37,8 +39,43 @@ pub(super) fn translate(
     let fragment_sig = module.ctx.get_sig(fragment_ref)
         .ok_or_else(|| "spirv raster: fragment entry has no signature".to_string())?;
 
-    if vertex_sig.args().first() != Some(&Type::I32) {
-        return Err("spirv raster: vertex arg 0 must be the u32/i32 vertex-index carrier".to_string());
+    let implicit_vertex_index = [SpirvBuiltinArgument {
+        arg_index: 0,
+        source: SpirvBuiltinSource::VertexIndex,
+    }];
+    let builtin_arguments = if builtin_arguments.is_empty() {
+        implicit_vertex_index.as_slice()
+    } else {
+        builtin_arguments
+    };
+    match builtin_arguments {
+        [SpirvBuiltinArgument {
+            arg_index: 0,
+            source: SpirvBuiltinSource::VertexIndex,
+        }] => {}
+        [SpirvBuiltinArgument {
+            arg_index: 0,
+            source: SpirvBuiltinSource::VertexIndex,
+        }, SpirvBuiltinArgument {
+            arg_index: 1,
+            source: SpirvBuiltinSource::InstanceIndex,
+        }] => {}
+        _ => {
+            return Err(
+                "spirv raster: builtin context must be vertex-index arg 0, optionally followed by instance-index arg 1"
+                    .to_string(),
+            );
+        }
+    }
+    let context_count = builtin_arguments.len();
+    if vertex_sig.args().len() < context_count
+        || vertex_sig.args()[..context_count]
+            .iter()
+            .any(|ty| *ty != Type::I32)
+    {
+        return Err(format!(
+            "spirv raster: vertex builtin context requires {context_count} u32/i32 carriers",
+        ));
     }
     if vertex_sig.ret_tys().len() < 5 || vertex_sig.ret_tys().iter().any(|ty| *ty != Type::F32) {
         return Err(format!(
@@ -61,7 +98,7 @@ pub(super) fn translate(
             pipeline.fragment_entry,
         ));
     }
-    let vertex_state = &vertex_sig.args()[1..];
+    let vertex_state = &vertex_sig.args()[context_count..];
     let fragment_state = &fragment_sig.args()[varying_count..];
     if vertex_state != fragment_state {
         return Err(format!(
@@ -80,11 +117,14 @@ pub(super) fn translate(
                 resource.name,
             ));
         }
-        let Some(state_position) = resource.arg_index.checked_sub(1).map(|index| index as usize)
+        let Some(state_position) = resource
+            .arg_index
+            .checked_sub(context_count as u32)
+            .map(|index| index as usize)
         else {
             return Err(format!(
-                "spirv raster: external resource {} cannot replace vertex-index arg 0",
-                resource.name,
+                "spirv raster: external resource {} cannot replace the vertex builtin prefix",
+                resource.name
             ));
         };
         if state_position >= vertex_state.len() {
@@ -213,7 +253,7 @@ pub(super) fn translate(
 
     let vertex = lower_vertex(
         module, vertex_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
-        u32_type, f32_type, bool_type, vec4f, output_type,
+        builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type,
     )?;
     let fragment = lower_fragment(
         module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
@@ -249,11 +289,14 @@ pub(super) fn translate(
         workgroup_size: [0, 0, 0],
         word: WordKind::U32,
         bindings,
-        builtin_inputs: vec![SpirvBuiltinInput {
-            arg_index: 0,
-            source: SpirvBuiltinSource::VertexIndex,
-            scalar: SpirvScalarKind::U32,
-        }],
+        builtin_inputs: builtin_arguments
+            .iter()
+            .map(|argument| SpirvBuiltinInput {
+                arg_index: argument.arg_index,
+                source: argument.source,
+                scalar: SpirvScalarKind::U32,
+            })
+            .collect(),
         result: None,
         trap: None,
         vertex_entry: Some(pipeline.vertex_entry.clone()),
@@ -431,19 +474,35 @@ fn lower_vertex(
     state_fields: &[(usize, Type)],
     external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
     varying_count: usize,
+    builtin_arguments: &[SpirvBuiltinArgument],
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     vec4f: naga::Handle<naga::Type>,
     output_type: naga::Handle<naga::Type>,
 ) -> Result<naga::Function, String> {
+    let arguments = builtin_arguments
+        .iter()
+        .map(|argument| {
+            let (name, builtin) = match argument.source {
+                SpirvBuiltinSource::VertexIndex => {
+                    ("vertex_index", naga::BuiltIn::VertexIndex)
+                }
+                SpirvBuiltinSource::InstanceIndex => {
+                    ("instance_index", naga::BuiltIn::InstanceIndex)
+                }
+                _ => unreachable!("authored-raster builtin context was validated above"),
+            };
+            naga::FunctionArgument {
+                name: Some(name.into()),
+                ty: u32_type,
+                binding: Some(naga::Binding::BuiltIn(builtin)),
+            }
+        })
+        .collect();
     let mut output = naga::Function {
         name: Some(pipeline.vertex_entry.clone()),
-        arguments: vec![naga::FunctionArgument {
-            name: Some("vertex_index".into()),
-            ty: u32_type,
-            binding: Some(naga::Binding::BuiltIn(naga::BuiltIn::VertexIndex)),
-        }],
+        arguments,
         result: Some(naga::FunctionResult { ty: output_type, binding: None }),
         local_variables: naga::Arena::new(),
         expressions: naga::Arena::new(),
@@ -454,10 +513,13 @@ fn lower_vertex(
     let error = module.func_store.try_view(func_ref, |function| -> Result<(), String> {
         let mut values = HashMap::new();
         let mut phis = HashMap::new();
-        let index = output.expressions.append(
-            naga::Expression::FunctionArgument(0), naga::Span::UNDEFINED,
-        );
-        values.insert(function.arg_values[0], index);
+        for (physical_index, argument) in builtin_arguments.iter().enumerate() {
+            let value = output.expressions.append(
+                naga::Expression::FunctionArgument(physical_index as u32),
+                naga::Span::UNDEFINED,
+            );
+            values.insert(function.arg_values[argument.arg_index as usize], value);
+        }
         for &(arg_index, global) in external_roots {
             let arg = function.arg_values[arg_index as usize];
             let root = output.expressions.append(
@@ -466,7 +528,14 @@ fn lower_vertex(
             );
             values.insert(arg, root);
         }
-        load_state(function, 1, state_fields, state_var, &mut output, &mut values);
+        load_state(
+            function,
+            builtin_arguments.len(),
+            state_fields,
+            state_var,
+            &mut output,
+            &mut values,
+        );
         let scfg = crate::structurize::structurize_function(function)?;
         let mut ignored = None;
         let naga_functions = super::NagaFunctionMap::new();
