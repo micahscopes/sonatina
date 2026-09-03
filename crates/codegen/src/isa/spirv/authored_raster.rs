@@ -5,11 +5,10 @@ use sonatina_ir::{InstDowncast, Module, Type};
 use crate::optim::dead_arg::analyze_live_arguments;
 
 use super::{
-    Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinInput,
-    SpirvBuiltinArgument, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout,
-    SpirvRasterPipeline, SpirvScalarKind, WordKind, append_external_resources,
-    emit_naga_regions, resolve_naga_value, spirv_instruction_is_lowered,
-    unsupported_signed_op_under_u32,
+    Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinArgument,
+    SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
+    SpirvScalarKind, SpirvShaderStage, WordKind, append_external_resources, emit_naga_regions,
+    resolve_naga_value, spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
 };
 
 /// Lower the narrow first authored-raster ABI. Keeping it separate from the
@@ -142,13 +141,16 @@ pub(super) fn translate(
         }
         resource_state_positions.push(state_position);
     }
-    let scalar_state = vertex_state
+    let declared_scalar_state = vertex_state
         .iter()
         .copied()
         .enumerate()
         .filter(|(index, _)| !resource_state_positions.contains(index))
         .collect::<Vec<_>>();
-    if scalar_state.iter().any(|(_, ty)| !matches!(ty, Type::I32 | Type::F32)) {
+    if declared_scalar_state
+        .iter()
+        .any(|(_, ty)| !matches!(ty, Type::I32 | Type::F32))
+    {
         return Err(
             "spirv raster: non-resource actor state admits only i32/u32 and f32 leaves"
             .to_string(),
@@ -160,31 +162,64 @@ pub(super) fn translate(
     // stage, mapped through the common actor-state suffix. Every declared
     // resource position remains excluded from scalar state above.
     let live_arguments = analyze_live_arguments(module);
-    let vertex_live = live_arguments.get(&vertex_ref);
-    let fragment_live = live_arguments.get(&fragment_ref);
+    let vertex_live = live_arguments.get(&vertex_ref).map(Vec::as_slice);
+    let fragment_live = live_arguments.get(&fragment_ref).map(Vec::as_slice);
+    let is_live = |mask: Option<&[bool]>, argument: usize| {
+        mask.and_then(|mask| mask.get(argument))
+            .copied()
+            .unwrap_or(true)
+    };
+    let scalar_state = declared_scalar_state
+        .into_iter()
+        .filter(|(state_position, _)| {
+            is_live(vertex_live, context_count + *state_position)
+                || is_live(fragment_live, varying_count + *state_position)
+        })
+        .collect::<Vec<_>>();
+    let state_stages = [
+        (
+            SpirvShaderStage::Vertex,
+            scalar_state
+                .iter()
+                .any(|(state_position, _)| is_live(vertex_live, context_count + *state_position)),
+        ),
+        (
+            SpirvShaderStage::Fragment,
+            scalar_state
+                .iter()
+                .any(|(state_position, _)| is_live(fragment_live, varying_count + *state_position)),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(stage, used)| used.then_some(stage))
+    .collect::<Vec<_>>();
     let emitted_external_resources = external_resources
         .iter()
         .zip(resource_state_positions.iter().copied())
-        .filter(|(resource, state_position)| {
-            let vertex_used = vertex_live
-                .and_then(|mask| mask.get(resource.arg_index as usize))
-                .copied()
-                .unwrap_or(true);
-            let fragment_arg = varying_count + *state_position;
-            let fragment_used = fragment_live
-                .and_then(|mask| mask.get(fragment_arg))
-                .copied()
-                .unwrap_or(true);
-            vertex_used || fragment_used
+        .filter_map(|(resource, state_position)| {
+            let vertex_used = is_live(vertex_live, resource.arg_index as usize);
+            let fragment_arg = varying_count + state_position;
+            let fragment_used = is_live(fragment_live, fragment_arg);
+            (vertex_used || fragment_used).then(|| {
+                let stages = [
+                    (SpirvShaderStage::Vertex, vertex_used),
+                    (SpirvShaderStage::Fragment, fragment_used),
+                ]
+                .into_iter()
+                .filter_map(|(stage, used)| used.then_some(stage))
+                .collect::<Vec<_>>();
+                (resource.clone(), stages)
+            })
         })
-        .map(|(resource, _)| resource.clone())
         .enumerate()
-        .map(|(binding, mut resource)| {
+        .map(|(binding, (mut resource, stages))| {
             resource.group = 0;
             resource.binding = binding as u32;
-            resource
+            (resource, stages)
         })
         .collect::<Vec<_>>();
+    let (emitted_external_resources, external_resource_stages): (Vec<_>, Vec<_>) =
+        emitted_external_resources.into_iter().unzip();
 
     // Calls have already been inlined by Fe. Object indexing/projection/load
     // resolves through the shared external globals. Allocation, private memory
@@ -269,6 +304,7 @@ pub(super) fn translate(
     let (external_roots, mut bindings) = append_external_resources(
         &mut naga_mod,
         &emitted_external_resources,
+        &external_resource_stages,
         WordKind::U32,
         u32_type,
         f32_type,
@@ -307,6 +343,7 @@ pub(super) fn translate(
             name: "state".to_string(),
             access: Access::Read,
             role: Role::Input,
+            stages: state_stages,
             stride: state_span,
             span: state_span,
             members: layout_members,

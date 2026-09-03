@@ -2,7 +2,7 @@ use sonatina_codegen::Backend;
 use sonatina_codegen::isa::spirv::{
     Access, LayoutMode, Role, SpirvBackend, SpirvBindingMember, SpirvBuiltinArgument,
     SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout,
-    SpirvResourceElement, SpirvResourceField, SpirvScalarKind, WordKind,
+    SpirvResourceElement, SpirvResourceField, SpirvScalarKind, SpirvShaderStage, WordKind,
 };
 use sonatina_ir::{
     Immediate, Linkage, Signature, Type,
@@ -45,6 +45,22 @@ fn assert_layout_metadata_invariants(layout: &SpirvLayout, arg_count: usize) {
         *slot = true;
     }
     for binding in &layout.bindings {
+        assert!(
+            !binding.stages.is_empty(),
+            "every physical binding has stage demand"
+        );
+        let mut stages = binding.stages.clone();
+        stages.sort_by_key(|stage| match stage {
+            SpirvShaderStage::Compute => 0,
+            SpirvShaderStage::Vertex => 1,
+            SpirvShaderStage::Fragment => 2,
+        });
+        stages.dedup();
+        assert_eq!(
+            stages.len(),
+            binding.stages.len(),
+            "binding stages are unique"
+        );
         assert!(binding.stride >= binding.span, "stride must cover span");
         if let Some(arg_index) = binding.resource_arg_index {
             let slot = seen.get_mut(arg_index as usize).expect("resource arg index in range");
@@ -4716,8 +4732,10 @@ fn explicit_compute_emits_only_transitively_live_external_resources() {
     let live = &artifact.layout.bindings[0];
     assert_eq!((live.name.as_str(), live.binding), ("live_values", 0));
     assert_eq!(live.resource_arg_index, Some(1));
+    assert_eq!(live.stages, vec![SpirvShaderStage::Compute]);
     let params = &artifact.layout.bindings[1];
     assert_eq!((params.role, params.binding), (Role::Input, 1));
+    assert_eq!(params.stages, vec![SpirvShaderStage::Compute]);
     assert_eq!(params.members.len(), 1);
     assert_eq!(params.members[0].arg_index, 2);
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
@@ -4845,14 +4863,36 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         .layout
         .bindings
         .iter()
-        .map(|binding| (binding.name.as_str(), binding.binding, binding.resource_arg_index))
+        .map(|binding| {
+            (
+                binding.name.as_str(),
+                binding.binding,
+                binding.resource_arg_index,
+                binding.stages.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         bindings,
         vec![
-            ("vertex_values", 0, Some(2)),
-            ("fragment_values", 1, Some(3)),
-            ("state", 2, None),
+            (
+                "vertex_values",
+                0,
+                Some(2),
+                vec![SpirvShaderStage::Vertex],
+            ),
+            (
+                "fragment_values",
+                1,
+                Some(3),
+                vec![SpirvShaderStage::Fragment],
+            ),
+            (
+                "state",
+                2,
+                None,
+                vec![SpirvShaderStage::Vertex, SpirvShaderStage::Fragment],
+            ),
         ],
     );
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
