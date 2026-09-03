@@ -908,6 +908,11 @@ impl Structurer<'_> {
                 })
             })
             .collect::<Vec<_>>();
+        if std::env::var_os("SONATINA_STRUCTURIZE_TRACE").is_some() {
+            eprintln!(
+                "[spirv structurize] merge header={header:?}, successors=({nz:?}, {z:?}), enclosing_stop={enclosing_stop:?}, immediate={immediate:?}"
+            );
+        }
         match immediate.as_slice() {
             [] => {
                 // A bounds-checked arm may either trap or continue at the
@@ -948,8 +953,8 @@ impl Structurer<'_> {
                     (true, false) if self.all_nonterminal_paths_reach(nz, z, cur_loop) => {
                         if self.returns(z)
                             && let Some(stop) = enclosing_stop
-                            && !self.returns(stop)
-                            && self.reaches_before_loop_header(nz, stop, cur_loop)
+                            && self.is_local_merge_candidate(stop, cur_loop)
+                            && self.all_nonterminal_paths_reach(nz, stop, cur_loop)
                         {
                             return Ok(Some(stop));
                         }
@@ -958,8 +963,8 @@ impl Structurer<'_> {
                     (false, true) if self.all_nonterminal_paths_reach(z, nz, cur_loop) => {
                         if self.returns(nz)
                             && let Some(stop) = enclosing_stop
-                            && !self.returns(stop)
-                            && self.reaches_before_loop_header(z, stop, cur_loop)
+                            && self.is_local_merge_candidate(stop, cur_loop)
+                            && self.all_nonterminal_paths_reach(z, stop, cur_loop)
                         {
                             return Ok(Some(stop));
                         }
@@ -1561,6 +1566,92 @@ mod tests {
             structured.stats().block_occurrences,
             structured.stats().referenced_blocks,
             "the direct phi-bearing merge must have one owner: {:?}",
+            structured.regions,
+        );
+    }
+
+    /// A lowered match arm may contain nested validation guards that share the
+    /// default trap. The trap is not an inner merge: every live path from the
+    /// guarded arm still belongs to the enclosing phi-bearing return merge.
+    #[test]
+    fn guarded_match_arm_retains_enclosing_phi_return_merge() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_single(
+            "guarded_match_with_trapping_default",
+            Linkage::Public,
+            &[Type::I32, Type::I1, Type::I1],
+            Type::I32,
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let first_arm = fb.append_block();
+        let fallback = fb.append_block();
+        let first_guard = fb.append_block();
+        let second_guard = fb.append_block();
+        let second_arm = fb.append_block();
+        let merge = fb.append_block();
+        let trap = fb.append_block();
+
+        let selector = fb.args()[0];
+        let first_ok = fb.args()[1];
+        let second_ok = fb.args()[2];
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+
+        fb.switch_to_block(entry);
+        let is_zero = fb.insert_inst(cmp::Eq::new(is, selector, zero), Type::I1);
+        fb.insert_inst_no_result(Br::new(is, is_zero, first_arm, fallback));
+        fb.switch_to_block(first_arm);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(fallback);
+        fb.insert_inst_no_result(Br::new(is, first_ok, first_guard, trap));
+        fb.switch_to_block(first_guard);
+        fb.insert_inst_no_result(Br::new(is, second_ok, second_guard, trap));
+        fb.switch_to_block(second_guard);
+        fb.insert_inst_no_result(Jump::new(is, second_arm));
+        fb.switch_to_block(second_arm);
+        fb.insert_inst_no_result(Jump::new(is, merge));
+        fb.switch_to_block(merge);
+        let result = fb.insert_inst(
+            Phi::new(is, vec![(zero, first_arm), (one, second_arm)]),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(Return::new_single(is, result));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+
+        fn block_occurrences(regions: &[Region], wanted: BlockId) -> usize {
+            regions
+                .iter()
+                .map(|region| match region {
+                    Region::Block(block) if *block == wanted => 1,
+                    Region::IfThenElse {
+                        then_branch,
+                        else_branch,
+                        ..
+                    } => {
+                        block_occurrences(then_branch, wanted)
+                            + block_occurrences(else_branch, wanted)
+                    }
+                    Region::Loop { body, .. } => block_occurrences(body, wanted),
+                    _ => 0,
+                })
+                .sum()
+        }
+
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(matches!(
+            structured.regions.last(),
+            Some(Region::Block(block)) if *block == merge
+        ));
+        assert_eq!(
+            block_occurrences(&structured.regions, merge),
+            1,
+            "the enclosing phi-bearing merge must have one owner: {:?}",
             structured.regions,
         );
     }
