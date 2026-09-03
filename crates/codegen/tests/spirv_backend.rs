@@ -533,6 +533,99 @@ fn spirv_typed_local_uses_implicit_zero_in_acyclic_child_block() {
 }
 
 #[test]
+fn spirv_dense_equality_ladder_emits_native_switch() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let entry_ref = mb.declare_function(Signature::new_single(
+        "dense_equality_ladder",
+        Linkage::Public,
+        &[Type::I32],
+        Type::I32,
+    )).unwrap();
+
+    let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+    let header0 = fb.append_block();
+    let case0 = fb.append_block();
+    let header1 = fb.append_block();
+    let case1 = fb.append_block();
+    let header2 = fb.append_block();
+    let case2 = fb.append_block();
+    let fallback = fb.append_block();
+    let merge = fb.append_block();
+    let selector = fb.args()[0];
+
+    fb.switch_to_block(header0);
+    let zero = fb.make_imm_value(0i32);
+    let is_zero = fb.insert_inst(cmp::Eq::new(is, selector, zero), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, is_zero, case0, header1));
+
+    fb.switch_to_block(case0);
+    let value0 = fb.make_imm_value(10i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(header1);
+    let one = fb.make_imm_value(1i32);
+    let is_one = fb.insert_inst(cmp::Eq::new(is, selector, one), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, is_one, case1, header2));
+
+    fb.switch_to_block(case1);
+    let value1 = fb.make_imm_value(20i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(header2);
+    let two = fb.make_imm_value(2i32);
+    let is_two = fb.insert_inst(cmp::Eq::new(is, selector, two), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, is_two, case2, fallback));
+
+    fb.switch_to_block(case2);
+    let value2 = fb.make_imm_value(30i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(fallback);
+    let fallback_value = fb.make_imm_value(40i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, merge));
+
+    fb.switch_to_block(merge);
+    let selected = fb.insert_inst(
+        control_flow::Phi::new(
+            is,
+            vec![
+                (value0, case0),
+                (value1, case1),
+                (value2, case2),
+                (fallback_value, fallback),
+            ],
+        ),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, selected));
+    fb.seal_all();
+    fb.finish();
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("dense equality ladder should lower as one switch");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.contains("switch ") && wgsl.contains("case 0u:") && wgsl.contains("case 2u:"),
+        "three dense equality arms should become native switch cases:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("native-switch WGSL must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("native-switch WGSL must validate for browser capabilities");
+}
+
+#[test]
 fn spirv_acyclic_zero_phi_uses_its_explicit_initializer() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
