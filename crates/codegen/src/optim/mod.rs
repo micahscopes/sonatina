@@ -11,6 +11,7 @@ pub mod dead_arg;
 pub mod dead_func;
 pub mod dead_ret;
 pub mod exact_func_merge;
+pub mod forwarded_ret;
 pub mod gvn;
 pub mod inliner;
 pub mod known_bits_simplify;
