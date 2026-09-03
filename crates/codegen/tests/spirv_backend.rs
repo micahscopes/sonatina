@@ -2789,6 +2789,195 @@ fn build_grid_loop_early_return_bypasses_sibling_module() -> sonatina_ir::Module
     mb.build()
 }
 
+/// A return-bearing loop nested in one arm of an outer conditional. The loop's
+/// early return must bypass the outer merge, while its normal exit must still
+/// supply the exact predecessor value to that merge.
+fn build_grid_conditional_with_returning_loop_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_conditional_with_returning_loop", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let loop_preheader = fb.append_block();
+    let outer_else = fb.append_block();
+    let loop_header = fb.append_block();
+    let loop_body = fb.append_block();
+    let early = fb.append_block();
+    let loop_latch = fb.append_block();
+    let loop_exit = fb.append_block();
+    let outer_merge = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let four = fb.make_imm_value(4i32);
+    let choose_loop = fb.insert_inst(cmp::Lt::new(is, px, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(
+        is,
+        choose_loop,
+        loop_preheader,
+        outer_else,
+    ));
+
+    fb.switch_to_block(loop_preheader);
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
+
+    fb.switch_to_block(outer_else);
+    let outside = fb.make_imm_value(22i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_merge));
+
+    fb.switch_to_block(loop_header);
+    let i = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(zero, loop_preheader)]),
+        Type::I32,
+    );
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, i, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(
+        is,
+        keep_going,
+        loop_body,
+        loop_exit,
+    ));
+
+    fb.switch_to_block(loop_body);
+    let return_early = fb.insert_inst(cmp::Lt::new(is, py, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(
+        is,
+        return_early,
+        early,
+        loop_latch,
+    ));
+
+    fb.switch_to_block(early);
+    let escaped = fb.make_imm_value(777i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
+
+    fb.switch_to_block(loop_latch);
+    let one = fb.make_imm_value(1i32);
+    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next_i, loop_latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
+
+    fb.switch_to_block(loop_exit);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_merge));
+
+    fb.switch_to_block(outer_merge);
+    let result = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(i, loop_exit), (outside, outer_else)]),
+        Type::I32,
+    );
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
+/// A return-bearing loop nested in another loop. Returning from the inner loop
+/// must cascade out of the outer loop, while normal inner-loop completion must
+/// resume the outer latch.
+fn build_grid_nested_returning_loop_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(
+        if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
+        Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_nested_returning_loop", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let outer_header = fb.append_block();
+    let inner_preheader = fb.append_block();
+    let inner_header = fb.append_block();
+    let inner_body = fb.append_block();
+    let early = fb.append_block();
+    let inner_latch = fb.append_block();
+    let inner_exit = fb.append_block();
+    let outer_latch = fb.append_block();
+    let outer_exit = fb.append_block();
+
+    fb.switch_to_block(entry);
+    let px = fb.args()[0];
+    let py = fb.args()[1];
+    let zero = fb.make_imm_value(0i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_header));
+
+    fb.switch_to_block(outer_header);
+    let outer_i = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(zero, entry)]),
+        Type::I32,
+    );
+    let two = fb.make_imm_value(2i32);
+    let outer_keep_going = fb.insert_inst(cmp::Lt::new(is, outer_i, two), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(
+        is,
+        outer_keep_going,
+        inner_preheader,
+        outer_exit,
+    ));
+
+    fb.switch_to_block(inner_preheader);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, inner_header));
+
+    fb.switch_to_block(inner_header);
+    let inner_i = fb.insert_inst(
+        control_flow::Phi::new(is, vec![(zero, inner_preheader)]),
+        Type::I32,
+    );
+    let inner_keep_going = fb.insert_inst(cmp::Lt::new(is, inner_i, two), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(
+        is,
+        inner_keep_going,
+        inner_body,
+        inner_exit,
+    ));
+
+    fb.switch_to_block(inner_body);
+    let return_early = fb.insert_inst(cmp::Lt::new(is, px, py), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(
+        is,
+        return_early,
+        early,
+        inner_latch,
+    ));
+
+    fb.switch_to_block(early);
+    let escaped = fb.make_imm_value(777i32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, escaped));
+
+    fb.switch_to_block(inner_latch);
+    let one = fb.make_imm_value(1i32);
+    let next_inner = fb.insert_inst(arith::Add::new(is, inner_i, one), Type::I32);
+    fb.append_phi_arg(inner_i, next_inner, inner_latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, inner_header));
+
+    fb.switch_to_block(inner_exit);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_latch));
+
+    fb.switch_to_block(outer_latch);
+    let next_outer = fb.insert_inst(arith::Add::new(is, outer_i, one), Type::I32);
+    fb.append_phi_arg(outer_i, next_outer, outer_latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer_header));
+
+    fb.switch_to_block(outer_exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, outer_i));
+    fb.seal_all();
+    fb.finish();
+    mb.build()
+}
+
 /// Three parallel loop-phi swaps: (a, b) starts at (11, 22), swaps on every
 /// backedge, and therefore exits as (22, 11). Sequential phi stores would
 /// overwrite one source before the other is read and produce the wrong result.
@@ -4086,6 +4275,45 @@ fn grid_loop_early_return_bypasses_post_loop_sibling_on_lavapipe() {
             assert_eq!(
                 output[(y * 8 + x) as usize],
                 if x < y { 777 } else { 4 },
+                "({x},{y})",
+            );
+        }
+    }
+}
+
+#[test]
+fn grid_conditional_with_returning_loop_executes_on_lavapipe() {
+    let module = build_grid_conditional_with_returning_loop_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("return-bearing loop nested in conditional should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let expected = if x >= 4 { 22 } else if y < 4 { 777 } else { 4 };
+            assert_eq!(output[(y * 8 + x) as usize], expected, "({x},{y})");
+        }
+    }
+}
+
+#[test]
+fn grid_nested_returning_loop_executes_on_lavapipe() {
+    let module = build_grid_nested_returning_loop_module();
+    let artifact = SpirvBackend::new()
+        .with_grid()
+        .with_workgroup_size(8, 8, 1)
+        .compile_module(&module)
+        .expect("return-bearing loop nested in loop should compile");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            assert_eq!(
+                output[(y * 8 + x) as usize],
+                if x < y { 777 } else { 2 },
                 "({x},{y})",
             );
         }
