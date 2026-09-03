@@ -461,7 +461,7 @@ fn spirv_typed_local_rejects_pointer_to_integer_escape() {
 }
 
 #[test]
-fn spirv_typed_local_rejects_cross_call_pointer_escape() {
+fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
         Vendor::Unknown,
@@ -472,6 +472,7 @@ fn spirv_typed_local_rejects_cross_call_pointer_escape() {
     let pair_ty =
         mb.declare_struct_type("BorrowedFixedLocalPair", &[Type::I32, Type::I32], false);
     let pair_ptr_ty = mb.ptr_type(pair_ty);
+    let word_ptr_ty = mb.ptr_type(Type::I32);
     let entry_ref = mb
         .declare_function(Signature::new_single(
             "typed_local_cross_call_entry",
@@ -493,8 +494,22 @@ fn spirv_typed_local_rejects_cross_call_pointer_escape() {
         let mut fb = mb.func_builder::<InstInserter>(helper_ref);
         let entry = fb.append_block();
         fb.switch_to_block(entry);
+        let pair = fb.args()[0];
         let zero = fb.make_imm_value(0i32);
-        fb.insert_inst_no_result(control_flow::Return::new_single(is, zero));
+        let first_index = fb.make_imm_value(0i32);
+        let second_index = fb.make_imm_value(1i32);
+        let first = fb.insert_inst(
+            data::Gep::new(is, [pair, zero, first_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        let second = fb.insert_inst(
+            data::Gep::new(is, [pair, zero, second_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        let first = fb.insert_inst(data::Mload::new(is, first, Type::I32), Type::I32);
+        let second = fb.insert_inst(data::Mload::new(is, second, Type::I32), Type::I32);
+        let sum = fb.insert_inst(arith::Add::new(is, first, second), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
         fb.seal_all();
         fb.finish();
     }
@@ -503,6 +518,21 @@ fn spirv_typed_local_rejects_cross_call_pointer_escape() {
         let entry = fb.append_block();
         fb.switch_to_block(entry);
         let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+        let zero = fb.make_imm_value(0i32);
+        let first_index = fb.make_imm_value(0i32);
+        let second_index = fb.make_imm_value(1i32);
+        let first = fb.insert_inst(
+            data::Gep::new(is, [slot, zero, first_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        let second = fb.insert_inst(
+            data::Gep::new(is, [slot, zero, second_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        let first_value = fb.make_imm_value(19i32);
+        let second_value = fb.make_imm_value(23i32);
+        fb.insert_inst_no_result(data::Mstore::new(is, first, first_value, Type::I32));
+        fb.insert_inst_no_result(data::Mstore::new(is, second, second_value, Type::I32));
         let result = fb.insert_inst(
             control_flow::Call::new(is, helper_ref, [slot].into_iter().collect()),
             Type::I32,
@@ -512,14 +542,30 @@ fn spirv_typed_local_rejects_cross_call_pointer_escape() {
         fb.finish();
     }
 
-    let message = spirv_rejection(
-        &mb.build(),
-        "a typed private pointer must not cross a call boundary",
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("a typed private local should cross a certified private helper borrow");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.matches("typed_local_cross_call_helper(").count() >= 2,
+        "the borrowed helper must remain one definition and one call:\n{wgsl}",
     );
     assert!(
-        message.contains("typed-local pointer") && message.contains("Fail closed"),
-        "unexpected rejection: {message}",
+        wgsl.contains("ptr<function"),
+        "the helper must receive a function-local pointer:\n{wgsl}",
     );
+    assert!(
+        !wgsl.contains("fe_heap"),
+        "the typed borrow must not restore the byte arena:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with a private typed borrow must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("WGSL with a private typed borrow must validate for browser capabilities");
 }
 
 #[test]

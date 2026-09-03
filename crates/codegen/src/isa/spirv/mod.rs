@@ -4740,6 +4740,13 @@ struct NagaTypedLocalType {
     size: u32,
 }
 
+#[cfg(feature = "spirv-backend")]
+#[derive(Default)]
+struct NagaTypedLocalUseClosure {
+    allocation_types: Vec<sonatina_ir::Type>,
+    borrowed_pointer_types: Vec<sonatina_ir::Type>,
+}
+
 // This is a conservative compiler policy, not a WebGPU hardware limit. It keeps
 // the first typed-local slice from silently moving a large arena into private
 // storage for every invocation. Device-tuned limits can replace it later.
@@ -5120,17 +5127,35 @@ fn helper_private_memory_abis(
 
 #[cfg(feature = "spirv-backend")]
 fn helper_naga_type(
+    ctx: &sonatina_ir::module::ModuleCtx,
     ty: sonatina_ir::Type,
     word: WordKind,
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
+    typed_local_types: &std::collections::HashMap<
+        sonatina_ir::Type,
+        NagaTypedLocalType,
+    >,
 ) -> Result<naga::Handle<naga::Type>, String> {
     match ty {
         sonatina_ir::Type::I1 => Ok(bool_type),
         sonatina_ir::Type::I32 if word == WordKind::U32 => Ok(word_type),
         sonatina_ir::Type::I64 if word == WordKind::I64 => Ok(word_type),
         sonatina_ir::Type::F32 if word == WordKind::U32 => Ok(f32_type),
+        other if other
+            .resolve_compound(ctx)
+            .is_some_and(|compound| matches!(compound, sonatina_ir::types::CompoundType::Ptr(_))) =>
+        {
+            typed_local_types
+                .get(&other)
+                .map(|mapped| mapped.handle)
+                .ok_or_else(|| {
+                    format!(
+                        "spirv: helper pointer ABI type {other:?} has no prevalidated typed-local representation. Fail closed."
+                    )
+                })
+        }
         other => Err(format!(
             "spirv: helper ABI type {other:?} is unsupported under the {word:?} word. Fail closed."
         )),
@@ -5141,15 +5166,40 @@ fn helper_naga_type(
 fn verify_naga_typed_local_use_closure(
     module: &Module,
     function_ref: sonatina_ir::module::FuncRef,
-) -> Result<Vec<sonatina_ir::Type>, String> {
+) -> Result<NagaTypedLocalUseClosure, String> {
     module
         .func_store
         .try_view(function_ref, |function| {
             use sonatina_ir::InstDowncast;
 
             let inst_set = function.inst_set();
-            let mut local_types = Vec::new();
+            let signature = module
+                .ctx
+                .get_sig(function_ref)
+                .ok_or_else(|| format!("spirv: reachable function {function_ref:?} has no signature. Fail closed."))?;
+            if signature.ret_tys().iter().copied().any(|ty| {
+                matches!(
+                    ty.resolve_compound(function.ctx()),
+                    Some(sonatina_ir::types::CompoundType::Ptr(_))
+                )
+            }) {
+                return Err(format!(
+                    "spirv: typed-local pointer escapes through the result of helper `{}`. Fail closed.",
+                    signature.name(),
+                ));
+            }
+            let mut closure = NagaTypedLocalUseClosure::default();
             let mut local_pointers = std::collections::HashSet::new();
+
+            for (&argument, &ty) in function.arg_values.iter().zip(signature.args()) {
+                if matches!(
+                    ty.resolve_compound(function.ctx()),
+                    Some(sonatina_ir::types::CompoundType::Ptr(_))
+                ) {
+                    local_pointers.insert(argument);
+                    closure.borrowed_pointer_types.push(ty);
+                }
+            }
 
             for block in function.layout.iter_block() {
                 for instruction in function.layout.iter_inst(block) {
@@ -5183,7 +5233,7 @@ fn verify_naga_typed_local_use_closure(
                             alloca.ty(),
                         ));
                     }
-                    local_types.push(*alloca.ty());
+                    closure.allocation_types.push(*alloca.ty());
                     local_pointers.insert(result);
                 }
             }
@@ -5339,6 +5389,54 @@ fn verify_naga_typed_local_use_closure(
                         continue;
                     }
 
+                    if let Some(call) =
+                        <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(
+                            inst_set,
+                            instruction_data,
+                        )
+                    {
+                        let callee = module.ctx.get_sig(*call.callee()).ok_or_else(|| {
+                            format!(
+                                "spirv: typed-local pointer reaches undeclared callee {:?}. Fail closed.",
+                                call.callee(),
+                            )
+                        })?;
+                        if call.args().len() != callee.args().len() {
+                            return Err(format!(
+                                "spirv: typed-local pointer call to `{}` has an inconsistent arity. Fail closed.",
+                                callee.name(),
+                            ));
+                        }
+                        for (&argument, &parameter_ty) in
+                            call.args().iter().zip(callee.args())
+                        {
+                            let argument_is_local = local_pointers.contains(&argument);
+                            let argument_ty = function.dfg.value_ty(argument);
+                            if argument_is_local {
+                                if argument_ty != parameter_ty
+                                    || !matches!(
+                                        parameter_ty.resolve_compound(function.ctx()),
+                                        Some(sonatina_ir::types::CompoundType::Ptr(_))
+                                    )
+                                {
+                                    return Err(format!(
+                                        "spirv: typed-local pointer {argument:?} crosses call `{}` through incompatible parameter type {parameter_ty:?}. Fail closed.",
+                                        callee.name(),
+                                    ));
+                                }
+                            } else if matches!(
+                                argument_ty.resolve_compound(function.ctx()),
+                                Some(sonatina_ir::types::CompoundType::Ptr(_))
+                            ) {
+                                return Err(format!(
+                                    "spirv: call `{}` receives pointer {argument:?} outside the verified typed-local closure. Fail closed.",
+                                    callee.name(),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+
                     if let Some(pointer) = instruction_data
                         .collect_values()
                         .into_iter()
@@ -5352,7 +5450,7 @@ fn verify_naga_typed_local_use_closure(
                 }
             }
 
-            Ok(local_types)
+            Ok(closure)
         })
         .ok_or_else(|| {
             format!(
@@ -5402,6 +5500,33 @@ fn intern_naga_typed_local_type(
                 .ctx
                 .with_ty_store(|store| store.resolve_compound(compound_ref).clone());
             match compound {
+                sonatina_ir::types::CompoundType::Ptr(pointee) => {
+                    let pointee = intern_naga_typed_local_type(
+                        module,
+                        pointee,
+                        word,
+                        word_type,
+                        f32_type,
+                        bool_type,
+                        types,
+                        cache,
+                    )?;
+                    let handle = types.insert(
+                        naga::Type {
+                            name: None,
+                            inner: naga::TypeInner::Pointer {
+                                base: pointee.handle,
+                                space: naga::AddressSpace::Function,
+                            },
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    NagaTypedLocalType {
+                        handle,
+                        alignment: 4,
+                        size: 4,
+                    }
+                }
                 sonatina_ir::types::CompoundType::Array { elem, len } => {
                     let elem = intern_naga_typed_local_type(
                         module, elem, word, word_type, f32_type, bool_type, types, cache,
@@ -5518,7 +5643,20 @@ fn collect_naga_typed_local_types(
     let mut cache = std::collections::HashMap::new();
     for &function_ref in call_order {
         let mut private_bytes = 0u32;
-        for ty in verify_naga_typed_local_use_closure(module, function_ref)? {
+        let closure = verify_naga_typed_local_use_closure(module, function_ref)?;
+        for ty in closure.borrowed_pointer_types {
+            intern_naga_typed_local_type(
+                module,
+                ty,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                types,
+                &mut cache,
+            )?;
+        }
+        for ty in closure.allocation_types {
             let local = intern_naga_typed_local_type(
                 module,
                 ty,
@@ -5546,12 +5684,14 @@ fn collect_naga_typed_local_types(
 
 #[cfg(feature = "spirv-backend")]
 fn helper_naga_argument_abi(
+    module: &Module,
     signature: &sonatina_ir::Signature,
     word: WordKind,
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     resource_capabilities: &NagaResourceCapabilities,
+    naga_functions: &NagaFunctionMap,
 ) -> Result<Vec<NagaArgumentSource>, String> {
     let mut physical_index = 0u32;
     signature
@@ -5567,7 +5707,15 @@ fn helper_naga_argument_abi(
                     "spirv: helper ABI type {ty:?} names more than one external resource; helper specialization is required. Fail closed."
                 )),
                 None => {
-                    helper_naga_type(ty, word, word_type, f32_type, bool_type)?;
+                    helper_naga_type(
+                        &module.ctx,
+                        ty,
+                        word,
+                        word_type,
+                        f32_type,
+                        bool_type,
+                        &naga_functions.typed_local_types,
+                    )?;
                     let source = NagaArgumentSource::Physical(physical_index);
                     physical_index += 1;
                     Ok(source)
@@ -5650,15 +5798,25 @@ fn helper_naga_result_abi(
         .filter(|ty| !resource_capabilities.contains_key(ty))
         .collect::<Vec<_>>();
     for &ty in &physical_types {
-        helper_naga_type(ty, word, word_type, f32_type, bool_type)?;
+        helper_naga_type(
+            &module.ctx,
+            ty,
+            word,
+            word_type,
+            f32_type,
+            bool_type,
+            &naga_functions.typed_local_types,
+        )?;
     }
     let physical_type = helper_naga_result_type(
+        module,
         signature.name(),
         &physical_types,
         word,
         word_type,
         f32_type,
         bool_type,
+        naga_functions,
         naga_types,
     )?;
 
@@ -5797,19 +5955,30 @@ fn align_helper_offset(offset: u32, alignment: u32) -> u32 {
 /// arena, or host boundary.
 #[cfg(feature = "spirv-backend")]
 fn helper_naga_result_type(
+    module: &Module,
     name: &str,
     return_types: &[sonatina_ir::Type],
     word: WordKind,
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
+    naga_functions: &NagaFunctionMap,
     types: &mut naga::UniqueArena<naga::Type>,
 ) -> Result<Option<naga::Handle<naga::Type>>, String> {
     if return_types.is_empty() {
         return Ok(None);
     }
     if let [ty] = return_types {
-        return helper_naga_type(*ty, word, word_type, f32_type, bool_type).map(Some);
+        return helper_naga_type(
+            &module.ctx,
+            *ty,
+            word,
+            word_type,
+            f32_type,
+            bool_type,
+            &naga_functions.typed_local_types,
+        )
+        .map(Some);
     }
 
     let mut members = Vec::with_capacity(return_types.len());
@@ -5830,7 +5999,15 @@ fn helper_naga_result_type(
         offset = align_helper_offset(offset, alignment);
         members.push(naga::StructMember {
             name: Some(format!("r{index}")),
-            ty: helper_naga_type(ty, word, word_type, f32_type, bool_type)?,
+            ty: helper_naga_type(
+                &module.ctx,
+                ty,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                &naga_functions.typed_local_types,
+            )?,
             binding: None,
             offset,
         });
@@ -5894,7 +6071,15 @@ fn lower_naga_helper(
         }
         arguments.push(naga::FunctionArgument {
             name: Some(format!("a{logical_index}")),
-            ty: helper_naga_type(ty, word, word_type, f32_type, bool_type)?,
+            ty: helper_naga_type(
+                &module.ctx,
+                ty,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                &naga_functions.typed_local_types,
+            )?,
             binding: None,
         });
     }
@@ -6929,12 +7114,14 @@ fn translate_to_naga(
             .get_sig(helper_ref)
             .ok_or_else(|| format!("spirv: helper {helper_ref:?} has no signature"))?;
         let argument_abi = helper_naga_argument_abi(
+            module,
             &helper_signature,
             word,
             word_type,
             f32_type,
             bool_type,
             &helper_resource_capabilities,
+            &naga_functions,
         )?;
         let result_abi = helper_naga_result_abi(
             module,
