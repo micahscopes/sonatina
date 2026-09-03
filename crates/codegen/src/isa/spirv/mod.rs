@@ -1399,6 +1399,146 @@ fn immediate_index_u32(
     }
 }
 
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedLocalProjection {
+    root: sonatina_ir::InstId,
+    indices: Vec<u32>,
+}
+
+/// Recover the constant structural path from one shader-local allocation to a
+/// typed pointer. Dynamic indices deliberately have no path because their
+/// aliasing is real and must keep explicit stores.
+#[cfg(feature = "spirv-backend")]
+fn typed_local_constant_projection(
+    function: &sonatina_ir::Function,
+    value: sonatina_ir::ValueId,
+) -> Option<TypedLocalProjection> {
+    use sonatina_ir::InstDowncast;
+
+    let instruction = function.dfg.value_inst(value)?;
+    let data = function.dfg.inst(instruction);
+    if <&sonatina_ir::inst::data::Alloca as InstDowncast>::downcast(function.inst_set(), data).is_some() {
+        return Some(TypedLocalProjection { root: instruction, indices: Vec::new() });
+    }
+    if let Some(gep) = <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(function.inst_set(), data) {
+        let (&base, indices) = gep.values().split_first()?;
+        let (&leading, indices) = indices.split_first()?;
+        if immediate_index_u32(function, leading) != Some(0) {
+            return None;
+        }
+        let mut projection = typed_local_constant_projection(function, base)?;
+        projection.indices.extend(indices.iter().map(|&index| immediate_index_u32(function, index)).collect::<Option<Vec<_>>>()?);
+        return Some(projection);
+    }
+    if let Some(bitcast) = <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(function.inst_set(), data) {
+        let mut projection = typed_local_constant_projection(function, *bitcast.from())?;
+        projection.indices.extend(typed_local_zero_projection_path(
+            function.ctx(), function.dfg.value_ty(*bitcast.from()), *bitcast.ty(),
+        )?);
+        return Some(projection);
+    }
+    None
+}
+
+#[cfg(feature = "spirv-backend")]
+fn typed_local_alloca_root(
+    function: &sonatina_ir::Function,
+    value: sonatina_ir::ValueId,
+) -> Option<sonatina_ir::InstId> {
+    use sonatina_ir::InstDowncast;
+
+    let instruction = function.dfg.value_inst(value)?;
+    let data = function.dfg.inst(instruction);
+    if <&sonatina_ir::inst::data::Alloca as InstDowncast>::downcast(function.inst_set(), data).is_some() {
+        return Some(instruction);
+    }
+    if let Some(gep) = <&sonatina_ir::inst::data::Gep as InstDowncast>::downcast(function.inst_set(), data) {
+        return typed_local_alloca_root(function, *gep.values().first()?);
+    }
+    if let Some(bitcast) = <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(function.inst_set(), data) {
+        return typed_local_alloca_root(function, *bitcast.from());
+    }
+    None
+}
+
+#[cfg(feature = "spirv-backend")]
+fn immediate_is_shader_zero(value: sonatina_ir::Immediate) -> bool {
+    matches!(
+        value,
+        sonatina_ir::Immediate::I1(false)
+            | sonatina_ir::Immediate::I8(0)
+            | sonatina_ir::Immediate::I16(0)
+            | sonatina_ir::Immediate::I32(0)
+            | sonatina_ir::Immediate::F32(0)
+            | sonatina_ir::Immediate::I64(0)
+            | sonatina_ir::Immediate::I128(0)
+    )
+}
+
+#[cfg(feature = "spirv-backend")]
+fn typed_local_projections_may_alias(left: &TypedLocalProjection, right: &TypedLocalProjection) -> bool {
+    left.root == right.root
+        && left.indices.iter().zip(&right.indices).all(|(left, right)| left == right)
+}
+
+/// Naga function locals are explicitly initialized with `ZeroValue`. An
+/// entry-block zero store to a constant, non-escaping typed projection is
+/// redundant while that projection still has its initial value. This scan is
+/// intentionally local and fail-closed. Dynamic projections, overlapping
+/// aggregate writes, and calls that borrow the allocation retain the store.
+#[cfg(feature = "spirv-backend")]
+fn typed_local_zero_store_is_redundant(
+    function: &sonatina_ir::Function,
+    store_instruction: sonatina_ir::InstId,
+    store: &sonatina_ir::inst::data::Mstore,
+) -> bool {
+    use sonatina_ir::InstDowncast;
+
+    let Some(value) = function.dfg.value_imm(*store.value()) else { return false };
+    if !immediate_is_shader_zero(value) {
+        return false;
+    }
+    let Some(target) = typed_local_constant_projection(function, *store.addr()) else { return false };
+    let Some(entry) = function.layout.entry_block() else { return false };
+    let mut root_seen = false;
+    let mut target_is_zero = false;
+    for instruction in function.layout.iter_inst(entry) {
+        if instruction == store_instruction {
+            return root_seen && target_is_zero;
+        }
+        if instruction == target.root {
+            root_seen = true;
+            target_is_zero = true;
+            continue;
+        }
+        if !root_seen {
+            continue;
+        }
+        let data = function.dfg.inst(instruction);
+        if let Some(previous) = <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(function.inst_set(), data)
+            && typed_local_alloca_root(function, *previous.addr()) == Some(target.root)
+        {
+            let Some(previous_projection) = typed_local_constant_projection(function, *previous.addr()) else {
+                target_is_zero = false;
+                continue;
+            };
+            if !typed_local_projections_may_alias(&previous_projection, &target) {
+                continue;
+            }
+            target_is_zero = previous_projection == target
+                && function.dfg.value_imm(*previous.value()).is_some_and(immediate_is_shader_zero);
+            continue;
+        }
+        if let Some(call) = <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(function.inst_set(), data)
+            && call.args().iter().any(|&argument| typed_local_alloca_root(function, argument) == Some(target.root))
+        {
+            target_is_zero = false;
+        }
+    }
+    false
+}
+
 /// SCCP represents an all-zero typed `Gep` as a pointer `Bitcast` when the
 /// source and projected pointer types differ. Naga has no pointer bitcast, but
 /// it does have the exact structural operation: one zero `AccessIndex` per
@@ -2670,6 +2810,9 @@ fn emit_single_inst(
             return false;
         };
         if function.dfg.value_ty(*store.addr()).is_pointer(function.ctx()) {
+            if typed_local_zero_store_is_redundant(function, inst_id, store) {
+                return true;
+            }
             target.push(
                 naga::Statement::Store {
                     pointer: addr,

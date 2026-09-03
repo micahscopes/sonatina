@@ -371,6 +371,82 @@ fn spirv_fixed_struct_local_survives_inside_scalar_helper() {
 }
 
 #[test]
+fn spirv_typed_local_uses_implicit_zero_but_keeps_later_zero_mutation() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty = mb.declare_struct_type(
+        "ZeroInitializedFixedLocalPair",
+        &[Type::I32, Type::I32],
+        false,
+    );
+    let pair_ptr_ty = mb.ptr_type(pair_ty);
+    let word_ptr_ty = mb.ptr_type(Type::I32);
+    let entry_ref = mb.declare_function(Signature::new_single(
+        "typed_local_implicit_zero",
+        Linkage::Public,
+        &[],
+        Type::I32,
+    )).unwrap();
+
+    let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+    let entry = fb.append_block();
+    fb.switch_to_block(entry);
+    let slot = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+    let zero_index = fb.make_imm_value(0i32);
+    let first_index = fb.make_imm_value(0i32);
+    let second_index = fb.make_imm_value(1i32);
+    let first = fb.insert_inst(
+        data::Gep::new(is, [slot, zero_index, first_index].into_iter().collect()),
+        word_ptr_ty,
+    );
+    let second = fb.insert_inst(
+        data::Gep::new(is, [slot, zero_index, second_index].into_iter().collect()),
+        word_ptr_ty,
+    );
+    let zero = fb.make_imm_value(0i32);
+    let seven = fb.make_imm_value(7i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, first, zero, Type::I32));
+    fb.insert_inst_no_result(data::Mstore::new(is, second, seven, Type::I32));
+    fb.insert_inst_no_result(data::Mstore::new(is, second, zero, Type::I32));
+    let loaded_first = fb.insert_inst(data::Mload::new(is, first, Type::I32), Type::I32);
+    let loaded_second = fb.insert_inst(data::Mload::new(is, second, Type::I32), Type::I32);
+    let sum = fb.insert_inst(arith::Add::new(is, loaded_first, loaded_second), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+    fb.seal_all();
+    fb.finish();
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("typed private initialization should preserve zero semantics");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    let explicit_zero_stores = wgsl.lines()
+        .filter(|line| line.contains(".f") && line.contains(" = 0u;"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        explicit_zero_stores.len(),
+        1,
+        "the pristine first field should use the local initializer while the second field's later zero mutation remains:\n{wgsl}",
+    );
+    assert!(
+        wgsl.lines().any(|line| line.contains(".f1_ = 7u;") || line.contains(".f1_ = 7i;")),
+        "the nonzero mutation must remain explicit:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("implicitly initialized typed-local WGSL must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("implicitly initialized typed-local WGSL must validate for browser capabilities");
+}
+
+#[test]
 fn spirv_typed_local_zero_projection_bitcast_restores_structural_access() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
