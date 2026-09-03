@@ -6775,6 +6775,7 @@ fn collect_naga_typed_local_types(
     let mut cache = std::collections::HashMap::new();
     for &function_ref in call_order {
         let mut private_bytes = 0u32;
+        let mut private_allocations = Vec::new();
         let closure = verify_naga_typed_local_use_closure(module, function_ref)?;
         for ty in closure.borrowed_pointer_types {
             intern_naga_typed_local_type(
@@ -6804,11 +6805,29 @@ fn collect_naga_typed_local_types(
                     "spirv: typed private storage size overflows u32 in {function_ref:?}. Fail closed."
                 )
             })?;
-            if private_bytes > MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION {
-                return Err(format!(
-                    "spirv: typed private storage in {function_ref:?} requires {private_bytes} bytes, over the conservative {MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION}-byte per-function budget. Fail closed."
-                ));
-            }
+            let name = types[local.handle]
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{ty:?}"));
+            private_allocations.push((name, local.size));
+        }
+        if private_bytes > MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION {
+            private_allocations.sort_by(|left, right| {
+                right
+                    .1
+                    .cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
+            let largest = private_allocations
+                .iter()
+                .take(8)
+                .map(|(name, size)| format!("{name}={size}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "spirv: typed private storage in {function_ref:?} requires {private_bytes} bytes across {} allocations, over the conservative {MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION}-byte per-function budget; largest allocations: {largest}. Fail closed.",
+                private_allocations.len(),
+            ));
         }
     }
     Ok(cache)
