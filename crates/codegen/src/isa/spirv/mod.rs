@@ -4371,25 +4371,83 @@ fn emit_non_loop_regions(
                 }
             }
             crate::structurize::Region::Loop { header, body } => {
-                // A loop nested inside this conditional arm: emit it into the arm's
-                // `target` block via the parameterized loop emitter, so the whole
-                // Naga Loop statement lands inside the `if`. dec's inlined operator
-                // loops carry no loop-internal Return (the kernel's single Return is
-                // at the end), so a returning nested loop is not needed yet and
-                // fails closed below.
                 let mut no_result = None;
                 let loop_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
                     func, value_map, phi_locals, &mut no_result, target, return_abi,
                     naga_functions, mem_ctx,
                 )?;
-                if loop_return.is_some() {
-                    return Err(format!(
-                        "spirv structurize: a loop nested inside a conditional with an \
-                         internal return is not supported yet (loop header {header:?})"
-                    ));
-                }
                 region_idx += 1;
+                if let Some(loop_return) = loop_return {
+                    let loop_exit = structured_loop_exit(function, inst_set, *header, body)?;
+                    let remaining = &regions[region_idx..];
+                    let mut continuation = naga::Block::new();
+                    let mut _continuation_returns = false;
+                    let mut continuation_edge_emitted = false;
+                    emit_non_loop_regions(
+                        function,
+                        inst_set,
+                        word,
+                        remaining,
+                        word_type,
+                        f32_type,
+                        bool_type,
+                        func,
+                        &mut continuation,
+                        value_map,
+                        phi_locals,
+                        transport,
+                        fallthrough_merge,
+                        &mut _continuation_returns,
+                        &mut continuation_edge_emitted,
+                        return_abi,
+                        naga_functions,
+                        mem_ctx,
+                    )?;
+                    if remaining.is_empty() && Some(loop_exit) == fallthrough_merge {
+                        // The loop emitter materialized the exact header-to-exit
+                        // phi edge in its normal exit arm.
+                        *edge_emitted = true;
+                    } else if !continuation_edge_emitted
+                        && let Some(merge) = fallthrough_merge
+                    {
+                        let normal_outcome = if remaining.is_empty() {
+                            ArmOutcome::Predecessor(loop_exit)
+                        } else {
+                            arm_outcome(function, inst_set, loop_exit, remaining)
+                        };
+                        if let ArmOutcome::Predecessor(from) = normal_outcome {
+                            emit_exact_phi_edge(
+                                function,
+                                inst_set,
+                                word,
+                                from,
+                                merge,
+                                func,
+                                &mut continuation,
+                                value_map,
+                                phi_locals,
+                            )?;
+                            *edge_emitted = true;
+                        }
+                    } else {
+                        *edge_emitted |= continuation_edge_emitted;
+                    }
+
+                    let returned = load_structured_return_flag(loop_return, func, target);
+                    let mut accept = naga::Block::new();
+                    forward_structured_return(loop_return, transport, func, &mut accept)?;
+                    target.push(
+                        naga::Statement::If {
+                            condition: returned,
+                            accept,
+                            reject: continuation,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    *may_return = true;
+                    return Ok(());
+                }
             }
             crate::structurize::Region::LoopExit { from, target } => return Err(format!(
                 "spirv: loop exit edge {from:?}->{target:?} appeared outside its loop"
@@ -4414,6 +4472,121 @@ struct StructuredReturnTransport {
     result: naga::Handle<naga::LocalVariable>,
     did_return: naga::Handle<naga::LocalVariable>,
     has_result: bool,
+}
+
+#[cfg(feature = "spirv-backend")]
+fn load_structured_return_flag(
+    source: StructuredReturnTransport,
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+) -> naga::Handle<naga::Expression> {
+    let pointer = func.expressions.append(
+        naga::Expression::LocalVariable(source.did_return),
+        naga::Span::UNDEFINED,
+    );
+    let returned = func.expressions.append(
+        naga::Expression::Load { pointer },
+        naga::Span::UNDEFINED,
+    );
+    target.push(
+        naga::Statement::Emit(naga::Range::new_from_bounds(returned, returned)),
+        naga::Span::UNDEFINED,
+    );
+    returned
+}
+
+#[cfg(feature = "spirv-backend")]
+fn forward_structured_return(
+    source: StructuredReturnTransport,
+    destination: StructuredReturnTransport,
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+) -> Result<(), String> {
+    if source.has_result != destination.has_result {
+        return Err(format!(
+            "spirv structurize: incompatible nested return transports, source has_result={}, destination has_result={}",
+            source.has_result, destination.has_result,
+        ));
+    }
+    if source.has_result {
+        let source_pointer = func.expressions.append(
+            naga::Expression::LocalVariable(source.result),
+            naga::Span::UNDEFINED,
+        );
+        let value = func.expressions.append(
+            naga::Expression::Load {
+                pointer: source_pointer,
+            },
+            naga::Span::UNDEFINED,
+        );
+        target.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(value, value)),
+            naga::Span::UNDEFINED,
+        );
+        let destination_pointer = func.expressions.append(
+            naga::Expression::LocalVariable(destination.result),
+            naga::Span::UNDEFINED,
+        );
+        target.push(
+            naga::Statement::Store {
+                pointer: destination_pointer,
+                value,
+            },
+            naga::Span::UNDEFINED,
+        );
+    }
+    let returned = func.expressions.append(
+        naga::Expression::Literal(naga::Literal::Bool(true)),
+        naga::Span::UNDEFINED,
+    );
+    let destination_pointer = func.expressions.append(
+        naga::Expression::LocalVariable(destination.did_return),
+        naga::Span::UNDEFINED,
+    );
+    target.push(
+        naga::Statement::Store {
+            pointer: destination_pointer,
+            value: returned,
+        },
+        naga::Span::UNDEFINED,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "spirv-backend")]
+fn structured_loop_exit(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    header: sonatina_ir::BlockId,
+    body_regions: &[crate::structurize::Region],
+) -> Result<sonatina_ir::BlockId, String> {
+    use sonatina_ir::InstDowncast;
+
+    let mut loop_blocks = std::collections::HashSet::new();
+    loop_blocks.insert(header);
+    region_blocks(body_regions, &mut loop_blocks);
+    let branch = function
+        .layout
+        .iter_inst(header)
+        .find_map(|iid| {
+            <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(
+                inst_set,
+                function.dfg.inst(iid),
+            )
+        })
+        .ok_or_else(|| format!("spirv: loop header {header:?} has no branch"))?;
+    let nz_in = loop_blocks.contains(branch.nz_dest());
+    let z_in = loop_blocks.contains(branch.z_dest());
+    if nz_in == z_in {
+        return Err(format!(
+            "spirv: loop {header:?} must have exactly one in-loop successor"
+        ));
+    }
+    Ok(if nz_in {
+        *branch.z_dest()
+    } else {
+        *branch.nz_dest()
+    })
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -4493,7 +4666,7 @@ fn emit_regions_in_loop(
 ) -> Result<RegionOutcome, String> {
     use sonatina_ir::InstDowncast;
     let mut outcome = None;
-    for region in regions {
+    for (region_index, region) in regions.iter().enumerate() {
         match region {
             crate::structurize::Region::Block(block) => {
                 emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
@@ -4627,36 +4800,67 @@ fn emit_regions_in_loop(
                 target.push(naga::Statement::If { condition, accept, reject }, naga::Span::UNDEFINED);
             }
             crate::structurize::Region::Loop { header, body } => {
-                // A loop nested inside this loop's body: emit it into `target` via
-                // the (already parameterized) loop emitter, so the inner Naga Loop
-                // lands inside the outer loop body. dec's inlined operator loops
-                // carry no loop-internal Return, so a returning inner loop is not
-                // needed yet and fails closed (the Break-cascade through the outer
-                // loop is a follow-on).
                 let mut nested_result = None;
                 let inner_return = emit_recursive_loop_region(
                     function, inst_set, word, *header, body, word_type, f32_type, bool_type,
                     func, value_map, phi_locals, &mut nested_result, target, return_abi,
                     naga_functions, mem_ctx,
                 )?;
-                if inner_return.is_some() {
-                    return Err(format!(
-                        "spirv structurize: a loop nested inside a loop with an internal \
-                         return is not supported yet (inner loop header {header:?})"
-                    ));
+                let inner_exit = structured_loop_exit(function, inst_set, *header, body)?;
+                if let Some(inner_return) = inner_return {
+                    let remaining = &regions[region_index + 1..];
+                    let mut continuation = naga::Block::new();
+                    let continuation_outcome = if remaining.is_empty() {
+                        RegionOutcome::Fallthrough(inner_exit)
+                    } else {
+                        emit_regions_in_loop(
+                            function,
+                            inst_set,
+                            word,
+                            remaining,
+                            loop_header,
+                            loop_exit,
+                            word_type,
+                            f32_type,
+                            bool_type,
+                            return_local,
+                            did_return_local,
+                            may_return,
+                            func,
+                            &mut continuation,
+                            value_map,
+                            phi_locals,
+                            result_expr,
+                            return_abi,
+                            naga_functions,
+                            mem_ctx,
+                        )?
+                    };
+                    let returned = load_structured_return_flag(inner_return, func, target);
+                    let mut accept = naga::Block::new();
+                    let outer_transport = StructuredReturnTransport {
+                        result: return_local,
+                        did_return: did_return_local,
+                        has_result: inner_return.has_result,
+                    };
+                    forward_structured_return(
+                        inner_return,
+                        outer_transport,
+                        func,
+                        &mut accept,
+                    )?;
+                    accept.push(naga::Statement::Break, naga::Span::UNDEFINED);
+                    target.push(
+                        naga::Statement::If {
+                            condition: returned,
+                            accept,
+                            reject: continuation,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    *may_return = true;
+                    return Ok(continuation_outcome);
                 }
-                // Control resumes at the inner loop's exit successor.
-                let mut inner_blocks = std::collections::HashSet::new();
-                inner_blocks.insert(*header);
-                region_blocks(body, &mut inner_blocks);
-                let inner_branch = function.layout.iter_inst(*header).find_map(|iid|
-                    <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(iid))
-                ).ok_or_else(|| format!("spirv: nested loop header {header:?} has no branch"))?;
-                let inner_exit = if inner_blocks.contains(inner_branch.nz_dest()) {
-                    *inner_branch.z_dest()
-                } else {
-                    *inner_branch.nz_dest()
-                };
                 outcome = Some(RegionOutcome::Fallthrough(inner_exit));
             }
             crate::structurize::Region::LoopExit { from, target: exit } => {
@@ -5047,6 +5251,14 @@ fn structurize_error_with_block_ir(
     func_ref: sonatina_ir::module::FuncRef,
     function: &sonatina_ir::Function,
 ) -> String {
+    let function_name = function
+        .ctx()
+        .get_sig(func_ref)
+        .map(|signature| signature.name().to_string())
+        .unwrap_or_else(|| format!("{func_ref:?}"));
+    let error = format!(
+        "spirv lowering failed in function `%{function_name}` ({func_ref:?}): {error}"
+    );
     let mut labels = Vec::new();
     for token in error.split(|character: char| !character.is_ascii_alphanumeric()) {
         let Some(number) = token.strip_prefix("block") else {
