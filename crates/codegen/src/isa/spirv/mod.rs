@@ -3376,10 +3376,10 @@ fn emit_single_inst(
         );
         return true;
     } else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as InstDowncast>::downcast(inst_set, inst_data) {
-        let Some(callee) = naga_functions.get(call.callee()) else {
+        let Some(callee) = naga_functions.call(&inst_id) else {
             *mem_error = Some(format!(
-                "spirv: reachable callee {:?} has no lowered Naga function. Fail closed.",
-                call.callee()
+                "spirv: call {inst_id:?} to reachable callee {:?} has no lowered Naga function variant. Fail closed.",
+                call.callee(),
             ));
             return false;
         };
@@ -5604,8 +5604,8 @@ const MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION: u32 = 16 * 1024;
 #[cfg(feature = "spirv-backend")]
 #[derive(Default)]
 struct NagaFunctionMap {
-    functions:
-        std::collections::HashMap<sonatina_ir::module::FuncRef, NagaFunctionInfo>,
+    call_sites:
+        std::collections::HashMap<sonatina_ir::InstId, NagaFunctionInfo>,
     typed_local_types:
         std::collections::HashMap<sonatina_ir::Type, NagaTypedLocalType>,
 }
@@ -5623,24 +5623,26 @@ impl NagaFunctionMap {
         >,
     ) -> Self {
         Self {
-            functions: std::collections::HashMap::new(),
+            call_sites: std::collections::HashMap::new(),
             typed_local_types,
         }
     }
 
-    fn get(
+    fn call(
         &self,
-        function: &sonatina_ir::module::FuncRef,
+        instruction: &sonatina_ir::InstId,
     ) -> Option<&NagaFunctionInfo> {
-        self.functions.get(function)
+        self.call_sites.get(instruction)
     }
 
-    fn insert(
+    fn replace_call_sites(
         &mut self,
-        function: sonatina_ir::module::FuncRef,
-        info: NagaFunctionInfo,
-    ) -> Option<NagaFunctionInfo> {
-        self.functions.insert(function, info)
+        call_sites: std::collections::HashMap<
+            sonatina_ir::InstId,
+            NagaFunctionInfo,
+        >,
+    ) {
+        self.call_sites = call_sites;
     }
 
     fn typed_local_type(
@@ -5662,10 +5664,59 @@ type NagaLogicalResultAbis = std::collections::HashMap<
 >;
 
 #[cfg(feature = "spirv-backend")]
-type NagaResourceArgumentBindings = std::collections::HashMap<
-    sonatina_ir::module::FuncRef,
-    Vec<Option<naga::Handle<naga::GlobalVariable>>>,
->;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct NagaFunctionVariant {
+    function: sonatina_ir::module::FuncRef,
+    ordinal: u32,
+}
+
+#[cfg(feature = "spirv-backend")]
+struct NagaResourceVariants {
+    entry: NagaFunctionVariant,
+    bindings: std::collections::HashMap<
+        sonatina_ir::module::FuncRef,
+        Vec<Vec<Option<naga::Handle<naga::GlobalVariable>>>>,
+    >,
+    calls: std::collections::HashMap<
+        (NagaFunctionVariant, sonatina_ir::InstId),
+        NagaFunctionVariant,
+    >,
+}
+
+#[cfg(feature = "spirv-backend")]
+impl NagaResourceVariants {
+    fn intern(
+        &mut self,
+        function: sonatina_ir::module::FuncRef,
+        bindings: Vec<Option<naga::Handle<naga::GlobalVariable>>>,
+    ) -> Result<NagaFunctionVariant, String> {
+        let variants = self.bindings.entry(function).or_default();
+        let ordinal = if let Some(index) = variants
+            .iter()
+            .position(|existing| *existing == bindings)
+        {
+            index
+        } else {
+            variants.push(bindings);
+            variants.len() - 1
+        };
+        Ok(NagaFunctionVariant {
+            function,
+            ordinal: u32::try_from(ordinal).map_err(|_| {
+                format!(
+                    "spirv: function {function:?} has more resource variants than fit in u32. Fail closed."
+                )
+            })?,
+        })
+    }
+
+    fn variants(
+        &self,
+        function: sonatina_ir::module::FuncRef,
+    ) -> &[Vec<Option<naga::Handle<naga::GlobalVariable>>>] {
+        self.bindings.get(&function).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
 
 #[cfg(feature = "spirv-backend")]
 fn resource_identity_graph(
@@ -5910,14 +5961,14 @@ fn helper_naga_logical_result_abis(
 }
 
 #[cfg(feature = "spirv-backend")]
-fn helper_resource_argument_bindings(
+fn helper_resource_variants(
     module: &Module,
     call_order: &[sonatina_ir::module::FuncRef],
     entry: sonatina_ir::module::FuncRef,
     external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
     resource_capabilities: &NagaResourceCapabilities,
     logical_result_abis: &NagaLogicalResultAbis,
-) -> Result<NagaResourceArgumentBindings, String> {
+) -> Result<NagaResourceVariants, String> {
     use sonatina_ir::{InstDowncast, inst::control_flow::Call};
 
     let entry_signature = module
@@ -5944,122 +5995,171 @@ fn helper_resource_argument_bindings(
         }
     }
 
-    let mut bindings = NagaResourceArgumentBindings::new();
-    bindings.insert(entry, entry_bindings);
+    let mut variants = NagaResourceVariants {
+        entry: NagaFunctionVariant {
+            function: entry,
+            ordinal: 0,
+        },
+        bindings: std::collections::HashMap::new(),
+        calls: std::collections::HashMap::new(),
+    };
+    variants.entry = variants.intern(entry, entry_bindings)?;
     for &function_ref in call_order.iter().rev() {
         let signature = module
             .ctx
             .get_sig(function_ref)
             .ok_or_else(|| format!("spirv: reachable function {function_ref:?} has no signature"))?;
-        let function_bindings = bindings
-            .entry(function_ref)
-            .or_insert_with(|| vec![None; signature.args().len()])
-            .clone();
-        if function_bindings.len() != signature.args().len() {
+        let function_variants = variants.variants(function_ref).to_vec();
+        if function_variants.is_empty() {
             return Err(format!(
-                "spirv: function `{}` has {} call-graph resource bindings for {} arguments. Fail closed.",
+                "spirv: reachable function `{}` has no entry-rooted resource variant. Fail closed.",
                 signature.name(),
-                function_bindings.len(),
-                signature.args().len(),
             ));
         }
-
-        module
-            .func_store
-            .try_view(function_ref, |function| -> Result<(), String> {
-                let graph = resource_identity_graph(
-                    function,
-                    resource_capabilities,
-                    logical_result_abis,
-                )?;
-                let mut seeds = Vec::new();
-                for (argument_index, ((&value, &ty), binding)) in function
-                    .arg_values
-                    .iter()
-                    .zip(signature.args())
-                    .zip(&function_bindings)
-                    .enumerate()
-                {
-                    if !resource_capabilities.contains(&ty) {
-                        continue;
-                    }
-                    let global = binding.ok_or_else(|| {
-                        format!(
-                            "spirv: resource argument {argument_index} of `{}` has no entry-rooted identity. Fail closed.",
-                            signature.name(),
-                        )
-                    })?;
-                    seeds.push((value, global));
-                }
-                let provenance = propagate_resource_identities(&graph, seeds)?;
-                let inst_set = function.inst_set();
-                for block in function.layout.iter_block() {
-                    for instruction in function.layout.iter_inst(block) {
-                        let Some(call) = <&Call as InstDowncast>::downcast(
-                            inst_set,
-                            function.dfg.inst(instruction),
-                        ) else {
+        for (variant_index, function_bindings) in function_variants.iter().enumerate() {
+            if function_bindings.len() != signature.args().len() {
+                return Err(format!(
+                    "spirv: function `{}` variant {variant_index} has {} call-graph resource bindings for {} arguments. Fail closed.",
+                    signature.name(),
+                    function_bindings.len(),
+                    signature.args().len(),
+                ));
+            }
+            let caller_variant = NagaFunctionVariant {
+                function: function_ref,
+                ordinal: u32::try_from(variant_index).map_err(|_| {
+                    format!(
+                        "spirv: function `{}` has more resource variants than fit in u32. Fail closed.",
+                        signature.name(),
+                    )
+                })?,
+            };
+            module
+                .func_store
+                .try_view(function_ref, |function| -> Result<(), String> {
+                    let graph = resource_identity_graph(
+                        function,
+                        resource_capabilities,
+                        logical_result_abis,
+                    )?;
+                    let mut seeds = Vec::new();
+                    for (argument_index, ((&value, &ty), binding)) in function
+                        .arg_values
+                        .iter()
+                        .zip(signature.args())
+                        .zip(function_bindings)
+                        .enumerate()
+                    {
+                        if !resource_capabilities.contains(&ty) {
                             continue;
-                        };
-                        let callee_signature = module.ctx.get_sig(*call.callee()).ok_or_else(|| {
+                        }
+                        let global = binding.ok_or_else(|| {
                             format!(
-                                "spirv: call from `{}` reaches {:?} without a signature. Fail closed.",
+                                "spirv: resource argument {argument_index} of `{}` has no entry-rooted identity. Fail closed.",
                                 signature.name(),
-                                call.callee(),
                             )
                         })?;
-                        let callee_bindings = bindings
-                            .entry(*call.callee())
-                            .or_insert_with(|| vec![None; callee_signature.args().len()]);
-                        if call.args().len() != callee_bindings.len() {
-                            return Err(format!(
-                                "spirv: call from `{}` to `{}` has {} arguments but {} resource-binding slots. Fail closed.",
-                                signature.name(),
-                                callee_signature.name(),
-                                call.args().len(),
-                                callee_bindings.len(),
-                            ));
-                        }
-                        for (argument_index, ((&argument, &ty), binding)) in call
-                            .args()
-                            .iter()
-                            .zip(callee_signature.args())
-                            .zip(callee_bindings.iter_mut())
-                            .enumerate()
-                        {
-                            if !resource_capabilities.contains(&ty) {
+                        seeds.push((value, global));
+                    }
+                    let provenance = propagate_resource_identities(&graph, seeds)?;
+                    let inst_set = function.inst_set();
+                    for block in function.layout.iter_block() {
+                        for instruction in function.layout.iter_inst(block) {
+                            let Some(call) = <&Call as InstDowncast>::downcast(
+                                inst_set,
+                                function.dfg.inst(instruction),
+                            ) else {
                                 continue;
-                            }
-                            let global = provenance.get(&argument).copied().ok_or_else(|| {
-                                format!(
-                                    "spirv: call from `{}` to `{}` passes resource argument {argument_index} without a proven entry-rooted identity. Fail closed.",
+                            };
+                            let callee_signature =
+                                module.ctx.get_sig(*call.callee()).ok_or_else(|| {
+                                    format!(
+                                        "spirv: call from `{}` reaches {:?} without a signature. Fail closed.",
+                                        signature.name(),
+                                        call.callee(),
+                                    )
+                                })?;
+                            let mut callee_bindings = vec![None; callee_signature.args().len()];
+                            if call.args().len() != callee_bindings.len() {
+                                return Err(format!(
+                                    "spirv: call from `{}` to `{}` has {} arguments but {} resource-binding slots. Fail closed.",
                                     signature.name(),
                                     callee_signature.name(),
-                                )
-                            })?;
-                            match *binding {
-                                None => *binding = Some(global),
-                                Some(previous) if previous == global => {}
-                                Some(previous) => {
-                                    return Err(format!(
-                                        "spirv: helper `{}` argument {argument_index} receives distinct resources {previous:?} and {global:?}; multiple resource-identity variants are required. Fail closed.",
-                                        callee_signature.name(),
-                                    ));
+                                    call.args().len(),
+                                    callee_bindings.len(),
+                                ));
+                            }
+                            for (argument_index, ((&argument, &ty), binding)) in call
+                                .args()
+                                .iter()
+                                .zip(callee_signature.args())
+                                .zip(callee_bindings.iter_mut())
+                                .enumerate()
+                            {
+                                if !resource_capabilities.contains(&ty) {
+                                    continue;
                                 }
+                                let global = provenance.get(&argument).copied().ok_or_else(|| {
+                                    format!(
+                                        "spirv: call from `{}` to `{}` passes resource argument {argument_index} without a proven entry-rooted identity. Fail closed.",
+                                        signature.name(),
+                                        callee_signature.name(),
+                                    )
+                                })?;
+                                *binding = Some(global);
+                            }
+                            let callee_variant =
+                                variants.intern(*call.callee(), callee_bindings)?;
+                            if let Some(previous) = variants
+                                .calls
+                                .insert((caller_variant, instruction), callee_variant)
+                                && previous != callee_variant
+                            {
+                                return Err(format!(
+                                    "spirv: call {instruction:?} from `{}` derives conflicting resource variants {previous:?} and {callee_variant:?}. Fail closed.",
+                                    signature.name(),
+                                ));
                             }
                         }
                     }
-                }
-                Ok(())
-            })
-            .ok_or_else(|| {
-                format!(
-                    "spirv: reachable function `{}` has no body while deriving call-graph resource identities. Fail closed.",
-                    signature.name(),
-                )
-            })??;
+                    Ok(())
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "spirv: reachable function `{}` has no body while deriving call-graph resource identities. Fail closed.",
+                        signature.name(),
+                    )
+                })??;
+        }
     }
-    Ok(bindings)
+    Ok(variants)
+}
+
+#[cfg(feature = "spirv-backend")]
+fn helper_variant_call_sites(
+    caller: NagaFunctionVariant,
+    resource_variants: &NagaResourceVariants,
+    lowered_variants: &std::collections::HashMap<
+        NagaFunctionVariant,
+        NagaFunctionInfo,
+    >,
+) -> Result<
+    std::collections::HashMap<sonatina_ir::InstId, NagaFunctionInfo>,
+    String,
+> {
+    let mut call_sites = std::collections::HashMap::new();
+    for (&(candidate, instruction), &callee) in &resource_variants.calls {
+        if candidate != caller {
+            continue;
+        }
+        let info = lowered_variants.get(&callee).cloned().ok_or_else(|| {
+            format!(
+                "spirv: call {instruction:?} from function variant {caller:?} reaches Naga function variant {callee:?} before it is lowered. Fail closed."
+            )
+        })?;
+        call_sites.insert(instruction, info);
+    }
+    Ok(call_sites)
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -8092,7 +8192,7 @@ fn translate_to_naga(
         first_func,
         &helper_resource_capabilities,
     )?;
-    let helper_resource_argument_bindings = helper_resource_argument_bindings(
+    let helper_resource_variants = helper_resource_variants(
         module,
         &call_order,
         first_func,
@@ -8174,6 +8274,10 @@ fn translate_to_naga(
 
     let mut naga_functions =
         NagaFunctionMap::with_typed_local_types(typed_local_types);
+    let mut lowered_variants = std::collections::HashMap::<
+        NagaFunctionVariant,
+        NagaFunctionInfo,
+    >::new();
     for helper_ref in call_order
         .iter()
         .copied()
@@ -8188,25 +8292,6 @@ fn translate_to_naga(
             .ctx
             .get_sig(helper_ref)
             .ok_or_else(|| format!("spirv: helper {helper_ref:?} has no signature"))?;
-        let resource_bindings = helper_resource_argument_bindings
-            .get(&helper_ref)
-            .ok_or_else(|| {
-                format!(
-                    "spirv: helper `{}` has no call-graph resource bindings. Fail closed.",
-                    helper_signature.name(),
-                )
-            })?;
-        let argument_abi = helper_naga_argument_abi(
-            module,
-            &helper_signature,
-            word,
-            word_type,
-            f32_type,
-            bool_type,
-            &helper_resource_capabilities,
-            resource_bindings,
-            &naga_functions,
-        )?;
         let result_abi = helper_naga_result_abi(
             module,
             helper_ref,
@@ -8219,46 +8304,95 @@ fn translate_to_naga(
             &naga_functions,
             &mut naga_mod.types,
         )?;
-        let helper = lower_naga_helper(
-            module,
-            helper_ref,
-            word,
-            word_type,
-            f32_type,
-            bool_type,
-            &argument_abi,
-            &result_abi,
-            helper_memory_abi,
-            helper_memory_types,
-            private_heap_words,
-            &helper_resource_capabilities,
-            &helper_logical_result_abis,
-            &naga_functions,
-        )
-        .map_err(|error| {
-            format!(
-                "spirv: helper `{}` lowering failed: {error}",
+        let resource_variants = helper_resource_variants.variants(helper_ref);
+        if resource_variants.is_empty() {
+            return Err(format!(
+                "spirv: helper `{}` has no entry-rooted resource variant. Fail closed.",
                 helper_signature.name(),
+            ));
+        }
+        for (variant_index, resource_bindings) in resource_variants.iter().enumerate() {
+            let helper_variant = NagaFunctionVariant {
+                function: helper_ref,
+                ordinal: u32::try_from(variant_index).map_err(|_| {
+                    format!(
+                        "spirv: helper `{}` has more resource variants than fit in u32. Fail closed.",
+                        helper_signature.name(),
+                    )
+                })?,
+            };
+            naga_functions.replace_call_sites(helper_variant_call_sites(
+                helper_variant,
+                &helper_resource_variants,
+                &lowered_variants,
+            )?);
+            let argument_abi = helper_naga_argument_abi(
+                module,
+                &helper_signature,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                &helper_resource_capabilities,
+                resource_bindings,
+                &naga_functions,
+            )?;
+            let mut helper = lower_naga_helper(
+                module,
+                helper_ref,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                &argument_abi,
+                &result_abi,
+                helper_memory_abi,
+                helper_memory_types,
+                private_heap_words,
+                &helper_resource_capabilities,
+                &helper_logical_result_abis,
+                &naga_functions,
             )
-        })?;
-        let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
-        if trace {
-            eprintln!(
-                "sonatina spirv: lowered helper, naga_handle={}, sonatina_ref={helper_ref:?}, name={}",
-                handle.index(),
-                helper_signature.name(),
+            .map_err(|error| {
+                format!(
+                    "spirv: helper `{}` resource variant {variant_index} lowering failed: {error}",
+                    helper_signature.name(),
+                )
+            })?;
+            if resource_variants.len() > 1 {
+                helper.name = Some(format!(
+                    "{}_resource_variant_{variant_index}",
+                    helper_signature.name(),
+                ));
+            }
+            let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
+            if trace {
+                let resources = resource_bindings
+                    .iter()
+                    .filter_map(|binding| binding.map(naga::Handle::index))
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "sonatina spirv: lowered helper, naga_handle={}, sonatina_ref={helper_ref:?}, name={}, resource_variant={variant_index}, resources={resources:?}",
+                    handle.index(),
+                    helper_signature.name(),
+                );
+            }
+            lowered_variants.insert(
+                helper_variant,
+                NagaFunctionInfo {
+                    handle,
+                    argument_abi,
+                    result_abi: result_abi.clone(),
+                    memory_abi: helper_memory_abi,
+                },
             );
         }
-        naga_functions.insert(
-            helper_ref,
-            NagaFunctionInfo {
-                handle,
-                argument_abi,
-                result_abi,
-                memory_abi: helper_memory_abi,
-            },
-        );
     }
+    naga_functions.replace_call_sites(helper_variant_call_sites(
+        helper_resource_variants.entry,
+        &helper_resource_variants,
+        &lowered_variants,
+    )?);
 
     // Grid mode fail-closed checks. Grid is a driver-declared envelope fact: the
     // translator never guesses it, and when asked for it, every precondition is
