@@ -1700,7 +1700,8 @@ fn spirv_external_resource_helper_fails_closed_on_ambiguous_capability() {
         .collect::<Vec<_>>()
         .join("; ");
     assert!(
-        message.contains("helper specialization is required"),
+        message.contains("helper `ambiguous_resource_helper` argument 0")
+            && message.contains("resource-identity specialization is required"),
         "the ambiguity must fail at the named helper-capability boundary: {message}",
     );
 }
