@@ -4566,9 +4566,9 @@ fn grid_parallel_loop_phi_swap_executes_on_lavapipe() {
     assert!(
         wgsl.lines().any(|line| {
             let line = line.trim_start();
-            line.starts_with("local_") && line.ends_with(" = 0u;")
+            line.starts_with("local") && line.ends_with(" = 0u;")
         }),
-        "the cyclic zero phi transfer must remain explicit after initialization:\n{wgsl}",
+        "the zero-valued entry phi transfer must remain explicit after declaration:\n{wgsl}",
     );
 
     let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
