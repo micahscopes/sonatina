@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 
-use sonatina_ir::{InstDowncast, Module, Type};
+use sonatina_ir::{Function, InstDowncast, Module, Type, Value};
 
 use crate::optim::dead_arg::analyze_live_arguments;
 
 use super::{
     Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinArgument,
     SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
-    SpirvScalarKind, SpirvShaderStage, WordKind, NagaResultAbi, NagaResultSource,
-    append_external_resources, emit_naga_regions, resolve_naga_value,
-    spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
+    SpirvScalarKind, SpirvShaderStage, WordKind, append_external_resources, emit_naga_regions,
+    resolve_naga_value, spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
 };
 
 // Physical shader entry names are compiler-owned ABI, not user-authored
@@ -328,25 +327,9 @@ pub(super) fn translate(
         emitted_external_resources.len() as u32,
     );
     let output_type = append_vertex_output_type(&mut naga_mod, f32_type, vec4f, varying_count);
-    let vertex_needs_return_transport = module
-        .func_store
-        .try_view(vertex_ref, |function| {
-            unique_source_return_arguments(function).map(|arguments| arguments.is_none())
-        })
-        .ok_or_else(|| "spirv raster: vertex body is unavailable".to_string())??;
-    let vertex_return_type = vertex_needs_return_transport.then(|| {
-        append_flat_result_type(
-            &mut naga_mod,
-            "RasterVertexLeaves",
-            f32_type,
-            4 + varying_count,
-        )
-    });
-
     let vertex = lower_vertex(
         module, vertex_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
         builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type,
-        vertex_return_type,
     )?;
     let fragment = lower_fragment(
         module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
@@ -504,46 +487,6 @@ fn append_vertex_output_type(
     )
 }
 
-fn append_flat_result_type(
-    module: &mut naga::Module,
-    name: &str,
-    member_type: naga::Handle<naga::Type>,
-    arity: usize,
-) -> naga::Handle<naga::Type> {
-    debug_assert!(arity > 1, "a scalar result needs no aggregate transport type");
-    let members = (0..arity)
-        .map(|index| naga::StructMember {
-            name: Some(format!("r{index}")),
-            ty: member_type,
-            binding: None,
-            offset: index as u32 * 4,
-        })
-        .collect();
-    module.types.insert(
-        naga::Type {
-            name: Some(name.into()),
-            inner: naga::TypeInner::Struct {
-                members,
-                span: arity as u32 * 4,
-            },
-        },
-        naga::Span::UNDEFINED,
-    )
-}
-
-fn direct_result_abi(
-    physical_type: naga::Handle<naga::Type>,
-    arity: usize,
-) -> NagaResultAbi {
-    NagaResultAbi {
-        logical: (0..arity)
-            .map(|index| NagaResultSource::Physical(index as u32))
-            .collect(),
-        physical_type: Some(physical_type),
-        physical_arity: arity,
-    }
-}
-
 fn load_state(
     function: &sonatina_ir::Function,
     first_arg: usize,
@@ -573,11 +516,7 @@ fn load_state(
     }
 }
 
-/// Return the logical leaves of a stage only when the source CFG has one
-/// unique return terminator. In that common case the structured body can be
-/// emitted without allocating aggregate return transport at every enclosing
-/// region; the final SSA leaves are already available after structurization.
-/// Multiple source returns deliberately select the general transport path.
+/// Return the logical leaves of a stage when its CFG has one return terminator.
 fn unique_source_return_arguments(
     function: &sonatina_ir::Function,
 ) -> Result<Option<Vec<sonatina_ir::ValueId>>, String> {
@@ -599,6 +538,94 @@ fn unique_source_return_arguments(
     }
     args.map(Some)
         .ok_or_else(|| "spirv raster: stage has no return terminator".to_string())
+}
+
+/// Give authored raster stages one ordinary SSA exit before structurization.
+///
+/// The generic structured-control-flow emitter supports returns nested inside
+/// arbitrary regions by threading mutable return state through every enclosing
+/// construct. That is useful for general helpers, but a large inlined shader
+/// with many source-level early returns can otherwise duplicate substantial
+/// continuations while the structured tree is formed. Raster stages have a
+/// fixed result signature, so a compiler-private clone can express the same
+/// semantics more directly: every old return jumps to one exit block and one
+/// phi per result selects its value. Source IR is never mutated.
+fn normalize_stage_to_single_exit(function: &Function) -> Result<Option<Function>, String> {
+    use sonatina_ir::inst::control_flow::{Phi, Return};
+
+    let mut returns = Vec::new();
+    for block in function.layout.iter_block() {
+        for inst in function.layout.iter_inst(block) {
+            if let Some(ret) = <&Return as InstDowncast>::downcast(
+                function.inst_set(),
+                function.dfg.inst(inst),
+            ) {
+                returns.push((block, inst, ret.args().as_slice().to_vec()));
+            }
+        }
+    }
+    match returns.len() {
+        0 => return Err("spirv raster: stage has no return terminator".to_string()),
+        1 => return Ok(None),
+        _ => {}
+    }
+
+    let result_types = returns[0]
+        .2
+        .iter()
+        .map(|value| function.dfg.value_ty(*value))
+        .collect::<Vec<_>>();
+    for (_, _, arguments) in &returns[1..] {
+        if arguments.len() != result_types.len() {
+            return Err(format!(
+                "spirv raster: stage return arity differs: expected {}, got {}",
+                result_types.len(),
+                arguments.len(),
+            ));
+        }
+        for (index, (&argument, &expected)) in
+            arguments.iter().zip(&result_types).enumerate()
+        {
+            let actual = function.dfg.value_ty(argument);
+            if actual != expected {
+                return Err(format!(
+                    "spirv raster: stage return type differs at leaf {index}: expected {expected:?}, got {actual:?}",
+                ));
+            }
+        }
+    }
+
+    let mut normalized = function.clone();
+    let exit = normalized.dfg.make_block();
+    normalized.layout.append_block(exit);
+    for (_, inst, _) in &returns {
+        let jump = normalized.dfg.make_jump(exit);
+        normalized.dfg.replace_inst(*inst, Box::new(jump));
+    }
+
+    let mut exit_values = smallvec::SmallVec::<[sonatina_ir::ValueId; 2]>::new();
+    for (result_index, result_type) in result_types.into_iter().enumerate() {
+        let arguments = returns
+            .iter()
+            .map(|(block, _, values)| (values[result_index], *block))
+            .collect();
+        let phi = Phi::new(normalized.inst_set(), arguments);
+        let phi_inst = normalized.dfg.make_inst(phi);
+        normalized.layout.append_inst(phi_inst, exit);
+        let phi_value = normalized.dfg.make_value(Value::Inst {
+            inst: phi_inst,
+            result_idx: 0,
+            ty: result_type,
+        });
+        normalized.dfg.attach_result(phi_inst, phi_value);
+        exit_values.push(phi_value);
+    }
+    let ret = Return::new(normalized.inst_set(), exit_values.into());
+    let ret_inst = normalized.dfg.make_inst(ret);
+    normalized.layout.append_inst(ret_inst, exit);
+    normalized.rebuild_users();
+
+    Ok(Some(normalized))
 }
 
 fn resolve_source_return_values(
@@ -632,7 +659,6 @@ fn lower_vertex(
     bool_type: naga::Handle<naga::Type>,
     vec4f: naga::Handle<naga::Type>,
     output_type: naga::Handle<naga::Type>,
-    return_type: Option<naga::Handle<naga::Type>>,
 ) -> Result<naga::Function, String> {
     let arguments = builtin_arguments
         .iter()
@@ -663,7 +689,9 @@ fn lower_vertex(
         body: naga::Block::new(),
         diagnostic_filter_leaf: None,
     };
-    let error = module.func_store.try_view(func_ref, |function| -> Result<(), String> {
+    let error = module.func_store.try_view(func_ref, |source_function| -> Result<(), String> {
+        let normalized = normalize_stage_to_single_exit(source_function)?;
+        let function = normalized.as_ref().unwrap_or(source_function);
         let mut values = HashMap::new();
         let mut phis = HashMap::new();
         for (physical_index, argument) in builtin_arguments.iter().enumerate() {
@@ -700,51 +728,24 @@ fn lower_vertex(
                 4 + varying_count,
             ));
         }
-        let return_abi = if unique_return.is_none() {
-            Some(direct_result_abi(
-                return_type.ok_or_else(|| {
-                    "spirv raster: multi-return vertex has no transport type".to_string()
-                })?,
-                4 + varying_count,
-            ))
-        } else {
-            None
-        };
+        debug_assert!(unique_return.is_some(), "raster stage was normalized to one exit");
         let mut result = None;
         let naga_functions = super::NagaFunctionMap::new();
         emit_naga_regions(
             function, function.inst_set(), WordKind::U32, &scfg.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
             &mut result,
-            return_abi.as_ref(),
+            None,
             &naga_functions,
             None,
         )?;
-        let leaves = if let Some(arguments) = unique_return {
-            resolve_source_return_values(function, arguments, &mut values, &phis, &mut output)?
-        } else {
-            let result = result
-                .ok_or_else(|| "spirv raster: vertex produced no return value".to_string())?;
-            let leaves = (0..4 + varying_count)
-                .map(|index| {
-                    output.expressions.append(
-                        naga::Expression::AccessIndex {
-                            base: result,
-                            index: index as u32,
-                        },
-                        naga::Span::UNDEFINED,
-                    )
-                })
-                .collect::<Vec<_>>();
-            output.body.push(
-                naga::Statement::Emit(naga::Range::new_from_bounds(
-                    leaves[0],
-                    *leaves.last().expect("raster vertex has at least five leaves"),
-                )),
-                naga::Span::UNDEFINED,
-            );
-            leaves
-        };
+        let leaves = resolve_source_return_values(
+            function,
+            unique_return.expect("raster stage was normalized to one exit"),
+            &mut values,
+            &phis,
+            &mut output,
+        )?;
         let position = output.expressions.append(
             naga::Expression::Compose { ty: vec4f, components: leaves[..4].to_vec() },
             naga::Span::UNDEFINED,
@@ -799,7 +800,9 @@ fn lower_fragment(
         body: naga::Block::new(),
         diagnostic_filter_leaf: None,
     };
-    let error = module.func_store.try_view(func_ref, |function| -> Result<(), String> {
+    let error = module.func_store.try_view(func_ref, |source_function| -> Result<(), String> {
+        let normalized = normalize_stage_to_single_exit(source_function)?;
+        let function = normalized.as_ref().unwrap_or(source_function);
         let mut values = HashMap::new();
         let mut phis = HashMap::new();
         for (index, arg) in function.arg_values.iter().copied().take(varying_count).enumerate() {
@@ -829,22 +832,24 @@ fn lower_fragment(
                 arguments.len(),
             ));
         }
-        let return_abi = direct_result_abi(u32_type, 1);
+        debug_assert!(unique_return.is_some(), "raster stage was normalized to one exit");
         let mut result = None;
         let naga_functions = super::NagaFunctionMap::new();
         emit_naga_regions(
             function, function.inst_set(), WordKind::U32, &scfg.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
             &mut result,
-            unique_return.is_none().then_some(&return_abi),
+            None,
             &naga_functions,
             None,
         )?;
-        let packed = if let Some(arguments) = unique_return {
-            resolve_source_return_values(function, arguments, &mut values, &phis, &mut output)?[0]
-        } else {
-            result.ok_or_else(|| "spirv raster: fragment produced no result".to_string())?
-        };
+        let packed = resolve_source_return_values(
+            function,
+            unique_return.expect("raster stage was normalized to one exit"),
+            &mut values,
+            &phis,
+            &mut output,
+        )?[0];
         let color = output.expressions.append(
             naga::Expression::Math {
                 fun: naga::MathFunction::Unpack4x8unorm,

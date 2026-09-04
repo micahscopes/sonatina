@@ -4950,7 +4950,7 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
 }
 
 #[test]
-fn authored_raster_transports_multi_value_returns_across_stage_branches() {
+fn authored_raster_normalizes_multi_value_returns_to_one_ssa_exit() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
         Vendor::Unknown,
@@ -5032,7 +5032,10 @@ fn authored_raster_transports_multi_value_returns_across_stage_branches() {
         .compile_module(&mb.build())
         .expect("branch-local raster returns should share the typed stage result transport");
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
-    assert!(wgsl.contains("struct RasterVertexLeaves"), "{wgsl}");
+    assert!(
+        !wgsl.contains("RasterVertexLeaves"),
+        "branch-local returns should merge through ordinary SSA phis, not a physical aggregate:\n{wgsl}",
+    );
     assert!(wgsl.contains("fn fe_vertex_main("), "{wgsl}");
     assert!(wgsl.contains("fn fe_fragment_main("), "{wgsl}");
     naga::valid::Validator::new(
@@ -5044,6 +5047,101 @@ fn authored_raster_transports_multi_value_returns_across_stage_branches() {
             .expect("branch-local raster return WGSL should reparse"),
     )
     .expect("branch-local raster return WGSL should validate for browsers");
+}
+
+#[test]
+fn authored_raster_many_early_returns_lower_with_linear_sized_control_flow() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let vertex_ref = mb
+        .declare_function(Signature::new(
+            "vs_many_early_returns",
+            Linkage::Public,
+            &[Type::I32],
+            &[Type::F32; 5],
+        ))
+        .unwrap();
+    let fragment_ref = mb
+        .declare_function(Signature::new_single(
+            "fs_many_early_returns",
+            Linkage::Public,
+            &[Type::F32],
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(vertex_ref);
+        let mut current = fb.append_block();
+        let zero = fb.make_imm_value(Immediate::F32(0.0f32.to_bits()));
+        let one = fb.make_imm_value(Immediate::F32(1.0f32.to_bits()));
+        for index in 0..48 {
+            let early = fb.append_block();
+            let next = fb.append_block();
+            fb.switch_to_block(current);
+            let split = fb.make_imm_value(index + 1);
+            let condition = fb.insert_inst(cmp::Lt::new(is, fb.args()[0], split), Type::I1);
+            fb.insert_inst_no_result(control_flow::Br::new(is, condition, early, next));
+
+            fb.switch_to_block(early);
+            let x = fb.make_imm_value(Immediate::F32(
+                ((index + 1) as f32 / 48.0).to_bits(),
+            ));
+            fb.insert_inst_no_result(control_flow::Return::new(
+                is,
+                [x, zero, zero, one, x]
+                    .into_iter()
+                    .collect::<smallvec::SmallVec<[_; 2]>>()
+                    .into(),
+            ));
+            current = next;
+        }
+        fb.switch_to_block(current);
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [one, zero, zero, one, one]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(fragment_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let white = fb.make_imm_value(-1i32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, white));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .with_authored_raster("vs_many_early_returns", "fs_many_early_returns")
+        .compile_module(&mb.build())
+        .expect("many raster early returns should normalize before structurization");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(!wgsl.contains("RasterVertexLeaves"), "{wgsl}");
+    assert!(
+        wgsl.len() < 50_000,
+        "48 early returns should produce linear-sized WGSL, got {} bytes",
+        wgsl.len(),
+    );
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(
+        &naga::front::wgsl::parse_str(wgsl)
+            .expect("many-return raster WGSL should reparse"),
+    )
+    .expect("many-return raster WGSL should validate for browsers");
 }
 
 #[test]
