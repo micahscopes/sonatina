@@ -72,6 +72,7 @@ pub enum Architecture {
     Aarch64,
     Riscv64im,
     Wasm32,
+    Shader,
 }
 
 impl Architecture {
@@ -82,6 +83,7 @@ impl Architecture {
             "aarch64" => Ok(Self::Aarch64),
             "riscv64im" => Ok(Self::Riscv64im),
             "wasm32" => Ok(Self::Wasm32),
+            "shader" => Ok(Self::Shader),
             _ => Err(InvalidTriple::ArchitectureNotSupported),
         }
     }
@@ -95,6 +97,7 @@ impl Display for Architecture {
             Self::Aarch64 => write!(f, "aarch64"),
             Self::Riscv64im => write!(f, "riscv64im"),
             Self::Wasm32 => write!(f, "wasm32"),
+            Self::Shader => write!(f, "shader"),
         }
     }
 }
@@ -132,11 +135,17 @@ pub enum OperatingSystem {
     Evm(EvmVersion),
     Native,
     ZkvmElf,
+    /// Environment selected by the shader compilation contract, not this triple.
+    Unknown,
 }
 
 impl OperatingSystem {
     fn parse(arch: Architecture, chain: Vendor, s: &str) -> Result<Self, InvalidTriple> {
         match (arch, chain) {
+            (Architecture::Shader, Vendor::Unknown) => match s {
+                "unknown" => Ok(Self::Unknown),
+                _ => Err(InvalidTriple::OsNotSupported),
+            },
             (Architecture::Evm, Vendor::Ethereum) => {
                 let evm_version = match s {
                     "frontier" => EvmVersion::Frontier,
@@ -176,6 +185,7 @@ impl Display for OperatingSystem {
             Self::Evm(evm_version) => write!(f, "{evm_version}"),
             Self::Native => write!(f, "native"),
             Self::ZkvmElf => write!(f, "zkvm-elf"),
+            Self::Unknown => write!(f, "unknown"),
         }
     }
 }

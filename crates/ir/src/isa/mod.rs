@@ -3,7 +3,9 @@ use sonatina_triple::TargetTriple;
 use crate::{AddressSpaceInfo, InstSetBase, Type, module::ModuleCtx};
 
 pub mod evm;
+mod arena32;
 pub mod native;
+pub mod shader;
 pub mod wasm32;
 
 pub trait Isa {
