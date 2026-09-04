@@ -2,13 +2,23 @@ use std::collections::HashMap;
 
 use sonatina_ir::{InstDowncast, Module, Type};
 
+use crate::optim::dead_arg::analyze_live_arguments;
+
 use super::{
-    Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinInput,
-    SpirvBuiltinArgument, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout,
-    SpirvRasterPipeline, SpirvScalarKind, WordKind, append_external_resources,
-    emit_naga_regions, resolve_naga_value, spirv_instruction_is_lowered,
-    unsupported_signed_op_under_u32,
+    Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinArgument,
+    SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
+    SpirvScalarKind, SpirvShaderStage, WordKind, append_external_resources, emit_naga_regions,
+    resolve_naga_value, spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
 };
+
+// Physical shader entry names are compiler-owned ABI, not user-authored
+// behavior identity. Keeping them fixed and WGSL-safe prevents a backend
+// writer from silently renaming otherwise valid source identifiers (Naga, for
+// example, suffixes names ending in a digit). The source behavior names still
+// select the Sonatina functions and remain available to higher-level manifests
+// for provenance and scheduling.
+const PHYSICAL_VERTEX_ENTRY: &str = "fe_vertex_main";
+const PHYSICAL_FRAGMENT_ENTRY: &str = "fe_fragment_main";
 
 /// Lower the narrow first authored-raster ABI. Keeping it separate from the
 /// established fullscreen path makes paired multi-value lowering opt-in and
@@ -140,18 +150,84 @@ pub(super) fn translate(
         }
         resource_state_positions.push(state_position);
     }
-    let scalar_state = vertex_state
+    let declared_scalar_state = vertex_state
         .iter()
         .copied()
         .enumerate()
         .filter(|(index, _)| !resource_state_positions.contains(index))
         .collect::<Vec<_>>();
-    if scalar_state.iter().any(|(_, ty)| !matches!(ty, Type::I32 | Type::F32)) {
+    if declared_scalar_state
+        .iter()
+        .any(|(_, ty)| !matches!(ty, Type::I32 | Type::F32))
+    {
         return Err(
             "spirv raster: non-resource actor state admits only i32/u32 and f32 leaves"
-                .to_string(),
+            .to_string(),
         );
     }
+
+    // Vertex and fragment share one physical bind group but have distinct
+    // entry signatures. Retain the union of resources that can reach either
+    // stage, mapped through the common actor-state suffix. Every declared
+    // resource position remains excluded from scalar state above.
+    let live_arguments = analyze_live_arguments(module);
+    let vertex_live = live_arguments.get(&vertex_ref).map(Vec::as_slice);
+    let fragment_live = live_arguments.get(&fragment_ref).map(Vec::as_slice);
+    let is_live = |mask: Option<&[bool]>, argument: usize| {
+        mask.and_then(|mask| mask.get(argument))
+            .copied()
+            .unwrap_or(true)
+    };
+    // The scalar record is the complete actor-state transport, not merely a
+    // shader-local optimization detail. Browser controls and resident Fe
+    // transitions preserve that record across frames, including fields that
+    // a particular raster pair does not read. Keep its semantic shape stable;
+    // only external GPU resources are eligible for physical liveness pruning.
+    let scalar_state = declared_scalar_state;
+    let state_stages = [
+        (
+            SpirvShaderStage::Vertex,
+            scalar_state
+                .iter()
+                .any(|(state_position, _)| is_live(vertex_live, context_count + *state_position)),
+        ),
+        (
+            SpirvShaderStage::Fragment,
+            scalar_state
+                .iter()
+                .any(|(state_position, _)| is_live(fragment_live, varying_count + *state_position)),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(stage, used)| used.then_some(stage))
+    .collect::<Vec<_>>();
+    let emitted_external_resources = external_resources
+        .iter()
+        .zip(resource_state_positions.iter().copied())
+        .filter_map(|(resource, state_position)| {
+            let vertex_used = is_live(vertex_live, resource.arg_index as usize);
+            let fragment_arg = varying_count + state_position;
+            let fragment_used = is_live(fragment_live, fragment_arg);
+            (vertex_used || fragment_used).then(|| {
+                let stages = [
+                    (SpirvShaderStage::Vertex, vertex_used),
+                    (SpirvShaderStage::Fragment, fragment_used),
+                ]
+                .into_iter()
+                .filter_map(|(stage, used)| used.then_some(stage))
+                .collect::<Vec<_>>();
+                (resource.clone(), stages)
+            })
+        })
+        .enumerate()
+        .map(|(binding, (mut resource, stages))| {
+            resource.group = 0;
+            resource.binding = binding as u32;
+            (resource, stages)
+        })
+        .collect::<Vec<_>>();
+    let (emitted_external_resources, external_resource_stages): (Vec<_>, Vec<_>) =
+        emitted_external_resources.into_iter().unzip();
 
     // Calls have already been inlined by Fe. Object indexing/projection/load
     // resolves through the shared external globals. Allocation, private memory
@@ -184,7 +260,7 @@ pub(super) fn translate(
                         || <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjIndex as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjProj as InstDowncast>::downcast(inst_set, data).is_some();
-                    if has_external_object_effect && external_resources.is_empty() {
+                    if has_external_object_effect && emitted_external_resources.is_empty() {
                         return Err(format!(
                             "spirv raster: {stage} body uses object operations without an external resource root; fail closed",
                         ));
@@ -235,7 +311,8 @@ pub(super) fn translate(
 
     let (external_roots, mut bindings) = append_external_resources(
         &mut naga_mod,
-        external_resources,
+        &emitted_external_resources,
+        &external_resource_stages,
         WordKind::U32,
         u32_type,
         f32_type,
@@ -247,7 +324,7 @@ pub(super) fn translate(
         u32_type,
         f32_type,
         varying_count,
-        external_resources.len() as u32,
+        emitted_external_resources.len() as u32,
     );
     let output_type = append_vertex_output_type(&mut naga_mod, f32_type, vec4f, varying_count);
 
@@ -257,23 +334,24 @@ pub(super) fn translate(
     )?;
     let fragment = lower_fragment(
         module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
-        u32_type, f32_type, bool_type, vec4f,
+        context_count, u32_type, f32_type, bool_type, vec4f,
     )?;
 
     naga_mod.entry_points.push(entry_point(
-        pipeline.vertex_entry.clone(), naga::ShaderStage::Vertex, vertex,
+        PHYSICAL_VERTEX_ENTRY.to_string(), naga::ShaderStage::Vertex, vertex,
     ));
     naga_mod.entry_points.push(entry_point(
-        pipeline.fragment_entry.clone(), naga::ShaderStage::Fragment, fragment,
+        PHYSICAL_FRAGMENT_ENTRY.to_string(), naga::ShaderStage::Fragment, fragment,
     ));
 
     if state_var.is_some() {
         bindings.push(SpirvBinding {
             group: 0,
-            binding: external_resources.len() as u32,
+            binding: emitted_external_resources.len() as u32,
             name: "state".to_string(),
             access: Access::Read,
             role: Role::Input,
+            stages: state_stages,
             stride: state_span,
             span: state_span,
             members: layout_members,
@@ -284,7 +362,7 @@ pub(super) fn translate(
     }
 
     Ok((naga_mod, SpirvLayout {
-        entry_point: pipeline.fragment_entry.clone(),
+        entry_point: PHYSICAL_FRAGMENT_ENTRY.to_string(),
         mode: LayoutMode::Render,
         workgroup_size: [0, 0, 0],
         word: WordKind::U32,
@@ -299,8 +377,8 @@ pub(super) fn translate(
             .collect(),
         result: None,
         trap: None,
-        vertex_entry: Some(pipeline.vertex_entry.clone()),
-        fragment_entry: Some(pipeline.fragment_entry.clone()),
+        vertex_entry: Some(PHYSICAL_VERTEX_ENTRY.to_string()),
+        fragment_entry: Some(PHYSICAL_FRAGMENT_ENTRY.to_string()),
         color_target_format: Some("rgba8unorm".to_string()),
     }))
 }
@@ -585,6 +663,7 @@ fn lower_fragment(
     state_fields: &[(usize, Type)],
     external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
     varying_count: usize,
+    vertex_context_count: usize,
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
@@ -614,7 +693,7 @@ fn lower_fragment(
             values.insert(arg, value);
         }
         for &(vertex_arg_index, global) in external_roots {
-            let state_index = vertex_arg_index as usize - 1;
+            let state_index = vertex_arg_index as usize - vertex_context_count;
             let fragment_arg_index = varying_count + state_index;
             let arg = function.arg_values[fragment_arg_index];
             let root = output.expressions.append(
