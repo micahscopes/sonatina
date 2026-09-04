@@ -5069,6 +5069,120 @@ fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
 }
 
 #[test]
+fn authored_raster_keeps_equal_stage_local_call_ids_distinct() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let vertex_helper = mb
+        .declare_function(Signature::new_single(
+            "vertex_helper_four",
+            Linkage::Private,
+            &[Type::F32; 4],
+            Type::F32,
+        ))
+        .unwrap();
+    let fragment_helper = mb
+        .declare_function(Signature::new_single(
+            "fragment_helper_three",
+            Linkage::Private,
+            &[Type::F32; 3],
+            Type::F32,
+        ))
+        .unwrap();
+    let vertex_ref = mb
+        .declare_function(Signature::new(
+            "vs_distinct_local_calls",
+            Linkage::Public,
+            &[Type::I32, Type::F32, Type::F32, Type::F32, Type::F32],
+            &[Type::F32; 5],
+        ))
+        .unwrap();
+    let fragment_ref = mb
+        .declare_function(Signature::new_single(
+            "fs_distinct_local_calls",
+            Linkage::Public,
+            &[Type::F32; 5],
+            Type::I32,
+        ))
+        .unwrap();
+
+    for (helper, arity) in [(vertex_helper, 4usize), (fragment_helper, 3usize)] {
+        let mut fb = mb.func_builder::<InstInserter>(helper);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let mut sum = fb.args()[0];
+        for index in 1..arity {
+            sum = fb.insert_inst(arith::Fadd::new(is, sum, fb.args()[index]), Type::F32);
+        }
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(vertex_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        // This is deliberately the first instruction in each stage root, so
+        // both calls receive the same function-local InstId.
+        let value = fb.insert_inst(
+            control_flow::Call::new(
+                is,
+                vertex_helper,
+                fb.args()[1..5].iter().copied().collect(),
+            ),
+            Type::F32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [value, fb.args()[1], fb.args()[2], fb.args()[3], fb.args()[4]]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(fragment_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let value = fb.insert_inst(
+            control_flow::Call::new(
+                is,
+                fragment_helper,
+                fb.args()[0..3].iter().copied().collect(),
+            ),
+            Type::F32,
+        );
+        let packed = fb.insert_inst(cast::F32ToI32::new(is, value), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, packed));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .with_authored_raster("vs_distinct_local_calls", "fs_distinct_local_calls")
+        .compile_module(&mb.build())
+        .expect("stage-local call IDs must select their own helper ABIs");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(wgsl.contains("fn vertex_helper_four("), "{wgsl}");
+    assert!(wgsl.contains("fn fragment_helper_three("), "{wgsl}");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(
+        &naga::front::wgsl::parse_str(wgsl)
+            .expect("stage-local call-ID WGSL should reparse"),
+    )
+    .expect("stage-local call-ID WGSL should validate for browsers");
+}
+
+#[test]
 fn authored_raster_normalizes_multi_value_returns_to_one_ssa_exit() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
