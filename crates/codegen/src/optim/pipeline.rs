@@ -10,6 +10,7 @@
 //! an ordered sequence of steps and executes them against a module.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use sonatina_ir::{
@@ -611,6 +612,15 @@ pub(crate) fn run_function_pass_round(
 ) {
     let mut round_facts = RoundFacts::default();
     for &pass in passes {
+        let trace = std::env::var_os("SONATINA_OPT_TRACE").is_some();
+        let started = Instant::now();
+        if trace {
+            let (functions, blocks, instructions, values) = module_ir_size(module);
+            eprintln!(
+                "[sonatina optim] begin pass={}, functions={functions}, blocks={blocks}, instructions={instructions}, values={values}",
+                pass.as_str(),
+            );
+        }
         if *func_behavior_dirty && pass.needs_func_behavior() {
             let _span = trace_span!("sonatina.optim.pipeline.func_behavior_analyze").entered();
             func_behavior::analyze_module(module);
@@ -623,7 +633,34 @@ pub(crate) fn run_function_pass_round(
         if result.changed && result.invalidates_object_facts {
             round_facts.clear();
         }
+        if trace {
+            let (functions, blocks, instructions, values) = module_ir_size(module);
+            eprintln!(
+                "[sonatina optim] end pass={}, changed={}, functions={functions}, blocks={blocks}, instructions={instructions}, values={values}, elapsed_ms={}",
+                pass.as_str(),
+                result.changed,
+                started.elapsed().as_millis(),
+            );
+        }
     }
+}
+
+fn module_ir_size(module: &Module) -> (usize, usize, usize, usize) {
+    let mut blocks = 0;
+    let mut instructions = 0;
+    let mut values = 0;
+    for func_ref in module.funcs() {
+        module.func_store.view(func_ref, |func| {
+            blocks += func.layout.iter_block().count();
+            instructions += func
+                .layout
+                .iter_block()
+                .map(|block| func.layout.iter_inst(block).count())
+                .sum::<usize>();
+            values += func.dfg.value_ids().count();
+        });
+    }
+    (module.funcs().len(), blocks, instructions, values)
 }
 
 #[derive(Default)]
@@ -664,19 +701,41 @@ fn run_module_pass(
 ) -> PassResult {
     let _span = debug_span!("sonatina.optim.pipeline.pass_round", pass = pass.as_str()).entered();
     if pass.needs_object_facts() && overrides.object_effects.is_none() {
+        let trace = std::env::var_os("SONATINA_OPT_TRACE").is_some();
+        let started = Instant::now();
+        if trace {
+            eprintln!("[sonatina optim] begin object-effect summaries");
+        }
         round_facts
             .object_effects
             .get_or_insert_with(|| compute_object_effect_summaries(module));
+        if trace {
+            eprintln!(
+                "[sonatina optim] end object-effect summaries, elapsed_ms={}",
+                started.elapsed().as_millis(),
+            );
+        }
     }
     let object_effects = overrides
         .object_effects
         .or(round_facts.object_effects.as_ref());
     if pass.needs_object_facts() && overrides.local_object_args.is_none() {
+        let trace = std::env::var_os("SONATINA_OPT_TRACE").is_some();
+        let started = Instant::now();
+        if trace {
+            eprintln!("[sonatina optim] begin local-object arguments");
+        }
         round_facts.local_object_args.get_or_insert_with(|| {
             object_effects
                 .map(|effects| collect_local_object_arg_info_with_effects(module, effects))
                 .unwrap_or_else(|| collect_local_object_arg_info(module))
         });
+        if trace {
+            eprintln!(
+                "[sonatina optim] end local-object arguments, elapsed_ms={}",
+                started.elapsed().as_millis(),
+            );
+        }
     }
     let local_object_args = overrides
         .local_object_args
