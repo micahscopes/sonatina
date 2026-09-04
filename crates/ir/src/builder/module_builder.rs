@@ -470,7 +470,7 @@ mod tests {
         func_builder.switch_to_block(entry);
         func_builder.insert_inst_no_result_with(|| {
             Call::new(
-                is.has_call().expect("target ISA must support `call`"),
+                is,
                 callee,
                 smallvec![],
             )

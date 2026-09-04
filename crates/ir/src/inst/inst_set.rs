@@ -403,10 +403,10 @@ mod tests {
             InstClassKind::Unary(UnaryInstKind::Snego)
         );
         assert_eq!(
-            Phi::new(inst_set.phi(), vec![(v, b0)]).kind(),
+            Phi::new(&inst_set, vec![(v, b0)]).kind(),
             InstClassKind::Phi
         );
-        assert_eq!(Jump::new(inst_set.jump(), b0).kind(), InstClassKind::Opaque);
+        assert_eq!(Jump::new(&inst_set, b0).kind(), InstClassKind::Opaque);
 
         let evm_inst_set = EvmInstSet::new();
         assert_eq!(

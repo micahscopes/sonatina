@@ -139,12 +139,12 @@ mod tests {
 
         let lhs = builder.make_imm_value(Immediate::I32(1));
         let rhs = builder.make_imm_value(Immediate::I32(2));
-        let has_add = builder.inst_set().has_add().unwrap();
+        let inst_set = builder.inst_set();
 
-        let produced = builder.insert_inst(Add::new(has_add, lhs, rhs), Type::I32);
+        let produced = builder.insert_inst(Add::new(inst_set, lhs, rhs), Type::I32);
         let producer_inst = builder.func.dfg.value_inst(produced).unwrap();
 
-        let consumed = builder.insert_inst(Add::new(has_add, produced, lhs), Type::I32);
+        let consumed = builder.insert_inst(Add::new(inst_set, produced, lhs), Type::I32);
         let consumer_inst = builder.func.dfg.value_inst(consumed).unwrap();
 
         builder.insert_return_unit();
@@ -183,12 +183,12 @@ mod tests {
 
         let lhs = builder.make_imm_value(Immediate::I32(1));
         let rhs = builder.make_imm_value(Immediate::I32(2));
-        let has_add = builder.inst_set().has_add().unwrap();
+        let inst_set = builder.inst_set();
 
-        let produced = builder.insert_inst(Add::new(has_add, lhs, rhs), Type::I32);
+        let produced = builder.insert_inst(Add::new(inst_set, lhs, rhs), Type::I32);
         let producer_inst = builder.func.dfg.value_inst(produced).unwrap();
 
-        let consumed = builder.insert_inst(Add::new(has_add, produced, lhs), Type::I32);
+        let consumed = builder.insert_inst(Add::new(inst_set, produced, lhs), Type::I32);
         let consumer_inst = builder.func.dfg.value_inst(consumed).unwrap();
 
         builder.insert_return_unit();
@@ -212,12 +212,12 @@ mod tests {
 
         let lhs = builder.make_imm_value(Immediate::I32(1));
         let rhs = builder.make_imm_value(Immediate::I32(2));
-        let has_add = builder.inst_set().has_add().unwrap();
+        let inst_set = builder.inst_set();
 
-        let produced = builder.insert_inst(Add::new(has_add, lhs, rhs), Type::I32);
+        let produced = builder.insert_inst(Add::new(inst_set, lhs, rhs), Type::I32);
         let producer_inst = builder.func.dfg.value_inst(produced).unwrap();
 
-        let consumed = builder.insert_inst(Add::new(has_add, produced, lhs), Type::I32);
+        let consumed = builder.insert_inst(Add::new(inst_set, produced, lhs), Type::I32);
         let consumer_inst = builder.func.dfg.value_inst(consumed).unwrap();
 
         builder.insert_return_unit();

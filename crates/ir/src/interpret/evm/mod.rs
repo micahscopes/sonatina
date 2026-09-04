@@ -457,7 +457,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        DataFlowGraph, HasInst, Immediate, Type,
+        DataFlowGraph, Immediate, Type,
         builder::test_util::test_isa,
         interpret::EvalResults,
         module::{FuncRef, ModuleCtx},
@@ -465,8 +465,7 @@ mod tests {
 
     use super::*;
 
-    struct TestHasInst;
-    impl<I: crate::Inst> HasInst<I> for TestHasInst {}
+    use crate::inst::evm::inst_set::EvmInstSet;
 
     struct TestState {
         dfg: DataFlowGraph,
@@ -520,7 +519,7 @@ mod tests {
 
     #[test]
     fn narrow_unsigned_saturating_ops_zero_extend_results() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let lhs = crate::ValueId::from_u32(0);
         let rhs = crate::ValueId::from_u32(1);
         let mut state = TestState::new([
@@ -568,7 +567,7 @@ mod tests {
 
     #[test]
     fn narrow_signed_saturating_ops_sign_extend_results() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let lhs = crate::ValueId::from_u32(0);
         let rhs = crate::ValueId::from_u32(1);
         let mut state = TestState::new([

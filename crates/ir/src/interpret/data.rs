@@ -258,15 +258,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        DataFlowGraph, HasInst, Type, Value, ValueId,
+        DataFlowGraph, Type, Value, ValueId,
         builder::test_util::test_isa,
         interpret::EvalResults,
         module::{FuncRef, ModuleCtx},
     };
 
-    struct TestHasInst;
-
-    impl<I: crate::Inst> HasInst<I> for TestHasInst {}
+    use crate::inst::evm::inst_set::EvmInstSet;
 
     struct TestState {
         dfg: DataFlowGraph,
@@ -337,7 +335,7 @@ mod tests {
         );
 
         assert_eq!(
-            Gep::new(&TestHasInst, smallvec![base, idx]).interpret(&mut state),
+            Gep::new(&EvmInstSet::new(), smallvec![base, idx]).interpret(&mut state),
             single_result(EvalValue::Imm(Immediate::I256(I256::from(32))))
         );
     }
@@ -378,11 +376,11 @@ mod tests {
         );
 
         assert_eq!(
-            InsertValue::new(&TestHasInst, dest, idx, value).interpret(&mut state),
+            InsertValue::new(&EvmInstSet::new(), dest, idx, value).interpret(&mut state),
             single_result(EvalValue::Undef)
         );
         assert_eq!(
-            ExtractValue::new(&TestHasInst, dest, idx).interpret(&mut state),
+            ExtractValue::new(&EvmInstSet::new(), dest, idx).interpret(&mut state),
             single_result(EvalValue::Undef)
         );
     }

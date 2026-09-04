@@ -521,7 +521,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        DataFlowGraph, HasInst, Immediate, Type,
+        DataFlowGraph, Immediate, Type,
         builder::test_util::test_isa,
         interpret::EvalResults,
         module::{FuncRef, ModuleCtx},
@@ -529,8 +529,7 @@ mod tests {
 
     use super::*;
 
-    struct TestHasInst;
-    impl<I: crate::Inst> HasInst<I> for TestHasInst {}
+    use crate::inst::evm::inst_set::EvmInstSet;
 
     struct TestState {
         dfg: DataFlowGraph,
@@ -584,7 +583,7 @@ mod tests {
 
     #[test]
     fn div_mod_by_zero_returns_undef() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let lhs = crate::ValueId::from_u32(0);
         let rhs = crate::ValueId::from_u32(1);
 
@@ -613,7 +612,7 @@ mod tests {
 
     #[test]
     fn shift_right_uses_expected_signedness() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let bits = crate::ValueId::from_u32(0);
         let value = crate::ValueId::from_u32(1);
         let mut state = TestState::new([
@@ -633,7 +632,7 @@ mod tests {
 
     #[test]
     fn shift_right_is_width_aware_for_subword_operands() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let bits = crate::ValueId::from_u32(0);
         let value = crate::ValueId::from_u32(1);
         let mut state = TestState::new([
@@ -666,7 +665,7 @@ mod tests {
 
     #[test]
     fn uaddo_returns_sum_and_overflow_flag() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let lhs = crate::ValueId::from_u32(0);
         let rhs = crate::ValueId::from_u32(1);
         let mut state = TestState::new([
@@ -685,7 +684,7 @@ mod tests {
 
     #[test]
     fn signed_overflow_ops_return_wrapped_values_and_flags() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let lhs = crate::ValueId::from_u32(0);
         let rhs = crate::ValueId::from_u32(1);
         let mut state = TestState::new([
@@ -718,7 +717,7 @@ mod tests {
 
     #[test]
     fn unsigned_and_signed_mul_sub_ops_cover_overflow_cases() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let lhs = crate::ValueId::from_u32(0);
         let rhs = crate::ValueId::from_u32(1);
         let mut state = TestState::new([
@@ -751,7 +750,7 @@ mod tests {
 
     #[test]
     fn saturating_ops_clamp_at_bounds() {
-        let hi = TestHasInst;
+        let hi = EvmInstSet::new();
         let lhs = crate::ValueId::from_u32(0);
         let rhs = crate::ValueId::from_u32(1);
 
