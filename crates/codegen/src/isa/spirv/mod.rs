@@ -3423,7 +3423,30 @@ fn emit_single_inst(
             ));
             return false;
         }
-        let mut arguments = Vec::new();
+        let physical_argument_count = callee
+            .argument_abi
+            .iter()
+            .filter_map(|source| match source {
+                NagaArgumentSource::Physical(index)
+                | NagaArgumentSource::Packed {
+                    physical_index: index,
+                    ..
+                } => Some(*index as usize + 1),
+                NagaArgumentSource::ImplicitResource(_) | NagaArgumentSource::Dead => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let mut physical_arguments = vec![None; physical_argument_count];
+        let mut packed_components = callee
+            .packed_arguments
+            .as_ref()
+            .map(|packed| {
+                packed
+                    .groups
+                    .iter()
+                    .map(|group| vec![None; group.member_count])
+                    .collect::<Vec<_>>()
+            });
         let mut logical_arguments = Vec::with_capacity(call.args().len());
         for (&logical_argument, source) in call.args().iter().zip(&callee.argument_abi) {
             if matches!(source, NagaArgumentSource::Dead) {
@@ -3451,17 +3474,132 @@ fn emit_single_inst(
                 }
             };
             logical_arguments.push(Some(argument));
-            if let NagaArgumentSource::Physical(physical_index) = source {
-                if *physical_index as usize != arguments.len() {
+            match source {
+                NagaArgumentSource::Physical(physical_index) => {
+                    let Some(slot) = physical_arguments.get_mut(*physical_index as usize) else {
+                        *mem_error = Some(format!(
+                            "spirv: helper call to {:?} has out-of-range physical argument index {physical_index}. Fail closed.",
+                            call.callee(),
+                        ));
+                        return false;
+                    };
+                    if slot.replace(argument).is_some() {
+                        *mem_error = Some(format!(
+                            "spirv: helper call to {:?} aliases physical argument index {physical_index}. Fail closed.",
+                            call.callee(),
+                        ));
+                        return false;
+                    }
+                }
+                NagaArgumentSource::Packed {
+                    physical_index,
+                    group_index,
+                    member_index,
+                } => {
+                    let Some(packed) = callee.packed_arguments.as_ref() else {
+                        *mem_error = Some(format!(
+                            "spirv: helper call to {:?} has a packed source without a packed ABI. Fail closed.",
+                            call.callee(),
+                        ));
+                        return false;
+                    };
+                    if packed.physical_index != *physical_index {
+                        *mem_error = Some(format!(
+                            "spirv: helper call to {:?} disagrees on packed physical argument index. Fail closed.",
+                            call.callee(),
+                        ));
+                        return false;
+                    }
+                    let Some(slot) = packed_components
+                        .as_mut()
+                        .and_then(|groups| groups.get_mut(*group_index as usize))
+                        .and_then(|components| components.get_mut(*member_index as usize))
+                    else {
+                        *mem_error = Some(format!(
+                            "spirv: helper call to {:?} has out-of-range packed location {group_index}:{member_index}. Fail closed.",
+                            call.callee(),
+                        ));
+                        return false;
+                    };
+                    if slot.replace(argument).is_some() {
+                        *mem_error = Some(format!(
+                            "spirv: helper call to {:?} aliases packed member index {member_index}. Fail closed.",
+                            call.callee(),
+                        ));
+                        return false;
+                    }
+                }
+                NagaArgumentSource::ImplicitResource(_) | NagaArgumentSource::Dead => {}
+            }
+        }
+        if let Some(packed) = callee.packed_arguments.as_ref() {
+            let Some(group_components) = packed_components.take() else {
+                *mem_error = Some(format!(
+                    "spirv: helper call to {:?} lost its packed argument components. Fail closed.",
+                    call.callee(),
+                ));
+                return false;
+            };
+            let mut components = Vec::with_capacity(packed.groups.len());
+            for (group, group_components) in packed.groups.iter().zip(group_components) {
+                let Some(group_components) =
+                    group_components.into_iter().collect::<Option<Vec<_>>>()
+                else {
                     *mem_error = Some(format!(
-                        "spirv: helper call to {:?} has a noncanonical physical argument index {physical_index}. Fail closed.",
+                        "spirv: helper call to {:?} did not initialize every packed argument. Fail closed.",
                         call.callee(),
                     ));
                     return false;
-                }
-                arguments.push(argument);
+                };
+                let group_value = func.expressions.append(
+                    naga::Expression::Compose {
+                        ty: group.ty,
+                        components: group_components,
+                    },
+                    naga::Span::UNDEFINED,
+                );
+                target.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(
+                        group_value,
+                        group_value,
+                    )),
+                    naga::Span::UNDEFINED,
+                );
+                components.push(group_value);
+            }
+            let composed = func.expressions.append(
+                naga::Expression::Compose {
+                    ty: packed.ty,
+                    components,
+                },
+                naga::Span::UNDEFINED,
+            );
+            target.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(composed, composed)),
+                naga::Span::UNDEFINED,
+            );
+            let Some(slot) = physical_arguments.get_mut(packed.physical_index as usize) else {
+                *mem_error = Some(format!(
+                    "spirv: helper call to {:?} lost its packed physical argument slot. Fail closed.",
+                    call.callee(),
+                ));
+                return false;
+            };
+            if slot.replace(composed).is_some() {
+                *mem_error = Some(format!(
+                    "spirv: helper call to {:?} aliases its packed physical argument slot. Fail closed.",
+                    call.callee(),
+                ));
+                return false;
             }
         }
+        let Some(mut arguments) = physical_arguments.into_iter().collect::<Option<Vec<_>>>() else {
+            *mem_error = Some(format!(
+                "spirv: helper call to {:?} did not initialize every physical argument. Fail closed.",
+                call.callee(),
+            ));
+            return false;
+        };
         if callee.memory_abi.heap {
             let Some(heap) = mem_ctx.and_then(|context| context.heap) else {
                 *mem_error = Some(format!(
@@ -5582,6 +5720,7 @@ fn spirv_instruction_is_lowered(
 struct NagaFunctionInfo {
     handle: naga::Handle<naga::Function>,
     argument_abi: Vec<NagaArgumentSource>,
+    packed_arguments: Option<NagaPackedArguments>,
     result_abi: NagaResultAbi,
     memory_abi: NagaMemoryAbi,
 }
@@ -5590,10 +5729,30 @@ struct NagaFunctionInfo {
 #[derive(Clone, Copy)]
 enum NagaArgumentSource {
     Physical(u32),
+    Packed {
+        physical_index: u32,
+        group_index: u32,
+        member_index: u32,
+    },
     ImplicitResource(naga::Handle<naga::GlobalVariable>),
     /// A logical source argument proven unable to reach a result or effect.
     /// It remains in Sonatina's stable signature but has no physical Naga ABI.
     Dead,
+}
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone)]
+struct NagaPackedArguments {
+    ty: naga::Handle<naga::Type>,
+    physical_index: u32,
+    groups: Vec<NagaPackedArgumentGroup>,
+}
+
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone)]
+struct NagaPackedArgumentGroup {
+    ty: naga::Handle<naga::Type>,
+    member_count: usize,
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -5646,6 +5805,12 @@ struct NagaTypedLocalUseClosure {
 // storage for every invocation. Device-tuned limits can replace it later.
 #[cfg(feature = "spirv-backend")]
 const MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION: u32 = 16 * 1024;
+
+// Dawn's portable WGSL frontend limits one function declaration to 255
+// parameters. Preserve helper calls beyond that logical arity by grouping
+// store-type values into one function-local ABI struct.
+#[cfg(feature = "spirv-backend")]
+const MAX_WGSL_FUNCTION_PARAMETERS: usize = 255;
 
 #[cfg(feature = "spirv-backend")]
 #[derive(Default)]
@@ -6972,6 +7137,185 @@ fn helper_naga_argument_abi(
 }
 
 #[cfg(feature = "spirv-backend")]
+#[allow(clippy::too_many_arguments)]
+fn pack_wide_naga_helper_arguments(
+    module: &Module,
+    signature: &sonatina_ir::Signature,
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    memory_abi: NagaMemoryAbi,
+    argument_abi: &mut [NagaArgumentSource],
+    naga_functions: &NagaFunctionMap,
+    types: &mut naga::UniqueArena<naga::Type>,
+) -> Result<Option<NagaPackedArguments>, String> {
+    let memory_parameters = usize::from(memory_abi.heap) * 2 + usize::from(memory_abi.trap);
+    let physical_parameters = argument_abi
+        .iter()
+        .filter(|source| matches!(source, NagaArgumentSource::Physical(_)))
+        .count();
+    if physical_parameters + memory_parameters <= MAX_WGSL_FUNCTION_PARAMETERS {
+        return Ok(None);
+    }
+
+    struct PackedGroupBuilder {
+        element_ty: naga::Handle<naga::Type>,
+        alignment: u32,
+        stride: u32,
+        logical_indices: Vec<usize>,
+    }
+
+    let mut groups = Vec::<PackedGroupBuilder>::new();
+    let mut packed_locations = vec![None; signature.args().len()];
+    for (logical_index, (&ty, source)) in
+        signature.args().iter().zip(argument_abi.iter()).enumerate()
+    {
+        if !matches!(source, NagaArgumentSource::Physical(_)) {
+            continue;
+        }
+        let (alignment, stride) = match ty {
+            sonatina_ir::Type::I1 => (4, 4),
+            sonatina_ir::Type::I32 | sonatina_ir::Type::F32
+                if word == WordKind::U32 => (4, 4),
+            sonatina_ir::Type::I64 if word == WordKind::I64 => (8, 8),
+            _ => continue,
+        };
+        let element_ty = helper_naga_type(
+            &module.ctx,
+            ty,
+            word,
+            word_type,
+            f32_type,
+            bool_type,
+            &naga_functions.typed_local_types,
+        )?;
+        let group_index = if let Some(index) = groups
+            .iter()
+            .position(|group| group.element_ty == element_ty)
+        {
+            index
+        } else {
+            groups.push(PackedGroupBuilder {
+                element_ty,
+                alignment,
+                stride,
+                logical_indices: Vec::new(),
+            });
+            groups.len() - 1
+        };
+        let member_index = groups[group_index].logical_indices.len();
+        groups[group_index].logical_indices.push(logical_index);
+        packed_locations[logical_index] = Some((group_index as u32, member_index as u32));
+    }
+    let packed_argument_count = packed_locations.iter().flatten().count();
+    if packed_argument_count < 2 {
+        return Err(format!(
+            "spirv: helper `{}` requires {} physical parameters, over the portable WGSL limit of {MAX_WGSL_FUNCTION_PARAMETERS}, but its ABI has fewer than two packable scalar values. Fail closed.",
+            signature.name(),
+            physical_parameters + memory_parameters,
+        ));
+    }
+
+    let direct_parameters = physical_parameters - packed_argument_count;
+    let packed_physical_parameters = 1 + direct_parameters + memory_parameters;
+    if packed_physical_parameters > MAX_WGSL_FUNCTION_PARAMETERS {
+        return Err(format!(
+            "spirv: helper `{}` still requires {packed_physical_parameters} physical parameters after scalar argument packing, over the portable WGSL limit of {MAX_WGSL_FUNCTION_PARAMETERS}. Fail closed.",
+            signature.name(),
+        ));
+    }
+
+    let physical_index = 0u32;
+    let mut next_direct_index = 1u32;
+    for (logical_index, source) in argument_abi.iter_mut().enumerate() {
+        if !matches!(source, NagaArgumentSource::Physical(_)) {
+            continue;
+        }
+        if let Some((group_index, member_index)) = packed_locations[logical_index] {
+            *source = NagaArgumentSource::Packed {
+                physical_index,
+                group_index,
+                member_index,
+            };
+        } else {
+            *source = NagaArgumentSource::Physical(next_direct_index);
+            next_direct_index += 1;
+        }
+    }
+
+    let mut members = Vec::with_capacity(groups.len());
+    let mut packed_groups = Vec::with_capacity(groups.len());
+    let mut offset = 0u32;
+    let mut struct_alignment = 1u32;
+    for (group_index, group) in groups.into_iter().enumerate() {
+        let member_count = u32::try_from(group.logical_indices.len()).map_err(|_| {
+            format!(
+                "spirv: packed helper argument group is too large in `{}`. Fail closed.",
+                signature.name(),
+            )
+        })?;
+        let member_count = std::num::NonZeroU32::new(member_count).ok_or_else(|| {
+            format!(
+                "spirv: packed helper argument group is empty in `{}`. Fail closed.",
+                signature.name(),
+            )
+        })?;
+        let group_span = group
+            .stride
+            .checked_mul(member_count.get())
+            .ok_or_else(|| {
+                format!(
+                    "spirv: packed helper argument array overflows u32 in `{}`. Fail closed.",
+                    signature.name(),
+                )
+            })?;
+        let group_ty = types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Array {
+                    base: group.element_ty,
+                    size: naga::ArraySize::Constant(member_count),
+                    stride: group.stride,
+                },
+            },
+            naga::Span::UNDEFINED,
+        );
+        offset = align_helper_offset(offset, group.alignment);
+        members.push(naga::StructMember {
+            name: Some(format!("g{group_index}")),
+            ty: group_ty,
+            binding: None,
+            offset,
+        });
+        offset = offset.checked_add(group_span).ok_or_else(|| {
+            format!(
+                "spirv: packed helper argument layout overflows u32 in `{}`. Fail closed.",
+                signature.name(),
+            )
+        })?;
+        struct_alignment = struct_alignment.max(group.alignment);
+        packed_groups.push(NagaPackedArgumentGroup {
+            ty: group_ty,
+            member_count: member_count.get() as usize,
+        });
+    }
+    let span = align_helper_offset(offset, struct_alignment);
+    let ty = types.insert(
+        naga::Type {
+            name: Some(format!("{}_arguments", signature.name())),
+            inner: naga::TypeInner::Struct { members, span },
+        },
+        naga::Span::UNDEFINED,
+    );
+    Ok(Some(NagaPackedArguments {
+        ty,
+        physical_index,
+        groups: packed_groups,
+    }))
+}
+
+#[cfg(feature = "spirv-backend")]
 fn helper_resource_capabilities(
     module: &Module,
     entry_signature: &sonatina_ir::Signature,
@@ -7290,6 +7634,7 @@ fn lower_naga_helper(
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     argument_abi: &[NagaArgumentSource],
+    packed_arguments: Option<&NagaPackedArguments>,
     result_abi: &NagaResultAbi,
     memory_abi: NagaMemoryAbi,
     memory_types: NagaMemoryAbiTypes,
@@ -7311,9 +7656,26 @@ fn lower_naga_helper(
         ));
     }
     let mut arguments = Vec::new();
+    if let Some(packed) = packed_arguments {
+        if packed.physical_index != 0 {
+            return Err(format!(
+                "spirv: helper `{}` has noncanonical packed argument index {}. Fail closed.",
+                signature.name(),
+                packed.physical_index,
+            ));
+        }
+        arguments.push(naga::FunctionArgument {
+            name: Some("fe_arguments".to_string()),
+            ty: packed.ty,
+            binding: None,
+        });
+    }
     for (logical_index, (&ty, source)) in signature.args().iter().zip(argument_abi).enumerate() {
-        let NagaArgumentSource::Physical(physical_index) = source else {
-            continue;
+        let physical_index = match source {
+            NagaArgumentSource::Physical(physical_index) => physical_index,
+            NagaArgumentSource::Packed { .. }
+            | NagaArgumentSource::ImplicitResource(_)
+            | NagaArgumentSource::Dead => continue,
         };
         if *physical_index as usize != arguments.len() {
             return Err(format!(
@@ -7408,9 +7770,48 @@ fn lower_naga_helper(
 
         let mut value_map = std::collections::HashMap::new();
         for (&argument, source) in function.arg_values.iter().zip(argument_abi) {
+            let mut packed_emit_start = None;
             let expression = match *source {
                 NagaArgumentSource::Physical(index) => {
                     naga::Expression::FunctionArgument(index)
+                }
+                NagaArgumentSource::Packed {
+                    physical_index,
+                    group_index,
+                    member_index,
+                } => {
+                    let Some(packed) = packed_arguments else {
+                        lowering_error = Some(format!(
+                            "spirv: helper `{}` has a packed source without a packed ABI. Fail closed.",
+                            signature.name(),
+                        ));
+                        return;
+                    };
+                    if packed.physical_index != physical_index
+                        || group_index as usize >= packed.groups.len()
+                    {
+                        lowering_error = Some(format!(
+                            "spirv: helper `{}` has an invalid packed argument location. Fail closed.",
+                            signature.name(),
+                        ));
+                        return;
+                    }
+                    let packed_argument = naga_function.expressions.append(
+                        naga::Expression::FunctionArgument(physical_index),
+                        naga::Span::UNDEFINED,
+                    );
+                    let packed_group = naga_function.expressions.append(
+                        naga::Expression::AccessIndex {
+                            base: packed_argument,
+                            index: group_index,
+                        },
+                        naga::Span::UNDEFINED,
+                    );
+                    packed_emit_start = Some(packed_group);
+                    naga::Expression::AccessIndex {
+                        base: packed_group,
+                        index: member_index,
+                    }
                 }
                 NagaArgumentSource::ImplicitResource(global) => {
                     naga::Expression::GlobalVariable(global)
@@ -7420,6 +7821,12 @@ fn lower_naga_helper(
             let expression = naga_function
                 .expressions
                 .append(expression, naga::Span::UNDEFINED);
+            if let Some(first) = packed_emit_start {
+                naga_function.body.push(
+                    naga::Statement::Emit(naga::Range::new_from_bounds(first, expression)),
+                    naga::Span::UNDEFINED,
+                );
+            }
             value_map.insert(argument, expression);
         }
         let resource_seeds = function
@@ -8487,7 +8894,7 @@ fn translate_to_naga(
                 &helper_resource_variants,
                 &lowered_variants,
             )?);
-            let argument_abi = helper_naga_argument_abi(
+            let mut argument_abi = helper_naga_argument_abi(
                 module,
                 helper_ref,
                 &helper_signature,
@@ -8500,6 +8907,18 @@ fn translate_to_naga(
                 &live_arguments,
                 &naga_functions,
             )?;
+            let packed_arguments = pack_wide_naga_helper_arguments(
+                module,
+                &helper_signature,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                helper_memory_abi,
+                &mut argument_abi,
+                &naga_functions,
+                &mut naga_mod.types,
+            )?;
             let mut helper = lower_naga_helper(
                 module,
                 helper_ref,
@@ -8508,6 +8927,7 @@ fn translate_to_naga(
                 f32_type,
                 bool_type,
                 &argument_abi,
+                packed_arguments.as_ref(),
                 &result_abi,
                 helper_memory_abi,
                 helper_memory_types,
@@ -8545,6 +8965,7 @@ fn translate_to_naga(
                 NagaFunctionInfo {
                     handle,
                     argument_abi,
+                    packed_arguments,
                     result_abi: result_abi.clone(),
                     memory_abi: helper_memory_abi,
                 },

@@ -286,6 +286,107 @@ fn spirv_scalar_helper_call_survives_as_a_valid_wgsl_function() {
 }
 
 #[test]
+fn spirv_wide_scalar_helper_uses_a_portable_packed_abi() {
+    const INTEGER_ARGUMENTS: usize = 130;
+    const FLOAT_ARGUMENTS: usize = 130;
+
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let mut helper_arguments = vec![Type::I32; INTEGER_ARGUMENTS];
+    helper_arguments.extend(vec![Type::F32; FLOAT_ARGUMENTS]);
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "wide_scalar_helper_entry",
+            Linkage::Public,
+            &[Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_single(
+            "wide_scalar_helper",
+            Linkage::Private,
+            &helper_arguments,
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let arguments = fb.args().to_vec();
+        let mut integer_sum = arguments[0];
+        for &argument in &arguments[1..INTEGER_ARGUMENTS] {
+            integer_sum = fb.insert_inst(arith::Add::new(is, integer_sum, argument), Type::I32);
+        }
+        let mut float_sum = arguments[INTEGER_ARGUMENTS];
+        for &argument in &arguments[INTEGER_ARGUMENTS + 1..] {
+            float_sum = fb.insert_inst(arith::Add::new(is, float_sum, argument), Type::F32);
+        }
+        let float_bits = fb.insert_inst(cast::Bitcast::new(is, float_sum, Type::I32), Type::I32);
+        let sum = fb.insert_inst(
+            arith::Add::new(is, integer_sum, float_bits),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let value = fb.args()[0];
+        let float = fb.insert_inst(cast::Bitcast::new(is, value, Type::F32), Type::F32);
+        let mut arguments = vec![value; INTEGER_ARGUMENTS];
+        arguments.extend(vec![float; FLOAT_ARGUMENTS]);
+        let result = fb.insert_inst(
+            control_flow::Call::new(is, helper_ref, arguments.into()),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("a wide scalar helper should lower through a packed function-local ABI");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.contains("wide_scalar_helper_arguments"),
+        "the wide helper must receive one generated argument aggregate:\n{wgsl}",
+    );
+    assert!(
+        wgsl.contains("array<u32, 130>") && wgsl.contains("array<f32, 130>"),
+        "each homogeneous scalar group must use one fixed array rather than hundreds of named struct fields:\n{wgsl}",
+    );
+    let declaration = wgsl
+        .lines()
+        .find(|line| line.starts_with("fn wide_scalar_helper("))
+        .expect("wide helper declaration");
+    assert_eq!(
+        declaration.matches(':').count(),
+        1,
+        "the wide helper must have one physical WGSL parameter:\n{declaration}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with a packed helper ABI must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("WGSL with a packed helper ABI must validate for browser capabilities");
+}
+
+#[test]
 fn spirv_fixed_struct_local_survives_inside_scalar_helper() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,

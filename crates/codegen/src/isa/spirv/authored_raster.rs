@@ -558,12 +558,24 @@ fn append_scalar_helpers(
     for &function_ref in call_order.iter().filter(|function| !root_set.contains(function)) {
         naga_functions.replace_call_sites(call_sites(module, [function_ref], &lowered)?);
         let signature = module.ctx.get_sig(function_ref).expect("helper signature checked above");
-        let argument_abi = signature
+        let mut argument_abi = signature
             .args()
             .iter()
             .enumerate()
             .map(|(index, _)| NagaArgumentSource::Physical(index as u32))
             .collect::<Vec<_>>();
+        let packed_arguments = super::pack_wide_naga_helper_arguments(
+            module,
+            &signature,
+            WordKind::U32,
+            u32_type,
+            f32_type,
+            bool_type,
+            NagaMemoryAbi::default(),
+            &mut argument_abi,
+            &naga_functions,
+            &mut naga_module.types,
+        )?;
         let physical_type = helper_naga_result_type(
             module,
             signature.name(),
@@ -588,6 +600,7 @@ fn append_scalar_helpers(
             f32_type,
             bool_type,
             &argument_abi,
+            packed_arguments.as_ref(),
             &result_abi,
             NagaMemoryAbi::default(),
             NagaMemoryAbiTypes::default(),
@@ -602,6 +615,7 @@ fn append_scalar_helpers(
             NagaFunctionInfo {
                 handle,
                 argument_abi,
+                packed_arguments,
                 result_abi,
                 memory_abi: NagaMemoryAbi::default(),
             },
