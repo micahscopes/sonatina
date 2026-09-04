@@ -5298,10 +5298,24 @@ fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
         fb.finish();
     }
 
+    let module = mb.build();
     let artifact = SpirvBackend::new()
         .with_authored_raster("vs_scalar_helpers", "fs_scalar_helpers")
-        .compile_module(&mb.build())
+        .compile_module(&module)
         .expect("authored raster should retain one shared scalar helper");
+    let explicit = SpirvBackend::new()
+        .compile_raster_entries(&module, vertex_ref, fragment_ref)
+        .expect("explicit paired entries should not depend on the first declared helper");
+    assert_eq!(explicit.words, artifact.words, "entry transport must preserve SPIR-V");
+    assert_eq!(explicit.wgsl, artifact.wgsl, "entry transport must preserve WGSL");
+    let errors = SpirvBackend::new()
+        .compile_raster_entries(&module, vertex_ref, vertex_ref)
+        .err().expect("one function cannot supply both stages");
+    assert!(errors.iter().any(|error| error.to_string().contains("must be distinct")));
+    let errors = SpirvBackend::new().with_compute()
+        .compile_raster_entries(&module, vertex_ref, fragment_ref)
+        .err().expect("compute configuration cannot silently select raster");
+    assert!(errors.iter().any(|error| error.to_string().contains("another entry mode")));
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
     assert_eq!(
         wgsl.matches("fn raster_pair_math(").count(),
@@ -5321,6 +5335,12 @@ fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
             .expect("authored scalar-helper WGSL should reparse"),
     )
     .expect("authored scalar-helper WGSL should validate for browsers");
+    module.remove_func(fragment_ref).unwrap();
+    let errors = SpirvBackend::new()
+        .compile_raster_entries(&module, vertex_ref, fragment_ref)
+        .err().expect("a removed raster entry must fail before translation");
+    assert!(errors.iter().any(|error| error.to_string().contains("fragment entry")
+        && error.to_string().contains("not defined in this module")));
 }
 
 #[test]
