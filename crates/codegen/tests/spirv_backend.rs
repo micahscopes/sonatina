@@ -4950,6 +4950,125 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
 }
 
 #[test]
+fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ref = mb
+        .declare_function(Signature::new(
+            "raster_pair_math",
+            Linkage::Private,
+            &[Type::F32, Type::F32],
+            &[Type::F32, Type::F32],
+        ))
+        .unwrap();
+    let vertex_ref = mb
+        .declare_function(Signature::new(
+            "vs_scalar_helpers",
+            Linkage::Public,
+            &[Type::I32, Type::F32],
+            &[Type::F32; 5],
+        ))
+        .unwrap();
+    let fragment_ref = mb
+        .declare_function(Signature::new_single(
+            "fs_scalar_helpers",
+            Linkage::Public,
+            &[Type::F32, Type::F32],
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(pair_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let sum = fb.insert_inst(arith::Fadd::new(is, fb.args()[0], fb.args()[1]), Type::F32);
+        let product =
+            fb.insert_inst(arith::Fmul::new(is, fb.args()[0], fb.args()[1]), Type::F32);
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [sum, product]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(vertex_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let index = fb.insert_inst(cast::I32ToF32::new(is, fb.args()[0]), Type::F32);
+        let first = fb.insert_inst_results(
+            control_flow::Call::new(is, pair_ref, [index, fb.args()[1]].into_iter().collect()),
+            &[Type::F32, Type::F32],
+        );
+        let second = fb.insert_inst_results(
+            control_flow::Call::new(is, pair_ref, [first[0], first[1]].into_iter().collect()),
+            &[Type::F32, Type::F32],
+        );
+        let zero = fb.make_imm_value(Immediate::F32(0.0f32.to_bits()));
+        let one = fb.make_imm_value(Immediate::F32(1.0f32.to_bits()));
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [second[0], second[1], zero, one, first[0]]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(fragment_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let pair = fb.insert_inst_results(
+            control_flow::Call::new(
+                is,
+                pair_ref,
+                [fb.args()[0], fb.args()[1]].into_iter().collect(),
+            ),
+            &[Type::F32, Type::F32],
+        );
+        let packed = fb.insert_inst(cast::F32ToI32::new(is, pair[0]), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, packed));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .with_authored_raster("vs_scalar_helpers", "fs_scalar_helpers")
+        .compile_module(&mb.build())
+        .expect("authored raster should retain one shared scalar helper");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert_eq!(
+        wgsl.matches("fn raster_pair_math(").count(),
+        1,
+        "the shared helper must be emitted once:\n{wgsl}",
+    );
+    assert!(
+        wgsl.matches("raster_pair_math(").count() >= 4,
+        "both stages must call the shared helper:\n{wgsl}",
+    );
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(
+        &naga::front::wgsl::parse_str(wgsl)
+            .expect("authored scalar-helper WGSL should reparse"),
+    )
+    .expect("authored scalar-helper WGSL should validate for browsers");
+}
+
+#[test]
 fn authored_raster_normalizes_multi_value_returns_to_one_ssa_exit() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,

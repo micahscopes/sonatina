@@ -7,7 +7,10 @@ use crate::optim::dead_arg::analyze_live_arguments;
 use super::{
     Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinArgument,
     SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
-    SpirvScalarKind, SpirvShaderStage, WordKind, append_external_resources, emit_naga_regions,
+    SpirvScalarKind, SpirvShaderStage, WordKind, NagaArgumentSource, NagaFunctionInfo,
+    NagaFunctionMap, NagaLogicalResultAbis, NagaMemoryAbi, NagaMemoryAbiTypes,
+    NagaResourceCapabilities, NagaResultAbi, NagaResultSource, append_external_resources,
+    emit_naga_regions, helper_naga_result_type, lower_naga_helper, reachable_call_postorder,
     resolve_naga_value, spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
 };
 
@@ -229,9 +232,10 @@ pub(super) fn translate(
     let (emitted_external_resources, external_resource_stages): (Vec<_>, Vec<_>) =
         emitted_external_resources.into_iter().unzip();
 
-    // Calls have already been inlined by Fe. Object indexing/projection/load
-    // resolves through the shared external globals. Allocation, private memory
-    // and traps still have no stage-paired channel.
+    // Fe retains only the scalar, memory-free portion of the helper graph.
+    // Object indexing/projection/load remains in the paired stage roots and
+    // resolves through their shared external globals. Allocation, pointers,
+    // private memory and traps still have no stage-paired helper channel.
     for (stage, func_ref) in [("vertex", vertex_ref), ("fragment", fragment_ref)] {
         module.func_store.try_view(func_ref, |function| -> Result<(), String> {
             let inst_set = function.inst_set();
@@ -327,13 +331,21 @@ pub(super) fn translate(
         emitted_external_resources.len() as u32,
     );
     let output_type = append_vertex_output_type(&mut naga_mod, f32_type, vec4f, varying_count);
+    let naga_functions = append_scalar_helpers(
+        module,
+        &[vertex_ref, fragment_ref],
+        &mut naga_mod,
+        u32_type,
+        f32_type,
+        bool_type,
+    )?;
     let vertex = lower_vertex(
         module, vertex_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
-        builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type,
+        builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type, &naga_functions,
     )?;
     let fragment = lower_fragment(
         module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
-        context_count, u32_type, f32_type, bool_type, vec4f,
+        context_count, u32_type, f32_type, bool_type, vec4f, &naga_functions,
     )?;
 
     naga_mod.entry_points.push(entry_point(
@@ -380,6 +392,204 @@ pub(super) fn translate(
         fragment_entry: Some(PHYSICAL_FRAGMENT_ENTRY.to_string()),
         color_target_format: Some("rgba8unorm".to_string()),
     }))
+}
+
+/// Materialize the ordinary scalar helper closure shared by both raster stages.
+///
+/// WebGPU functions cannot receive storage-resource pointers, so resource
+/// identity remains a property of the paired entry roots. This first authored
+/// raster helper ABI is intentionally smaller than the general compute ABI:
+/// booleans, u32/f32 scalars, flattened multi-results, and no memory effects.
+/// The compiler rejects every wider shape rather than silently inlining it in
+/// the backend or smuggling state through a generated global.
+fn append_scalar_helpers(
+    module: &Module,
+    roots: &[sonatina_ir::module::FuncRef],
+    naga_module: &mut naga::Module,
+    u32_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+) -> Result<NagaFunctionMap, String> {
+    use sonatina_ir::InstDowncast;
+
+    let root_set = roots.iter().copied().collect::<std::collections::HashSet<_>>();
+    let mut call_order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for &root in roots {
+        for function in reachable_call_postorder(module, root)? {
+            if seen.insert(function) {
+                call_order.push(function);
+            }
+        }
+    }
+
+    let scalar = |ty: Type| matches!(ty, Type::I1 | Type::I32 | Type::F32);
+    let mut logical_results = NagaLogicalResultAbis::new();
+    for &function_ref in call_order.iter().filter(|function| !root_set.contains(function)) {
+        let signature = module
+            .ctx
+            .get_sig(function_ref)
+            .ok_or_else(|| format!("spirv raster: helper {function_ref:?} has no signature"))?;
+        if !signature.args().iter().copied().all(scalar)
+            || !signature.ret_tys().iter().copied().all(scalar)
+        {
+            return Err(format!(
+                "spirv raster: helper `{}` crosses the scalar helper ABI with {:?} -> {:?}; fail closed",
+                signature.name(),
+                signature.args(),
+                signature.ret_tys(),
+            ));
+        }
+        module
+            .func_store
+            .try_view(function_ref, |function| -> Result<(), String> {
+                for block in function.layout.iter_block() {
+                    for instruction in function.layout.iter_inst(block) {
+                        let data = function.dfg.inst(instruction);
+                        if data.declared_effect_hint().has_memory_effect()
+                            && function.dfg.call_info(instruction).is_none()
+                        {
+                            return Err(format!(
+                                "spirv raster: helper `{}` has memory effect `{}` outside the scalar helper ABI; fail closed",
+                                signature.name(),
+                                data.as_text(),
+                            ));
+                        }
+                        if function
+                            .dfg
+                            .inst_results(instruction)
+                            .iter()
+                            .copied()
+                            .any(|value| !scalar(function.dfg.value_ty(value)))
+                            || data
+                                .collect_values()
+                                .into_iter()
+                                .any(|value| !scalar(function.dfg.value_ty(value)))
+                        {
+                            return Err(format!(
+                                "spirv raster: helper `{}` contains a non-scalar value outside the scalar helper ABI; fail closed",
+                                signature.name(),
+                            ));
+                        }
+                        if <&sonatina_ir::inst::control_flow::CallIndirect as InstDowncast>::downcast(
+                            function.inst_set(),
+                            data,
+                        )
+                        .is_some()
+                        {
+                            return Err(format!(
+                                "spirv raster: helper `{}` contains an indirect call; fail closed",
+                                signature.name(),
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .ok_or_else(|| {
+                format!("spirv raster: helper `{}` has no body", signature.name())
+            })??;
+        logical_results.insert(
+            function_ref,
+            signature
+                .ret_tys()
+                .iter()
+                .enumerate()
+                .map(|(index, _)| NagaResultSource::Physical(index as u32))
+                .collect(),
+        );
+    }
+
+    fn call_sites(
+        module: &Module,
+        functions: impl IntoIterator<Item = sonatina_ir::module::FuncRef>,
+        lowered: &HashMap<sonatina_ir::module::FuncRef, NagaFunctionInfo>,
+    ) -> Result<HashMap<sonatina_ir::InstId, NagaFunctionInfo>, String> {
+        let mut sites = HashMap::new();
+        for function_ref in functions {
+            module
+                .func_store
+                .try_view(function_ref, |function| -> Result<(), String> {
+                    for block in function.layout.iter_block() {
+                        for instruction in function.layout.iter_inst(block) {
+                            let Some(call) = function.dfg.call_info(instruction) else {
+                                continue;
+                            };
+                            let info = lowered.get(&call.callee()).ok_or_else(|| {
+                                format!(
+                                    "spirv raster: call to helper {:?} has no lowered scalar ABI; fail closed",
+                                    call.callee(),
+                                )
+                            })?;
+                            sites.insert(instruction, info.clone());
+                        }
+                    }
+                    Ok(())
+                })
+                .ok_or_else(|| {
+                    format!("spirv raster: function {function_ref:?} has no body")
+                })??;
+        }
+        Ok(sites)
+    }
+
+    let resource_capabilities = NagaResourceCapabilities::new();
+    let mut naga_functions = NagaFunctionMap::new();
+    let mut lowered = HashMap::<sonatina_ir::module::FuncRef, NagaFunctionInfo>::new();
+    for &function_ref in call_order.iter().filter(|function| !root_set.contains(function)) {
+        naga_functions.replace_call_sites(call_sites(module, [function_ref], &lowered)?);
+        let signature = module.ctx.get_sig(function_ref).expect("helper signature checked above");
+        let argument_abi = signature
+            .args()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| NagaArgumentSource::Physical(index as u32))
+            .collect::<Vec<_>>();
+        let physical_type = helper_naga_result_type(
+            module,
+            signature.name(),
+            signature.ret_tys(),
+            WordKind::U32,
+            u32_type,
+            f32_type,
+            bool_type,
+            &naga_functions,
+            &mut naga_module.types,
+        )?;
+        let result_abi = NagaResultAbi {
+            logical: logical_results[&function_ref].clone(),
+            physical_type,
+            physical_arity: signature.ret_tys().len(),
+        };
+        let helper = lower_naga_helper(
+            module,
+            function_ref,
+            WordKind::U32,
+            u32_type,
+            f32_type,
+            bool_type,
+            &argument_abi,
+            &result_abi,
+            NagaMemoryAbi::default(),
+            NagaMemoryAbiTypes::default(),
+            0,
+            &resource_capabilities,
+            &logical_results,
+            &naga_functions,
+        )?;
+        let handle = naga_module.functions.append(helper, naga::Span::UNDEFINED);
+        lowered.insert(
+            function_ref,
+            NagaFunctionInfo {
+                handle,
+                argument_abi,
+                result_abi,
+                memory_abi: NagaMemoryAbi::default(),
+            },
+        );
+    }
+    naga_functions.replace_call_sites(call_sites(module, roots.iter().copied(), &lowered)?);
+    Ok(naga_functions)
 }
 
 fn scalar_type(
@@ -659,6 +869,7 @@ fn lower_vertex(
     bool_type: naga::Handle<naga::Type>,
     vec4f: naga::Handle<naga::Type>,
     output_type: naga::Handle<naga::Type>,
+    naga_functions: &NagaFunctionMap,
 ) -> Result<naga::Function, String> {
     let arguments = builtin_arguments
         .iter()
@@ -730,13 +941,12 @@ fn lower_vertex(
         }
         debug_assert!(unique_return.is_some(), "raster stage was normalized to one exit");
         let mut result = None;
-        let naga_functions = super::NagaFunctionMap::new();
         emit_naga_regions(
             function, function.inst_set(), WordKind::U32, &scfg.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
             &mut result,
             None,
-            &naga_functions,
+            naga_functions,
             None,
         )?;
         let leaves = resolve_source_return_values(
@@ -785,6 +995,7 @@ fn lower_fragment(
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     vec4f: naga::Handle<naga::Type>,
+    naga_functions: &NagaFunctionMap,
 ) -> Result<naga::Function, String> {
     let mut output = naga::Function {
         name: Some(pipeline.fragment_entry.clone()),
@@ -834,13 +1045,12 @@ fn lower_fragment(
         }
         debug_assert!(unique_return.is_some(), "raster stage was normalized to one exit");
         let mut result = None;
-        let naga_functions = super::NagaFunctionMap::new();
         emit_naga_regions(
             function, function.inst_set(), WordKind::U32, &scfg.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
             &mut result,
             None,
-            &naga_functions,
+            naga_functions,
             None,
         )?;
         let packed = resolve_source_return_values(
