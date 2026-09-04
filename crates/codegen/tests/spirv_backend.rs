@@ -4933,6 +4933,10 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
     assert_eq!(artifact.layout.fragment_entry.as_deref(), Some("fe_fragment_main"));
     assert!(wgsl.contains("fn fe_vertex_main("), "{wgsl}");
     assert!(wgsl.contains("fn fe_fragment_main("), "{wgsl}");
+    assert!(
+        !wgsl.contains("RasterVertexLeaves"),
+        "a unique source return needs no aggregate transport:\n{wgsl}",
+    );
     assert!(!wgsl.contains("fn vs_resource_identity_0_("), "{wgsl}");
     assert!(!wgsl.contains("fn fs_resource_identity_0_("), "{wgsl}");
     assert!(wgsl.contains("@builtin(instance_index)"), "{wgsl}");
