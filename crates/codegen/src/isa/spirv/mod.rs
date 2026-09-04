@@ -568,6 +568,32 @@ fn compact_naga_control(module: &mut naga::Module) -> usize {
     compacted
 }
 
+#[cfg(feature = "spirv-backend")]
+fn validate_naga_portable_wgsl_limits(module: &naga::Module) -> Result<(), String> {
+    let validate_function = |kind: &str, name: &str, function: &naga::Function| {
+        let parameter_count = function.arguments.len();
+        if parameter_count > MAX_WGSL_FUNCTION_PARAMETERS {
+            return Err(format!(
+                "spirv: {kind} `{name}` has {parameter_count} physical parameters after ABI lowering, over the portable WGSL limit of {MAX_WGSL_FUNCTION_PARAMETERS}. Fail closed."
+            ));
+        }
+        Ok(())
+    };
+
+    for (handle, function) in module.functions.iter() {
+        let name = function
+            .name
+            .as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("function_{}", handle.index()));
+        validate_function("helper", &name, function)?;
+    }
+    for entry in &module.entry_points {
+        validate_function("entry point", &entry.name, &entry.function)?;
+    }
+    Ok(())
+}
+
 impl Backend for SpirvBackend {
     type Artifact = SpirvArtifact;
     type Error = SpirvError;
@@ -604,6 +630,9 @@ impl Backend for SpirvBackend {
                 started.elapsed().as_millis()
             );
         }
+
+        validate_naga_portable_wgsl_limits(&naga_mod)
+            .map_err(|error| vec![SpirvError::Validation(error)])?;
 
         let phase = std::time::Instant::now();
         let validation = naga::valid::Validator::new(
@@ -10727,4 +10756,70 @@ fn translate_to_naga(
     };
 
     Ok((naga_mod, layout))
+}
+
+#[cfg(all(test, feature = "spirv-backend"))]
+mod tests {
+    use super::{MAX_WGSL_FUNCTION_PARAMETERS, validate_naga_portable_wgsl_limits};
+
+    fn naga_function_with_parameters(
+        name: &str,
+        count: usize,
+        ty: naga::Handle<naga::Type>,
+    ) -> naga::Function {
+        let mut function = naga::Function {
+            name: Some(name.to_string()),
+            ..Default::default()
+        };
+        function.arguments = (0..count)
+            .map(|index| naga::FunctionArgument {
+                name: Some(format!("a{index}")),
+                ty,
+                binding: None,
+            })
+            .collect();
+        function
+    }
+
+    #[test]
+    fn final_naga_module_enforces_portable_wgsl_parameter_limit() {
+        let mut module = naga::Module::default();
+        let word = module.types.insert(
+            naga::Type {
+                name: None,
+                inner: naga::TypeInner::Scalar(naga::Scalar {
+                    kind: naga::ScalarKind::Uint,
+                    width: 4,
+                }),
+            },
+            naga::Span::UNDEFINED,
+        );
+        module.functions.append(
+            naga_function_with_parameters(
+                "at_the_limit",
+                MAX_WGSL_FUNCTION_PARAMETERS,
+                word,
+            ),
+            naga::Span::UNDEFINED,
+        );
+        validate_naga_portable_wgsl_limits(&module)
+            .expect("the portable WGSL parameter limit must be inclusive");
+
+        module.functions.append(
+            naga_function_with_parameters(
+                "over_the_limit",
+                MAX_WGSL_FUNCTION_PARAMETERS + 1,
+                word,
+            ),
+            naga::Span::UNDEFINED,
+        );
+        let error = validate_naga_portable_wgsl_limits(&module)
+            .expect_err("the final physical module must reject an over-wide function");
+        assert!(
+            error.contains("over_the_limit")
+                && error.contains("256 physical parameters")
+                && error.contains("limit of 255"),
+            "unexpected conformance error: {error}",
+        );
+    }
 }
