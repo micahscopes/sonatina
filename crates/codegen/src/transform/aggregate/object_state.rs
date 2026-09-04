@@ -23,12 +23,12 @@ use super::{
 /// exact same leaf-set lattice while keeping whole roots and contiguous fields
 /// constant-size.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct LiveLeafSet {
+pub(crate) struct LeafIntervalSet {
     ranges: Vec<Range<usize>>,
 }
 
-impl LiveLeafSet {
-    fn mark_range(&mut self, range: Range<usize>) {
+impl LeafIntervalSet {
+    pub(crate) fn mark_range(&mut self, range: Range<usize>) {
         if range.start >= range.end {
             return;
         }
@@ -56,7 +56,7 @@ impl LiveLeafSet {
         self.ranges = merged;
     }
 
-    fn clear_range(&mut self, range: Range<usize>) {
+    pub(crate) fn clear_range(&mut self, range: Range<usize>) {
         if range.start >= range.end {
             return;
         }
@@ -76,13 +76,34 @@ impl LiveLeafSet {
         self.ranges = remaining;
     }
 
-    fn union_with(&mut self, other: &Self) {
+    pub(crate) fn union_with(&mut self, other: &Self) {
         for range in &other.ranges {
             self.mark_range(range.clone());
         }
     }
 
-    fn intersects(&self, range: Range<usize>) -> bool {
+    pub(crate) fn intersect_with(&mut self, other: &Self) {
+        let mut intersection = Vec::new();
+        let mut left = 0;
+        let mut right = 0;
+        while left < self.ranges.len() && right < other.ranges.len() {
+            let lhs = &self.ranges[left];
+            let rhs = &other.ranges[right];
+            let start = lhs.start.max(rhs.start);
+            let end = lhs.end.min(rhs.end);
+            if start < end {
+                intersection.push(start..end);
+            }
+            if lhs.end <= rhs.end {
+                left += 1;
+            } else {
+                right += 1;
+            }
+        }
+        self.ranges = intersection;
+    }
+
+    pub(crate) fn intersects(&self, range: Range<usize>) -> bool {
         range.start < range.end
             && self
                 .ranges
@@ -90,12 +111,29 @@ impl LiveLeafSet {
                 .any(|live| live.start < range.end && range.start < live.end)
     }
 
+    pub(crate) fn contains_range(&self, range: Range<usize>) -> bool {
+        range.start >= range.end
+            || self
+                .ranges
+                .iter()
+                .any(|live| live.start <= range.start && range.end <= live.end)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ranges.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interval_count(&self) -> usize {
+        self.ranges.len()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
 }
 
-pub(crate) type LiveLeafMap = FxHashMap<ValueId, LiveLeafSet>;
+pub(crate) type LiveLeafMap = FxHashMap<ValueId, LeafIntervalSet>;
 pub(crate) type ObjectSliceList = SmallVec<[ObjectSlice; 4]>;
 pub(crate) type ObservedRoots = SmallVec<[ValueId; 4]>;
 
@@ -250,7 +288,7 @@ mod tests {
 
     #[test]
     fn live_leaf_intervals_keep_large_roots_compact_and_exact() {
-        let mut live = LiveLeafSet::default();
+        let mut live = LeafIntervalSet::default();
         live.mark_range(0..100_000_000);
         assert_eq!(live.ranges, vec![0..100_000_000]);
 
@@ -266,6 +304,21 @@ mod tests {
 
         live.clear_range(0..100_000_000);
         assert!(live.is_empty());
+    }
+
+    #[test]
+    fn leaf_interval_intersection_is_exact() {
+        let mut left = LeafIntervalSet::default();
+        left.mark_range(0..10);
+        left.mark_range(20..40);
+        let mut right = LeafIntervalSet::default();
+        right.mark_range(5..25);
+        right.mark_range(30..35);
+
+        left.intersect_with(&right);
+        assert_eq!(left.ranges, vec![5..10, 20..25, 30..35]);
+        assert!(left.contains_range(20..25));
+        assert!(!left.contains_range(9..21));
     }
 
     fn parse_test_module(src: &str) -> sonatina_ir::Module {

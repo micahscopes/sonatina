@@ -9,7 +9,9 @@ use crate::loop_analysis::{Loop, LoopTree};
 
 use super::{
     LocalObjectArgInfo, ObjectEffectSummaryMap, RootInit, SliceSet,
-    object_state::{is_pure_object_address_inst, observed_roots_ignoring_pure_address_ops},
+    object_state::{
+        LeafIntervalSet, is_pure_object_address_inst, observed_roots_ignoring_pure_address_ops,
+    },
     object_tracking::{
         AggregateObjectFacts, ObjectSlice, TrackedObject, enum_tag_object_slice,
         enum_variant_field_object_slice, object_slice_overlaps_effect, slice_is_covered_by,
@@ -87,7 +89,7 @@ enum ObjectClobber {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 struct MemoryState {
     carriers: FxHashMap<ObjectSlice, MemoryCarrier>,
-    initialized_leaves: FxHashMap<ValueId, FxHashSet<usize>>,
+    initialized_leaves: FxHashMap<ValueId, LeafIntervalSet>,
     active_roots: FxHashSet<ValueId>,
     blocked_roots: FxHashSet<ValueId>,
 }
@@ -475,7 +477,7 @@ fn meet_memory_states<'a>(
             .unwrap_or_default();
         for pred in &rest {
             if let Some(pred_initialized) = pred.initialized_leaves.get(&root) {
-                initialized.retain(|leaf| pred_initialized.contains(leaf));
+                initialized.intersect_with(pred_initialized);
             } else {
                 initialized.clear();
             }
@@ -987,7 +989,7 @@ fn mark_slice_initialized(state: &mut MemoryState, slice: ObjectSlice) {
         .initialized_leaves
         .entry(slice.root)
         .or_default()
-        .extend(slice.first_leaf..slice.first_leaf + slice.leaf_count);
+        .mark_range(slice.first_leaf..slice.first_leaf + slice.leaf_count);
 }
 
 fn mark_effect_leaves_initialized(
@@ -995,11 +997,11 @@ fn mark_effect_leaves_initialized(
     base_slice: ObjectSlice,
     leaves: &FxHashSet<usize>,
 ) {
-    state
-        .initialized_leaves
-        .entry(base_slice.root)
-        .or_default()
-        .extend(leaves.iter().map(|leaf| base_slice.first_leaf + *leaf));
+    let initialized = state.initialized_leaves.entry(base_slice.root).or_default();
+    for leaf in leaves {
+        let leaf = base_slice.first_leaf + *leaf;
+        initialized.mark_range(leaf..leaf + 1);
+    }
 }
 
 fn slice_is_fully_initialized(state: &MemoryState, slice: ObjectSlice) -> bool {
@@ -1007,8 +1009,7 @@ fn slice_is_fully_initialized(state: &MemoryState, slice: ObjectSlice) -> bool {
         .initialized_leaves
         .get(&slice.root)
         .is_some_and(|initialized| {
-            (slice.first_leaf..slice.first_leaf + slice.leaf_count)
-                .all(|leaf| initialized.contains(&leaf))
+            initialized.contains_range(slice.first_leaf..slice.first_leaf + slice.leaf_count)
         })
 }
 
@@ -1077,6 +1078,49 @@ mod tests {
                 .read_state(load_inst)
                 .map(ObjectReadState::key)
         })
+    }
+
+    #[test]
+    fn live_in_large_array_initialization_is_bounded() {
+        let module = parse_test_module(
+            r#"
+target = "wasm32-unknown-native"
+
+func private %f(v0.objref<[i32; 100000000]>) {
+block0:
+    return;
+}
+"#,
+        );
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.view(func_ref, |func| {
+            let root = func.arg_values[0];
+            let return_inst = func
+                .layout
+                .iter_block()
+                .flat_map(|block| func.layout.iter_inst(block))
+                .find(|&inst| {
+                    downcast::<&control_flow::Return>(func.inst_set(), func.dfg.inst(inst)).is_some()
+                })
+                .expect("return instruction");
+            let mut local_object_args = FxHashMap::default();
+            local_object_args.insert(
+                0,
+                LocalObjectArgInfo {
+                    init: RootInit::LoadLiveIn,
+                    fresh_result_out: false,
+                },
+            );
+            let mut object_memory = ObjectMemoryAnalysis::default();
+            object_memory.compute_with_loaded_value_carriers(
+                func,
+                Some(&local_object_args),
+                None,
+            );
+            let initialized = &object_memory.inst_pre_states[&return_inst].initialized_leaves[&root];
+            assert_eq!(initialized.interval_count(), 1);
+            assert!(initialized.contains_range(0..100_000_000));
+        });
     }
 
     #[test]
