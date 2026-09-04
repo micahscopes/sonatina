@@ -174,6 +174,50 @@ fn spirv_arithmetic_return_valid() {
 }
 
 #[test]
+fn spirv_explicit_entry_ignores_declaration_order() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let decoy = mb.declare_function(Signature::new_single(
+        "unselected_i64", Linkage::Public, &[], Type::I64,
+    )).unwrap();
+    let selected = mb.declare_function(Signature::new_single(
+        "selected_u32", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    )).unwrap();
+    for (function, value) in [(decoy, Immediate::from(99i64)), (selected, Immediate::from(42i32))] {
+        let mut fb = mb.func_builder::<InstInserter>(function);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let value = fb.make_imm_value(value);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+        fb.seal_all();
+        fb.finish();
+    }
+    let module = mb.build();
+    for backend in [SpirvBackend::new(), SpirvBackend::new().with_render()] {
+        let artifact = backend.compile_entry(&module, selected)
+            .expect("the explicitly selected entry must supply both signature and body");
+        assert_eq!(artifact.layout.word, WordKind::U32);
+        let wgsl = artifact.wgsl.expect("selected u32 entry has WGSL output");
+        assert!(wgsl.contains("42u"), "selected body missing: {wgsl}");
+        assert!(!wgsl.contains("99"), "unselected body leaked: {wgsl}");
+        let reparsed = naga::front::wgsl::parse_str(&wgsl).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        ).validate(&reparsed).unwrap();
+    }
+    module.remove_func(selected).unwrap();
+    let errors = match SpirvBackend::new().compile_entry(&module, selected) {
+        Ok(_) => panic!("removed entry must be rejected"),
+        Err(errors) => errors,
+    };
+    assert!(errors.iter().any(|error| error.to_string().contains("not defined in this module")));
+}
+
+#[test]
 fn spirv_scalar_helper_call_survives_as_a_valid_wgsl_function() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,

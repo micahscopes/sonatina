@@ -607,10 +607,32 @@ impl Backend for SpirvBackend {
 
     #[cfg(feature = "spirv-backend")]
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
+        self.compile_module_for_entry(module, None)
+    }
+}
+
+#[cfg(feature = "spirv-backend")]
+impl SpirvBackend {
+    /// Compile a specific entry in this module, independently of declaration order.
+    /// Paired authored raster uses its pipeline interface instead.
+    pub fn compile_entry(
+        &self,
+        module: &Module,
+        entry: sonatina_ir::module::FuncRef,
+    ) -> Result<SpirvArtifact, Vec<SpirvError>> {
+        self.compile_module_for_entry(module, Some(entry))
+    }
+
+    fn compile_module_for_entry(
+        &self,
+        module: &Module,
+        entry: Option<sonatina_ir::module::FuncRef>,
+    ) -> Result<SpirvArtifact, Vec<SpirvError>> {
         let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
         let started = std::time::Instant::now();
         let (mut naga_mod, layout) = translate_to_naga(
             module,
+            entry,
             self.workgroup_size,
             self.grid,
             self.render,
@@ -8066,6 +8088,7 @@ fn compute_builtin_slot(source: SpirvBuiltinSource) -> Option<(usize, Option<u32
 #[cfg(feature = "spirv-backend")]
 fn translate_to_naga(
     module: &Module,
+    entry: Option<sonatina_ir::module::FuncRef>,
     workgroup_size: [u32; 3],
     grid: bool,
     render: bool,
@@ -8081,6 +8104,9 @@ fn translate_to_naga(
     let started = std::time::Instant::now();
 
     if let Some(raster) = authored_raster {
+        if entry.is_some() {
+            return Err("spirv raster: an individual entry cannot override the paired raster interface".to_string());
+        }
         if grid || render || compute {
             return Err("spirv raster: authored raster, grid, fullscreen render, and compute modes are mutually exclusive".to_string());
         }
@@ -8100,14 +8126,20 @@ fn translate_to_naga(
     // no SHADER_INT64); I64 -> i64 (the original path, bit-for-bit). Anything else,
     // a missing return, or a mixed-width argument fails closed.
     let funcs_peek = module.funcs();
-    let first_func = *funcs_peek
-        .first()
-        .ok_or_else(|| "spirv: module has no functions to translate".to_string())?;
+    let first_func = match entry {
+        Some(entry) if funcs_peek.contains(&entry) => entry,
+        Some(entry) => return Err(format!(
+            "spirv: selected entry {entry:?} is not defined in this module"
+        )),
+        None => *funcs_peek
+            .first()
+            .ok_or_else(|| "spirv: module has no functions to translate".to_string())?,
+    };
 
     let sig = module
         .ctx
         .get_sig(first_func)
-        .ok_or_else(|| "spirv: first function has no declared signature".to_string())?;
+        .ok_or_else(|| "spirv: selected entry has no declared signature".to_string())?;
 
     let word = match sig.single_ret_ty() {
         Some(sonatina_ir::Type::I32) => WordKind::U32,
@@ -9830,11 +9862,10 @@ fn translate_to_naga(
             diagnostic_filter_leaf: None,
         };
 
-        let funcs = module.funcs();
         let mut result_expr = None;
         let mut body_error = None;
-        if let Some(&func_ref) = funcs.first() {
-            module.func_store.try_view(func_ref, |function| {
+        {
+            module.func_store.try_view(first_func, |function| {
                 let inst_set = function.inst_set();
                 let mut value_map: HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>> =
                     HashMap::new();
@@ -10337,8 +10368,7 @@ fn translate_to_naga(
         None
     };
 
-    // Translate the first Sonatina function
-    let funcs = module.funcs();
+    // Translate the selected Sonatina entry.
     let mut result_expr = None;
     // In grid mode, the gid.x / gid.y expressions bound to args 0,1 are emitted
     // inside the body closure but reused by the per-pixel store that follows it,
@@ -10347,8 +10377,8 @@ fn translate_to_naga(
         None;
 
     let mut body_error = None;
-    if let Some(&func_ref) = funcs.first() {
-        module.func_store.try_view(func_ref, |function| {
+    {
+        module.func_store.try_view(first_func, |function| {
             let inst_set = function.inst_set();
             let mut value_map: HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>> =
                 HashMap::new();
