@@ -338,6 +338,16 @@ pub struct SpirvBackend {
     pub heap_words: u32,
 }
 
+#[cfg(feature = "spirv-backend")]
+#[derive(Clone, Copy)]
+enum ShaderEntries {
+    Single(sonatina_ir::module::FuncRef),
+    Raster {
+        vertex: sonatina_ir::module::FuncRef,
+        fragment: sonatina_ir::module::FuncRef,
+    },
+}
+
 impl SpirvBackend {
     pub fn new() -> Self {
         Self {
@@ -620,13 +630,24 @@ impl SpirvBackend {
         module: &Module,
         entry: sonatina_ir::module::FuncRef,
     ) -> Result<SpirvArtifact, Vec<SpirvError>> {
-        self.compile_module_for_entry(module, Some(entry))
+        self.compile_module_for_entry(module, Some(ShaderEntries::Single(entry)))
+    }
+
+    /// Compile source-authored raster stages by module-local function identity.
+    /// This selects the paired raster interface without a name lookup.
+    pub fn compile_raster_entries(
+        &self,
+        module: &Module,
+        vertex: sonatina_ir::module::FuncRef,
+        fragment: sonatina_ir::module::FuncRef,
+    ) -> Result<SpirvArtifact, Vec<SpirvError>> {
+        self.compile_module_for_entry(module, Some(ShaderEntries::Raster { vertex, fragment }))
     }
 
     fn compile_module_for_entry(
         &self,
         module: &Module,
-        entry: Option<sonatina_ir::module::FuncRef>,
+        entry: Option<ShaderEntries>,
     ) -> Result<SpirvArtifact, Vec<SpirvError>> {
         let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
         let started = std::time::Instant::now();
@@ -8088,7 +8109,7 @@ fn compute_builtin_slot(source: SpirvBuiltinSource) -> Option<(usize, Option<u32
 #[cfg(feature = "spirv-backend")]
 fn translate_to_naga(
     module: &Module,
-    entry: Option<sonatina_ir::module::FuncRef>,
+    entry: Option<ShaderEntries>,
     workgroup_size: [u32; 3],
     grid: bool,
     render: bool,
@@ -8102,6 +8123,18 @@ fn translate_to_naga(
     use std::collections::HashMap;
     let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
     let started = std::time::Instant::now();
+
+    if let Some(ShaderEntries::Raster { vertex, fragment }) = entry {
+        if authored_raster.is_some() || grid || render || compute {
+            return Err("spirv raster: explicit raster entries cannot be combined with another entry mode".to_string());
+        }
+        if dispatch_grid != [1, 1, 1] {
+            return Err("spirv raster: a fixed dispatch grid is invalid for authored raster".to_string());
+        }
+        return authored_raster::translate_entries(
+            module, vertex, fragment, external_resources, builtin_arguments,
+        );
+    }
 
     if let Some(raster) = authored_raster {
         if entry.is_some() {
@@ -8127,10 +8160,11 @@ fn translate_to_naga(
     // a missing return, or a mixed-width argument fails closed.
     let funcs_peek = module.funcs();
     let first_func = match entry {
-        Some(entry) if funcs_peek.contains(&entry) => entry,
-        Some(entry) => return Err(format!(
+        Some(ShaderEntries::Single(entry)) if funcs_peek.contains(&entry) => entry,
+        Some(ShaderEntries::Single(entry)) => return Err(format!(
             "spirv: selected entry {entry:?} is not defined in this module"
         )),
+        Some(ShaderEntries::Raster { .. }) => unreachable!("raster entries handled above"),
         None => *funcs_peek
             .first()
             .ok_or_else(|| "spirv: module has no functions to translate".to_string())?,

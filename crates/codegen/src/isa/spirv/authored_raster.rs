@@ -47,10 +47,35 @@ pub(super) fn translate(
     let fragment_ref = find_entry(&pipeline.fragment_entry).ok_or_else(|| {
         format!("spirv raster: fragment entry `{}` is absent", pipeline.fragment_entry)
     })?;
+    translate_entries(module, vertex_ref, fragment_ref, external_resources, builtin_arguments)
+}
+
+pub(super) fn translate_entries(
+    module: &Module,
+    vertex_ref: sonatina_ir::module::FuncRef,
+    fragment_ref: sonatina_ir::module::FuncRef,
+    external_resources: &[SpirvExternalResource],
+    builtin_arguments: &[SpirvBuiltinArgument],
+) -> Result<(naga::Module, SpirvLayout), String> {
+    if vertex_ref == fragment_ref {
+        return Err("spirv raster: vertex and fragment entries must be distinct".to_string());
+    }
+    let functions = module.funcs();
+    for (stage, entry) in [("vertex", vertex_ref), ("fragment", fragment_ref)] {
+        if !functions.contains(&entry) {
+            return Err(format!("spirv raster: selected {stage} entry {entry:?} is not defined in this module"));
+        }
+    }
     let vertex_sig = module.ctx.get_sig(vertex_ref)
         .ok_or_else(|| "spirv raster: vertex entry has no signature".to_string())?;
     let fragment_sig = module.ctx.get_sig(fragment_ref)
         .ok_or_else(|| "spirv raster: fragment entry has no signature".to_string())?;
+    // Names are diagnostic and emitted-symbol metadata only. Stage identity was
+    // selected and checked above using the module's function handles.
+    let pipeline = &SpirvRasterPipeline {
+        vertex_entry: vertex_sig.name().to_owned(),
+        fragment_entry: fragment_sig.name().to_owned(),
+    };
 
     let implicit_vertex_index = [SpirvBuiltinArgument {
         arg_index: 0,
