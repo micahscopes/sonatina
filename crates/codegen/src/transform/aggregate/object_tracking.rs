@@ -337,9 +337,7 @@ pub(crate) fn root_leaf_count_for_ty(
     if ty == Type::Unit {
         return 0;
     }
-    layout_cache
-        .shape(ctx, ty)
-        .map_or(1, |shape| shape.leaves.len())
+    layout_cache.flattened_leaf_count(ctx, ty).unwrap_or(1)
 }
 
 pub(crate) fn whole_root_slice_for_value(

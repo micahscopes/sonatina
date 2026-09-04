@@ -696,9 +696,7 @@ pub(crate) fn whole_object_slice(
     let leaf_count = if ty == Type::Unit {
         0
     } else {
-        layout_cache
-            .shape(ctx, ty)
-            .map_or(1, |shape| shape.leaves.len())
+        layout_cache.flattened_leaf_count(ctx, ty).unwrap_or(1)
     };
     shape::AggregateSlice {
         ty,

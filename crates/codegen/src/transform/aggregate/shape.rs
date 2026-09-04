@@ -87,6 +87,18 @@ impl AggregateLayoutCache {
         self.with_layout(module, |layout| layout.shape(ty))
     }
 
+    /// Count flattened scalar leaves without materializing every leaf path.
+    ///
+    /// Analyses that only need the extent of an aggregate (for example,
+    /// whole-object effect and liveness summaries) must use this query. A
+    /// fixed-size GPU buffer can contain millions of scalar leaves; building
+    /// an [`AggregateShape`] for such a buffer turns a constant-size summary
+    /// into a proportional allocation even when no individual leaf is ever
+    /// inspected.
+    pub fn flattened_leaf_count(&mut self, module: &ModuleCtx, ty: Type) -> Option<usize> {
+        self.with_layout(module, |layout| layout.flattened_leaf_count(ty))
+    }
+
     pub fn runtime_leaves(&mut self, module: &ModuleCtx, ty: Type) -> Option<RuntimeLeaves> {
         self.with_layout(module, |layout| layout.runtime_leaves(ty))
     }
@@ -1445,6 +1457,37 @@ mod tests {
         types::{EnumReprHint, VariantData},
     };
     use sonatina_parser::parse_module;
+
+    #[test]
+    fn flattened_leaf_count_does_not_materialize_large_array_paths() {
+        let module = parse_test_module(
+            r#"
+target = "wasm32-unknown-native"
+func private %f(v0.objref<[i32; 100000000]>) {
+block0:
+    return;
+}
+"#,
+        );
+        let array_ty = module
+            .ctx
+            .get_sig(module.funcs()[0])
+            .and_then(|sig| sig.args().first().copied())
+            .and_then(|ty| match ty.resolve_compound(&module.ctx) {
+                Some(CompoundType::ObjRef(elem)) => Some(elem),
+                _ => None,
+            })
+            .expect("array pointee type");
+        let mut cache = AggregateLayoutCache::default();
+        assert_eq!(
+            cache.flattened_leaf_count(&module.ctx, array_ty),
+            Some(100_000_000)
+        );
+        assert!(
+            cache.shape_cache.is_empty(),
+            "count-only queries must not materialize leaf paths"
+        );
+    }
 
     fn parse_test_module(src: &str) -> Module {
         parse_module(src).expect("parse should succeed").module

@@ -406,12 +406,12 @@ impl AggregateScalarize {
                 let Some(ptr_value) = ptr_value else {
                     continue;
                 };
+                if self.aggregate_leaf_count(module, ty).is_none_or(|count| count > 4) {
+                    continue;
+                }
                 let Some(shape) = self.aggregate_shape(module, ty) else {
                     continue;
                 };
-                if shape.leaves.len() > 4 {
-                    continue;
-                }
                 roots.push((ptr_value, root_kind, ty, shape));
             }
         }
@@ -424,12 +424,15 @@ impl AggregateScalarize {
                 let Some(root_ty) = objref_element_ty(module, func.dfg.value_ty(root_value)) else {
                     continue;
                 };
+                if self
+                    .aggregate_leaf_count(module, root_ty)
+                    .is_none_or(|count| count > 4)
+                {
+                    continue;
+                }
                 let Some(shape) = self.aggregate_shape(module, root_ty) else {
                     continue;
                 };
-                if shape.leaves.len() > 4 {
-                    continue;
-                }
                 let kind = if info.fresh_result_out {
                     RootKind::SyntheticOutArg { index: idx }
                 } else {
@@ -1003,10 +1006,9 @@ impl AggregateScalarize {
             if !shape::is_supported_scalar_shape_ty(module, ty) {
                 continue;
             }
-            if self
-                .aggregate_shape(module, ty)
-                .is_some_and(|shape| shape.leaves.len() > MAX_SCALARIZABLE_VALUE_LEAVES)
-            {
+            if self.aggregate_leaf_count(module, ty).is_none_or(|count| {
+                count > MAX_SCALARIZABLE_VALUE_LEAVES
+            }) {
                 continue;
             }
             let ok = match func.dfg.value(value) {
@@ -2386,6 +2388,14 @@ impl AggregateScalarize {
         self.layout_cache.shape(module, ty)
     }
 
+    fn aggregate_leaf_count(
+        &mut self,
+        module: &sonatina_ir::module::ModuleCtx,
+        ty: Type,
+    ) -> Option<usize> {
+        self.layout_cache.flattened_leaf_count(module, ty)
+    }
+
     fn aggregate_single_runtime_word_leaf(
         &mut self,
         module: &sonatina_ir::module::ModuleCtx,
@@ -3186,6 +3196,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn large_array_root_is_rejected_before_shape_materialization() {
+        let module = parse_test_module(
+            r#"
+target = "wasm32-unknown-native"
+
+func private %f() -> objref<[i32; 100000000]> {
+block0:
+    v0.objref<[i32; 100000000]> = obj.alloc [i32; 100000000];
+    return v0;
+}
+"#,
+        );
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.modify(func_ref, |func| {
+            AggregateScalarize::default().run(func);
+        });
+        module.func_store.view(func_ref, |func| {
+            assert_eq!(func.layout.iter_block().count(), 1);
+        });
     }
 
     #[test]

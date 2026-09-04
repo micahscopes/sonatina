@@ -11,9 +11,10 @@ use super::{
     LocalObjectArgInfo, LocalObjectArgMap, ObjectEffectSummaryMap, SliceSet,
     cleanup::DeadPureInstCleanup,
     object_state::{
-        LiveLeafMap, clear_live_slice, enum_write_variant_slices, mark_live_slice,
-        mark_live_tracked_object, mark_root_live, observed_roots_ignoring_pure_address_ops,
-        slice_has_live_leaf, tracked_root_total_leaves, union_live_leaf_maps,
+        LiveLeafMap, clear_live_leaf, clear_live_slice, enum_write_variant_slices, mark_live_leaf,
+        mark_live_slice, mark_live_tracked_object, mark_root_live,
+        observed_roots_ignoring_pure_address_ops, slice_has_live_leaf,
+        tracked_root_total_leaves, union_live_leaf_maps,
     },
     object_tracking::{
         AggregateObjectFacts, ObjectSlice, TrackedObject, enum_tag_object_slice,
@@ -824,8 +825,9 @@ fn mark_live_slice_set(live: &mut LiveLeafMap, base_slice: ObjectSlice, slices: 
         clear_or_mark_live_slice(live, base_slice, true);
         return;
     };
-    let root_live = live.entry(base_slice.root).or_default();
-    root_live.extend(leaves.iter().map(|leaf| base_slice.first_leaf + *leaf));
+    for leaf in leaves {
+        mark_live_leaf(live, base_slice.root, base_slice.first_leaf + *leaf);
+    }
 }
 
 fn clear_live_slice_set(live: &mut LiveLeafMap, base_slice: ObjectSlice, slices: &SliceSet) {
@@ -840,10 +842,8 @@ fn clear_live_slice_set(live: &mut LiveLeafMap, base_slice: ObjectSlice, slices:
         clear_or_mark_live_slice(live, base_slice, false);
         return;
     };
-    if let Some(root_live) = live.get_mut(&base_slice.root) {
-        for leaf in leaves {
-            root_live.remove(&(base_slice.first_leaf + leaf));
-        }
+    for leaf in leaves {
+        clear_live_leaf(live, base_slice.root, base_slice.first_leaf + *leaf);
     }
 }
 
@@ -1226,6 +1226,28 @@ mod tests {
                 &local_object_args,
                 &object_effects,
             );
+        });
+    }
+
+    #[test]
+    fn whole_large_array_liveness_is_bounded() {
+        let module = parse_test_module(
+            r#"
+target = "wasm32-unknown-native"
+
+func private %f() -> objref<[i32; 100000000]> {
+block0:
+    v0.objref<[i32; 100000000]> = obj.alloc [i32; 100000000];
+    return v0;
+}
+"#,
+        );
+        let func_ref = lookup_func(&module, "f");
+        module.func_store.modify(func_ref, |func| {
+            ObjectLoadStore::default().run(func);
+        });
+        module.func_store.view(func_ref, |func| {
+            assert_eq!(func.layout.iter_block().count(), 1);
         });
     }
 

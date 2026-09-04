@@ -1702,8 +1702,8 @@ fn fresh_call_root_projection(
             ty: pointee_ty,
             first_leaf: 0,
             leaf_count: layout_cache
-                .shape(func.ctx(), pointee_ty)
-                .map_or(1, |shape| shape.leaves.len()),
+                .flattened_leaf_count(func.ctx(), pointee_ty)
+                .unwrap_or(1),
         },
     })
 }

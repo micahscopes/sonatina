@@ -1,6 +1,7 @@
 use cranelift_entity::SecondaryMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
+use std::ops::Range;
 use sonatina_ir::{
     Function, InstId, ValueId,
     inst::{cast, control_flow, data, downcast},
@@ -14,7 +15,87 @@ use super::{
     provenance::MayProvenance,
 };
 
-pub(crate) type LiveLeafMap = FxHashMap<ValueId, FxHashSet<usize>>;
+/// A normalized union of half-open live-leaf intervals.
+///
+/// Whole fixed-size arrays are common in GPU actors. Representing their live
+/// leaves one hash entry at a time made an otherwise small control module
+/// consume gigabytes during object load/store analysis. Intervals preserve the
+/// exact same leaf-set lattice while keeping whole roots and contiguous fields
+/// constant-size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LiveLeafSet {
+    ranges: Vec<Range<usize>>,
+}
+
+impl LiveLeafSet {
+    fn mark_range(&mut self, range: Range<usize>) {
+        if range.start >= range.end {
+            return;
+        }
+        let mut start = range.start;
+        let mut end = range.end;
+        let mut merged = Vec::with_capacity(self.ranges.len() + 1);
+        let mut inserted = false;
+        for current in std::mem::take(&mut self.ranges) {
+            if current.end < start {
+                merged.push(current);
+            } else if end < current.start {
+                if !inserted {
+                    merged.push(start..end);
+                    inserted = true;
+                }
+                merged.push(current);
+            } else {
+                start = start.min(current.start);
+                end = end.max(current.end);
+            }
+        }
+        if !inserted {
+            merged.push(start..end);
+        }
+        self.ranges = merged;
+    }
+
+    fn clear_range(&mut self, range: Range<usize>) {
+        if range.start >= range.end {
+            return;
+        }
+        let mut remaining = Vec::with_capacity(self.ranges.len() + 1);
+        for current in std::mem::take(&mut self.ranges) {
+            if current.end <= range.start || range.end <= current.start {
+                remaining.push(current);
+                continue;
+            }
+            if current.start < range.start {
+                remaining.push(current.start..range.start);
+            }
+            if range.end < current.end {
+                remaining.push(range.end..current.end);
+            }
+        }
+        self.ranges = remaining;
+    }
+
+    fn union_with(&mut self, other: &Self) {
+        for range in &other.ranges {
+            self.mark_range(range.clone());
+        }
+    }
+
+    fn intersects(&self, range: Range<usize>) -> bool {
+        range.start < range.end
+            && self
+                .ranges
+                .iter()
+                .any(|live| live.start < range.end && range.start < live.end)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+}
+
+pub(crate) type LiveLeafMap = FxHashMap<ValueId, LiveLeafSet>;
 pub(crate) type ObjectSliceList = SmallVec<[ObjectSlice; 4]>;
 pub(crate) type ObservedRoots = SmallVec<[ValueId; 4]>;
 
@@ -76,24 +157,24 @@ pub(crate) fn union_live_leaf_maps(states: impl Iterator<Item = LiveLeafMap>) ->
     let mut out = LiveLeafMap::default();
     for state in states {
         for (root, leaves) in state {
-            out.entry(root).or_default().extend(leaves);
+            out.entry(root).or_default().union_with(&leaves);
         }
     }
     out
 }
 
 pub(crate) fn mark_root_live(live: &mut LiveLeafMap, root: ValueId, total_leaves: usize) {
-    let entry = live.entry(root).or_default();
-    for leaf in 0..total_leaves {
-        entry.insert(leaf);
-    }
+    live.entry(root).or_default().mark_range(0..total_leaves);
 }
 
 pub(crate) fn mark_live_slice(live: &mut LiveLeafMap, slice: ObjectSlice) {
-    let entry = live.entry(slice.root).or_default();
-    for leaf in slice.first_leaf..slice.first_leaf + slice.leaf_count {
-        entry.insert(leaf);
-    }
+    live.entry(slice.root).or_default().mark_range(
+        slice.first_leaf..slice.first_leaf + slice.leaf_count,
+    );
+}
+
+pub(crate) fn mark_live_leaf(live: &mut LiveLeafMap, root: ValueId, leaf: usize) {
+    live.entry(root).or_default().mark_range(leaf..leaf + 1);
 }
 
 pub(crate) fn mark_live_tracked_object(live: &mut LiveLeafMap, tracked: TrackedObject) {
@@ -109,17 +190,25 @@ pub(crate) fn clear_live_slice(live: &mut LiveLeafMap, slice: ObjectSlice) {
     let Some(entry) = live.get_mut(&slice.root) else {
         return;
     };
-    for leaf in slice.first_leaf..slice.first_leaf + slice.leaf_count {
-        entry.remove(&leaf);
-    }
+    entry.clear_range(slice.first_leaf..slice.first_leaf + slice.leaf_count);
     if entry.is_empty() {
         live.remove(&slice.root);
     }
 }
 
+pub(crate) fn clear_live_leaf(live: &mut LiveLeafMap, root: ValueId, leaf: usize) {
+    let Some(entry) = live.get_mut(&root) else {
+        return;
+    };
+    entry.clear_range(leaf..leaf + 1);
+    if entry.is_empty() {
+        live.remove(&root);
+    }
+}
+
 pub(crate) fn slice_has_live_leaf(live: &LiveLeafMap, slice: ObjectSlice) -> bool {
     live.get(&slice.root).is_some_and(|entry| {
-        (slice.first_leaf..slice.first_leaf + slice.leaf_count).any(|leaf| entry.contains(&leaf))
+        entry.intersects(slice.first_leaf..slice.first_leaf + slice.leaf_count)
     })
 }
 
@@ -158,6 +247,26 @@ mod tests {
     };
     use sonatina_ir::module::FuncRef;
     use sonatina_parser::parse_module;
+
+    #[test]
+    fn live_leaf_intervals_keep_large_roots_compact_and_exact() {
+        let mut live = LiveLeafSet::default();
+        live.mark_range(0..100_000_000);
+        assert_eq!(live.ranges, vec![0..100_000_000]);
+
+        live.clear_range(40..60);
+        assert_eq!(live.ranges, vec![0..40, 60..100_000_000]);
+        assert!(live.intersects(39..41));
+        assert!(!live.intersects(45..55));
+
+        live.mark_range(45..55);
+        assert_eq!(live.ranges, vec![0..40, 45..55, 60..100_000_000]);
+        live.mark_range(35..65);
+        assert_eq!(live.ranges, vec![0..100_000_000]);
+
+        live.clear_range(0..100_000_000);
+        assert!(live.is_empty());
+    }
 
     fn parse_test_module(src: &str) -> sonatina_ir::Module {
         parse_module(src).expect("parse should succeed").module
