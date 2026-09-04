@@ -616,6 +616,58 @@ impl Backend for SpirvBackend {
             Err(error) => {
                 if trace {
                     eprintln!("sonatina spirv: naga validation failed: {error:?}");
+                    if let naga::valid::ValidationError::Function {
+                        handle,
+                        name,
+                        source:
+                            naga::valid::FunctionError::InvalidStoreTypes { pointer, value },
+                    } = error.as_inner()
+                    {
+                        let function = &naga_mod.functions[*handle];
+                        eprintln!(
+                            "sonatina spirv: invalid helper store, function={name}, pointer={pointer:?} value={value:?}"
+                        );
+                        let mut pending = vec![*pointer, *value];
+                        let mut seen = Vec::new();
+                        while let Some(expression) = pending.pop() {
+                            if seen.contains(&expression) {
+                                continue;
+                            }
+                            seen.push(expression);
+                            eprintln!(
+                                "sonatina spirv: function={name} expression={expression:?} value={:?}",
+                                function.expressions[expression],
+                            );
+                            match &function.expressions[expression] {
+                                naga::Expression::LocalVariable(local) => {
+                                    let local = &function.local_variables[*local];
+                                    eprintln!(
+                                        "sonatina spirv: function={name} local={local:?} type={:?}",
+                                        naga_mod.types[local.ty],
+                                    );
+                                }
+                                naga::Expression::CallResult(callee) => {
+                                    eprintln!(
+                                        "sonatina spirv: function={name} callee={callee:?} name={:?} result={:?}",
+                                        naga_mod.functions[*callee].name,
+                                        naga_mod.functions[*callee].result,
+                                    );
+                                }
+                                naga::Expression::FunctionArgument(index) => {
+                                    let argument = &function.arguments[*index as usize];
+                                    eprintln!(
+                                        "sonatina spirv: function={name} argument={index} value={argument:?} type={:?}",
+                                        naga_mod.types[argument.ty],
+                                    );
+                                }
+                                naga::Expression::AccessIndex { base, .. }
+                                | naga::Expression::Load { pointer: base } => {
+                                    pending.push(*base);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     for entry in &naga_mod.entry_points {
                         let expression_count = entry.function.expressions.len();
                         let invalid_expression = match error.as_inner() {
