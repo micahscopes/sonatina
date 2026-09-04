@@ -331,7 +331,7 @@ pub(super) fn translate(
         emitted_external_resources.len() as u32,
     );
     let output_type = append_vertex_output_type(&mut naga_mod, f32_type, vec4f, varying_count);
-    let naga_functions = append_scalar_helpers(
+    let (mut naga_functions, mut root_call_sites) = append_scalar_helpers(
         module,
         &[vertex_ref, fragment_ref],
         &mut naga_mod,
@@ -339,10 +339,20 @@ pub(super) fn translate(
         f32_type,
         bool_type,
     )?;
+    naga_functions.replace_call_sites(
+        root_call_sites.remove(&vertex_ref).ok_or_else(|| {
+            "spirv raster: vertex root has no derived helper call-site map".to_string()
+        })?,
+    );
     let vertex = lower_vertex(
         module, vertex_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
         builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type, &naga_functions,
     )?;
+    naga_functions.replace_call_sites(
+        root_call_sites.remove(&fragment_ref).ok_or_else(|| {
+            "spirv raster: fragment root has no derived helper call-site map".to_string()
+        })?,
+    );
     let fragment = lower_fragment(
         module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
         context_count, u32_type, f32_type, bool_type, vec4f, &naga_functions,
@@ -409,7 +419,16 @@ fn append_scalar_helpers(
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
-) -> Result<NagaFunctionMap, String> {
+) -> Result<
+    (
+        NagaFunctionMap,
+        HashMap<
+            sonatina_ir::module::FuncRef,
+            HashMap<sonatina_ir::InstId, NagaFunctionInfo>,
+        >,
+    ),
+    String,
+> {
     use sonatina_ir::InstDowncast;
 
     let root_set = roots.iter().copied().collect::<std::collections::HashSet<_>>();
@@ -588,8 +607,16 @@ fn append_scalar_helpers(
             },
         );
     }
-    naga_functions.replace_call_sites(call_sites(module, roots.iter().copied(), &lowered)?);
-    Ok(naga_functions)
+    // Instruction IDs are local to one Sonatina function. Keep each authored
+    // stage root's call sites separate: merging the vertex and fragment maps
+    // would allow an equal numeric ID in one stage to overwrite the other's
+    // (possibly differently shaped) helper ABI.
+    let root_call_sites = roots
+        .iter()
+        .copied()
+        .map(|root| Ok((root, call_sites(module, [root], &lowered)?)))
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    Ok((naga_functions, root_call_sites))
 }
 
 fn scalar_type(
