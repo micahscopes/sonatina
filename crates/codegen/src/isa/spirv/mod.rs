@@ -3668,6 +3668,12 @@ fn emit_block_to_target(
             mem_ctx,
             mem_error,
         );
+        // Preserve the first lowering invariant failure. Continuing after a
+        // failed instruction only produces secondary unresolved-value errors
+        // for its consumers and used to overwrite the actionable root cause.
+        if mem_error.is_some() {
+            break;
+        }
     }
 }
 
