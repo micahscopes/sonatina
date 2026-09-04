@@ -175,11 +175,11 @@ fn spirv_arithmetic_return_valid() {
 
 #[test]
 fn spirv_explicit_entry_ignores_declaration_order() {
-    let isa = Native::new(TargetTriple::new(
-        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
-    ));
+    let isa = sonatina_ir::isa::shader::Shader::new(
+        TargetTriple::parse("shader-unknown-unknown").unwrap(),
+    );
     let is = isa.inst_set();
-    let mb = native_module_builder();
+    let mb = ModuleBuilder::new(ModuleCtx::new(&isa));
     let decoy = mb.declare_function(Signature::new_single(
         "unselected_i64", Linkage::Public, &[], Type::I64,
     )).unwrap();

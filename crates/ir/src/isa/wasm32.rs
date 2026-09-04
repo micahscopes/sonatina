@@ -12,10 +12,10 @@ use std::sync::LazyLock;
 
 use sonatina_triple::{Architecture, TargetTriple};
 
-use super::{Endian, Isa, TypeLayout, TypeLayoutError};
+use super::{Isa, TypeLayout, arena32::Arena32TypeLayout};
 use crate::{
-    AddressSpaceDesc, AddressSpaceId, AddressSpaceInfo, AddressSpaceKind, Type,
-    inst::native::inst_set::NativeInstSet, module::ModuleCtx, types::CompoundType,
+    AddressSpaceDesc, AddressSpaceId, AddressSpaceInfo, AddressSpaceKind,
+    inst::native::inst_set::NativeInstSet,
 };
 
 pub mod space {
@@ -67,7 +67,7 @@ impl Isa for Wasm32 {
     }
 
     fn type_layout(&self) -> &'static dyn TypeLayout {
-        const TL: Wasm32TypeLayout = Wasm32TypeLayout {};
+        const TL: Arena32TypeLayout = Arena32TypeLayout {};
         &TL
     }
 
@@ -79,90 +79,6 @@ impl Isa for Wasm32 {
     fn inst_set(&self) -> &'static Self::InstSet {
         static IS: LazyLock<NativeInstSet> = LazyLock::new(NativeInstSet::new);
         &IS
-    }
-}
-
-struct Wasm32TypeLayout {}
-
-impl TypeLayout for Wasm32TypeLayout {
-    fn size_of(&self, ty: Type, ctx: &ModuleCtx) -> Result<usize, TypeLayoutError> {
-        let size = match ty {
-            Type::Unit => 0,
-            Type::I1 => 1,
-            Type::I8 => 1,
-            Type::I16 => 2,
-            Type::I32 => 4,
-            Type::F32 => 4,
-            Type::I64 => 8,
-            Type::I128 => 16,
-            Type::I256 => 32,
-            Type::EnumTag(_) => return Err(TypeLayoutError::UnrepresentableType(ty)),
-            Type::Compound(cmpd) => {
-                let cmpd = ctx.with_ty_store(|s| s.resolve_compound(cmpd).clone());
-                match cmpd {
-                    CompoundType::Array { elem, len } => {
-                        let elem_size = self.size_of(elem, ctx)?;
-                        elem_size * len
-                    }
-                    CompoundType::Struct(s) => {
-                        let mut total = 0;
-                        for &field in &s.fields {
-                            let align = self.align_of(field, ctx)?;
-                            total = (total + align - 1) & !(align - 1);
-                            total += self.size_of(field, ctx)?;
-                        }
-                        let struct_align = s
-                            .fields
-                            .iter()
-                            .map(|f| self.align_of(*f, ctx).unwrap_or(1))
-                            .max()
-                            .unwrap_or(1);
-                        (total + struct_align - 1) & !(struct_align - 1)
-                    }
-                    // Pointers/refs are 32-bit on wasm linear memory.
-                    CompoundType::Ptr(_) | CompoundType::ObjRef(_) | CompoundType::ConstRef(_) => 4,
-                    _ => return Err(TypeLayoutError::UnsupportedType(ty)),
-                }
-            }
-        };
-        Ok(size)
-    }
-
-    fn align_of(&self, ty: Type, ctx: &ModuleCtx) -> Result<usize, TypeLayoutError> {
-        let align = match ty {
-            Type::Unit => 1,
-            Type::I1 | Type::I8 => 1,
-            Type::I16 => 2,
-            Type::I32 => 4,
-            Type::F32 => 4,
-            Type::I64 => 8,
-            Type::I128 => 16,
-            Type::I256 => 32,
-            Type::EnumTag(_) => return Err(TypeLayoutError::UnrepresentableType(ty)),
-            Type::Compound(cmpd) => {
-                let cmpd = ctx.with_ty_store(|s| s.resolve_compound(cmpd).clone());
-                match cmpd {
-                    CompoundType::Array { elem, .. } => self.align_of(elem, ctx)?,
-                    CompoundType::Struct(s) => s
-                        .fields
-                        .iter()
-                        .map(|f| self.align_of(*f, ctx).unwrap_or(1))
-                        .max()
-                        .unwrap_or(1),
-                    CompoundType::Ptr(_) | CompoundType::ObjRef(_) | CompoundType::ConstRef(_) => 4,
-                    _ => return Err(TypeLayoutError::UnsupportedType(ty)),
-                }
-            }
-        };
-        Ok(align)
-    }
-
-    fn pointer_repl(&self) -> Type {
-        Type::I32
-    }
-
-    fn endian(&self) -> Endian {
-        Endian::Le
     }
 }
 

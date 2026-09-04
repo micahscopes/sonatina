@@ -716,6 +716,10 @@ fn module_ctx_from_triple(triple: TargetTriple) -> ModuleCtx {
             let isa = ir::isa::wasm32::Wasm32::new(triple);
             ModuleCtx::new(&isa)
         }
+        Architecture::Shader => {
+            let isa = ir::isa::shader::Shader::new(triple);
+            ModuleCtx::new(&isa)
+        }
     }
 }
 
