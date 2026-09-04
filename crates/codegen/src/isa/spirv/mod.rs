@@ -6515,16 +6515,20 @@ fn helper_naga_type(
         sonatina_ir::Type::I32 if word == WordKind::U32 => Ok(word_type),
         sonatina_ir::Type::I64 if word == WordKind::I64 => Ok(word_type),
         sonatina_ir::Type::F32 if word == WordKind::U32 => Ok(f32_type),
-        other if other
-            .resolve_compound(ctx)
-            .is_some_and(|compound| matches!(compound, sonatina_ir::types::CompoundType::Ptr(_))) =>
-        {
+        other if other.resolve_compound(ctx).is_some_and(|compound| {
+            matches!(
+                compound,
+                sonatina_ir::types::CompoundType::Ptr(_)
+                    | sonatina_ir::types::CompoundType::Array { .. }
+                    | sonatina_ir::types::CompoundType::Struct(_)
+            )
+        }) => {
             typed_local_types
                 .get(&other)
                 .map(|mapped| mapped.handle)
                 .ok_or_else(|| {
                     format!(
-                        "spirv: helper pointer ABI type {other:?} has no prevalidated typed-local representation. Fail closed."
+                        "spirv: helper typed-local ABI type {other:?} has no prevalidated representation. Fail closed."
                     )
                 })
         }
@@ -8584,54 +8588,64 @@ fn translate_to_naga(
                             .push((iid, size_bytes.saturating_mul(executions)));
                     }
                     if let Some(load) = <&sonatina_ir::inst::data::Mload as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
-                        has_mem |= !f
-                            .dfg
-                            .value_ty(*load.addr())
-                            .is_pointer(&module.ctx);
+                        let address_ty = f.dfg.value_ty(*load.addr());
+                        let pointer_pointee = match address_ty.resolve_compound(&module.ctx) {
+                            Some(sonatina_ir::types::CompoundType::Ptr(pointee)) => Some(pointee),
+                            _ => None,
+                        };
+                        has_mem |= pointer_pointee.is_none();
                         let result_ty = f
                             .dfg
                             .inst_result(iid)
                             .map(|result| f.dfg.value_ty(result));
-                        let admitted = word == WordKind::U32
+                        let typed_local = pointer_pointee == Some(*load.ty())
+                            && result_ty == Some(*load.ty());
+                        let byte_arena = word == WordKind::U32
                             && matches!(
                                 (load.ty(), result_ty),
                                 (sonatina_ir::Type::I1, Some(sonatina_ir::Type::I1))
                                     | (sonatina_ir::Type::I1, Some(sonatina_ir::Type::I32))
                                     | (sonatina_ir::Type::I32, Some(sonatina_ir::Type::I32))
                             );
+                        let admitted = typed_local || byte_arena;
                         if !admitted {
                             let instruction = inst_data.as_text();
                             let context = instruction_ir_context(
                                 first_func, f, bid, &instruction,
                             );
                             return Err(format!(
-                                "spirv: Mload memory/result types {:?}/{result_ty:?} are unsupported \
-                                 (u32 admits I1 -> I1 or I32 and I32 -> I32) in `{}` at {bid:?}; \
+                                "spirv: Mload address/memory/result types {address_ty:?}/{:?}/{result_ty:?} are unsupported \
+                                 (typed-local pointers require an exact pointee/result match; the u32 byte arena admits I1 -> I1 or I32 and I32 -> I32) in `{}` at {bid:?}; \
                                  instruction `{instruction}`; IR `{context}`. Fail closed.",
                                 load.ty(), sig.name(),
                             ));
                         }
                     }
                     if let Some(store) = <&sonatina_ir::inst::data::Mstore as sonatina_ir::InstDowncast>::downcast(is, inst_data) {
-                        has_mem |= !f
-                            .dfg
-                            .value_ty(*store.addr())
-                            .is_pointer(&module.ctx);
+                        let address_ty = f.dfg.value_ty(*store.addr());
+                        let pointer_pointee = match address_ty.resolve_compound(&module.ctx) {
+                            Some(sonatina_ir::types::CompoundType::Ptr(pointee)) => Some(pointee),
+                            _ => None,
+                        };
+                        has_mem |= pointer_pointee.is_none();
                         let value_ty = f.dfg.value_ty(*store.value());
-                        let admitted = word == WordKind::U32
+                        let typed_local = pointer_pointee == Some(*store.ty())
+                            && value_ty == *store.ty();
+                        let byte_arena = word == WordKind::U32
                             && matches!(
                                 (store.ty(), value_ty),
                                 (sonatina_ir::Type::I1, sonatina_ir::Type::I1)
                                     | (sonatina_ir::Type::I32, sonatina_ir::Type::I32)
                             );
+                        let admitted = typed_local || byte_arena;
                         if !admitted {
                             let instruction = inst_data.as_text();
                             let context = instruction_ir_context(
                                 first_func, f, bid, &instruction,
                             );
                             return Err(format!(
-                                "spirv: Mstore memory/value types {:?}/{value_ty:?} are unsupported \
-                                 (u32 admits matching I1 or I32 values) in `{}` at {bid:?}; \
+                                "spirv: Mstore address/memory/value types {address_ty:?}/{:?}/{value_ty:?} are unsupported \
+                                 (typed-local pointers require an exact pointee/value match; the u32 byte arena admits matching I1 or I32 values) in `{}` at {bid:?}; \
                                  instruction `{instruction}`; IR `{context}`. Fail closed.",
                                 store.ty(), sig.name(),
                             ));
