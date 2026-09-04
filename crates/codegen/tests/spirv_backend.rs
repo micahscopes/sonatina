@@ -488,6 +488,116 @@ fn spirv_fixed_struct_local_survives_inside_scalar_helper() {
 }
 
 #[test]
+fn spirv_typed_aggregate_value_crosses_a_private_helper() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty =
+        mb.declare_struct_type("TypedAggregateValuePair", &[Type::I32, Type::I32], false);
+    let pair_ptr_ty = mb.ptr_type(pair_ty);
+    let word_ptr_ty = mb.ptr_type(Type::I32);
+    let entry_ref = mb
+        .declare_function(Signature::new_single(
+            "typed_aggregate_value_entry",
+            Linkage::Public,
+            &[Type::I32, Type::I32],
+            Type::I32,
+        ))
+        .unwrap();
+    let helper_ref = mb
+        .declare_function(Signature::new_single(
+            "typed_aggregate_value_helper",
+            Linkage::Private,
+            &[pair_ty],
+            pair_ty,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let argument = fb.args()[0];
+        let owned = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+        fb.insert_inst_no_result(data::Mstore::new(is, owned, argument, pair_ty));
+        let result = fb.insert_inst(data::Mload::new(is, owned, pair_ty), pair_ty);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let source = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+        let zero = fb.make_imm_value(0i32);
+        let first_index = fb.make_imm_value(0i32);
+        let second_index = fb.make_imm_value(1i32);
+        let first = fb.insert_inst(
+            data::Gep::new(is, [source, zero, first_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        let second = fb.insert_inst(
+            data::Gep::new(is, [source, zero, second_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        fb.insert_inst_no_result(data::Mstore::new(is, first, fb.args()[0], Type::I32));
+        fb.insert_inst_no_result(data::Mstore::new(is, second, fb.args()[1], Type::I32));
+        let source_value = fb.insert_inst(data::Mload::new(is, source, pair_ty), pair_ty);
+        let result_value = fb.insert_inst(
+            control_flow::Call::new(is, helper_ref, [source_value].into_iter().collect()),
+            pair_ty,
+        );
+        let result = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr_ty);
+        fb.insert_inst_no_result(data::Mstore::new(is, result, result_value, pair_ty));
+        let result_first = fb.insert_inst(
+            data::Gep::new(is, [result, zero, first_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        let result_second = fb.insert_inst(
+            data::Gep::new(is, [result, zero, second_index].into_iter().collect()),
+            word_ptr_ty,
+        );
+        let result_first =
+            fb.insert_inst(data::Mload::new(is, result_first, Type::I32), Type::I32);
+        let result_second =
+            fb.insert_inst(data::Mload::new(is, result_second, Type::I32), Type::I32);
+        let sum = fb.insert_inst(
+            arith::Add::new(is, result_first, result_second),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .compile_module(&mb.build())
+        .expect("typed aggregate values should cross a private helper");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(
+        wgsl.matches("typed_aggregate_value_helper(").count() >= 2,
+        "the aggregate helper must remain one definition and one call:\n{wgsl}",
+    );
+    assert!(
+        !wgsl.contains("fe_heap"),
+        "typed aggregate values must not use the byte arena:\n{wgsl}",
+    );
+    let reparsed = naga::front::wgsl::parse_str(wgsl)
+        .expect("WGSL with a typed aggregate value must reparse");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&reparsed)
+    .expect("WGSL with a typed aggregate value must validate for browser capabilities");
+}
+
+#[test]
 fn spirv_typed_local_uses_implicit_zero_but_keeps_later_zero_mutation() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
