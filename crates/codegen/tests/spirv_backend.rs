@@ -4783,7 +4783,7 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
 
     let vertex_ref = mb
         .declare_function(Signature::new(
-            "vs_resource_identity",
+            "vs_resource_identity_0",
             Linkage::Public,
             &vertex_args,
             &vertex_results,
@@ -4791,7 +4791,7 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         .unwrap();
     let fragment_ref = mb
         .declare_function(Signature::new_single(
-            "fs_resource_identity",
+            "fs_resource_identity_0",
             Linkage::Public,
             &fragment_args,
             Type::I32,
@@ -4860,7 +4860,7 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         length: 4,
     };
     let artifact = SpirvBackend::new()
-        .with_authored_raster("vs_resource_identity", "fs_resource_identity")
+        .with_authored_raster("vs_resource_identity_0", "fs_resource_identity_0")
         .with_builtin_argument(SpirvBuiltinArgument {
             arg_index: 0,
             source: SpirvBuiltinSource::VertexIndex,
@@ -4927,10 +4927,16 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         "a dormant scalar field remains in the stable actor-state ABI",
     );
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert_eq!(artifact.layout.vertex_entry.as_deref(), Some("fe_vertex_main"));
+    assert_eq!(artifact.layout.fragment_entry.as_deref(), Some("fe_fragment_main"));
+    assert!(wgsl.contains("fn fe_vertex_main("), "{wgsl}");
+    assert!(wgsl.contains("fn fe_fragment_main("), "{wgsl}");
+    assert!(!wgsl.contains("fn vs_resource_identity_0_("), "{wgsl}");
+    assert!(!wgsl.contains("fn fs_resource_identity_0_("), "{wgsl}");
     assert!(wgsl.contains("@builtin(instance_index)"), "{wgsl}");
     assert!(!wgsl.contains("unused_values"), "{wgsl}");
     let fragment = wgsl
-        .split("fn fs_resource_identity")
+        .split("fn fe_fragment_main")
         .nth(1)
         .expect("named fragment entry");
     assert!(fragment.contains("fragment_values"), "{fragment}");

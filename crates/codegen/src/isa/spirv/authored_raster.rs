@@ -11,6 +11,15 @@ use super::{
     resolve_naga_value, spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
 };
 
+// Physical shader entry names are compiler-owned ABI, not user-authored
+// behavior identity. Keeping them fixed and WGSL-safe prevents a backend
+// writer from silently renaming otherwise valid source identifiers (Naga, for
+// example, suffixes names ending in a digit). The source behavior names still
+// select the Sonatina functions and remain available to higher-level manifests
+// for provenance and scheduling.
+const PHYSICAL_VERTEX_ENTRY: &str = "fe_vertex_main";
+const PHYSICAL_FRAGMENT_ENTRY: &str = "fe_fragment_main";
+
 /// Lower the narrow first authored-raster ABI. Keeping it separate from the
 /// established fullscreen path makes paired multi-value lowering opt-in and
 /// leaves existing shader byte streams alone.
@@ -329,10 +338,10 @@ pub(super) fn translate(
     )?;
 
     naga_mod.entry_points.push(entry_point(
-        pipeline.vertex_entry.clone(), naga::ShaderStage::Vertex, vertex,
+        PHYSICAL_VERTEX_ENTRY.to_string(), naga::ShaderStage::Vertex, vertex,
     ));
     naga_mod.entry_points.push(entry_point(
-        pipeline.fragment_entry.clone(), naga::ShaderStage::Fragment, fragment,
+        PHYSICAL_FRAGMENT_ENTRY.to_string(), naga::ShaderStage::Fragment, fragment,
     ));
 
     if state_var.is_some() {
@@ -353,7 +362,7 @@ pub(super) fn translate(
     }
 
     Ok((naga_mod, SpirvLayout {
-        entry_point: pipeline.fragment_entry.clone(),
+        entry_point: PHYSICAL_FRAGMENT_ENTRY.to_string(),
         mode: LayoutMode::Render,
         workgroup_size: [0, 0, 0],
         word: WordKind::U32,
@@ -368,8 +377,8 @@ pub(super) fn translate(
             .collect(),
         result: None,
         trap: None,
-        vertex_entry: Some(pipeline.vertex_entry.clone()),
-        fragment_entry: Some(pipeline.fragment_entry.clone()),
+        vertex_entry: Some(PHYSICAL_VERTEX_ENTRY.to_string()),
+        fragment_entry: Some(PHYSICAL_FRAGMENT_ENTRY.to_string()),
         color_target_format: Some("rgba8unorm".to_string()),
     }))
 }
