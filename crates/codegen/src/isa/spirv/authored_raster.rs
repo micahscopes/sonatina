@@ -7,8 +7,9 @@ use crate::optim::dead_arg::analyze_live_arguments;
 use super::{
     Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinArgument,
     SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
-    SpirvScalarKind, SpirvShaderStage, WordKind, append_external_resources, emit_naga_regions,
-    resolve_naga_value, spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
+    SpirvScalarKind, SpirvShaderStage, WordKind, NagaResultAbi, NagaResultSource,
+    append_external_resources, emit_naga_regions, spirv_instruction_is_lowered,
+    unsupported_signed_op_under_u32,
 };
 
 // Physical shader entry names are compiler-owned ABI, not user-authored
@@ -327,10 +328,17 @@ pub(super) fn translate(
         emitted_external_resources.len() as u32,
     );
     let output_type = append_vertex_output_type(&mut naga_mod, f32_type, vec4f, varying_count);
+    let vertex_return_type = append_flat_result_type(
+        &mut naga_mod,
+        "RasterVertexLeaves",
+        f32_type,
+        4 + varying_count,
+    );
 
     let vertex = lower_vertex(
         module, vertex_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
         builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type,
+        vertex_return_type,
     )?;
     let fragment = lower_fragment(
         module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
@@ -488,6 +496,46 @@ fn append_vertex_output_type(
     )
 }
 
+fn append_flat_result_type(
+    module: &mut naga::Module,
+    name: &str,
+    member_type: naga::Handle<naga::Type>,
+    arity: usize,
+) -> naga::Handle<naga::Type> {
+    debug_assert!(arity > 1, "a scalar result needs no aggregate transport type");
+    let members = (0..arity)
+        .map(|index| naga::StructMember {
+            name: Some(format!("r{index}")),
+            ty: member_type,
+            binding: None,
+            offset: index as u32 * 4,
+        })
+        .collect();
+    module.types.insert(
+        naga::Type {
+            name: Some(name.into()),
+            inner: naga::TypeInner::Struct {
+                members,
+                span: arity as u32 * 4,
+            },
+        },
+        naga::Span::UNDEFINED,
+    )
+}
+
+fn direct_result_abi(
+    physical_type: naga::Handle<naga::Type>,
+    arity: usize,
+) -> NagaResultAbi {
+    NagaResultAbi {
+        logical: (0..arity)
+            .map(|index| NagaResultSource::Physical(index as u32))
+            .collect(),
+        physical_type: Some(physical_type),
+        physical_arity: arity,
+    }
+}
+
 fn load_state(
     function: &sonatina_ir::Function,
     first_arg: usize,
@@ -517,32 +565,6 @@ fn load_state(
     }
 }
 
-fn source_return_values(
-    function: &sonatina_ir::Function,
-    values: &HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
-    phis: &HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
-    naga_func: &mut naga::Function,
-) -> Result<Vec<naga::Handle<naga::Expression>>, String> {
-    let mut args = None;
-    for block in function.layout.iter_block() {
-        for inst in function.layout.iter_inst(block) {
-            if let Some(ret) = <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(
-                function.inst_set(), function.dfg.inst(inst),
-            ) {
-                if args.is_some() {
-                    return Err("spirv raster: multiple return terminators need multi-value return transport; fail closed".to_string());
-                }
-                args = Some(ret.args().as_slice().to_vec());
-            }
-        }
-    }
-    args.ok_or_else(|| "spirv raster: stage has no return terminator".to_string())?
-        .into_iter()
-        .map(|value| resolve_naga_value(value, function, WordKind::U32, values, phis, naga_func)
-            .ok_or_else(|| format!("spirv raster: returned value {value:?} is unresolved")))
-        .collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn lower_vertex(
     module: &Module,
@@ -558,6 +580,7 @@ fn lower_vertex(
     bool_type: naga::Handle<naga::Type>,
     vec4f: naga::Handle<naga::Type>,
     output_type: naga::Handle<naga::Type>,
+    return_type: naga::Handle<naga::Type>,
 ) -> Result<naga::Function, String> {
     let arguments = builtin_arguments
         .iter()
@@ -615,20 +638,34 @@ fn lower_vertex(
             &mut values,
         );
         let scfg = crate::structurize::structurize_function(function)?;
-        let mut ignored = None;
+        let return_abi = direct_result_abi(return_type, 4 + varying_count);
+        let mut result = None;
         let naga_functions = super::NagaFunctionMap::new();
         emit_naga_regions(
             function, function.inst_set(), WordKind::U32, &scfg.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
-            &mut ignored, None, &naga_functions, None,
+            &mut result, Some(&return_abi), &naga_functions, None,
         )?;
-        let leaves = source_return_values(function, &values, &phis, &mut output)?;
-        if leaves.len() != 4 + varying_count {
-            return Err(format!(
-                "spirv raster: vertex returned {} leaves; expected {}",
-                leaves.len(), 4 + varying_count,
-            ));
-        }
+        let result = result
+            .ok_or_else(|| "spirv raster: vertex produced no return value".to_string())?;
+        let leaves = (0..4 + varying_count)
+            .map(|index| {
+                output.expressions.append(
+                    naga::Expression::AccessIndex {
+                        base: result,
+                        index: index as u32,
+                    },
+                    naga::Span::UNDEFINED,
+                )
+            })
+            .collect::<Vec<_>>();
+        output.body.push(
+            naga::Statement::Emit(naga::Range::new_from_bounds(
+                leaves[0],
+                *leaves.last().expect("raster vertex has at least five leaves"),
+            )),
+            naga::Span::UNDEFINED,
+        );
         let position = output.expressions.append(
             naga::Expression::Compose { ty: vec4f, components: leaves[..4].to_vec() },
             naga::Span::UNDEFINED,
@@ -704,12 +741,13 @@ fn lower_fragment(
         }
         load_state(function, varying_count, state_fields, state_var, &mut output, &mut values);
         let scfg = crate::structurize::structurize_function(function)?;
+        let return_abi = direct_result_abi(u32_type, 1);
         let mut result = None;
         let naga_functions = super::NagaFunctionMap::new();
         emit_naga_regions(
             function, function.inst_set(), WordKind::U32, &scfg.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
-            &mut result, None, &naga_functions, None,
+            &mut result, Some(&return_abi), &naga_functions, None,
         )?;
         let packed = result.ok_or_else(|| "spirv raster: fragment produced no result".to_string())?;
         let color = output.expressions.append(

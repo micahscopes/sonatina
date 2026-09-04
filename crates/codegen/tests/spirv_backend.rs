@@ -4946,6 +4946,103 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
 }
 
 #[test]
+fn authored_raster_transports_multi_value_returns_across_stage_branches() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let vertex_ref = mb
+        .declare_function(Signature::new(
+            "vs_branching_returns",
+            Linkage::Public,
+            &[Type::I32],
+            &[Type::F32; 5],
+        ))
+        .unwrap();
+    let fragment_ref = mb
+        .declare_function(Signature::new_single(
+            "fs_branching_returns",
+            Linkage::Public,
+            &[Type::F32],
+            Type::I32,
+        ))
+        .unwrap();
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(vertex_ref);
+        let entry = fb.append_block();
+        let left = fb.append_block();
+        let right = fb.append_block();
+        fb.switch_to_block(entry);
+        let split = fb.make_imm_value(3i32);
+        let condition = fb.insert_inst(cmp::Lt::new(is, fb.args()[0], split), Type::I1);
+        fb.insert_inst_no_result(control_flow::Br::new(is, condition, left, right));
+
+        let zero = fb.make_imm_value(Immediate::F32(0.0f32.to_bits()));
+        let one = fb.make_imm_value(Immediate::F32(1.0f32.to_bits()));
+        let minus_one = fb.make_imm_value(Immediate::F32((-1.0f32).to_bits()));
+        fb.switch_to_block(left);
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [minus_one, zero, zero, one, zero]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.switch_to_block(right);
+        fb.insert_inst_no_result(control_flow::Return::new(
+            is,
+            [one, zero, zero, one, one]
+                .into_iter()
+                .collect::<smallvec::SmallVec<[_; 2]>>()
+                .into(),
+        ));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    {
+        let mut fb = mb.func_builder::<InstInserter>(fragment_ref);
+        let entry = fb.append_block();
+        let dark = fb.append_block();
+        let light = fb.append_block();
+        fb.switch_to_block(entry);
+        let half = fb.make_imm_value(Immediate::F32(0.5f32.to_bits()));
+        let condition = fb.insert_inst(cmp::Flt::new(is, fb.args()[0], half), Type::I1);
+        fb.insert_inst_no_result(control_flow::Br::new(is, condition, dark, light));
+        fb.switch_to_block(dark);
+        let dark_color = fb.make_imm_value(255i32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, dark_color));
+        fb.switch_to_block(light);
+        let light_color = fb.make_imm_value(65535i32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, light_color));
+        fb.seal_all();
+        fb.finish();
+    }
+
+    let artifact = SpirvBackend::new()
+        .with_authored_raster("vs_branching_returns", "fs_branching_returns")
+        .compile_module(&mb.build())
+        .expect("branch-local raster returns should share the typed stage result transport");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
+    assert!(wgsl.contains("struct RasterVertexLeaves"), "{wgsl}");
+    assert!(wgsl.contains("fn fe_vertex_main("), "{wgsl}");
+    assert!(wgsl.contains("fn fe_fragment_main("), "{wgsl}");
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(
+        &naga::front::wgsl::parse_str(wgsl)
+            .expect("branch-local raster return WGSL should reparse"),
+    )
+    .expect("branch-local raster return WGSL should validate for browsers");
+}
+
+#[test]
 fn explicit_compute_rejects_signed_external_storage_until_carrier_semantics_exist() {
     let mut resource = external_complex_resource(0, Access::ReadWrite);
     let SpirvResourceElement::Record { fields, .. } = &mut resource.element else {
