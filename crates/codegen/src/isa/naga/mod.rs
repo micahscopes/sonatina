@@ -9065,6 +9065,129 @@ fn analyze_naga_entry_interface(
 }
 
 #[cfg(feature = "spirv-backend")]
+fn validate_naga_entry_mode(
+    pipeline: ShaderPipeline,
+    word: WordKind,
+    workgroup_size: [u32; 3],
+    body: &NagaEntryBodyPlan,
+    emitted_external_resources: &[SpirvExternalResource],
+) -> Result<(), String> {
+    let grid = matches!(pipeline, ShaderPipeline::LegacyGrid { .. });
+    let render = matches!(pipeline, ShaderPipeline::Fullscreen { .. });
+    let compute = matches!(pipeline, ShaderPipeline::Compute { .. });
+    let param_count = body.parameter_count;
+    let has_obj_alloc = body.has_object_allocation;
+    let has_mem = body.uses_arena;
+    let has_unreachable = body.may_trap;
+    // Grid mode fail-closed checks. Grid is a driver-declared envelope fact: the
+    // translator never guesses it, and when asked for it, every precondition is
+    // enforced here so no wrong shader is ever emitted.
+    if grid {
+        if word != WordKind::U32 {
+            return Err(
+                "spirv grid: grid mode requires the u32 word (browser profile); got i64"
+                    .to_string(),
+            );
+        }
+        if param_count < 2 {
+            return Err(format!(
+                "spirv grid: a grid kernel needs at least (px, py) args; got {param_count}"
+            ));
+        }
+        if has_obj_alloc {
+            return Err(
+                "spirv grid: grid and batch (ObjAlloc) modes are mutually exclusive".to_string(),
+            );
+        }
+        if !(workgroup_size[0] >= 1 && workgroup_size[1] >= 1 && workgroup_size[2] == 1) {
+            return Err("spirv grid: grid dispatch is 2D; workgroup z must be 1".to_string());
+        }
+    }
+
+    // Batch (ObjAlloc) mode reuses the output storage buffer AS the
+    // allocation (a completely different mechanism from the private-heap
+    // array emulation, `RUNG3_SPIRV_ARRAYS_DESIGN.md` section 1, option B
+    // REJECTED). Combining the two is out of scope here: fail closed with a
+    // named error rather than silently picking one interpretation.
+    if has_obj_alloc && has_mem {
+        return Err(
+            "spirv: function-local [u32; N] arrays (MemAllocDynamic/Mload/Mstore) inside a \
+             batch (ObjAlloc) mode kernel are unsupported. Fail closed."
+                .to_string(),
+        );
+    }
+    if compute {
+        if has_obj_alloc {
+            return Err(
+                "spirv compute: external-resource compute must not contain ObjAlloc or select Batch"
+                    .to_string(),
+            );
+        }
+    }
+    if render {
+        if word != WordKind::U32 {
+            return Err(
+                "spirv render: render mode requires the u32 word (browser profile); got i64"
+                    .to_string(),
+            );
+        }
+        if param_count < 2 {
+            return Err(format!(
+                "spirv render: a render kernel needs at least (px, py) args; got {param_count}"
+            ));
+        }
+        if has_mem {
+            return Err(
+                "spirv render: function-local [u32; N] arrays (MemAllocDynamic/Mload/Mstore) \
+                 are unsupported in render mode. Fail closed."
+                    .to_string(),
+            );
+        }
+        if has_unreachable {
+            // Finding A (2026-08-08): render mode's fragment/vertex functions
+            // are a separate naga::Function scope from the compute-mode
+            // `func` the trap channel is threaded through below, so a trap
+            // here has no `MemCtx` to raise. Rather than build a second,
+            // parallel trap-channel for the render path (no current fixture
+            // needs it), fail closed and preserve the pin's original
+            // behavior for this mode: a trap in render is a named compile
+            // error, never a silent zero pixel.
+            return Err(
+                "spirv render: a trap (Unreachable -- an array-bounds check, a checked-usize \
+                 overflow, or a generic MIR trap) is unsupported in render mode (no trap \
+                 channel is wired for the vertex/fragment functions). Fail closed."
+                    .to_string(),
+            );
+        }
+        if has_obj_alloc {
+            return Err(
+                "spirv render: render and batch (ObjAlloc) modes are mutually exclusive"
+                .to_string(),
+            );
+        }
+        if let Some(resource) = emitted_external_resources
+            .iter()
+            .find(|resource| resource.access != Access::Read)
+        {
+            return Err(format!(
+                "spirv render: external resource {} must be read-only",
+                resource.name
+            ));
+        }
+        if let Some(resource) = emitted_external_resources
+            .iter()
+            .find(|resource| resource.arg_index < 2)
+        {
+            return Err(format!(
+                "spirv render: external resource {} cannot replace fragment coordinate arg {}",
+                resource.name, resource.arg_index
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "spirv-backend")]
 fn translate_to_naga(
     module: &Module,
     pipeline: ShaderPipeline,
@@ -9092,6 +9215,14 @@ fn translate_to_naga(
 
     let word_width = word.width_bytes();
 
+    let prepared = prepare_naga_entry(
+        module, first_func, word,
+        if render { SpirvShaderStage::Fragment } else { SpirvShaderStage::Compute },
+        &emitted_external_resources, &live_arguments, heap_words, trace, started,
+    )?;
+    validate_naga_entry_mode(
+        pipeline, word, workgroup_size, &prepared.body, &emitted_external_resources,
+    )?;
     let PreparedNagaEntry {
         module: mut naga_mod,
         word_type,
@@ -9101,7 +9232,7 @@ fn translate_to_naga(
             parameter_count: param_count,
             has_object_allocation: has_obj_alloc,
             uses_arena: has_mem,
-            may_trap: has_unreachable,
+            may_trap: _,
             arena_high_water_bytes: _,
         },
         private_heap_words,
@@ -9119,11 +9250,7 @@ fn translate_to_naga(
             private_heap_type,
             needs_trap_channel,
         },
-    } = prepare_naga_entry(
-        module, first_func, word,
-        if render { SpirvShaderStage::Fragment } else { SpirvShaderStage::Compute },
-        &emitted_external_resources, &live_arguments, heap_words, trace, started,
-    )?;
+    } = prepared;
     let mut lowered_variants = std::collections::HashMap::<
         NagaFunctionVariant,
         NagaFunctionInfo,
@@ -9210,43 +9337,6 @@ fn translate_to_naga(
         &lowered_variants,
     )?);
 
-    // Grid mode fail-closed checks. Grid is a driver-declared envelope fact: the
-    // translator never guesses it, and when asked for it, every precondition is
-    // enforced here so no wrong shader is ever emitted.
-    if grid {
-        if word != WordKind::U32 {
-            return Err(
-                "spirv grid: grid mode requires the u32 word (browser profile); got i64"
-                    .to_string(),
-            );
-        }
-        if param_count < 2 {
-            return Err(format!(
-                "spirv grid: a grid kernel needs at least (px, py) args; got {param_count}"
-            ));
-        }
-        if has_obj_alloc {
-            return Err(
-                "spirv grid: grid and batch (ObjAlloc) modes are mutually exclusive".to_string(),
-            );
-        }
-        if !(workgroup_size[0] >= 1 && workgroup_size[1] >= 1 && workgroup_size[2] == 1) {
-            return Err("spirv grid: grid dispatch is 2D; workgroup z must be 1".to_string());
-        }
-    }
-
-    // Batch (ObjAlloc) mode reuses the output storage buffer AS the
-    // allocation (a completely different mechanism from the private-heap
-    // array emulation, `RUNG3_SPIRV_ARRAYS_DESIGN.md` section 1, option B
-    // REJECTED). Combining the two is out of scope here: fail closed with a
-    // named error rather than silently picking one interpretation.
-    if has_obj_alloc && has_mem {
-        return Err(
-            "spirv: function-local [u32; N] arrays (MemAllocDynamic/Mload/Mstore) inside a \
-             batch (ObjAlloc) mode kernel are unsupported. Fail closed."
-                .to_string(),
-        );
-    }
 
     // ======================================================================
     // Explicit compute mode. The stage returns unit and communicates only via
@@ -9254,12 +9344,6 @@ fn translate_to_naga(
     // one read-only parameter record after the authored resource bindings.
     // ======================================================================
     if compute {
-        if has_obj_alloc {
-            return Err(
-                "spirv compute: external-resource compute must not contain ObjAlloc or select Batch"
-                    .to_string(),
-            );
-        }
 
         let parameter_args = sig
             .args()
@@ -9743,75 +9827,11 @@ fn translate_to_naga(
     // fullscreen-triangle `@vertex` and a `@fragment` that binds args 0,1 to
     // `u32(position.xy)`, runs the SAME mode-blind body translation Grid uses,
     // and returns `unpack4x8unorm(result)` as an `@location(0) vec4<f32>` color.
-    // There is NO output storage buffer. Every precondition is enforced here so
-    // no wrong shader is ever emitted; Scalar/Grid/Batch never reach this branch
-    // and are byte-untouched.
+    // There is no output storage buffer. Interface and body-mode preconditions
+    // were checked before helper emission. Scalar/Grid/Batch never reach this
+    // branch.
     // ======================================================================
     if render {
-        if grid {
-            return Err(
-                "spirv render: render and grid modes are mutually exclusive".to_string(),
-            );
-        }
-        if word != WordKind::U32 {
-            return Err(
-                "spirv render: render mode requires the u32 word (browser profile); got i64"
-                    .to_string(),
-            );
-        }
-        if param_count < 2 {
-            return Err(format!(
-                "spirv render: a render kernel needs at least (px, py) args; got {param_count}"
-            ));
-        }
-        if has_mem {
-            return Err(
-                "spirv render: function-local [u32; N] arrays (MemAllocDynamic/Mload/Mstore) \
-                 are unsupported in render mode. Fail closed."
-                    .to_string(),
-            );
-        }
-        if has_unreachable {
-            // Finding A (2026-08-08): render mode's fragment/vertex functions
-            // are a separate naga::Function scope from the compute-mode
-            // `func` the trap channel is threaded through below, so a trap
-            // here has no `MemCtx` to raise. Rather than build a second,
-            // parallel trap-channel for the render path (no current fixture
-            // needs it), fail closed and preserve the pin's original
-            // behavior for this mode: a trap in render is a named compile
-            // error, never a silent zero pixel.
-            return Err(
-                "spirv render: a trap (Unreachable -- an array-bounds check, a checked-usize \
-                 overflow, or a generic MIR trap) is unsupported in render mode (no trap \
-                 channel is wired for the vertex/fragment functions). Fail closed."
-                    .to_string(),
-            );
-        }
-        if has_obj_alloc {
-            return Err(
-                "spirv render: render and batch (ObjAlloc) modes are mutually exclusive"
-                .to_string(),
-            );
-        }
-        if let Some(resource) = emitted_external_resources
-            .iter()
-            .find(|resource| resource.access != Access::Read)
-        {
-            return Err(format!(
-                "spirv render: external resource {} must be read-only",
-                resource.name
-            ));
-        }
-        if let Some(resource) = emitted_external_resources
-            .iter()
-            .find(|resource| resource.arg_index < 2)
-        {
-            return Err(format!(
-                "spirv render: external resource {} cannot replace fragment coordinate arg {}",
-                resource.name, resource.arg_index
-            ));
-        }
-
         // ---- types: f32, vec4<f32> (the vertex/fragment stage I/O) ----------
         let f32_scalar = naga::Scalar { kind: naga::ScalarKind::Float, width: 4 };
         let vec4f = naga_mod.types.insert(
@@ -10896,6 +10916,48 @@ fn translate_to_naga(
 #[cfg(all(test, feature = "spirv-backend"))]
 mod tests {
     use super::{MAX_WGSL_FUNCTION_PARAMETERS, validate_naga_portable_wgsl_limits};
+
+    #[test]
+    fn entry_mode_validation_rejects_incompatible_body_facts() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+func public %entry(v0.i32, v1.i32) -> i32 {
+    block0:
+        return 0.i32;
+}
+"#).unwrap();
+        let entry = parsed.module.funcs()[0];
+        let grid = super::ShaderPipeline::LegacyGrid { entry, workgroup_size: [1, 1, 1] };
+        let compute = super::ShaderPipeline::Compute {
+            entry, workgroup_size: [1, 1, 1], dispatch_grid: [1, 1, 1],
+        };
+        let render = super::ShaderPipeline::Fullscreen { entry };
+        // Test this gate's derived-body contract independently of interface
+        // checks and emission. It does not authorize these synthetic bodies.
+        for (pipeline, object, arena, trap, diagnostic) in [
+            (grid, true, false, false, "grid and batch"),
+            (compute, true, false, false, "external-resource compute"),
+            (compute, true, true, false, "inside a batch"),
+            (render, false, true, false, "unsupported in render mode"),
+            (render, false, false, true, "trap"),
+            (render, true, false, false, "render and batch"),
+        ] {
+            let mut body = super::NagaEntryBodyPlan {
+                parameter_count: 2, has_object_allocation: object,
+                uses_arena: arena, may_trap: trap, arena_high_water_bytes: 0,
+            };
+            let error = super::validate_naga_entry_mode(
+                pipeline, super::WordKind::U32, [1, 1, 1], &body, &[],
+            ).unwrap_err();
+            assert!(error.contains(diagnostic), "{diagnostic}: {error}");
+            body.has_object_allocation = false;
+            body.uses_arena = false;
+            body.may_trap = false;
+            super::validate_naga_entry_mode(
+                pipeline, super::WordKind::U32, [1, 1, 1], &body, &[],
+            ).expect("compatible body facts pass this gate");
+        }
+    }
 
     #[test]
     fn entry_interface_analysis_checks_dispatch_before_body_lowering() {
