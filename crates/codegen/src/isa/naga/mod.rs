@@ -5385,11 +5385,13 @@ fn structured_loop_exit(
             "spirv: loop {header:?} must have exactly one in-loop successor"
         ));
     }
-    Ok(if nz_in {
+    let direct_exit = if nz_in {
         *branch.z_dest()
     } else {
         *branch.nz_dest()
-    })
+    };
+    Ok(crate::structurize::forwarded_loop_exit(function, header, direct_exit,
+        |block| loop_blocks.contains(&block)).unwrap_or(direct_exit))
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -5986,7 +5988,9 @@ fn emit_recursive_loop_region(
     if nz_in == z_in {
         return Err(format!("spirv: loop {header:?} must have exactly one in-loop successor"));
     }
-    let exit = if nz_in { *branch.z_dest() } else { *branch.nz_dest() };
+    let direct_exit = if nz_in { *branch.z_dest() } else { *branch.nz_dest() };
+    let exit = crate::structurize::forwarded_loop_exit(function, header, direct_exit,
+        |block| loop_blocks.contains(&block)).unwrap_or(direct_exit);
     ensure_phi_locals(
         function, inst_set, word, exit, word_type, f32_type, bool_type, func, value_map,
         phi_locals, naga_functions,
@@ -6024,9 +6028,27 @@ fn emit_recursive_loop_region(
     }
     let mut exit_arm = naga::Block::new();
     let mut exit_values = value_map.clone();
-    emit_exact_phi_edge(
-        function, inst_set, word, header, exit, func, &mut exit_arm, &mut exit_values, phi_locals,
+    ensure_phi_locals(
+        function, inst_set, word, direct_exit, word_type, f32_type, bool_type, func,
+        &mut exit_values, phi_locals, naga_functions,
     )?;
+    emit_exact_phi_edge(
+        function, inst_set, word, header, direct_exit, func, &mut exit_arm, &mut exit_values, phi_locals,
+    )?;
+    if direct_exit != exit {
+        // Exhaustion and success have different incoming values at the join.
+        // Run the fallback construction only on exhaustion, then transport its
+        // original CFG edge. The success arms already transport their edges.
+        emit_phi_loads_for_block(function, inst_set, direct_exit, func, &mut exit_arm,
+            &mut exit_values, phi_locals);
+        let mut error = None;
+        emit_block_to_target(function, inst_set, word, word_type, direct_exit, func,
+            &mut exit_arm, &mut exit_values, phi_locals, &mut nested_result_expr,
+            return_abi, naga_functions, mem_ctx, &mut error);
+        if let Some(error) = error { return Err(error); }
+        emit_exact_phi_edge(function, inst_set, word, direct_exit, exit, func,
+            &mut exit_arm, &mut exit_values, phi_locals)?;
+    }
     may_return |= emit_loop_exit_return(
         function, inst_set, word, word_type, exit, return_local, did_return_local,
         func, &mut exit_arm, &mut exit_values, phi_locals, &mut nested_result_expr,
@@ -6036,7 +6058,9 @@ fn emit_recursive_loop_region(
         let value = *value_map.get(&result)
             .ok_or_else(|| format!("spirv: loop header result {result:?} was not emitted"))?;
         let pointer = func.expressions.append(naga::Expression::LocalVariable(local), naga::Span::UNDEFINED);
-        exit_arm.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+        // Header values dominate both normal and early exits. Capture each
+        // iteration's values before selecting either arm, not only exhaustion.
+        loop_body.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
     }
     exit_arm.push(naga::Statement::Break, naga::Span::UNDEFINED);
     let (accept, reject) = if nz_in { (continue_arm, exit_arm) } else { (exit_arm, continue_arm) };

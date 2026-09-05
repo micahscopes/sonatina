@@ -32,7 +32,9 @@ pub enum Region {
     /// A loop with a header and body regions. `body` is the structured form of
     /// the loop's blocks starting at the header's in-loop successor; the header
     /// block itself (phis, exit condition, exit branch) is referenced by
-    /// `header` and consumed by the emitter's loop preamble.
+    /// `header` and consumed by the emitter's loop preamble. A single
+    /// exhaustion-only forwarding block, recognized by `forwarded_loop_exit`,
+    /// is likewise consumed on that header's exit edge rather than as a sibling.
     Loop { header: BlockId, body: Vec<Region> },
     /// An edge from a loop body to that loop's canonical fallthrough block.
     /// The source block remains a separate `Block` region when it contains
@@ -257,6 +259,30 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
         block_order: rpo,
         regions,
     })
+}
+
+/// An exhaustion-only block can construct a fallback before joining an early
+/// loop exit. Realize that block on the header's exit edge, not unconditionally
+/// after the loop. Only a single-block corridor with exactly one incoming edge
+/// is admitted here; more general multi-exit loops retain their diagnostics.
+pub(crate) fn forwarded_loop_exit(
+    function: &Function,
+    header: BlockId,
+    exit: BlockId,
+    in_loop: impl Fn(BlockId) -> bool,
+) -> Option<BlockId> {
+    let is = function.inst_set();
+    let join = function.layout.iter_inst(exit).find_map(|iid| {
+        <&Jump as InstDowncast>::downcast(is, function.dfg.inst(iid)).map(|j| *j.dest())
+    })?;
+    if in_loop(join) { return None; }
+    let mut cfg = ControlFlowGraph::default();
+    cfg.compute(function);
+    let mut predecessors = cfg.preds_of(exit);
+    if predecessors.next().copied() != Some(header) || predecessors.next().is_some() {
+        return None;
+    }
+    cfg.preds_of(join).any(|pred| *pred != header && in_loop(*pred)).then_some(join)
 }
 
 /// A block's classified terminator.
@@ -624,6 +650,13 @@ impl Structurer<'_> {
                     if let Some(exit) = self.loop_direct_exit(b, lp) {
                         if self.returns(exit) {
                             consumed.insert(exit);
+                        } else if let Some(join) = forwarded_loop_exit(self.function, b, exit,
+                            |block| self.in_loop(block, lp))
+                        {
+                            // The emitter owns this block on the header's
+                            // exhaustion edge, just as it owns a returning exit.
+                            consumed.insert(exit);
+                            if self.returns(join) { consumed.insert(join); }
                         }
                     }
                     cur = self.loop_fallthrough(b, lp)?;
@@ -878,13 +911,15 @@ impl Structurer<'_> {
         }
     }
 
-    /// The block execution resumes at after the loop: the header's out-of-loop
-    /// exit target if it continues (non-return); `None` if the exit returns
-    /// (the emitter funnels that return value out of the loop).
+    /// The block execution resumes at after the loop: the header's exit, or
+    /// the shared join after an exhaustion-only forwarder. `None` for a
+    /// returning exit (the emitter funnels its return value out of the loop).
     fn loop_fallthrough(&self, header: BlockId, lp: Loop) -> Result<Option<BlockId>, String> {
         match self.term(header) {
             Term::Br(nz, z) => {
-                let exit = if self.in_loop(nz, lp) { z } else { nz };
+                let direct_exit = if self.in_loop(nz, lp) { z } else { nz };
+                let exit = forwarded_loop_exit(self.function, header, direct_exit,
+                    |block| self.in_loop(block, lp)).unwrap_or(direct_exit);
                 if self.returns(exit) {
                     Ok(None)
                 } else {
