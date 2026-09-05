@@ -1673,6 +1673,21 @@ fn spirv_private_helper_returns_whole_typed_value() {
     let helper = mb.declare_function(Signature::new_single(
         "snapshot_pair", Linkage::Private, &[pair_ptr], pair_ty,
     )).unwrap();
+    let update = mb.declare_function(Signature::new_single(
+        "update_pair_value", Linkage::Private, &[pair_ty], pair_ty,
+    )).unwrap();
+    {
+        let mut fb = mb.func_builder::<InstInserter>(update);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let input = fb.args()[0];
+        let zero = fb.make_imm_value(0i32);
+        let replacement = fb.make_imm_value(99i32);
+        let output = fb.insert_inst(data::InsertValue::new(is, input, zero, replacement), pair_ty);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, output));
+        fb.seal_all();
+        fb.finish();
+    }
     {
         let mut fb = mb.func_builder::<InstInserter>(helper);
         let block = fb.append_block();
@@ -1702,7 +1717,9 @@ fn spirv_private_helper_returns_whole_typed_value() {
         fb.insert_inst_no_result(data::Mstore::new(is, original_first, after, Type::I32));
         fb.insert_inst_no_result(data::Mstore::new(is, saved, snapshot, pair_ty));
         let projected = fb.insert_inst(data::ExtractValue::new(is, snapshot, zero), Type::I32);
-        let updated = fb.insert_inst(data::InsertValue::new(is, snapshot, zero, after), pair_ty);
+        let updated = fb.insert_inst(
+            control_flow::Call::new(is, update, [snapshot].into_iter().collect()), pair_ty,
+        );
         let updated_first = fb.insert_inst(data::ExtractValue::new(is, updated, zero), Type::I32);
         let saved_first = fb.insert_inst(
             data::Gep::new(is, [saved, zero, zero].into_iter().collect()), word_ptr,
@@ -1728,6 +1745,12 @@ fn spirv_private_helper_returns_whole_typed_value() {
         parsed.types[helper.result.as_ref().unwrap().ty].inner,
         naga::TypeInner::Struct { .. },
     ));
+    let update = parsed.functions.iter().map(|(_, function)| function)
+        .find(|function| function.name.as_deref() == Some("update_pair_value"))
+        .expect("aggregate value update must remain outlined");
+    assert_eq!(update.arguments.len(), 1);
+    assert!(matches!(parsed.types[update.arguments[0].ty].inner, naga::TypeInner::Struct { .. }));
+    assert!(update.local_variables.is_empty(), "by-value update needs no private allocation");
     assert!(!wgsl.contains("fe_heap"));
     assert_eq!(run_grid_u32(wgsl, 1, 1, 1, 1, &[]), vec![183],
         "mutating the original to 99 must not change the returned snapshot");
