@@ -1537,6 +1537,70 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
 }
 
 #[test]
+fn spirv_aggregate_loop_phis_preserve_parallel_snapshots() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty = mb.declare_struct_type("LoopPair", &[Type::I32, Type::I32], false);
+    let entry = mb.declare_function(Signature::new_single(
+        "entry", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    )).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(entry);
+    let start = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let exit = fb.append_block();
+    let a_var = fb.declare_var(pair_ty);
+    let b_var = fb.declare_var(pair_ty);
+    let count_var = fb.declare_var(Type::I32);
+    fb.switch_to_block(start);
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    let a_first = fb.make_imm_value(41i32);
+    let b_first = fb.make_imm_value(9i32);
+    let blank = fb.make_undef_value(pair_ty);
+    let a = fb.insert_inst(data::InsertValue::new(is, blank, zero, a_first), pair_ty);
+    let a = fb.insert_inst(data::InsertValue::new(is, a, one, one), pair_ty);
+    let b = fb.insert_inst(data::InsertValue::new(is, blank, zero, b_first), pair_ty);
+    let b = fb.insert_inst(data::InsertValue::new(is, b, one, one), pair_ty);
+    fb.def_var(a_var, a);
+    fb.def_var(b_var, b);
+    fb.def_var(count_var, zero);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(header);
+    let count = fb.use_var(count_var);
+    let three = fb.make_imm_value(3i32);
+    let keep_going = fb.insert_inst(cmp::Lt::new(is, count, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, keep_going, body, exit));
+    fb.switch_to_block(body);
+    let a = fb.use_var(a_var);
+    let b = fb.use_var(b_var);
+    fb.def_var(a_var, b);
+    fb.def_var(b_var, a);
+    let next = fb.insert_inst(arith::Add::new(is, count, one), Type::I32);
+    fb.def_var(count_var, next);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(exit);
+    let a = fb.use_var(a_var);
+    let b = fb.use_var(b_var);
+    let left = fb.insert_inst(data::ExtractValue::new(is, a, zero), Type::I32);
+    let right = fb.insert_inst(data::ExtractValue::new(is, b, zero), Type::I32);
+    let hundred = fb.make_imm_value(100i32);
+    let left = fb.insert_inst(arith::Mul::new(is, left, hundred), Type::I32);
+    let result = fb.insert_inst(arith::Add::new(is, left, right), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
+    fb.seal_all();
+    fb.finish();
+    let artifact = SpirvBackend::new().compile_module(&mb.build()).unwrap();
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    assert!(!wgsl.contains("fe_heap"));
+    assert_eq!(run_grid_u32(wgsl, 1, 1, 1, 1, &[]), vec![941],
+        "three simultaneous swaps must retain both previous aggregate values");
+}
+
+#[test]
 fn spirv_constructs_aggregate_ssa_without_allocations() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
