@@ -36,6 +36,30 @@ fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum OverflowArithmetic { Add, Sub, Mul }
+
+fn overflow_operands(
+    inst_set: &dyn InstSetBase,
+    instruction: &dyn Inst,
+) -> Option<(OverflowArithmetic, bool, ValueId, ValueId)> {
+    use sonatina_ir::inst::arith::{Saddo, Smulo, Ssubo, Uaddo, Umulo, Usubo};
+    macro_rules! recognize {
+        ($kind:ty, $op:ident, $signed:expr) => {
+            if let Some(inst) = <&$kind as InstDowncast>::downcast(inst_set, instruction) {
+                return Some((OverflowArithmetic::$op, $signed, *inst.lhs(), *inst.rhs()));
+            }
+        };
+    }
+    recognize!(Uaddo, Add, false);
+    recognize!(Usubo, Sub, false);
+    recognize!(Umulo, Mul, false);
+    recognize!(Saddo, Add, true);
+    recognize!(Ssubo, Sub, true);
+    recognize!(Smulo, Mul, true);
+    None
+}
+
 /// Preserve both results of unsigned overflow arithmetic. Narrow integers
 /// use their semantic width, not merely their i32 Wasm carrier.
 fn unsigned_overflow_arithmetic(
@@ -44,7 +68,7 @@ fn unsigned_overflow_arithmetic(
     ty: Type,
     lhs: waffle::Value,
     rhs: waffle::Value,
-    multiply: bool,
+    arithmetic: OverflowArithmetic,
 ) -> Result<(waffle::Value, waffle::Value), String> {
     let bits = match ty {
         Type::I1 => 1,
@@ -56,13 +80,24 @@ fn unsigned_overflow_arithmetic(
     };
     let wide = bits == 64;
     let carrier = if wide { WType::I64 } else { WType::I32 };
-    let op = match (wide, multiply) {
-        (false, false) => Operator::I32Add,
-        (false, true) => Operator::I32Mul,
-        (true, false) => Operator::I64Add,
-        (true, true) => Operator::I64Mul,
+    let op = match (wide, arithmetic) {
+        (false, OverflowArithmetic::Add) => Operator::I32Add,
+        (false, OverflowArithmetic::Sub) => Operator::I32Sub,
+        (false, OverflowArithmetic::Mul) => Operator::I32Mul,
+        (true, OverflowArithmetic::Add) => Operator::I64Add,
+        (true, OverflowArithmetic::Sub) => Operator::I64Sub,
+        (true, OverflowArithmetic::Mul) => Operator::I64Mul,
     };
     let raw = body.add_op(block, op, &[lhs, rhs], &[carrier]);
+    if matches!(arithmetic, OverflowArithmetic::Sub) {
+        let compare = if wide { Operator::I64LtU } else { Operator::I32LtU };
+        let overflow = body.add_op(block, compare, &[lhs, rhs], &[WType::I32]);
+        let result = if bits < 32 {
+            let limit = body.add_op(block, Operator::I32Const { value: (1 << bits) - 1 }, &[], &[WType::I32]);
+            body.add_op(block, Operator::I32And, &[raw, limit], &[WType::I32])
+        } else { raw };
+        return Ok((result, overflow));
+    }
     if bits < 32 {
         // Inputs are typed unsigned values. Their full sum/product fits i32
         // for every admitted narrow width, including the i16 product.
@@ -71,7 +106,7 @@ fn unsigned_overflow_arithmetic(
         let overflow = body.add_op(block, Operator::I32LtU, &[limit, raw], &[WType::I32]);
         return Ok((result, overflow));
     }
-    if !multiply {
+    if matches!(arithmetic, OverflowArithmetic::Add) {
         let compare = if wide { Operator::I64LtU } else { Operator::I32LtU };
         let overflow = body.add_op(block, compare, &[raw, lhs], &[WType::I32]);
         return Ok((raw, overflow));
@@ -94,6 +129,91 @@ fn unsigned_overflow_arithmetic(
     let mismatch = body.add_op(block, ne, &[quotient, rhs], &[WType::I32]);
     let lhs_nonzero = body.add_op(block, Operator::I32Eqz, &[lhs_zero], &[WType::I32]);
     let overflow = body.add_op(block, Operator::I32And, &[mismatch, lhs_nonzero], &[WType::I32]);
+    Ok((raw, overflow))
+}
+
+fn signed_overflow_arithmetic(
+    body: &mut FunctionBody,
+    block: waffle::Block,
+    ty: Type,
+    lhs: waffle::Value,
+    rhs: waffle::Value,
+    arithmetic: OverflowArithmetic,
+) -> Result<(waffle::Value, waffle::Value), String> {
+    let bits = match ty {
+        Type::I1 => 1,
+        Type::I8 => 8,
+        Type::I16 => 16,
+        Type::I32 => 32,
+        Type::I64 => 64,
+        other => return Err(format!("unsupported Wasm signed overflow arithmetic type {other:?}")),
+    };
+    let op = match arithmetic {
+        OverflowArithmetic::Add => Operator::I64Add,
+        OverflowArithmetic::Sub => Operator::I64Sub,
+        OverflowArithmetic::Mul => Operator::I64Mul,
+    };
+    if bits < 64 {
+        // All signed i32 products fit i64. Sign-extend from the semantic
+        // width before widening, then check bounds before narrowing.
+        let widen = |body: &mut FunctionBody, value| {
+            let value = if bits < 32 {
+                let shift = body.add_op(block, Operator::I32Const { value: 32 - bits }, &[], &[WType::I32]);
+                let shifted = body.add_op(block, Operator::I32Shl, &[value, shift], &[WType::I32]);
+                body.add_op(block, Operator::I32ShrS, &[shifted, shift], &[WType::I32])
+            } else { value };
+            body.add_op(block, Operator::I64ExtendI32S, &[value], &[WType::I64])
+        };
+        let lhs = widen(body, lhs);
+        let rhs = widen(body, rhs);
+        let exact = body.add_op(block, op, &[lhs, rhs], &[WType::I64]);
+        let min = body.add_op(block, Operator::I64Const { value: (-(1i64 << (bits - 1))) as u64 }, &[], &[WType::I64]);
+        let max = body.add_op(block, Operator::I64Const { value: (1u64 << (bits - 1)) - 1 }, &[], &[WType::I64]);
+        let below = body.add_op(block, Operator::I64LtS, &[exact, min], &[WType::I32]);
+        let above = body.add_op(block, Operator::I64LtS, &[max, exact], &[WType::I32]);
+        let overflow = body.add_op(block, Operator::I32Or, &[below, above], &[WType::I32]);
+        let raw = body.add_op(block, Operator::I32WrapI64, &[exact], &[WType::I32]);
+        let result = if bits < 32 {
+            let mask = body.add_op(block, Operator::I32Const { value: (1 << bits) - 1 }, &[], &[WType::I32]);
+            body.add_op(block, Operator::I32And, &[raw, mask], &[WType::I32])
+        } else { raw };
+        return Ok((result, overflow));
+    }
+    let raw = body.add_op(block, op, &[lhs, rhs], &[WType::I64]);
+    let zero = body.add_op(block, Operator::I64Const { value: 0 }, &[], &[WType::I64]);
+    let lhs_changed = body.add_op(block, Operator::I64Xor, &[lhs, raw], &[WType::I64]);
+    if !matches!(arithmetic, OverflowArithmetic::Mul) {
+        let other = match arithmetic {
+            OverflowArithmetic::Add => body.add_op(block, Operator::I64Xor, &[rhs, raw], &[WType::I64]),
+            OverflowArithmetic::Sub => body.add_op(block, Operator::I64Xor, &[lhs, rhs], &[WType::I64]),
+            OverflowArithmetic::Mul => unreachable!(),
+        };
+        let sign_change = body.add_op(block, Operator::I64And, &[lhs_changed, other], &[WType::I64]);
+        let overflow = body.add_op(block, Operator::I64LtS, &[sign_change, zero], &[WType::I32]);
+        return Ok((raw, overflow));
+    }
+    // Compare unsigned magnitudes before multiplying. abs(MIN) remains
+    // representable as an unsigned word, and no signed MIN / -1 occurs.
+    let shift = body.add_op(block, Operator::I64Const { value: 63 }, &[], &[WType::I64]);
+    let magnitude = |body: &mut FunctionBody, value| {
+        let sign = body.add_op(block, Operator::I64ShrS, &[value, shift], &[WType::I64]);
+        let flipped = body.add_op(block, Operator::I64Xor, &[value, sign], &[WType::I64]);
+        body.add_op(block, Operator::I64Sub, &[flipped, sign], &[WType::I64])
+    };
+    let lhs_abs = magnitude(body, lhs);
+    let rhs_abs = magnitude(body, rhs);
+    let signs = body.add_op(block, Operator::I64Xor, &[lhs, rhs], &[WType::I64]);
+    let negative = body.add_op(block, Operator::I64LtS, &[signs, zero], &[WType::I32]);
+    let negative_word = body.add_op(block, Operator::I64ExtendI32U, &[negative], &[WType::I64]);
+    let max = body.add_op(block, Operator::I64Const { value: i64::MAX as u64 }, &[], &[WType::I64]);
+    let limit = body.add_op(block, Operator::I64Add, &[max, negative_word], &[WType::I64]);
+    let lhs_zero = body.add_op(block, Operator::I64Eqz, &[lhs_abs], &[WType::I32]);
+    let zero_word = body.add_op(block, Operator::I64ExtendI32U, &[lhs_zero], &[WType::I64]);
+    let divisor = body.add_op(block, Operator::I64Or, &[lhs_abs, zero_word], &[WType::I64]);
+    let allowed = body.add_op(block, Operator::I64DivU, &[limit, divisor], &[WType::I64]);
+    let exceeds = body.add_op(block, Operator::I64LtU, &[allowed, rhs_abs], &[WType::I32]);
+    let lhs_nonzero = body.add_op(block, Operator::I32Eqz, &[lhs_zero], &[WType::I32]);
+    let overflow = body.add_op(block, Operator::I32And, &[exceeds, lhs_nonzero], &[WType::I32]);
     Ok((raw, overflow))
 }
 
@@ -1641,31 +1761,15 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
-                    // Unsigned arithmetic returns both the wrapped value and
-                    // its exact semantic-width overflow flag.
-                    else if let Some(uaddo) = <&sonatina_ir::inst::arith::Uaddo as InstDowncast>::downcast(inst_set, inst_data) {
+                    // All overflow operations share result transport. Their
+                    // signedness and semantic width select the exact checks.
+                    else if let Some((op, signed, lhs_id, rhs_id)) = overflow_operands(inst_set, inst_data) {
                         let ir_results = function.dfg.inst_results(inst_id);
                         if !ir_results.is_empty() {
-                            let lhs = resolve_value(function, *uaddo.lhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let rhs = resolve_value(function, *uaddo.rhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let (wval, overflow) = unsigned_overflow_arithmetic(
-                                &mut body, wb, function.dfg.value_ty(*uaddo.lhs()), lhs, rhs, false,
-                            )?;
-                            value_map.insert(ir_results[0], wval);
-                            if ir_results.len() >= 2 {
-                                value_map.insert(ir_results[1], overflow);
-                            }
-                        }
-                    }
-                    // Multiplication uses the same width and result contract.
-                    else if let Some(umulo) = <&sonatina_ir::inst::arith::Umulo as InstDowncast>::downcast(inst_set, inst_data) {
-                        let ir_results = function.dfg.inst_results(inst_id);
-                        if !ir_results.is_empty() {
-                            let lhs = resolve_value(function, *umulo.lhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let rhs = resolve_value(function, *umulo.rhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let (wval, overflow) = unsigned_overflow_arithmetic(
-                                &mut body, wb, function.dfg.value_ty(*umulo.lhs()), lhs, rhs, true,
-                            )?;
+                            let lhs = resolve_value(function, lhs_id, &value_map, &mut body, wb).ok_or("unresolved overflow lhs")?;
+                            let rhs = resolve_value(function, rhs_id, &value_map, &mut body, wb).ok_or("unresolved overflow rhs")?;
+                            let lower = if signed { signed_overflow_arithmetic } else { unsigned_overflow_arithmetic };
+                            let (wval, overflow) = lower(&mut body, wb, function.dfg.value_ty(lhs_id), lhs, rhs, op)?;
                             value_map.insert(ir_results[0], wval);
                             if ir_results.len() >= 2 {
                                 value_map.insert(ir_results[1], overflow);

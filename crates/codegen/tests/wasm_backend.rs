@@ -26,12 +26,13 @@ fn wasm32_module_builder() -> ModuleBuilder {
 }
 
 #[test]
-fn unsigned_arithmetic_preserves_value_and_overflow_on_wasm() {
+fn integer_arithmetic_preserves_value_and_overflow_on_wasm() {
     for ty in [Type::I64, Type::I32, Type::I16, Type::I8, Type::I1] {
         let isa = Wasm32::new(wasm32_triple());
         let is = isa.inst_set();
         let mb = wasm32_module_builder();
-        for (name, multiply) in [("add", false), ("mul", true)] {
+        let operations = ["uadd", "usub", "umul", "sadd", "ssub", "smul"];
+        for name in operations {
             let function = mb.declare_function(Signature::new(
                 name, Linkage::Public, &[ty, ty], &[ty, Type::I1],
             )).unwrap();
@@ -39,10 +40,14 @@ fn unsigned_arithmetic_preserves_value_and_overflow_on_wasm() {
             let entry = fb.append_block();
             fb.switch_to_block(entry);
             let (lhs, rhs) = (fb.args()[0], fb.args()[1]);
-            let results = if multiply {
-                fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &[ty, Type::I1])
-            } else {
-                fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &[ty, Type::I1])
+            let results = match name {
+                "uadd" => fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &[ty, Type::I1]),
+                "usub" => fb.insert_inst_results(arith::Usubo::new(is, lhs, rhs), &[ty, Type::I1]),
+                "umul" => fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &[ty, Type::I1]),
+                "sadd" => fb.insert_inst_results(arith::Saddo::new(is, lhs, rhs), &[ty, Type::I1]),
+                "ssub" => fb.insert_inst_results(arith::Ssubo::new(is, lhs, rhs), &[ty, Type::I1]),
+                "smul" => fb.insert_inst_results(arith::Smulo::new(is, lhs, rhs), &[ty, Type::I1]),
+                _ => unreachable!(),
             };
             fb.insert_inst_no_result(control_flow::Return::new(is, results.into()));
             fb.seal_all();
@@ -64,6 +69,10 @@ fn unsigned_arithmetic_preserves_value_and_overflow_on_wasm() {
         };
         let mut cases = vec![(0, 0), (0, max), (max, 0), (1, max), (max, 1),
             (max, 2), (max, max), (max / 2, 2), (max / 2 + 1, 2), (6, 7)];
+        let sign = max / 2 + 1;
+        cases.extend([(sign, max), (max, sign), (sign, 1), (sign, 0),
+            (0, sign), (sign, sign), (sign - 1, 1), (sign - 1, max),
+            (sign - 1, sign - 1), (sign, 2), (sign / 2, 2)]);
         let mut seed = 0x5a17_904e_8213_c6bdu64;
         for _ in 0..256 {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -73,10 +82,28 @@ fn unsigned_arithmetic_preserves_value_and_overflow_on_wasm() {
         }
         for (lhs, rhs) in cases {
             let (lhs, rhs) = (lhs & max, rhs & max);
-            for (name, multiply) in [("add", false), ("mul", true)] {
-                let exact = if multiply { (lhs as u128) * (rhs as u128) }
-                    else { (lhs as u128) + (rhs as u128) };
-                let expected = ((exact as u64) & max, i32::from(exact > max as u128));
+            for name in operations {
+                let expected = if name.starts_with('s') {
+                    let signed = |value: u64| if value & sign != 0 {
+                        value as i128 - (max as i128 + 1)
+                    } else { value as i128 };
+                    let (lhs, rhs) = (signed(lhs), signed(rhs));
+                    let exact = match name {
+                        "sadd" => lhs + rhs,
+                        "ssub" => lhs - rhs,
+                        "smul" => lhs * rhs,
+                        _ => unreachable!(),
+                    };
+                    ((exact as u64) & max, i32::from(exact < -(sign as i128) || exact >= sign as i128))
+                } else {
+                    let exact = match name {
+                        "uadd" => (lhs as u128) + (rhs as u128),
+                        "usub" => (lhs as u128).wrapping_sub(rhs as u128),
+                        "umul" => (lhs as u128) * (rhs as u128),
+                        _ => unreachable!(),
+                    };
+                    ((exact as u64) & max, i32::from(exact > max as u128))
+                };
                 let actual = if ty != Type::I64 {
                     let function = instance.get_typed_func::<(i32, i32), (i32, i32)>(&mut store, name).unwrap();
                     let (value, overflow) = function.call(&mut store, (lhs as i32, rhs as i32)).unwrap();
