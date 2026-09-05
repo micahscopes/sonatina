@@ -8789,7 +8789,7 @@ fn prepare_naga_entry(
         word_type,
         f32_type,
     )?;
-    let helper_context = helper_plan::EntryHelperContext::derive(
+    let helper_context = helper_plan::EntryHelperContext::analyze(
         module,
         &call_order,
         first_func,
@@ -8801,7 +8801,7 @@ fn prepare_naga_entry(
         module, &call_order, first_func, word, word_type, f32_type, bool_type,
         helper_context, &entry_body_plan, private_heap_words, live_arguments,
         typed_local_types, &mut naga_mod.types,
-    )?;
+    )?.into_complete()?;
     Ok(PreparedNagaEntry {
         module: naga_mod, word_type, f32_type, bool_type, body: entry_body_plan,
         private_heap_words, external_roots, external_layout_bindings, helpers,
@@ -10931,7 +10931,30 @@ func private %leaf(v0.objref<[i32; 8]>) -> i32 {
         assert_eq!(context.variants.rejections.len(), 1);
         assert_eq!(context.variants.rejections[0].0, bad);
         assert!(context.memory.as_ref().expect("independent memory analysis").contains_key(&leaf));
-        assert!(context.into_complete().is_err(), "emission consumes the same complete-context gate");
+        let float = naga_module.types.insert(naga::Type {
+            name: None, inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Float, width: 4,
+            }),
+        }, naga::Span::UNDEFINED);
+        let boolean = naga_module.types.insert(naga::Type {
+            name: None, inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Bool, width: 1,
+            }),
+        }, naga::Span::UNDEFINED);
+        let locals = super::collect_naga_typed_local_types(
+            module, &order, super::WordKind::U32, ty, float, boolean, &mut naga_module.types,
+        );
+        let body = super::analyze_naga_entry_body(module, entry, super::WordKind::U32, 8192)
+            .expect("entry itself is representable");
+        let selection = super::helper_plan::prepare_entry_helpers(
+            module, &order, entry, super::WordKind::U32, ty, float, boolean,
+            context, &body, 0, &live, locals, &mut naga_module.types,
+        ).expect("partial context feeds the shared physical planner");
+        assert_eq!(selection.helpers.rejections.len(), 1);
+        assert_eq!(selection.helpers.rejections[0].0, bad);
+        let planned = selection.helpers.plans.iter().map(|plan| plan.variant.function).collect::<Vec<_>>();
+        assert_eq!(planned, vec![leaf, good]);
+        assert!(selection.into_complete().is_err(), "emission consumes the same complete-context gate");
         assert!(super::helper_resource_variants(
             module, &order, entry, &[(0, first), (0, second)],
             &resources, &logical, &live,
