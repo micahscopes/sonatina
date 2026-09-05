@@ -1,5 +1,7 @@
 use sonatina_codegen::Backend;
-use sonatina_codegen::isa::naga::NagaBackend;
+use sonatina_codegen::isa::naga::{
+    NagaBackend, ShaderEncoding, ShaderEntries, ShaderEnvironment, ShaderTargetContract,
+};
 use sonatina_codegen::isa::spirv::{
     Access, LayoutMode, Role, SpirvBackend, SpirvBindingMember, SpirvBuiltinArgument,
     SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout,
@@ -200,6 +202,18 @@ fn spirv_explicit_entry_ignores_declaration_order() {
     for backend in [NagaBackend::new(), NagaBackend::new().with_render()] {
         let artifact = backend.compile_entry(&module, selected)
             .expect("the explicitly selected entry must supply both signature and body");
+        let target = ShaderTargetContract::new(ShaderEnvironment::WebGpu,
+            [ShaderEncoding::Wgsl, ShaderEncoding::Spirv]).unwrap();
+        let checked = backend.compile_for_target(&module, ShaderEntries::Single(selected), &target)
+            .expect("the same u32 shader must satisfy the explicit WebGPU contract");
+        assert_eq!(checked.wgsl, artifact.wgsl);
+        assert_eq!(checked.words, artifact.words);
+        for encoding in [ShaderEncoding::Wgsl, ShaderEncoding::Spirv] {
+            let target = ShaderTargetContract::new(ShaderEnvironment::WebGpu, [encoding]).unwrap();
+            let output = backend.compile_for_target(&module, ShaderEntries::Single(selected), &target).unwrap();
+            assert_eq!(output.wgsl.is_some(), encoding == ShaderEncoding::Wgsl);
+            assert_eq!(!output.words.is_empty(), encoding == ShaderEncoding::Spirv);
+        }
         assert_eq!(artifact.layout.word, WordKind::U32);
         let wgsl = artifact.wgsl.expect("selected u32 entry has WGSL output");
         assert!(wgsl.contains("42u"), "selected body missing: {wgsl}");
@@ -210,6 +224,18 @@ fn spirv_explicit_entry_ignores_declaration_order() {
             naga::valid::Capabilities::empty(),
         ).validate(&reparsed).unwrap();
     }
+    let target = ShaderTargetContract::new(ShaderEnvironment::WebGpu, [ShaderEncoding::Wgsl]).unwrap();
+    let errors = NagaBackend::new().compile_for_target(&module, ShaderEntries::Single(decoy), &target)
+        .err().expect("the WebGPU profile must reject the i64 entry before emission");
+    assert!(errors.iter().any(|error| matches!(error, sonatina_codegen::isa::naga::SpirvError::Validation(_))));
+    let cpu_module = native_module_builder().build();
+    let errors = NagaBackend::new().compile_for_target(&cpu_module, ShaderEntries::Single(selected), &target)
+        .err().expect("CPU modules cannot satisfy an explicit shader contract");
+    assert!(errors.iter().any(|error| error.to_string().contains("Shader ISA")));
+    assert!(ShaderTargetContract::new(ShaderEnvironment::Vulkan, [ShaderEncoding::Spirv]).is_err());
+    assert!(ShaderTargetContract::new(ShaderEnvironment::WebGl2, [ShaderEncoding::GlslEs]).is_err());
+    assert!(ShaderTargetContract::new(ShaderEnvironment::WebGpu, [ShaderEncoding::GlslEs]).is_err());
+    assert!(ShaderTargetContract::new(ShaderEnvironment::WebGpu, []).is_err());
     module.remove_func(selected).unwrap();
     let errors = match SpirvBackend::new().compile_entry(&module, selected) {
         Ok(_) => panic!("removed entry must be rejected"),

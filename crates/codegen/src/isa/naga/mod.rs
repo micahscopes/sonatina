@@ -6,6 +6,9 @@
 
 use sonatina_ir::Module;
 
+mod target;
+pub use target::{ShaderEncoding, ShaderEnvironment, ShaderTargetContract};
+
 #[cfg(feature = "spirv-backend")]
 use sonatina_ir::ir_writer::FuncWriter;
 
@@ -287,6 +290,7 @@ pub struct SpirvRasterPipeline {
 }
 
 pub struct ShaderArtifact {
+    /// Empty when SPIR-V was not requested by an explicit target contract.
     pub words: Vec<u32>,
     /// WGSL source for wgpu execution (available when spirv-backend feature is on)
     pub wgsl: Option<String>,
@@ -341,7 +345,7 @@ pub struct NagaBackend {
 
 #[cfg(feature = "spirv-backend")]
 #[derive(Clone, Copy)]
-enum ShaderEntries {
+pub enum ShaderEntries {
     Single(sonatina_ir::module::FuncRef),
     Raster {
         vertex: sonatina_ir::module::FuncRef,
@@ -618,7 +622,7 @@ impl Backend for NagaBackend {
 
     #[cfg(feature = "spirv-backend")]
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
-        self.compile_module_for_entry(module, None)
+        self.compile_module_for_entry(module, None, None)
     }
 }
 
@@ -631,7 +635,7 @@ impl NagaBackend {
         module: &Module,
         entry: sonatina_ir::module::FuncRef,
     ) -> Result<ShaderArtifact, Vec<SpirvError>> {
-        self.compile_module_for_entry(module, Some(ShaderEntries::Single(entry)))
+        self.compile_module_for_entry(module, Some(ShaderEntries::Single(entry)), None)
     }
 
     /// Compile source-authored raster stages by module-local function identity.
@@ -642,14 +646,38 @@ impl NagaBackend {
         vertex: sonatina_ir::module::FuncRef,
         fragment: sonatina_ir::module::FuncRef,
     ) -> Result<ShaderArtifact, Vec<SpirvError>> {
-        self.compile_module_for_entry(module, Some(ShaderEntries::Raster { vertex, fragment }))
+        self.compile_module_for_entry(module, Some(ShaderEntries::Raster { vertex, fragment }), None)
+    }
+
+    /// Compile under a checked environment profile with required outputs.
+    /// Unlike the compatibility entry points, this requires a Shader ISA module.
+    pub fn compile_for_target(
+        &self,
+        module: &Module,
+        entries: ShaderEntries,
+        target: &ShaderTargetContract,
+    ) -> Result<ShaderArtifact, Vec<SpirvError>> {
+        if module.ctx.triple.architecture != sonatina_triple::Architecture::Shader {
+            return Err(vec![SpirvError::UnsupportedTarget(
+                "an explicit shader target requires a Shader ISA module".to_owned(),
+            )]);
+        }
+        self.compile_module_for_entry(module, Some(entries), Some(target))
     }
 
     fn compile_module_for_entry(
         &self,
         module: &Module,
         entry: Option<ShaderEntries>,
+        target: Option<&ShaderTargetContract>,
     ) -> Result<ShaderArtifact, Vec<SpirvError>> {
+        let capabilities = match target.map(ShaderTargetContract::environment) {
+            Some(ShaderEnvironment::WebGpu) => naga::valid::Capabilities::empty(),
+            Some(environment) => return Err(vec![SpirvError::UnsupportedTarget(format!(
+                "shader environment {environment:?} has no implemented capability profile"
+            ))]),
+            None => naga::valid::Capabilities::all(),
+        };
         let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
         let started = std::time::Instant::now();
         let (mut naga_mod, layout) = translate_to_naga(
@@ -681,7 +709,7 @@ impl NagaBackend {
         let phase = std::time::Instant::now();
         let validation = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
+            capabilities,
         )
         .validate(&naga_mod);
         let info = match validation {
@@ -794,8 +822,12 @@ impl NagaBackend {
         };
 
         let phase = std::time::Instant::now();
-        let words = naga::back::spv::write_vec(&naga_mod, &info, &options, None)
-            .map_err(|e| vec![SpirvError::Translation(format!("{e}"))])?;
+        let words = if target.is_none_or(|target| target.requests(ShaderEncoding::Spirv)) {
+            naga::back::spv::write_vec(&naga_mod, &info, &options, None)
+                .map_err(|e| vec![SpirvError::Translation(format!("{e}"))])?
+        } else {
+            Vec::new()
+        };
         if trace {
             eprintln!(
                 "sonatina spirv: emitted spirv, words={}, elapsed_ms={}",
@@ -806,9 +838,20 @@ impl NagaBackend {
 
         // Also emit WGSL for wgpu execution
         let phase = std::time::Instant::now();
-        let wgsl = naga::back::wgsl::write_string(
-            &naga_mod, &info, naga::back::wgsl::WriterFlags::empty()
-        ).ok();
+        let wgsl = if target.is_none_or(|target| target.requests(ShaderEncoding::Wgsl)) {
+            let output = naga::back::wgsl::write_string(
+                &naga_mod, &info, naga::back::wgsl::WriterFlags::empty()
+            );
+            if target.is_some() {
+                Some(output.map_err(|error| vec![SpirvError::Translation(format!(
+                    "required WGSL encoding failed: {error}"
+                ))])?)
+            } else {
+                output.ok()
+            }
+        } else {
+            None
+        };
         if trace {
             eprintln!(
                 "sonatina spirv: emitted wgsl, bytes={}, elapsed_ms={}, total_elapsed_ms={}",
