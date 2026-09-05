@@ -14,9 +14,14 @@ target = "wasm32-unknown-native"
 
 func public %entry() -> i32 {
     block0:
-        v0.i256 = call %parent;
+        v0.i32 = call %ancestor;
         v1.i32 = call %sibling;
         return v1;
+}
+func private %ancestor() -> i32 {
+    block0:
+        v0.i256 = call %parent;
+        return 31.i32;
 }
 func private %parent() -> i256 {
     block0:
@@ -38,6 +43,7 @@ func private %sibling() -> i32 {
         }).expect("fixture function exists");
         let entry = find("entry");
         let parent = find("parent");
+        let ancestor = find("ancestor");
         let leaf = find("leaf");
         let sibling = find("sibling");
         let order = super::super::reachable_call_postorder(module, entry).unwrap();
@@ -59,9 +65,11 @@ func private %sibling() -> i32 {
             &context.memory, NagaMemoryAbiTypes::default(), &live,
             &NagaFunctionMap::new(), &mut types,
         );
-        assert_eq!(report.rejections.len(), 1);
+        assert_eq!(report.rejections.len(), 2);
         assert_eq!(report.rejections[0].0, parent);
         assert!(report.rejections[0].1.contains("unsupported"));
+        assert_eq!(report.rejections[1].0, ancestor);
+        assert!(report.rejections[1].1.contains("rejected or unplanned callee"));
         let planned = report.plans.iter().map(|plan| plan.variant.function).collect::<Vec<_>>();
         assert_eq!(planned, vec![leaf, sibling]);
         assert!(report.into_complete().is_err(), "partial reports cannot authorize emission");
@@ -98,7 +106,8 @@ pub(super) struct PhysicalHelperParameters {
 
 /// Per-function ABI outcomes in call-postorder. An unsupported parent must not
 /// discard an independently representable child or prevent visiting siblings.
-/// Plans are local representation facts, not transitive callability proofs.
+/// Successful plans also require all their direct callees to have succeeded.
+/// Shared entry context and typed-local validation remain prerequisites.
 pub(super) struct HelperAbiReport {
     pub plans: Vec<PlannedHelperAbi>,
     pub rejections: Vec<(FuncRef, String)>,
@@ -280,6 +289,7 @@ pub struct HelperBodyPlan {
     pub(super) structured: crate::structurize::StructuredCfg,
     instruction_count: usize,
     accesses_resource: bool,
+    callees: Vec<FuncRef>,
 }
 
 impl HelperBodyPlan {
@@ -312,10 +322,14 @@ fn derive_helper_body(module: &Module, function_ref: FuncRef) -> Result<HelperBo
         let inst_set = function.inst_set();
         let mut instruction_count = 0;
         let mut accesses_resource = false;
+        let mut callees = Vec::new();
         for block in function.layout.iter_block() {
             for instruction in function.layout.iter_inst(block) {
                 instruction_count += 1;
                 let inst = function.dfg.inst(instruction);
+                if let Some(call) = function.dfg.call_info(instruction) {
+                    callees.push(call.callee());
+                }
                 if !super::spirv_instruction_is_lowered(inst_set, inst) {
                     return Err(format!(
                         "spirv: instruction `{}` is unsupported in helper `{}`. Fail closed.",
@@ -339,7 +353,7 @@ fn derive_helper_body(module: &Module, function_ref: FuncRef) -> Result<HelperBo
         }
         let structured = crate::structurize::structurize_function(function)
             .map_err(|error| super::structurize_error_with_block_ir(error, function_ref, function))?;
-        Ok(HelperBodyPlan { structured, instruction_count, accesses_resource })
+        Ok(HelperBodyPlan { structured, instruction_count, accesses_resource, callees })
     }).ok_or_else(|| format!("spirv: helper {function_ref:?} has no body. Fail closed."))?
 }
 
@@ -366,6 +380,7 @@ pub(super) fn plan_helper_abis(
     types: &mut naga::UniqueArena<naga::Type>,
 ) -> HelperAbiReport {
     let mut report = HelperAbiReport { plans: Vec::new(), rejections: Vec::new() };
+    let mut callable = std::collections::HashSet::new();
     for function in call_order
         .iter()
         .copied()
@@ -466,7 +481,20 @@ pub(super) fn plan_helper_abis(
             Ok(plans)
         })();
         match outcome {
-            Ok(plans) => report.plans.extend(plans),
+            Ok(plans) => {
+                // Body plans are shared by every resource variant. A local
+                // ABI is not callable while any selected callee is unresolved.
+                let blocked = plans.first().into_iter().flat_map(|plan| &plan.body.callees)
+                    .copied().find(|callee| !callable.contains(callee));
+                if let Some(callee) = blocked {
+                    report.rejections.push((function, format!(
+                        "spirv: helper {function:?} requires rejected or unplanned callee {callee:?}. Fail closed.",
+                    )));
+                } else {
+                    callable.insert(function);
+                    report.plans.extend(plans);
+                }
+            }
             Err(error) => report.rejections.push((function, error)),
         }
     }
