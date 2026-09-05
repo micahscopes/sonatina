@@ -33,6 +33,77 @@ fn native_module_builder() -> ModuleBuilder {
 }
 
 #[test]
+fn cranelift_definition_order_follows_cfg_not_block_layout() {
+    for reversed in [false, true] {
+        let isa = native_isa();
+        let is = isa.inst_set();
+        let mb = native_module_builder();
+        let function = mb.declare_function(Signature::new_single(
+            "layout", Linkage::Public, &[Type::I32], Type::I32,
+        )).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(function);
+        let entry = fb.append_block();
+        let first = fb.append_block();
+        let second = fb.append_block();
+        let (definition, use_block) = if reversed { (second, first) } else { (first, second) };
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, definition));
+        fb.switch_to_block(definition);
+        let two = fb.make_imm_value(2i32);
+        let value = fb.insert_inst(arith::Add::new(is, fb.args()[0], two), Type::I32);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, use_block));
+        fb.switch_to_block(use_block);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+        fb.seal_all();
+        fb.finish();
+        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        type Probe = unsafe extern "C" fn(i32) -> i32;
+        let probe: Probe = unsafe { std::mem::transmute(artifact.get_func_ptr::<Probe>("layout").unwrap()) };
+        for value in [0i32, 40, -7, i32::MAX] {
+            assert_eq!(unsafe { probe(value) }, value.wrapping_add(2), "reversed={reversed}");
+        }
+    }
+}
+
+#[test]
+fn cranelift_loop_phi_transport_is_independent_of_block_layout() {
+    for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        let isa = native_isa();
+        let is = isa.inst_set();
+        let mb = native_module_builder();
+        let function = mb.declare_function(Signature::new_single(
+            "layout_loop", Linkage::Public, &[Type::I32], Type::I32,
+        )).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(function);
+        let entry = fb.append_block();
+        let blocks = [fb.append_block(), fb.append_block(), fb.append_block()];
+        let [header, body, exit] = order.map(|index| blocks[index]);
+        fb.switch_to_block(entry);
+        let zero = fb.make_imm_value(0i32);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+        fb.switch_to_block(header);
+        let index = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+        let cond = fb.insert_inst(cmp::Slt::new(is, index, fb.args()[0]), Type::I1);
+        fb.insert_inst_no_result(control_flow::Br::new(is, cond, body, exit));
+        fb.switch_to_block(body);
+        let one = fb.make_imm_value(1i32);
+        let next = fb.insert_inst(arith::Add::new(is, index, one), Type::I32);
+        fb.append_phi_arg(index, next, body);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+        fb.switch_to_block(exit);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, index));
+        fb.seal_all();
+        fb.finish();
+        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        type Probe = unsafe extern "C" fn(i32) -> i32;
+        let probe: Probe = unsafe { std::mem::transmute(artifact.get_func_ptr::<Probe>("layout_loop").unwrap()) };
+        for count in [-1, 0, 1, 7, 100] {
+            assert_eq!(unsafe { probe(count) }, count.max(0), "order={order:?}");
+        }
+    }
+}
+
+#[test]
 fn cranelift_integer_overflow_matches_wide_oracle() {
     let operations = ["uadd", "usub", "umul", "sadd", "ssub", "smul"];
     for (ty, bits) in [(Type::I1, 1), (Type::I8, 8), (Type::I16, 16), (Type::I32, 32), (Type::I64, 64)] {

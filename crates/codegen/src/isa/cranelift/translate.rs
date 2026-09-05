@@ -243,7 +243,12 @@ fn translate_function(
     let mut loop_tree = crate::loop_analysis::LoopTree::new();
     loop_tree.compute(&cfg, &domtree);
 
-    for block in function.layout.iter_block() {
+    // Layout order is not dominance order. In particular, check/trap
+    // continuations may be appended after blocks that consume their values.
+    // Reverse postorder visits dominating definitions before ordinary uses;
+    // loop-carried values remain block parameters with explicit edge arguments.
+    let block_order: Vec<_> = cfg.post_order().collect();
+    for block in block_order.into_iter().rev() {
         let clif_block = block_map[&block];
         if block != entry {
             builder.switch_to_block(clif_block);
@@ -659,8 +664,8 @@ fn translate_function(
                 } else {
                     let args: Vec<clif::Value> = ret.args().as_slice()
                         .iter()
-                        .filter_map(|v| resolve_value(function, *v, &value_map, &mut builder).ok())
-                        .collect();
+                        .map(|v| resolve_value(function, *v, &value_map, &mut builder))
+                        .collect::<Result<Vec<_>, _>>()?;
                     builder.ins().return_(&args);
                 }
             } else if <&sonatina_ir::inst::control_flow::CallIndirect as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data).is_some() {
