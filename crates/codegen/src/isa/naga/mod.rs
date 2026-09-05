@@ -6154,12 +6154,15 @@ struct NagaFunctionVariant {
 }
 
 #[cfg(feature = "spirv-backend")]
+type NagaResourceVariantBindings = std::collections::HashMap<
+    sonatina_ir::module::FuncRef,
+    Vec<Vec<Option<naga::Handle<naga::GlobalVariable>>>>,
+>;
+
+#[cfg(feature = "spirv-backend")]
 struct NagaResourceVariants {
     entry: NagaFunctionVariant,
-    bindings: std::collections::HashMap<
-        sonatina_ir::module::FuncRef,
-        Vec<Vec<Option<naga::Handle<naga::GlobalVariable>>>>,
-    >,
+    bindings: NagaResourceVariantBindings,
     calls: std::collections::HashMap<
         (NagaFunctionVariant, sonatina_ir::InstId),
         NagaFunctionVariant,
@@ -6424,12 +6427,12 @@ fn reachable_call_postorder(
 fn helper_naga_logical_result_abis(
     module: &Module,
     call_order: &[sonatina_ir::module::FuncRef],
-    entry: sonatina_ir::module::FuncRef,
+    roots: &[sonatina_ir::module::FuncRef],
     resource_capabilities: &NagaResourceCapabilities,
 ) -> Result<NagaLogicalResultAbis, String> {
     let mut result_abis = NagaLogicalResultAbis::new();
     for &function_ref in call_order {
-        if function_ref == entry {
+        if roots.contains(&function_ref) {
             continue;
         }
         let logical = helper_naga_logical_result_abi(
@@ -8972,7 +8975,7 @@ fn translate_to_naga(
     let helper_logical_result_abis = helper_naga_logical_result_abis(
         module,
         &call_order,
-        first_func,
+        &[first_func],
         &helper_resource_capabilities,
     )?;
     let helper_resource_variants = helper_resource_variants(
@@ -9061,14 +9064,14 @@ fn translate_to_naga(
     let helper_plans = helper_plan::plan_helper_abis(
         module,
         &call_order,
-        first_func,
+        &[first_func],
         word,
         word_type,
         f32_type,
         bool_type,
         &helper_resource_capabilities,
         &helper_logical_result_abis,
-        &helper_resource_variants,
+        &helper_resource_variants.bindings,
         &helper_memory_abis,
         &live_arguments,
         &naga_functions,

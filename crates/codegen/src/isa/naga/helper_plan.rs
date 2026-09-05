@@ -10,7 +10,7 @@ use sonatina_ir::{Module, module::FuncRef};
 use super::{
     NagaArgumentSource, NagaFunctionMap, NagaFunctionVariant, NagaLiveArguments,
     NagaLogicalResultAbis, NagaMemoryAbi, NagaPackedArguments, NagaResourceCapabilities,
-    NagaResourceVariants, NagaResultAbi, WordKind, helper_naga_argument_abi,
+    NagaResourceVariantBindings, NagaResultAbi, WordKind, helper_naga_argument_abi,
     helper_naga_result_abi, pack_wide_naga_helper_arguments,
 };
 
@@ -100,14 +100,14 @@ fn derive_helper_body(module: &Module, function_ref: FuncRef) -> Result<HelperBo
 pub(super) fn plan_helper_abis(
     module: &Module,
     call_order: &[FuncRef],
-    entry: FuncRef,
+    roots: &[FuncRef],
     word: WordKind,
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     resource_capabilities: &NagaResourceCapabilities,
     logical_results: &NagaLogicalResultAbis,
-    resource_variants: &NagaResourceVariants,
+    resource_variants: &NagaResourceVariantBindings,
     memory_abis: &HashMap<FuncRef, NagaMemoryAbi>,
     live_arguments: &NagaLiveArguments,
     functions: &NagaFunctionMap,
@@ -117,7 +117,7 @@ pub(super) fn plan_helper_abis(
     for function in call_order
         .iter()
         .copied()
-        .filter(|&function| function != entry)
+        .filter(|function| !roots.contains(function))
     {
         let memory = memory_abis.get(&function).copied().ok_or_else(|| {
             format!("spirv: helper {function:?} has no derived private-memory ABI. Fail closed.")
@@ -139,7 +139,10 @@ pub(super) fn plan_helper_abis(
             functions,
             types,
         )?;
-        let variants = resource_variants.variants(function);
+        let variants = resource_variants
+            .get(&function)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if variants.is_empty() {
             return Err(format!(
                 "spirv: helper `{}` has no entry-rooted resource variant. Fail closed.",
