@@ -112,6 +112,11 @@ func public %mismatch(v0.f32, v1.i32, v2.f32) -> i32 {
         let fragment = find("fragment");
         let prepared = prepare_raster_entries(module, vertex, fragment, &[], &[])
             .expect("paired entry preparation");
+        assert!(prepared.vertex.normalized.is_none());
+        assert_eq!(prepared.vertex.return_arguments.len(), 5);
+        assert!(!prepared.vertex.structured.regions.is_empty());
+        assert_eq!(prepared.fragment.return_arguments.len(), 1);
+        assert!(!prepared.fragment.structured.regions.is_empty());
         assert_eq!(prepared.context_count, 1);
         assert_eq!(prepared.varying_count, 1);
         assert_eq!(prepared.scalar_state, vec![(0, Type::F32), (1, Type::I32)]);
@@ -129,6 +134,8 @@ func public %mismatch(v0.f32, v1.i32, v2.f32) -> i32 {
 }
 
 struct RasterEntryPreparation {
+    vertex: RasterStagePlan,
+    fragment: RasterStagePlan,
     pipeline: SpirvRasterPipeline,
     builtin_arguments: Vec<SpirvBuiltinArgument>,
     context_count: usize,
@@ -137,6 +144,36 @@ struct RasterEntryPreparation {
     state_stages: Vec<SpirvShaderStage>,
     emitted_external_resources: Vec<SpirvExternalResource>,
     external_resource_stages: Vec<Vec<SpirvShaderStage>>,
+}
+
+/// Own the normalized body together with the control-flow and return IDs derived
+/// from it. Emission must not reconstruct these decisions against another body.
+struct RasterStagePlan {
+    normalized: Option<Function>,
+    structured: crate::structurize::StructuredCfg,
+    return_arguments: Vec<sonatina_ir::ValueId>,
+}
+
+fn prepare_raster_stage(
+    module: &Module,
+    root: sonatina_ir::module::FuncRef,
+    stage: &str,
+    expected_leaves: usize,
+) -> Result<RasterStagePlan, String> {
+    module.func_store.try_view(root, |source| {
+        let normalized = normalize_stage_to_single_exit(source)?;
+        let function = normalized.as_ref().unwrap_or(source);
+        let structured = crate::structurize::structurize_function(function)?;
+        let return_arguments = unique_source_return_arguments(function)?
+            .ok_or_else(|| format!("spirv raster: {stage} normalization did not produce one exit"))?;
+        if return_arguments.len() != expected_leaves {
+            return Err(format!(
+                "spirv raster: {stage} returned {} leaves; expected {expected_leaves}",
+                return_arguments.len(),
+            ));
+        }
+        Ok(RasterStagePlan { normalized, structured, return_arguments })
+    }).ok_or_else(|| format!("spirv raster: {stage} body is unavailable"))?
 }
 
 fn prepare_raster_entries(
@@ -411,7 +448,10 @@ fn prepare_raster_entries(
             Ok(())
         }).ok_or_else(|| format!("spirv raster: {stage} body is unavailable"))??;
     }
+    let vertex = prepare_raster_stage(module, vertex_ref, "vertex", 4 + varying_count)?;
+    let fragment = prepare_raster_stage(module, fragment_ref, "fragment", 1)?;
     Ok(RasterEntryPreparation {
+        vertex, fragment,
         pipeline, context_count, varying_count, scalar_state, state_stages,
         emitted_external_resources, external_resource_stages,
         builtin_arguments: builtin_arguments.to_vec(),
@@ -426,6 +466,7 @@ pub(super) fn translate_entries(
     builtin_arguments: &[SpirvBuiltinArgument],
 ) -> Result<(naga::Module, SpirvLayout), String> {
     let RasterEntryPreparation {
+        vertex: vertex_plan, fragment: fragment_plan,
         pipeline, context_count, varying_count, scalar_state, state_stages,
         emitted_external_resources, external_resource_stages,
         builtin_arguments,
@@ -480,7 +521,7 @@ pub(super) fn translate_entries(
         })?,
     );
     let vertex = lower_vertex(
-        module, vertex_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
+        module, vertex_ref, &vertex_plan, pipeline, state_var, &scalar_state, &external_roots,
         builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type, &naga_functions,
     )?;
     naga_functions.replace_call_sites(
@@ -489,7 +530,7 @@ pub(super) fn translate_entries(
         })?,
     );
     let fragment = lower_fragment(
-        module, fragment_ref, pipeline, state_var, &scalar_state, &external_roots, varying_count,
+        module, fragment_ref, &fragment_plan, pipeline, state_var, &scalar_state, &external_roots, varying_count,
         context_count, u32_type, f32_type, bool_type, vec4f, &naga_functions,
     )?;
 
@@ -1045,13 +1086,14 @@ fn normalize_stage_to_single_exit(function: &Function) -> Result<Option<Function
 
 fn resolve_source_return_values(
     function: &sonatina_ir::Function,
-    arguments: Vec<sonatina_ir::ValueId>,
+    arguments: &[sonatina_ir::ValueId],
     values: &mut HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phis: &HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
     naga_func: &mut naga::Function,
 ) -> Result<Vec<naga::Handle<naga::Expression>>, String> {
     arguments
-        .into_iter()
+        .iter()
+        .copied()
         .map(|value| {
             resolve_naga_value(value, function, WordKind::U32, values, phis, naga_func)
                 .ok_or_else(|| format!("spirv raster: returned value {value:?} is unresolved"))
@@ -1063,11 +1105,11 @@ fn resolve_source_return_values(
 fn lower_vertex(
     module: &Module,
     func_ref: sonatina_ir::module::FuncRef,
+    plan: &RasterStagePlan,
     pipeline: &SpirvRasterPipeline,
     state_var: Option<naga::Handle<naga::GlobalVariable>>,
     state_fields: &[(usize, Type)],
     external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
-    varying_count: usize,
     builtin_arguments: &[SpirvBuiltinArgument],
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
@@ -1106,8 +1148,7 @@ fn lower_vertex(
         diagnostic_filter_leaf: None,
     };
     let error = module.func_store.try_view(func_ref, |source_function| -> Result<(), String> {
-        let normalized = normalize_stage_to_single_exit(source_function)?;
-        let function = normalized.as_ref().unwrap_or(source_function);
+        let function = plan.normalized.as_ref().unwrap_or(source_function);
         let mut values = HashMap::new();
         let mut phis = HashMap::new();
         for (physical_index, argument) in builtin_arguments.iter().enumerate() {
@@ -1133,21 +1174,9 @@ fn lower_vertex(
             &mut output,
             &mut values,
         );
-        let scfg = crate::structurize::structurize_function(function)?;
-        let unique_return = unique_source_return_arguments(function)?;
-        if let Some(arguments) = &unique_return
-            && arguments.len() != 4 + varying_count
-        {
-            return Err(format!(
-                "spirv raster: vertex returned {} leaves; expected {}",
-                arguments.len(),
-                4 + varying_count,
-            ));
-        }
-        debug_assert!(unique_return.is_some(), "raster stage was normalized to one exit");
         let mut result = None;
         emit_naga_regions(
-            function, function.inst_set(), WordKind::U32, &scfg.regions,
+            function, function.inst_set(), WordKind::U32, &plan.structured.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
             &mut result,
             None,
@@ -1156,7 +1185,7 @@ fn lower_vertex(
         )?;
         let leaves = resolve_source_return_values(
             function,
-            unique_return.expect("raster stage was normalized to one exit"),
+            &plan.return_arguments,
             &mut values,
             &phis,
             &mut output,
@@ -1190,6 +1219,7 @@ fn lower_vertex(
 fn lower_fragment(
     module: &Module,
     func_ref: sonatina_ir::module::FuncRef,
+    plan: &RasterStagePlan,
     pipeline: &SpirvRasterPipeline,
     state_var: Option<naga::Handle<naga::GlobalVariable>>,
     state_fields: &[(usize, Type)],
@@ -1217,8 +1247,7 @@ fn lower_fragment(
         diagnostic_filter_leaf: None,
     };
     let error = module.func_store.try_view(func_ref, |source_function| -> Result<(), String> {
-        let normalized = normalize_stage_to_single_exit(source_function)?;
-        let function = normalized.as_ref().unwrap_or(source_function);
+        let function = plan.normalized.as_ref().unwrap_or(source_function);
         let mut values = HashMap::new();
         let mut phis = HashMap::new();
         for (index, arg) in function.arg_values.iter().copied().take(varying_count).enumerate() {
@@ -1238,20 +1267,9 @@ fn lower_fragment(
             values.insert(arg, root);
         }
         load_state(function, varying_count, state_fields, state_var, &mut output, &mut values);
-        let scfg = crate::structurize::structurize_function(function)?;
-        let unique_return = unique_source_return_arguments(function)?;
-        if let Some(arguments) = &unique_return
-            && arguments.len() != 1
-        {
-            return Err(format!(
-                "spirv raster: fragment returned {} leaves; expected 1",
-                arguments.len(),
-            ));
-        }
-        debug_assert!(unique_return.is_some(), "raster stage was normalized to one exit");
         let mut result = None;
         emit_naga_regions(
-            function, function.inst_set(), WordKind::U32, &scfg.regions,
+            function, function.inst_set(), WordKind::U32, &plan.structured.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
             &mut result,
             None,
@@ -1260,7 +1278,7 @@ fn lower_fragment(
         )?;
         let packed = resolve_source_return_values(
             function,
-            unique_return.expect("raster stage was normalized to one exit"),
+            &plan.return_arguments,
             &mut values,
             &phis,
             &mut output,
