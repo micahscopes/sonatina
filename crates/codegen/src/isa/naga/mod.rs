@@ -8809,22 +8809,33 @@ fn prepare_naga_entry(
 }
 
 #[cfg(feature = "spirv-backend")]
-fn translate_to_naga(
+/// Entry signature, bindings, builtins, and dispatch facts, before body lowering.
+/// Body legality and the paired authored-raster interface are separate gates.
+struct NagaEntryInterface {
+    first_func: sonatina_ir::module::FuncRef,
+    signature: sonatina_ir::Signature,
+    workgroup_size: [u32; 3],
+    word: WordKind,
+    compute_invocation_extent: [u32; 3],
+    compute_invocation_count: u32,
+    compute_trap_span: u32,
+    resource_arg_indices: std::collections::HashSet<usize>,
+    builtin_arg_indices: std::collections::HashSet<usize>,
+    live_arguments: NagaLiveArguments,
+    emitted_external_resources: Vec<SpirvExternalResource>,
+}
+
+#[cfg(feature = "spirv-backend")]
+fn analyze_naga_entry_interface(
     module: &Module,
     pipeline: ShaderPipeline,
     external_resources: &[SpirvExternalResource],
     builtin_arguments: &[SpirvBuiltinArgument],
-    heap_words: u32,
-) -> Result<(naga::Module, SpirvLayout), String> {
-    use std::collections::HashMap;
-    let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
-    let started = std::time::Instant::now();
-
+    trace: bool,
+) -> Result<NagaEntryInterface, String> {
     let (first_func, workgroup_size, dispatch_grid) = match pipeline {
-        ShaderPipeline::Raster { vertex, fragment } => {
-            return authored_raster::translate_entries(
-                module, vertex, fragment, external_resources, builtin_arguments,
-            );
+        ShaderPipeline::Raster { .. } => {
+            return Err("naga: authored raster requires paired-entry interface analysis".to_string());
         }
         ShaderPipeline::Compute { entry, workgroup_size, dispatch_grid } =>
             (entry, workgroup_size, dispatch_grid),
@@ -9046,6 +9057,38 @@ fn translate_to_naga(
     if (grid || render) && sig.args().get(0..2) != Some(&[sonatina_ir::Type::I32, sonatina_ir::Type::I32]) {
         return Err("spirv grid/render: coordinate args 0 and 1 must both be i32".to_string());
     }
+    Ok(NagaEntryInterface {
+        first_func, signature: sig, workgroup_size, word,
+        compute_invocation_extent, compute_invocation_count, compute_trap_span,
+        resource_arg_indices, builtin_arg_indices, live_arguments, emitted_external_resources,
+    })
+}
+
+#[cfg(feature = "spirv-backend")]
+fn translate_to_naga(
+    module: &Module,
+    pipeline: ShaderPipeline,
+    external_resources: &[SpirvExternalResource],
+    builtin_arguments: &[SpirvBuiltinArgument],
+    heap_words: u32,
+) -> Result<(naga::Module, SpirvLayout), String> {
+    use std::collections::HashMap;
+    let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
+    let started = std::time::Instant::now();
+
+    if let ShaderPipeline::Raster { vertex, fragment } = pipeline {
+        return authored_raster::translate_entries(
+            module, vertex, fragment, external_resources, builtin_arguments,
+        );
+    }
+    let NagaEntryInterface {
+        first_func, signature: sig, workgroup_size, word,
+        compute_invocation_extent, compute_invocation_count, compute_trap_span,
+        resource_arg_indices, builtin_arg_indices, live_arguments, emitted_external_resources,
+    } = analyze_naga_entry_interface(module, pipeline, external_resources, builtin_arguments, trace)?;
+    let grid = matches!(pipeline, ShaderPipeline::LegacyGrid { .. });
+    let render = matches!(pipeline, ShaderPipeline::Fullscreen { .. });
+    let compute = matches!(pipeline, ShaderPipeline::Compute { .. });
 
     let word_width = word.width_bytes();
 
@@ -10853,6 +10896,52 @@ fn translate_to_naga(
 #[cfg(all(test, feature = "spirv-backend"))]
 mod tests {
     use super::{MAX_WGSL_FUNCTION_PARAMETERS, validate_naga_portable_wgsl_limits};
+
+    #[test]
+    fn entry_interface_analysis_checks_dispatch_before_body_lowering() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+func public %entry(v0.i32) {
+    block0:
+        v1.i256 = call %unsupported;
+        return;
+}
+func private %unsupported() -> i256 {
+    block0:
+        return 0.i256;
+}
+"#).expect("interface fixture parses");
+        let module = &parsed.module;
+        let entry = module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == "entry")
+        }).unwrap();
+        let pipeline = super::ShaderPipeline::Compute {
+            entry, workgroup_size: [4, 2, 1], dispatch_grid: [3, 5, 1],
+        };
+        let interface = super::analyze_naga_entry_interface(module, pipeline, &[], &[], false)
+            .expect("valid interface is independent of unsupported helper body");
+        assert_eq!(interface.first_func, entry);
+        assert_eq!(interface.compute_invocation_extent, [12, 10, 1]);
+        assert_eq!(interface.compute_invocation_count, 120);
+        assert_eq!(interface.compute_trap_span, 480);
+        assert!(super::analyze_naga_entry_interface(module,
+            super::ShaderPipeline::Compute {
+                entry, workgroup_size: [0, 2, 1], dispatch_grid: [3, 5, 1],
+            }, &[], &[], false,
+        ).err().unwrap().contains("must be nonzero"));
+        assert!(super::analyze_naga_entry_interface(module,
+            super::ShaderPipeline::Compute {
+                entry, workgroup_size: [u32::MAX, 2, 1], dispatch_grid: [2, 5, 1],
+            }, &[], &[], false,
+        ).err().unwrap().contains("x invocation extent overflows"));
+        let builtin = super::SpirvBuiltinArgument {
+            arg_index: 1, source: super::SpirvBuiltinSource::GlobalInvocationIdX,
+        };
+        assert!(super::analyze_naga_entry_interface(module, pipeline, &[], &[builtin], false)
+            .err().unwrap().contains("missing kernel arg"));
+        assert!(super::translate_to_naga(module, pipeline, &[], &[], 8192).is_err(),
+            "valid entry interface does not authorize an unsupported physical helper ABI");
+    }
 
     #[test]
     fn resource_variant_report_retains_independent_entry_rooted_calls() {
