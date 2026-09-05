@@ -31,6 +31,46 @@ pub(super) struct PhysicalHelperParameters {
     pub explicit_count: u32,
 }
 
+/// Entry-rooted facts shared by logical ABI planning and instruction emission.
+/// Resource identity and transitive memory requirements are derived together,
+/// before physical parameter types or helper bodies are constructed.
+pub(super) struct EntryHelperContext {
+    pub resources: NagaResourceCapabilities,
+    pub logical_results: NagaLogicalResultAbis,
+    pub variants: super::NagaResourceVariants,
+    pub memory: HashMap<FuncRef, NagaMemoryAbi>,
+}
+
+impl EntryHelperContext {
+    pub fn derive(
+        module: &Module,
+        call_order: &[FuncRef],
+        entry: FuncRef,
+        external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
+        live_arguments: &NagaLiveArguments,
+        entry_owns_arena: bool,
+    ) -> Result<Self, String> {
+        let signature = module.ctx.get_sig(entry)
+            .ok_or_else(|| format!("spirv: entry {entry:?} has no signature"))?;
+        let resources = super::helper_resource_capabilities(module, &signature, external_roots)?;
+        let logical_results = super::helper_naga_logical_result_abis(
+            module, call_order, &[entry], &resources,
+        )?;
+        let variants = super::helper_resource_variants(
+            module, call_order, entry, external_roots, &resources,
+            &logical_results, live_arguments,
+        )?;
+        let memory = super::helper_private_memory_abis(module, call_order, entry)?;
+        if memory.values().any(|abi| abi.heap) && !entry_owns_arena {
+            return Err(
+                "spirv: a reachable helper accesses the private arena, but the entry function owns no proven arena allocation. Fail closed."
+                    .to_string(),
+            );
+        }
+        Ok(Self { resources, logical_results, variants, memory })
+    }
+}
+
 /// Instruction/control-flow eligibility only, not a complete callable ABI.
 /// Resource identity, types, argument packing, and transitive memory transport
 /// still require the contextual planner. Recompute after changing the module.
