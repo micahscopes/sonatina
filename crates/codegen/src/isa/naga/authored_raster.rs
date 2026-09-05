@@ -572,7 +572,7 @@ fn append_scalar_helpers(
         &live_arguments,
         &naga_functions,
         &mut naga_module.types,
-    )?;
+    ).into_complete()?;
     let mut lowered = HashMap::<sonatina_ir::module::FuncRef, NagaFunctionInfo>::new();
     for super::helper_plan::PlannedHelperAbi {
         variant,

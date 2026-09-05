@@ -3,6 +3,71 @@
 //! These are derived views tied to the current module and Naga type arena,
 //! not serialized certificates or a second representation of control flow.
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_report_preserves_children_and_siblings_of_rejected_parent() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+
+func public %entry() -> i32 {
+    block0:
+        v0.i256 = call %parent;
+        v1.i32 = call %sibling;
+        return v1;
+}
+func private %parent() -> i256 {
+    block0:
+        v0.i32 = call %leaf;
+        return 0.i256;
+}
+func private %leaf() -> i32 {
+    block0:
+        return 17.i32;
+}
+func private %sibling() -> i32 {
+    block0:
+        return 23.i32;
+}
+"#).expect("partial ABI fixture parses");
+        let module = &parsed.module;
+        let find = |name| module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == name)
+        }).expect("fixture function exists");
+        let entry = find("entry");
+        let parent = find("parent");
+        let leaf = find("leaf");
+        let sibling = find("sibling");
+        let order = super::super::reachable_call_postorder(module, entry).unwrap();
+        assert!(order.iter().position(|&f| f == parent) < order.iter().position(|&f| f == sibling));
+        let live = super::super::analyze_live_arguments(module);
+        let context = EntryHelperContext::derive(module, &order, entry, &[], &live, false)
+            .expect("logical context is independent of the unsupported physical return type");
+        let mut types = naga::UniqueArena::new();
+        let mut scalar = |kind, width| types.insert(naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar { kind, width }),
+        }, naga::Span::UNDEFINED);
+        let word = scalar(naga::ScalarKind::Uint, 4);
+        let float = scalar(naga::ScalarKind::Float, 4);
+        let boolean = scalar(naga::ScalarKind::Bool, 1);
+        let report = plan_helper_abis(
+            module, &order, &[entry], WordKind::U32, word, float, boolean,
+            &context.resources, &context.logical_results, &context.variants.bindings,
+            &context.memory, NagaMemoryAbiTypes::default(), &live,
+            &NagaFunctionMap::new(), &mut types,
+        );
+        assert_eq!(report.rejections.len(), 1);
+        assert_eq!(report.rejections[0].0, parent);
+        assert!(report.rejections[0].1.contains("unsupported"));
+        let planned = report.plans.iter().map(|plan| plan.variant.function).collect::<Vec<_>>();
+        assert_eq!(planned, vec![leaf, sibling]);
+        assert!(report.into_complete().is_err(), "partial reports cannot authorize emission");
+    }
+}
+
 use std::{collections::HashMap, sync::Arc};
 
 use sonatina_ir::{Module, module::FuncRef};
@@ -29,6 +94,25 @@ pub(super) struct PlannedHelperAbi {
 pub(super) struct PhysicalHelperParameters {
     pub arguments: Vec<naga::FunctionArgument>,
     pub explicit_count: u32,
+}
+
+/// Per-function ABI outcomes in call-postorder. An unsupported parent must not
+/// discard an independently representable child or prevent visiting siblings.
+/// Plans are local representation facts, not transitive callability proofs.
+pub(super) struct HelperAbiReport {
+    pub plans: Vec<PlannedHelperAbi>,
+    pub rejections: Vec<(FuncRef, String)>,
+}
+
+impl HelperAbiReport {
+    /// Final emission requires every selected helper. Keep the existing first
+    /// diagnostic ordering, and never emit only the successful subset.
+    pub fn into_complete(self) -> Result<Vec<PlannedHelperAbi>, String> {
+        match self.rejections.into_iter().next() {
+            Some((_, error)) => Err(error),
+            None => Ok(self.plans),
+        }
+    }
 }
 
 /// Entry-rooted facts shared by logical ABI planning and instruction emission.
@@ -181,7 +265,7 @@ pub(super) fn prepare_entry_helpers(
         live_arguments,
         &naga_functions,
         types,
-    )?;
+    ).into_complete()?;
 
     Ok(PreparedEntryHelpers {
         context, plans: helper_plans, functions: naga_functions,
@@ -259,9 +343,10 @@ fn derive_helper_body(module: &Module, function_ref: FuncRef) -> Result<HelperBo
     }).ok_or_else(|| format!("spirv: helper {function_ref:?} has no body. Fail closed."))?
 }
 
-/// Preserve call-postorder and resource-variant order. All type interning and
-/// physical ABI adaptation complete before instruction emission starts. Body
-/// legality and final Naga validation remain separate required gates.
+/// Preserve call-postorder and resource-variant order, recording each helper's
+/// outcome independently. Shared entry context must already be derived. Type
+/// interning and physical ABI adaptation precede instruction emission; callers
+/// must require a complete report before emitting the selected call graph.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_helper_abis(
     module: &Module,
@@ -279,103 +364,113 @@ pub(super) fn plan_helper_abis(
     live_arguments: &NagaLiveArguments,
     functions: &NagaFunctionMap,
     types: &mut naga::UniqueArena<naga::Type>,
-) -> Result<Vec<PlannedHelperAbi>, String> {
-    let mut plans = Vec::new();
+) -> HelperAbiReport {
+    let mut report = HelperAbiReport { plans: Vec::new(), rejections: Vec::new() };
     for function in call_order
         .iter()
         .copied()
         .filter(|function| !roots.contains(function))
     {
-        let memory = memory_abis.get(&function).copied().ok_or_else(|| {
-            format!("spirv: helper {function:?} has no derived private-memory ABI. Fail closed.")
-        })?;
-        let signature = module
-            .ctx
-            .get_sig(function)
-            .ok_or_else(|| format!("spirv: helper {function:?} has no signature"))?;
-        let body = Arc::new(derive_helper_body(module, function)?);
-        let result = helper_naga_result_abi(
-            module,
-            function,
-            word,
-            word_type,
-            f32_type,
-            bool_type,
-            resource_capabilities,
-            logical_results,
-            functions,
-            types,
-        )?;
-        let variants = resource_variants
-            .get(&function)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        if variants.is_empty() {
-            return Err(format!(
-                "spirv: helper `{}` has no entry-rooted resource variant. Fail closed.",
-                signature.name(),
-            ));
-        }
-        for (index, bindings) in variants.iter().enumerate() {
-            let variant = NagaFunctionVariant {
-                function,
-                ordinal: u32::try_from(index).map_err(|_| {
-                    format!(
-                        "spirv: helper `{}` has more resource variants than fit in u32. Fail closed.",
-                        signature.name(),
-                    )
-                })?,
-            };
-            let mut arguments = helper_naga_argument_abi(
+        // A rejected resource variant rejects the whole helper. Do not expose
+        // a prefix of its variants as a callable function.
+        let outcome = (|| -> Result<Vec<PlannedHelperAbi>, String> {
+            let mut plans = Vec::new();
+            let memory = memory_abis.get(&function).copied().ok_or_else(|| {
+                format!("spirv: helper {function:?} has no derived private-memory ABI. Fail closed.")
+            })?;
+            let signature = module
+                .ctx
+                .get_sig(function)
+                .ok_or_else(|| format!("spirv: helper {function:?} has no signature"))?;
+            let body = Arc::new(derive_helper_body(module, function)?);
+            let result = helper_naga_result_abi(
                 module,
                 function,
-                &signature,
                 word,
                 word_type,
                 f32_type,
                 bool_type,
                 resource_capabilities,
-                bindings,
-                live_arguments,
-                functions,
-            )?;
-            let packed_arguments = pack_wide_naga_helper_arguments(
-                module,
-                &signature,
-                word,
-                word_type,
-                f32_type,
-                bool_type,
-                memory,
-                &mut arguments,
+                logical_results,
                 functions,
                 types,
             )?;
-            let parameters = plan_physical_parameters(
-                module,
-                &signature,
-                word,
-                word_type,
-                f32_type,
-                bool_type,
-                &arguments,
-                packed_arguments.as_ref(),
-                memory,
-                memory_types,
-                functions,
-            )?;
-            plans.push(PlannedHelperAbi {
-                variant,
-                arguments,
-                packed_arguments,
-                result: result.clone(),
-                memory,
-                body: Arc::clone(&body),
-                parameters,
-            });
+            let variants = resource_variants
+                .get(&function)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if variants.is_empty() {
+                return Err(format!(
+                    "spirv: helper `{}` has no entry-rooted resource variant. Fail closed.",
+                    signature.name(),
+                ));
+            }
+            for (index, bindings) in variants.iter().enumerate() {
+                let variant = NagaFunctionVariant {
+                    function,
+                    ordinal: u32::try_from(index).map_err(|_| {
+                        format!(
+                            "spirv: helper `{}` has more resource variants than fit in u32. Fail closed.",
+                            signature.name(),
+                        )
+                    })?,
+                };
+                let mut arguments = helper_naga_argument_abi(
+                    module,
+                    function,
+                    &signature,
+                    word,
+                    word_type,
+                    f32_type,
+                    bool_type,
+                    resource_capabilities,
+                    bindings,
+                    live_arguments,
+                    functions,
+                )?;
+                let packed_arguments = pack_wide_naga_helper_arguments(
+                    module,
+                    &signature,
+                    word,
+                    word_type,
+                    f32_type,
+                    bool_type,
+                    memory,
+                    &mut arguments,
+                    functions,
+                    types,
+                )?;
+                let parameters = plan_physical_parameters(
+                    module,
+                    &signature,
+                    word,
+                    word_type,
+                    f32_type,
+                    bool_type,
+                    &arguments,
+                    packed_arguments.as_ref(),
+                    memory,
+                    memory_types,
+                    functions,
+                )?;
+                plans.push(PlannedHelperAbi {
+                    variant,
+                    arguments,
+                    packed_arguments,
+                    result: result.clone(),
+                    memory,
+                    body: Arc::clone(&body),
+                    parameters,
+                });
+            }
+            Ok(plans)
+        })();
+        match outcome {
+            Ok(plans) => report.plans.extend(plans),
+            Err(error) => report.rejections.push((function, error)),
         }
     }
-    Ok(plans)
+    report
 }
 
 #[allow(clippy::too_many_arguments)]
