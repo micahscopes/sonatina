@@ -6428,26 +6428,45 @@ fn reachable_call_postorder(
 }
 
 #[cfg(feature = "spirv-backend")]
+struct NagaLogicalResultReport {
+    results: NagaLogicalResultAbis,
+    rejections: Vec<(sonatina_ir::module::FuncRef, String)>,
+}
+
+#[cfg(feature = "spirv-backend")]
+impl NagaLogicalResultReport {
+    fn into_complete(self) -> Result<NagaLogicalResultAbis, String> {
+        match self.rejections.into_iter().next() {
+            Some((_, error)) => Err(error),
+            None => Ok(self.results),
+        }
+    }
+}
+
+#[cfg(feature = "spirv-backend")]
 fn helper_naga_logical_result_abis(
     module: &Module,
     call_order: &[sonatina_ir::module::FuncRef],
     roots: &[sonatina_ir::module::FuncRef],
     resource_capabilities: &NagaResourceCapabilities,
-) -> Result<NagaLogicalResultAbis, String> {
+) -> NagaLogicalResultReport {
     let mut result_abis = NagaLogicalResultAbis::new();
+    let mut rejections = Vec::new();
     for &function_ref in call_order {
         if roots.contains(&function_ref) {
             continue;
         }
-        let logical = helper_naga_logical_result_abi(
+        match helper_naga_logical_result_abi(
             module,
             function_ref,
             resource_capabilities,
             &result_abis,
-        )?;
-        result_abis.insert(function_ref, logical);
+        ) {
+            Ok(logical) => { result_abis.insert(function_ref, logical); }
+            Err(error) => { rejections.push((function_ref, error)); }
+        }
     }
-    Ok(result_abis)
+    NagaLogicalResultReport { results: result_abis, rejections }
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -10800,6 +10819,51 @@ fn translate_to_naga(
 #[cfg(all(test, feature = "spirv-backend"))]
 mod tests {
     use super::{MAX_WGSL_FUNCTION_PARAMETERS, validate_naga_portable_wgsl_limits};
+
+    #[test]
+    fn resource_result_report_retains_independent_identity_after_conflicting_returns() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+func private %bad(v0.objref<[i32; 8]>, v1.objref<[i32; 8]>, v2.i1) -> objref<[i32; 8]> {
+    block0:
+        br v2 block1 block2;
+    block1:
+        return v0;
+    block2:
+        return v1;
+}
+func private %caller(v0.objref<[i32; 8]>, v1.objref<[i32; 8]>, v2.i1) -> objref<[i32; 8]> {
+    block0:
+        v3.objref<[i32; 8]> = call %bad v0 v1 v2;
+        return v3;
+}
+func private %good(v0.objref<[i32; 8]>) -> objref<[i32; 8]> {
+    block0:
+        return v0;
+}
+"#).expect("resource-result report fixture parses");
+        let module = &parsed.module;
+        let find = |name| module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == name)
+        }).expect("fixture function exists");
+        let bad = find("bad");
+        let caller = find("caller");
+        let good = find("good");
+        let resource_type = module.ctx.func_sig(good, |signature| signature.args()[0]);
+        let resources = super::NagaResourceCapabilities::from([resource_type]);
+        let report = super::helper_naga_logical_result_abis(
+            module, &[bad, caller, good], &[], &resources,
+        );
+        assert_eq!(report.rejections.len(), 2);
+        assert_eq!(report.rejections[0].0, bad);
+        assert!(report.rejections[0].1.contains("different argument identities"));
+        assert_eq!(report.rejections[1].0, caller);
+        assert!(!report.results.contains_key(&bad));
+        assert!(!report.results.contains_key(&caller), "a caller cannot invent an unresolved identity");
+        assert!(matches!(report.results[&good].as_slice(),
+            [super::NagaResultSource::PassthroughArgument(0)]));
+        assert!(report.into_complete().is_err(), "partial resource results cannot authorize emission");
+    }
 
     #[test]
     fn typed_local_report_retains_types_after_an_unsupported_local() {

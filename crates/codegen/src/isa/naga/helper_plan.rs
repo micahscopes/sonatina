@@ -148,7 +148,7 @@ impl EntryHelperContext {
         let resources = super::helper_resource_capabilities(module, &signature, external_roots)?;
         let logical_results = super::helper_naga_logical_result_abis(
             module, call_order, &[entry], &resources,
-        )?;
+        ).into_complete()?;
         let variants = super::helper_resource_variants(
             module, call_order, entry, external_roots, &resources,
             &logical_results, live_arguments,
