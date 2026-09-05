@@ -1463,6 +1463,55 @@ fn spirv_private_arena_helper_survives_through_an_explicit_pointer_abi() {
 }
 
 #[test]
+fn spirv_private_arena_helper_requires_entry_ownership() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64,
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let entry_ref = mb.declare_function(Signature::new_single(
+        "unowned_arena_entry", Linkage::Public, &[Type::I32], Type::I32,
+    )).unwrap();
+    let helper_ref = mb.declare_function(Signature::new_single(
+        "borrowed_arena_load", Linkage::Private, &[Type::I32], Type::I32,
+    )).unwrap();
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper_ref);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let address = fb.args()[0];
+        let value = fb.insert_inst(data::Mload::new(is, address, Type::I32), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry_ref);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let address = fb.args()[0];
+        let value = fb.insert_inst(
+            control_flow::Call::new(is, helper_ref, [address].into_iter().collect()),
+            Type::I32,
+        );
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+        fb.seal_all();
+        fb.finish();
+    }
+    let module = mb.build();
+    sonatina_codegen::isa::naga::analyze_helper_body(&module, helper_ref)
+        .expect("a borrowed load is body-eligible, not proof of caller ownership");
+    let errors = match SpirvBackend::new().compile_module(&module) {
+        Ok(_) => panic!("an integer address must not manufacture an entry-owned arena"),
+        Err(errors) => errors,
+    };
+    let message = errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    assert!(message.contains("entry function owns no proven arena allocation"), "{message}");
+}
+
+#[test]
 fn spirv_private_arena_helper_cannot_own_an_unaccounted_allocation() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,

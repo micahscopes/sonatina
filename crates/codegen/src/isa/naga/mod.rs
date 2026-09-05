@@ -8893,35 +8893,21 @@ fn translate_to_naga(
         word_type,
         f32_type,
     )?;
-    let helper_resource_capabilities = helper_resource_capabilities(
-        module,
-        &sig,
-        &external_roots,
-    )?;
-    let helper_logical_result_abis = helper_naga_logical_result_abis(
-        module,
-        &call_order,
-        &[first_func],
-        &helper_resource_capabilities,
-    )?;
-    let helper_resource_variants = helper_resource_variants(
+    let helper_plan::EntryHelperContext {
+        resources: helper_resource_capabilities,
+        logical_results: helper_logical_result_abis,
+        variants: helper_resource_variants,
+        memory: helper_memory_abis,
+    } = helper_plan::EntryHelperContext::derive(
         module,
         &call_order,
         first_func,
         &external_roots,
-        &helper_resource_capabilities,
-        &helper_logical_result_abis,
         &live_arguments,
+        has_mem,
     )?;
-    let helper_memory_abis = helper_private_memory_abis(module, &call_order, first_func)?;
     let helper_memory = helper_memory_abis.values().any(|abi| abi.heap);
     let helper_trap = helper_memory_abis.values().any(|abi| abi.trap);
-    if helper_memory && !has_mem {
-        return Err(
-            "spirv: a reachable helper accesses the private arena, but the entry function owns no proven arena allocation. Fail closed."
-                .to_string(),
-        );
-    }
     let needs_trap_channel = has_mem || has_unreachable || helper_trap;
     let private_heap_type = if has_mem {
         let heap_len = std::num::NonZeroU32::new(private_heap_words)
