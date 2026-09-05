@@ -81,7 +81,13 @@ pub extern "C" fn __u256_mul(a: *const [u64; 4], b: *const [u64; 4], result: *mu
     }
 }
 
-/// u256 addmod: result = (a + b) % m
+fn from_limbs(limbs: [u64; 4]) -> sonatina_ir::U256 {
+    let mut value = sonatina_ir::U256::zero();
+    value.0 = limbs;
+    value
+}
+
+/// u256 addmod with an untruncated sum; zero modulus returns zero.
 #[unsafe(no_mangle)]
 pub extern "C" fn __u256_addmod(
     a: *const [u64; 4],
@@ -89,48 +95,22 @@ pub extern "C" fn __u256_addmod(
     m: *const [u64; 4],
     result: *mut [u64; 4],
 ) {
-    let a = unsafe { &*a };
-    let b = unsafe { &*b };
-    let m = unsafe { &*m };
-    let r = unsafe { &mut *result };
-
-    // Add with carry into 5 limbs
-    let mut sum = [0u64; 5];
-    let mut carry = 0u64;
-    for i in 0..4 {
-        let (s1, c1) = a[i].overflowing_add(b[i]);
-        let (s2, c2) = s1.overflowing_add(carry);
-        sum[i] = s2;
-        carry = (c1 as u64) + (c2 as u64);
-    }
-    sum[4] = carry;
-
-    // Reduce: while sum >= m, subtract m
-    // Simple approach for MVP — not optimized
-    loop {
-        let mut ge = false;
-        for i in (0..5).rev() {
-            let mi = if i < 4 { m[i] } else { 0 };
-            if sum[i] > mi { ge = true; break; }
-            if sum[i] < mi { break; }
-            if i == 0 { ge = true; }
-        }
-        if !ge { break; }
-
-        let mut borrow = 0u64;
-        for i in 0..5 {
-            let mi = if i < 4 { m[i] } else { 0 };
-            let (s1, c1) = sum[i].overflowing_sub(mi);
-            let (s2, c2) = s1.overflowing_sub(borrow);
-            sum[i] = s2;
-            borrow = (c1 as u64) + (c2 as u64);
-        }
-    }
-
-    r.copy_from_slice(&sum[..4]);
+    use sonatina_ir::U256;
+    // Copy inputs before writing the destination, which may alias an input.
+    let a = from_limbs(unsafe { *a });
+    let b = from_limbs(unsafe { *b });
+    let m = from_limbs(unsafe { *m });
+    let value = if m.is_zero() {
+        [0; 4]
+    } else {
+        let wide_m = m.full_mul(U256::one());
+        let remainder = (a.full_mul(U256::one()) + b.full_mul(U256::one())) % wide_m;
+        remainder.0[..4].try_into().unwrap()
+    };
+    unsafe { *result = value };
 }
 
-/// u256 mulmod: result = (a * b) % m
+/// u256 mulmod with a full 512-bit product; zero modulus returns zero.
 #[unsafe(no_mangle)]
 pub extern "C" fn __u256_mulmod(
     a: *const [u64; 4],
@@ -138,60 +118,82 @@ pub extern "C" fn __u256_mulmod(
     m: *const [u64; 4],
     result: *mut [u64; 4],
 ) {
-    let a = unsafe { &*a };
-    let b = unsafe { &*b };
-    let m = unsafe { &*m };
-    let r = unsafe { &mut *result };
-
-    // Full 512-bit product
-    let mut prod = [0u64; 8];
-    for i in 0..4 {
-        let mut carry = 0u128;
-        for j in 0..4 {
-            let p = (a[i] as u128) * (b[j] as u128) + (prod[i + j] as u128) + carry;
-            prod[i + j] = p as u64;
-            carry = p >> 64;
-        }
-        prod[i + 4] = carry as u64;
-    }
-
-    // Reduce 512-bit product modulo m using repeated subtraction
-    // This is O(n) where n is the quotient — fine for small values,
-    // needs Barrett/Montgomery reduction for production use
-    let mut remainder = prod;
-    loop {
-        // Check if remainder >= m (comparing upper limbs first)
-        let mut ge = false;
-        let mut all_upper_zero = true;
-        for i in (4..8).rev() {
-            if remainder[i] > 0 { ge = true; all_upper_zero = false; break; }
-        }
-        if all_upper_zero {
-            for i in (0..4).rev() {
-                if remainder[i] > m[i] { ge = true; break; }
-                if remainder[i] < m[i] { break; }
-                if i == 0 { ge = true; }
-            }
-        }
-        if !ge { break; }
-
-        // Subtract m from remainder
-        let mut borrow = 0u64;
-        for i in 0..8 {
-            let mi = if i < 4 { m[i] } else { 0 };
-            let (s1, c1) = remainder[i].overflowing_sub(mi);
-            let (s2, c2) = s1.overflowing_sub(borrow);
-            remainder[i] = s2;
-            borrow = (c1 as u64) + (c2 as u64);
-        }
-    }
-
-    r.copy_from_slice(&remainder[..4]);
+    use sonatina_ir::U256;
+    let a = from_limbs(unsafe { *a });
+    let b = from_limbs(unsafe { *b });
+    let m = from_limbs(unsafe { *m });
+    let value = if m.is_zero() {
+        [0; 4]
+    } else {
+        let remainder = a.full_mul(b) % m.full_mul(U256::one());
+        remainder.0[..4].try_into().unwrap()
+    };
+    unsafe { *result = value };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modular_arithmetic_matches_independent_ruint_oracle() {
+        use revm::primitives::U256;
+        let mut seed = 0x6a09e667f3bcc909u64;
+        let mut next = || {
+            std::array::from_fn(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            })
+        };
+        for index in 0..512 {
+            let a = next();
+            let b = next();
+            let m = match index % 8 {
+                0 => [0; 4],
+                1 => [1, 0, 0, 0],
+                2 => [13, 0, 0, 0],
+                _ => next(),
+            };
+            let aa = U256::from_limbs(a);
+            let bb = U256::from_limbs(b);
+            let mm = U256::from_limbs(m);
+            let mut out = [0; 4];
+            __u256_addmod(&a, &b, &m, &mut out);
+            assert_eq!(out, aa.add_mod(bb, mm).into_limbs(), "add case {index}");
+            __u256_mulmod(&a, &b, &m, &mut out);
+            assert_eq!(out, aa.mul_mod(bb, mm).into_limbs(), "mul case {index}");
+            let mut aliased = a;
+            let ptr = &mut aliased as *mut [u64; 4];
+            __u256_mulmod(ptr, &b, &m, ptr);
+            assert_eq!(aliased, out, "alias case {index}");
+        }
+    }
+
+    #[test]
+    fn modular_full_width_boundaries() {
+        let max = [u64::MAX; 4];
+        let zero = [0; 4];
+        let one = [1, 0, 0, 0];
+        let two = [2, 0, 0, 0];
+        let mut out = [99; 4];
+        for modulus in [zero, one, max] {
+            __u256_addmod(&max, &max, &modulus, &mut out);
+            assert_eq!(out, zero);
+            __u256_mulmod(&max, &max, &modulus, &mut out);
+            assert_eq!(out, zero);
+        }
+        __u256_addmod(&max, &one, &max, &mut out);
+        assert_eq!(out, one);
+        __u256_mulmod(&max, &max, &two, &mut out);
+        assert_eq!(out, one);
+        let almost_max = [u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX];
+        __u256_mulmod(&almost_max, &almost_max, &max, &mut out);
+        assert_eq!(out, one);
+        __u256_addmod(&almost_max, &almost_max, &max, &mut out);
+        assert_eq!(out, [u64::MAX - 2, u64::MAX, u64::MAX, u64::MAX]);
+    }
 
     #[test]
     fn test_u256_add() {
