@@ -3892,15 +3892,20 @@ fn build_grid_multi_exit_f32_phi_module() -> sonatina_ir::Module {
 /// A directly-returning canonical exit phi is fed by the normal header edge,
 /// a conditional body edge, and an unconditional jump block outside the loop
 /// SCC. This pins both body-exit forms without relying on a following sibling.
-fn build_grid_direct_return_multi_exit_f32_phi_module() -> sonatina_ir::Module {
+fn build_grid_direct_return_multi_exit_f32_phi_module(outlined: bool) -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(
         if cfg!(target_arch = "x86_64") { Architecture::X86_64 } else { Architecture::Aarch64 },
         Vendor::Unknown, OperatingSystem::Native,
     ));
     let is = isa.inst_set();
     let mb = native_module_builder();
+    let wrapper = outlined.then(|| mb.declare_function(Signature::new_single(
+        "grid_loop_exit_caller", Linkage::Public,
+        &[Type::I32, Type::I32], Type::I32,
+    )).unwrap());
     let sig = Signature::new_single(
-        "grid_direct_return_multi_exit_f32_phi", Linkage::Public,
+        "grid_direct_return_multi_exit_f32_phi",
+        if outlined { Linkage::Private } else { Linkage::Public },
         &[Type::I32, Type::I32], Type::I32,
     );
     let fr = mb.declare_function(sig).unwrap();
@@ -3961,6 +3966,22 @@ fn build_grid_direct_return_multi_exit_f32_phi_module() -> sonatina_ir::Module {
     fb.insert_inst_no_result(control_flow::Return::new_single(is, output));
     fb.seal_all();
     fb.finish();
+    if let Some(wrapper) = wrapper {
+        let mut fb = mb.func_builder::<InstInserter>(wrapper);
+        let entry = fb.append_block();
+        fb.switch_to_block(entry);
+        let x = fb.args()[0];
+        let y = fb.args()[1];
+        let result = fb.insert_inst(
+            control_flow::Call::new(is, fr, [x, y].into_iter().collect()),
+            Type::I32,
+        );
+        // A helper return must not bypass the caller's remaining computation.
+        let output = fb.insert_inst(arith::Add::new(is, result, y), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, output));
+        fb.seal_all();
+        fb.finish();
+    }
     mb.build()
 }
 
@@ -6160,13 +6181,28 @@ fn grid_multi_exit_f32_phi_executes_on_lavapipe() {
 
 #[test]
 fn grid_direct_return_multi_exit_f32_phi_executes_on_lavapipe() {
-    let module = build_grid_direct_return_multi_exit_f32_phi_module();
+    check_direct_return_multi_exit_f32_phi(false);
+}
+
+#[test]
+fn grid_outlined_direct_return_multi_exit_f32_phi_executes_on_lavapipe() {
+    check_direct_return_multi_exit_f32_phi(true);
+}
+
+fn check_direct_return_multi_exit_f32_phi(outlined: bool) {
+    let module = build_grid_direct_return_multi_exit_f32_phi_module(outlined);
     let artifact = SpirvBackend::new()
         .with_grid()
         .with_workgroup_size(8, 8, 1)
         .compile_module(&module)
         .expect("direct-return loop exit phi should preserve every exact edge");
     let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    if outlined {
+        assert_eq!(wgsl.matches("fn grid_direct_return_multi_exit_f32_phi(").count(), 1,
+            "the loop must remain in one helper body:\n{wgsl}");
+        assert_eq!(wgsl.matches("grid_direct_return_multi_exit_f32_phi(").count(), 2,
+            "the helper must retain its call site:\n{wgsl}");
+    }
     let output = run_grid_u32(wgsl, 8, 8, 8, 8, &[]);
     for y in 0..8u32 {
         for x in 0..8u32 {
@@ -6175,7 +6211,7 @@ fn grid_direct_return_multi_exit_f32_phi_executes_on_lavapipe() {
                 1 => 41,
                 2 => 52,
                 _ => 3 + 10 * x,
-            };
+            } + if outlined { y } else { 0 };
             assert_eq!(output[(y * 8 + x) as usize], expected,
                 "direct-return exit at ({x}, {y}); emitted WGSL:\n{wgsl}");
         }
