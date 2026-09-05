@@ -25,33 +25,6 @@ use super::{
 const PHYSICAL_VERTEX_ENTRY: &str = "fe_vertex_main";
 const PHYSICAL_FRAGMENT_ENTRY: &str = "fe_fragment_main";
 
-/// Lower the narrow first authored-raster ABI. Keeping it separate from the
-/// established fullscreen path makes paired multi-value lowering opt-in and
-/// leaves existing shader byte streams alone.
-pub(super) fn translate(
-    module: &Module,
-    pipeline: &SpirvRasterPipeline,
-    external_resources: &[SpirvExternalResource],
-    builtin_arguments: &[SpirvBuiltinArgument],
-) -> Result<(naga::Module, SpirvLayout), String> {
-    if pipeline.vertex_entry == pipeline.fragment_entry {
-        return Err("spirv raster: vertex and fragment entries must be distinct".to_string());
-    }
-
-    let find_entry = |name: &str| {
-        module.funcs().iter().copied().find(|func| {
-            module.ctx.get_sig(*func).is_some_and(|sig| sig.name() == name)
-        })
-    };
-    let vertex_ref = find_entry(&pipeline.vertex_entry).ok_or_else(|| {
-        format!("spirv raster: vertex entry `{}` is absent", pipeline.vertex_entry)
-    })?;
-    let fragment_ref = find_entry(&pipeline.fragment_entry).ok_or_else(|| {
-        format!("spirv raster: fragment entry `{}` is absent", pipeline.fragment_entry)
-    })?;
-    translate_entries(module, vertex_ref, fragment_ref, external_resources, builtin_arguments)
-}
-
 pub(super) fn translate_entries(
     module: &Module,
     vertex_ref: sonatina_ir::module::FuncRef,

@@ -1,6 +1,7 @@
 use sonatina_codegen::Backend;
 use sonatina_codegen::isa::naga::{
-    NagaBackend, ShaderEncoding, ShaderEntries, ShaderEnvironment, ShaderTargetContract,
+    NagaBackend, ShaderCompileRequest, ShaderEncoding, ShaderEntries, ShaderEnvironment,
+    ShaderPipeline, ShaderTargetContract,
 };
 use sonatina_codegen::isa::spirv::{
     Access, LayoutMode, Role, SpirvBackend, SpirvBindingMember, SpirvBuiltinArgument,
@@ -208,6 +209,15 @@ fn spirv_explicit_entry_ignores_declaration_order() {
             .expect("the same u32 shader must satisfy the explicit WebGPU contract");
         assert_eq!(checked.wgsl, artifact.wgsl);
         assert_eq!(checked.words, artifact.words);
+        let pipeline = if backend.render {
+            ShaderPipeline::Fullscreen { entry: selected }
+        } else {
+            ShaderPipeline::LegacyScalar { entry: selected, workgroup_size: [64, 1, 1] }
+        };
+        let requested = NagaBackend::compile_request(&module, &ShaderCompileRequest::new(&target, pipeline))
+            .expect("a self-contained request must need no backend mode flags");
+        assert_eq!(requested.wgsl, artifact.wgsl);
+        assert_eq!(requested.words, artifact.words);
         for encoding in [ShaderEncoding::Wgsl, ShaderEncoding::Spirv] {
             let target = ShaderTargetContract::new(ShaderEnvironment::WebGpu, [encoding]).unwrap();
             let output = backend.compile_for_target(&module, ShaderEntries::Single(selected), &target).unwrap();
@@ -5233,13 +5243,11 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
 
 #[test]
 fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
-    let isa = Native::new(TargetTriple::new(
-        Architecture::X86_64,
-        Vendor::Unknown,
-        OperatingSystem::Native,
-    ));
+    let isa = sonatina_ir::isa::shader::Shader::new(
+        TargetTriple::parse("shader-unknown-unknown").unwrap(),
+    );
     let is = isa.inst_set();
-    let mb = native_module_builder();
+    let mb = ModuleBuilder::new(ModuleCtx::new(&isa));
     let pair_ref = mb
         .declare_function(Signature::new(
             "raster_pair_math",
@@ -5330,6 +5338,14 @@ fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
         .with_authored_raster("vs_scalar_helpers", "fs_scalar_helpers")
         .compile_module(&module)
         .expect("authored raster should retain one shared scalar helper");
+    let target = ShaderTargetContract::new(ShaderEnvironment::WebGpu,
+        [ShaderEncoding::Wgsl, ShaderEncoding::Spirv]).unwrap();
+    let request = ShaderCompileRequest::new(&target,
+        ShaderPipeline::Raster { vertex: vertex_ref, fragment: fragment_ref });
+    let requested = NagaBackend::compile_request(&module, &request)
+        .expect("the typed raster request must share the same lowering");
+    assert_eq!(requested.wgsl, artifact.wgsl);
+    assert_eq!(requested.words, artifact.words);
     let explicit = SpirvBackend::new()
         .compile_raster_entries(&module, vertex_ref, fragment_ref)
         .expect("explicit paired entries should not depend on the first declared helper");
