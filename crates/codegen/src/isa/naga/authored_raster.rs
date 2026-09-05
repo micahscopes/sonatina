@@ -568,6 +568,7 @@ fn append_scalar_helpers(
         &logical_results,
         &resource_bindings,
         &memory_abis,
+        NagaMemoryAbiTypes::default(),
         &live_arguments,
         &naga_functions,
         &mut naga_module.types,
@@ -580,6 +581,7 @@ fn append_scalar_helpers(
         result: result_abi,
         memory: memory_abi,
         body: body_plan,
+        parameters,
     } in plans
     {
         let function_ref = variant.function;
@@ -596,7 +598,7 @@ fn append_scalar_helpers(
             packed_arguments.as_ref(),
             &result_abi,
             memory_abi,
-            NagaMemoryAbiTypes::default(),
+            parameters,
             0,
             &resource_capabilities,
             &logical_results,
