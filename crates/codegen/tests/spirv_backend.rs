@@ -4889,6 +4889,195 @@ fn grid_executes_on_lavapipe() {
     eprintln!("grid_executes_on_lavapipe OK: {w}x{h}, all pixels == x + 1024*y");
 }
 
+#[test]
+fn grid_overflow_arithmetic_executes_on_lavapipe() {
+    for bits in [1, 32] {
+        for name in ["uadd", "usub", "umul", "sadd", "ssub", "smul"] {
+            let isa = Native::new(TargetTriple::new(
+                Architecture::X86_64,
+                Vendor::Unknown,
+                OperatingSystem::Native,
+            ));
+            let is = isa.inst_set();
+            let mb = native_module_builder();
+            let entry = mb
+                .declare_function(Signature::new_single(
+                    "overflow_grid",
+                    Linkage::Public,
+                    &[Type::I32; 4],
+                    Type::I32,
+                ))
+                .unwrap();
+            let mut fb = mb.func_builder::<InstInserter>(entry);
+            let start = fb.append_block();
+            let value_block = fb.append_block();
+            let flag_block = fb.append_block();
+            let yes = fb.append_block();
+            let no = fb.append_block();
+            fb.switch_to_block(start);
+            let x = fb.args()[0];
+            let multiplier = fb.make_imm_value(0x9e3779b9u32 as i32);
+            let rhs_multiplier = fb.make_imm_value(1664525i32);
+            let lhs = fb.insert_inst(arith::Mul::new(is, x, multiplier), Type::I32);
+            let lhs = fb.insert_inst(arith::Add::new(is, lhs, fb.args()[2]), Type::I32);
+            let rhs = fb.insert_inst(arith::Mul::new(is, x, rhs_multiplier), Type::I32);
+            let rhs = fb.insert_inst(arith::Add::new(is, rhs, fb.args()[3]), Type::I32);
+            let ty = if bits == 1 { Type::I1 } else { Type::I32 };
+            let (lhs, rhs) = if bits == 1 {
+                (
+                    fb.insert_inst(cast::Trunc::new(is, lhs, ty), ty),
+                    fb.insert_inst(cast::Trunc::new(is, rhs, ty), ty),
+                )
+            } else {
+                (lhs, rhs)
+            };
+            let types = [ty, Type::I1];
+            let results = match name {
+                "uadd" => fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &types),
+                "usub" => fb.insert_inst_results(arith::Usubo::new(is, lhs, rhs), &types),
+                "umul" => fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &types),
+                "sadd" => fb.insert_inst_results(arith::Saddo::new(is, lhs, rhs), &types),
+                "ssub" => fb.insert_inst_results(arith::Ssubo::new(is, lhs, rhs), &types),
+                _ => fb.insert_inst_results(arith::Smulo::new(is, lhs, rhs), &types),
+            };
+            let zero = fb.make_imm_value(0i32);
+            let one = fb.make_imm_value(1i32);
+            let value_lane = fb.insert_inst(cmp::Eq::new(is, fb.args()[1], zero), Type::I1);
+            fb.insert_inst_no_result(control_flow::Br::new(
+                is,
+                value_lane,
+                value_block,
+                flag_block,
+            ));
+            fb.switch_to_block(value_block);
+            if bits == 1 {
+                fb.insert_inst_no_result(control_flow::Br::new(is, results[0], yes, no));
+            } else {
+                fb.insert_return(results[0]);
+            }
+            fb.switch_to_block(flag_block);
+            fb.insert_inst_no_result(control_flow::Br::new(is, results[1], yes, no));
+            fb.switch_to_block(yes);
+            fb.insert_return(one);
+            fb.switch_to_block(no);
+            fb.insert_return(zero);
+            fb.seal_all();
+            fb.finish();
+            let artifact = SpirvBackend::new()
+                .with_grid()
+                .with_workgroup_size(8, 1, 1)
+                .compile_module(&mb.build())
+                .unwrap();
+            assert!(!artifact.words.is_empty(), "SPIR-V must also be emitted");
+            for (lhs_seed, rhs_seed) in [
+                (0u32, 0u32),
+                (0, u32::MAX),
+                (u32::MAX, 0),
+                (1, u32::MAX),
+                (u32::MAX, 1),
+                (u32::MAX, u32::MAX),
+                (1 << 31, u32::MAX),
+                (1 << 31, 1),
+                ((1 << 31) - 1, 1),
+            ] {
+                let input: Vec<u8> = [lhs_seed, rhs_seed]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect();
+                let output = run_grid_u32(artifact.wgsl.as_ref().unwrap(), 256, 2, 8, 1, &input);
+                for x in 0..256u32 {
+                    let lhs = x.wrapping_mul(0x9e3779b9).wrapping_add(lhs_seed);
+                    let rhs = x.wrapping_mul(1664525).wrapping_add(rhs_seed);
+                    let (value, flag) = if bits == 1 {
+                        let signed = name.starts_with('s');
+                        let a = (lhs & 1) as i8 * if signed { -1 } else { 1 };
+                        let b = (rhs & 1) as i8 * if signed { -1 } else { 1 };
+                        let value = match &name[1..] {
+                            "add" => a + b,
+                            "sub" => a - b,
+                            _ => a * b,
+                        };
+                        (
+                            (value & 1) as u32,
+                            if signed {
+                                !(-1..=0).contains(&value)
+                            } else {
+                                !(0..=1).contains(&value)
+                            },
+                        )
+                    } else {
+                        match name {
+                            "uadd" => lhs.overflowing_add(rhs),
+                            "usub" => lhs.overflowing_sub(rhs),
+                            "umul" => lhs.overflowing_mul(rhs),
+                            name => {
+                                let (value, flag) = match name {
+                                    "sadd" => (lhs as i32).overflowing_add(rhs as i32),
+                                    "ssub" => (lhs as i32).overflowing_sub(rhs as i32),
+                                    _ => (lhs as i32).overflowing_mul(rhs as i32),
+                                };
+                                (value as u32, flag)
+                            }
+                        }
+                    };
+                    assert_eq!(
+                        (output[x as usize], output[256 + x as usize]),
+                        (value, u32::from(flag)),
+                        "i{bits} {name}({lhs}, {rhs})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scalar_i64_overflow_validates_as_spirv() {
+    for name in ["uadd", "usub", "umul", "sadd", "ssub", "smul"] {
+        let isa = Native::new(TargetTriple::new(
+            Architecture::X86_64,
+            Vendor::Unknown,
+            OperatingSystem::Native,
+        ));
+        let is = isa.inst_set();
+        let mb = native_module_builder();
+        let entry = mb
+            .declare_function(Signature::new_single(
+                "wide_overflow",
+                Linkage::Public,
+                &[Type::I64; 2],
+                Type::I64,
+            ))
+            .unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(entry);
+        let start = fb.append_block();
+        let overflow = fb.append_block();
+        let normal = fb.append_block();
+        fb.switch_to_block(start);
+        let (lhs, rhs) = (fb.args()[0], fb.args()[1]);
+        let types = [Type::I64, Type::I1];
+        let results = match name {
+            "uadd" => fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &types),
+            "usub" => fb.insert_inst_results(arith::Usubo::new(is, lhs, rhs), &types),
+            "umul" => fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &types),
+            "sadd" => fb.insert_inst_results(arith::Saddo::new(is, lhs, rhs), &types),
+            "ssub" => fb.insert_inst_results(arith::Ssubo::new(is, lhs, rhs), &types),
+            _ => fb.insert_inst_results(arith::Smulo::new(is, lhs, rhs), &types),
+        };
+        fb.insert_inst_no_result(control_flow::Br::new(is, results[1], overflow, normal));
+        fb.switch_to_block(overflow);
+        let marker = fb.make_imm_value(i64::MIN);
+        fb.insert_return(marker);
+        fb.switch_to_block(normal);
+        fb.insert_return(results[0]);
+        fb.seal_all();
+        fb.finish();
+        let artifact = NagaBackend::new().compile_module(&mb.build()).unwrap();
+        assert_eq!(artifact.layout.word, WordKind::I64);
+        assert!(!artifact.words.is_empty());
+    }
+}
+
 /// Execute a top-level conditional and its merge phi. Both arms are exercised
 /// across the grid and the phi feeds another instruction after the merge.
 #[test]

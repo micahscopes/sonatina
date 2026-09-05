@@ -22,6 +22,8 @@ mod authored_raster;
 
 #[cfg(feature = "spirv-backend")]
 mod helper_plan;
+#[cfg(feature = "spirv-backend")]
+mod overflow;
 
 #[cfg(feature = "spirv-backend")]
 pub use helper_plan::{HelperBodyPlan, ShaderCallableHelper, ShaderHelperAnalysis, analyze_helper_body};
@@ -2360,7 +2362,32 @@ fn emit_single_inst(
     if <&sonatina_ir::inst::control_flow::Jump as InstDowncast>::downcast(inst_set, inst_data).is_some() { return false; }
     if <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, inst_data).is_some() { return false; }
 
-    if let Some(add) = <&sonatina_ir::inst::arith::Add as InstDowncast>::downcast(inst_set, inst_data) {
+    if let Some((op, signed, lhs, rhs)) = crate::isa::overflow::overflow_operands(inst_set, inst_data) {
+        let results = function.dfg.inst_results(inst_id);
+        if results.len() != 2 || function.dfg.value_ty(results[1]) != sonatina_ir::Type::I1
+            || function.dfg.value_ty(lhs) != function.dfg.value_ty(rhs)
+            || function.dfg.value_ty(results[0]) != function.dfg.value_ty(lhs)
+        {
+            *mem_error = Some("invalid two-result Naga overflow arithmetic signature".into());
+            return false;
+        }
+        let operands = (
+            resolve_naga_value(lhs, function, word, value_map, phi_locals, func),
+            resolve_naga_value(rhs, function, word, value_map, phi_locals, func),
+        );
+        let (Some(left), Some(right)) = operands else {
+            *mem_error = Some("unresolved Naga overflow arithmetic operands".into());
+            return false;
+        };
+        match overflow::emit(func, target, word, function.dfg.value_ty(lhs), op, signed, left, right) {
+            Ok((value, flag)) => {
+                value_map.insert(results[0], value);
+                value_map.insert(results[1], flag);
+                return true;
+            }
+            Err(error) => { *mem_error = Some(error); return false; }
+        }
+    } else if let Some(add) = <&sonatina_ir::inst::arith::Add as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let lhs = resolve_naga_value(*add.lhs(), function, word, value_map, phi_locals, func).unwrap();
             let rhs = resolve_naga_value(*add.rhs(), function, word, value_map, phi_locals, func).unwrap();
@@ -6093,6 +6120,7 @@ fn spirv_instruction_is_lowered(
     use sonatina_ir::{InstDowncast, inst::{arith, cmp, control_flow, data, logic}};
 
     inst.is_terminator()
+        || crate::isa::overflow::overflow_operands(is, inst).is_some()
         || <&control_flow::Phi as InstDowncast>::downcast(is, inst).is_some()
         || <&control_flow::Call as InstDowncast>::downcast(is, inst).is_some()
         || <&arith::Add as InstDowncast>::downcast(is, inst).is_some()
