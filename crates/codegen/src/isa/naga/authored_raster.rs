@@ -9,10 +9,10 @@ use crate::optim::dead_arg::analyze_live_arguments;
 use super::{
     Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinArgument,
     SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
-    SpirvScalarKind, SpirvShaderStage, WordKind, NagaArgumentSource, NagaFunctionInfo,
-    NagaFunctionMap, NagaLogicalResultAbis, NagaMemoryAbi, NagaMemoryAbiTypes,
-    NagaResourceCapabilities, NagaResultAbi, NagaResultSource, append_external_resources,
-    emit_naga_regions, helper_naga_result_type, lower_naga_helper, reachable_call_postorder,
+    SpirvScalarKind, SpirvShaderStage, WordKind, NagaFunctionInfo,
+    NagaFunctionMap, NagaMemoryAbi, NagaMemoryAbiTypes,
+    NagaResourceCapabilities, append_external_resources,
+    emit_naga_regions, lower_naga_helper, reachable_call_postorder,
     resolve_naga_value, spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
 };
 
@@ -443,7 +443,9 @@ fn append_scalar_helpers(
     }
 
     let scalar = |ty: Type| matches!(ty, Type::I1 | Type::I32 | Type::F32);
-    let mut logical_results = NagaLogicalResultAbis::new();
+    let mut resource_bindings = super::NagaResourceVariantBindings::new();
+    let mut memory_abis = HashMap::new();
+    let mut live_arguments = super::NagaLiveArguments::default();
     for &function_ref in call_order.iter().filter(|function| !root_set.contains(function)) {
         let signature = module
             .ctx
@@ -508,15 +510,12 @@ fn append_scalar_helpers(
             .ok_or_else(|| {
                 format!("spirv raster: helper `{}` has no body", signature.name())
             })??;
-        logical_results.insert(
-            function_ref,
-            signature
-                .ret_tys()
-                .iter()
-                .enumerate()
-                .map(|(index, _)| NagaResultSource::Physical(index as u32))
-                .collect(),
-        );
+        // This validated context has no resource or memory transport and
+        // retains every scalar argument. It supplies facts to the common ABI
+        // planner rather than constructing a separate physical convention.
+        resource_bindings.insert(function_ref, vec![vec![None; signature.args().len()]]);
+        memory_abis.insert(function_ref, NagaMemoryAbi::default());
+        live_arguments.insert(function_ref, vec![true; signature.args().len()]);
     }
 
     fn call_sites(
@@ -553,47 +552,38 @@ fn append_scalar_helpers(
     }
 
     let resource_capabilities = NagaResourceCapabilities::new();
+    let logical_results = super::helper_naga_logical_result_abis(
+        module, &call_order, roots, &resource_capabilities,
+    )?;
     let mut naga_functions = NagaFunctionMap::new();
+    let plans = super::helper_plan::plan_helper_abis(
+        module,
+        &call_order,
+        roots,
+        WordKind::U32,
+        u32_type,
+        f32_type,
+        bool_type,
+        &resource_capabilities,
+        &logical_results,
+        &resource_bindings,
+        &memory_abis,
+        &live_arguments,
+        &naga_functions,
+        &mut naga_module.types,
+    )?;
     let mut lowered = HashMap::<sonatina_ir::module::FuncRef, NagaFunctionInfo>::new();
-    for &function_ref in call_order.iter().filter(|function| !root_set.contains(function)) {
-        let body_plan = super::analyze_helper_body(module, function_ref)
-            .map_err(|error| error.to_string())?;
+    for super::helper_plan::PlannedHelperAbi {
+        variant,
+        arguments: argument_abi,
+        packed_arguments,
+        result: result_abi,
+        memory: memory_abi,
+        body: body_plan,
+    } in plans
+    {
+        let function_ref = variant.function;
         naga_functions.replace_call_sites(call_sites(module, [function_ref], &lowered)?);
-        let signature = module.ctx.get_sig(function_ref).expect("helper signature checked above");
-        let mut argument_abi = signature
-            .args()
-            .iter()
-            .enumerate()
-            .map(|(index, _)| NagaArgumentSource::Physical(index as u32))
-            .collect::<Vec<_>>();
-        let packed_arguments = super::pack_wide_naga_helper_arguments(
-            module,
-            &signature,
-            WordKind::U32,
-            u32_type,
-            f32_type,
-            bool_type,
-            NagaMemoryAbi::default(),
-            &mut argument_abi,
-            &naga_functions,
-            &mut naga_module.types,
-        )?;
-        let physical_type = helper_naga_result_type(
-            module,
-            signature.name(),
-            signature.ret_tys(),
-            WordKind::U32,
-            u32_type,
-            f32_type,
-            bool_type,
-            &naga_functions,
-            &mut naga_module.types,
-        )?;
-        let result_abi = NagaResultAbi {
-            logical: logical_results[&function_ref].clone(),
-            physical_type,
-            physical_arity: signature.ret_tys().len(),
-        };
         let helper = lower_naga_helper(
             module,
             function_ref,
@@ -605,7 +595,7 @@ fn append_scalar_helpers(
             &argument_abi,
             packed_arguments.as_ref(),
             &result_abi,
-            NagaMemoryAbi::default(),
+            memory_abi,
             NagaMemoryAbiTypes::default(),
             0,
             &resource_capabilities,
@@ -620,7 +610,7 @@ fn append_scalar_helpers(
                 argument_abi,
                 packed_arguments,
                 result_abi,
-                memory_abi: NagaMemoryAbi::default(),
+                memory_abi,
             },
         );
     }
