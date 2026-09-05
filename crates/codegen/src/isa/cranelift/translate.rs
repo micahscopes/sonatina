@@ -18,10 +18,33 @@ pub(super) fn translate_module(
 ) -> Result<HashMap<String, FuncId>, String> {
     let mut func_map: HashMap<String, FuncId> = HashMap::new();
     let mut func_id_map: HashMap<FuncRef, FuncId> = HashMap::new();
+    let mut runtime_declarations = HashMap::new();
 
     let funcs = module.funcs();
 
     for &func_ref in &funcs {
+        let has_body = module
+            .func_store
+            .try_view(func_ref, |function| function.layout.entry_block().is_some())
+            .unwrap_or(false);
+        if !has_body {
+            let runtime = module.ctx.func_sig(func_ref, |sig| {
+                let runtime = match sig.name() {
+                    "addmod" | "__addmod" | "__u256_addmod" => "__u256_addmod",
+                    "mulmod" | "__mulmod" | "__u256_mulmod" => "__u256_mulmod",
+                    name => return Err(format!("unsupported native runtime declaration `{name}`")),
+                };
+                if sig.args() != [Type::I256; 3] || sig.ret_tys() != [Type::I256] {
+                    return Err(format!(
+                        "native runtime declaration `{}` requires (i256, i256, i256) -> i256",
+                        sig.name()
+                    ));
+                }
+                Ok(runtime)
+            })?;
+            runtime_declarations.insert(func_ref, runtime);
+            continue;
+        }
         let (name, sig) = module.ctx.func_sig(func_ref, |sig| {
             let name = sig.name().to_string();
             let clif_sig = sonatina_sig_to_clif(sig, jit);
@@ -38,30 +61,37 @@ pub(super) fn translate_module(
 
     for &func_ref in &funcs {
         let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
-        // Skip intrinsic functions (intercepted at call sites as runtime calls)
-        if name.contains("addmod") || name.contains("mulmod") {
+        if runtime_declarations.contains_key(&func_ref) {
             continue;
         }
 
         let translated = module.func_store.try_view(func_ref, |function| {
             if function.layout.entry_block().is_none() {
-                return Ok(());
+                return Err("authored function has no entry block".to_string());
             }
             let func_id = func_id_map[&func_ref];
-            translate_function(module, function, func_ref, func_id, &func_id_map, jit)
+            translate_function(
+                module,
+                function,
+                func_ref,
+                func_id,
+                &func_id_map,
+                &runtime_declarations,
+                jit,
+            )
         });
-        if let Some(result) = translated {
-            if let Err(e) = result {
-                return Err(format!("failed to translate function {name}: {e}"));
-            }
-        }
+        translated
+            .ok_or_else(|| format!("missing authored function body {name}"))?
+            .map_err(|e| format!("failed to translate function {name}: {e}"))?;
     }
 
     Ok(func_map)
 }
 
 fn returns_struct(sig: &Signature) -> bool {
-    sig.ret_tys().iter().any(|ty| matches!(ty, Type::Compound(_)))
+    sig.ret_tys()
+        .iter()
+        .any(|ty| matches!(ty, Type::Compound(_)))
 }
 
 /// Cranelift's host ABIs do not admit an arbitrary number of direct scalar
@@ -140,10 +170,13 @@ fn translate_function(
     func_ref: FuncRef,
     func_id: FuncId,
     func_id_map: &HashMap<FuncRef, FuncId>,
+    runtime_declarations: &HashMap<FuncRef, &'static str>,
     jit: &mut JITModule,
 ) -> Result<(), String> {
     let mut ctx = jit.make_context();
-    let sig = module.ctx.func_sig(func_ref, |sig| sonatina_sig_to_clif(sig, jit));
+    let sig = module
+        .ctx
+        .func_sig(func_ref, |sig| sonatina_sig_to_clif(sig, jit));
     ctx.func.signature = sig;
 
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -634,13 +667,7 @@ fn translate_function(
                 return Err("cranelift translation: call_indirect is not lowered yet".to_string());
             } else if let Some(call) = <&sonatina_ir::inst::control_flow::Call as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let callee = *call.callee();
-                let callee_name = module.ctx.func_sig(callee, |sig| sig.name().to_string());
-
-                // Intercept known u256 intrinsic functions (name may be mangled)
-                let is_addmod = callee_name == "addmod" || callee_name.contains("addmod");
-                let is_mulmod = callee_name == "mulmod" || callee_name.contains("mulmod");
-                if is_addmod || is_mulmod {
-                    let intrinsic_name = if is_addmod { "__u256_addmod" } else { "__u256_mulmod" };
+                if let Some(&intrinsic_name) = runtime_declarations.get(&callee) {
                     let args: Result<Vec<_>, _> = call.args()
                         .iter()
                         .map(|v| resolve_value(function, *v, &value_map, &mut builder))

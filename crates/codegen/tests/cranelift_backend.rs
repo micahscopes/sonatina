@@ -223,6 +223,178 @@ fn cranelift_i128_constants_preserve_both_words() {
 }
 
 #[test]
+fn authored_modular_names_remain_native_functions() {
+    for name in [
+        "addmod",
+        "mulmod",
+        "__addmod",
+        "__mulmod",
+        "__u256_addmod",
+        "__u256_mulmod",
+        "authored_addmod_helper",
+        "authored_mulmod_helper",
+    ] {
+        let isa = native_isa();
+        let is = isa.inst_set();
+        let mb = native_module_builder();
+        let helper = mb
+            .declare_function(Signature::new_single(
+                name,
+                Linkage::Public,
+                &[Type::I64, Type::I64],
+                Type::I64,
+            ))
+            .unwrap();
+        let entry = mb
+            .declare_function(Signature::new_single(
+                "invoke_authored",
+                Linkage::Public,
+                &[Type::I64, Type::I64],
+                Type::I64,
+            ))
+            .unwrap();
+        {
+            let mut fb = mb.func_builder::<InstInserter>(helper);
+            let block = fb.append_block();
+            fb.switch_to_block(block);
+            let value = fb.insert_inst(arith::Add::new(is, fb.args()[0], fb.args()[1]), Type::I64);
+            fb.insert_return(value);
+            fb.seal_all();
+            fb.finish();
+        }
+        {
+            let mut fb = mb.func_builder::<InstInserter>(entry);
+            let block = fb.append_block();
+            fb.switch_to_block(block);
+            let value = fb.insert_inst(
+                control_flow::Call::new(is, helper, fb.args().iter().copied().collect()),
+                Type::I64,
+            );
+            fb.insert_return(value);
+            fb.seal_all();
+            fb.finish();
+        }
+        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        for exported in [name, "invoke_authored"] {
+            let function: unsafe extern "C" fn(i64, i64) -> i64 = unsafe {
+                std::mem::transmute(
+                    artifact
+                        .get_func_ptr::<unsafe extern "C" fn(i64, i64) -> i64>(exported)
+                        .unwrap(),
+                )
+            };
+            assert_eq!(unsafe { function(40, 2) }, 42, "{name} via {exported}");
+        }
+    }
+}
+
+#[test]
+fn native_modular_declarations_require_exact_names_and_signatures() {
+    for name in [
+        "addmod",
+        "mulmod",
+        "__addmod",
+        "__mulmod",
+        "__u256_addmod",
+        "__u256_mulmod",
+    ] {
+        for modulus in [0usize, 13] {
+            let isa = native_isa();
+            let is = isa.inst_set();
+            let mb = native_module_builder();
+            let declaration = mb
+                .declare_function(Signature::new_single(
+                    name,
+                    Linkage::Private,
+                    &[Type::I256; 3],
+                    Type::I256,
+                ))
+                .unwrap();
+            let entry = mb
+                .declare_function(Signature::new_single(
+                    "modular_probe",
+                    Linkage::Public,
+                    &[],
+                    Type::I64,
+                ))
+                .unwrap();
+            let mut fb = mb.func_builder::<InstInserter>(entry);
+            let block = fb.append_block();
+            fb.switch_to_block(block);
+            let args = [17usize, 29, modulus].map(|value| {
+                fb.make_imm_value(sonatina_ir::Immediate::I256(sonatina_ir::I256::from_usize(
+                    value,
+                )))
+            });
+            let value = fb.insert_inst(
+                control_flow::Call::new(is, declaration, args.into_iter().collect()),
+                Type::I256,
+            );
+            let low = fb.insert_inst(cast::Trunc::new(is, value, Type::I64), Type::I64);
+            fb.insert_return(low);
+            fb.seal_all();
+            fb.finish();
+            let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+            let probe: unsafe extern "C" fn() -> u64 = unsafe {
+                std::mem::transmute(
+                    artifact
+                        .get_func_ptr::<unsafe extern "C" fn() -> u64>("modular_probe")
+                        .unwrap(),
+                )
+            };
+            let expected = if modulus == 0 {
+                0
+            } else if name.ends_with("addmod") {
+                (17 + 29) % modulus
+            } else {
+                (17 * 29) % modulus
+            };
+            assert_eq!(
+                unsafe { probe() },
+                expected as u64,
+                "{name}, modulus {modulus}"
+            );
+            assert!(
+                unsafe { artifact.get_func_ptr::<()>(name) }.is_none(),
+                "runtime declarations must not appear as undefined JIT exports"
+            );
+        }
+    }
+    for (name, args, expected) in [
+        (
+            "authored_addmod_helper",
+            vec![Type::I256; 3],
+            "unsupported native runtime declaration",
+        ),
+        (
+            "addmod",
+            vec![Type::I64; 3],
+            "requires (i256, i256, i256) -> i256",
+        ),
+        (
+            "mulmod",
+            vec![Type::I256; 2],
+            "requires (i256, i256, i256) -> i256",
+        ),
+    ] {
+        let mb = native_module_builder();
+        mb.declare_function(Signature::new_single(
+            name,
+            Linkage::Private,
+            &args,
+            Type::I256,
+        ))
+        .unwrap();
+        let error = CraneliftBackend::new()
+            .compile_module(&mb.build())
+            .err()
+            .expect("invalid declaration must fail closed");
+        let error = format!("{error:?}");
+        assert!(error.contains(name) && error.contains(expected), "{error}");
+    }
+}
+
+#[test]
 fn cranelift_add_two_i64s() {
     let isa = native_isa();
     let is = isa.inst_set();
