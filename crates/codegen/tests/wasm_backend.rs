@@ -25,6 +25,73 @@ fn wasm32_module_builder() -> ModuleBuilder {
     ModuleBuilder::new(ctx)
 }
 
+#[test]
+fn unsigned_arithmetic_preserves_value_and_overflow_on_wasm() {
+    for ty in [Type::I64, Type::I32, Type::I16, Type::I8, Type::I1] {
+        let isa = Wasm32::new(wasm32_triple());
+        let is = isa.inst_set();
+        let mb = wasm32_module_builder();
+        for (name, multiply) in [("add", false), ("mul", true)] {
+            let function = mb.declare_function(Signature::new(
+                name, Linkage::Public, &[ty, ty], &[ty, Type::I1],
+            )).unwrap();
+            let mut fb = mb.func_builder::<InstInserter>(function);
+            let entry = fb.append_block();
+            fb.switch_to_block(entry);
+            let (lhs, rhs) = (fb.args()[0], fb.args()[1]);
+            let results = if multiply {
+                fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &[ty, Type::I1])
+            } else {
+                fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &[ty, Type::I1])
+            };
+            fb.insert_inst_no_result(control_flow::Return::new(is, results.into()));
+            fb.seal_all();
+            fb.finish();
+        }
+        let artifact = WasmBackend::new().compile_module(&mb.build()).unwrap();
+        wasmparser::validate(&artifact.bytes).unwrap();
+        let engine = wasmtime::Engine::default();
+        let module = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
+        let mut store = wasmtime::Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).unwrap();
+        let max = match ty {
+            Type::I1 => 1,
+            Type::I8 => u8::MAX as u64,
+            Type::I16 => u16::MAX as u64,
+            Type::I32 => u32::MAX as u64,
+            Type::I64 => u64::MAX,
+            _ => unreachable!(),
+        };
+        let mut cases = vec![(0, 0), (0, max), (max, 0), (1, max), (max, 1),
+            (max, 2), (max, max), (max / 2, 2), (max / 2 + 1, 2), (6, 7)];
+        let mut seed = 0x5a17_904e_8213_c6bdu64;
+        for _ in 0..256 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let lhs = seed;
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            cases.push((lhs, seed));
+        }
+        for (lhs, rhs) in cases {
+            let (lhs, rhs) = (lhs & max, rhs & max);
+            for (name, multiply) in [("add", false), ("mul", true)] {
+                let exact = if multiply { (lhs as u128) * (rhs as u128) }
+                    else { (lhs as u128) + (rhs as u128) };
+                let expected = ((exact as u64) & max, i32::from(exact > max as u128));
+                let actual = if ty != Type::I64 {
+                    let function = instance.get_typed_func::<(i32, i32), (i32, i32)>(&mut store, name).unwrap();
+                    let (value, overflow) = function.call(&mut store, (lhs as i32, rhs as i32)).unwrap();
+                    (value as u32 as u64, overflow)
+                } else {
+                    let function = instance.get_typed_func::<(i64, i64), (i64, i32)>(&mut store, name).unwrap();
+                    let (value, overflow) = function.call(&mut store, (lhs as i64, rhs as i64)).unwrap();
+                    (value as u64, overflow)
+                };
+                assert_eq!(actual, expected, "{ty:?} {name}({lhs}, {rhs})");
+            }
+        }
+    }
+}
+
 fn mutable_i32_global_module() -> sonatina_ir::Module {
     let isa = Wasm32::new(wasm32_triple());
     let is = isa.inst_set();

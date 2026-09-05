@@ -36,6 +36,67 @@ fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
     }
 }
 
+/// Preserve both results of unsigned overflow arithmetic. Narrow integers
+/// use their semantic width, not merely their i32 Wasm carrier.
+fn unsigned_overflow_arithmetic(
+    body: &mut FunctionBody,
+    block: waffle::Block,
+    ty: Type,
+    lhs: waffle::Value,
+    rhs: waffle::Value,
+    multiply: bool,
+) -> Result<(waffle::Value, waffle::Value), String> {
+    let bits = match ty {
+        Type::I1 => 1,
+        Type::I8 => 8,
+        Type::I16 => 16,
+        Type::I32 => 32,
+        Type::I64 => 64,
+        other => return Err(format!("unsupported Wasm unsigned overflow arithmetic type {other:?}")),
+    };
+    let wide = bits == 64;
+    let carrier = if wide { WType::I64 } else { WType::I32 };
+    let op = match (wide, multiply) {
+        (false, false) => Operator::I32Add,
+        (false, true) => Operator::I32Mul,
+        (true, false) => Operator::I64Add,
+        (true, true) => Operator::I64Mul,
+    };
+    let raw = body.add_op(block, op, &[lhs, rhs], &[carrier]);
+    if bits < 32 {
+        // Inputs are typed unsigned values. Their full sum/product fits i32
+        // for every admitted narrow width, including the i16 product.
+        let limit = body.add_op(block, Operator::I32Const { value: (1 << bits) - 1 }, &[], &[WType::I32]);
+        let result = body.add_op(block, Operator::I32And, &[raw, limit], &[WType::I32]);
+        let overflow = body.add_op(block, Operator::I32LtU, &[limit, raw], &[WType::I32]);
+        return Ok((result, overflow));
+    }
+    if !multiply {
+        let compare = if wide { Operator::I64LtU } else { Operator::I32LtU };
+        let overflow = body.add_op(block, compare, &[raw, lhs], &[WType::I32]);
+        return Ok((raw, overflow));
+    }
+    // Product overflow iff lhs != 0 and wrapped_product / lhs != rhs.
+    // Substitute one for a zero divisor without introducing control flow or
+    // a trap in an otherwise total operation.
+    let eqz = if wide { Operator::I64Eqz } else { Operator::I32Eqz };
+    let lhs_zero = body.add_op(block, eqz, &[lhs], &[WType::I32]);
+    let zero_word = if wide {
+        body.add_op(block, Operator::I64ExtendI32U, &[lhs_zero], &[WType::I64])
+    } else {
+        lhs_zero
+    };
+    let or = if wide { Operator::I64Or } else { Operator::I32Or };
+    let divisor = body.add_op(block, or, &[lhs, zero_word], &[carrier]);
+    let div = if wide { Operator::I64DivU } else { Operator::I32DivU };
+    let quotient = body.add_op(block, div, &[raw, divisor], &[carrier]);
+    let ne = if wide { Operator::I64Ne } else { Operator::I32Ne };
+    let mismatch = body.add_op(block, ne, &[quotient, rhs], &[WType::I32]);
+    let lhs_nonzero = body.add_op(block, Operator::I32Eqz, &[lhs_zero], &[WType::I32]);
+    let overflow = body.add_op(block, Operator::I32And, &[mismatch, lhs_nonzero], &[WType::I32]);
+    Ok((raw, overflow))
+}
+
 fn sonatina_to_waffle_type_in_ctx(ctx: &ModuleCtx, ty: Type) -> Option<WType> {
     if matches!(
         ty.resolve_compound(ctx),
@@ -1580,31 +1641,34 @@ fn translate_function(
                             value_map.insert(result, wval);
                         }
                     }
-                    // Uaddo (just add, ignore overflow for WASM)
+                    // Unsigned arithmetic returns both the wrapped value and
+                    // its exact semantic-width overflow flag.
                     else if let Some(uaddo) = <&sonatina_ir::inst::arith::Uaddo as InstDowncast>::downcast(inst_set, inst_data) {
                         let ir_results = function.dfg.inst_results(inst_id);
                         if !ir_results.is_empty() {
                             let lhs = resolve_value(function, *uaddo.lhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
                             let rhs = resolve_value(function, *uaddo.rhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let wval = body.add_op(wb, Operator::I64Add, &[lhs, rhs], &[WType::I64]);
+                            let (wval, overflow) = unsigned_overflow_arithmetic(
+                                &mut body, wb, function.dfg.value_ty(*uaddo.lhs()), lhs, rhs, false,
+                            )?;
                             value_map.insert(ir_results[0], wval);
                             if ir_results.len() >= 2 {
-                                let zero = body.add_op(wb, Operator::I32Const { value: 0 }, &[], &[WType::I32]);
-                                value_map.insert(ir_results[1], zero);
+                                value_map.insert(ir_results[1], overflow);
                             }
                         }
                     }
-                    // Umulo (just mul, ignore overflow)
+                    // Multiplication uses the same width and result contract.
                     else if let Some(umulo) = <&sonatina_ir::inst::arith::Umulo as InstDowncast>::downcast(inst_set, inst_data) {
                         let ir_results = function.dfg.inst_results(inst_id);
                         if !ir_results.is_empty() {
                             let lhs = resolve_value(function, *umulo.lhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
                             let rhs = resolve_value(function, *umulo.rhs(), &value_map, &mut body, wb).ok_or("unresolved")?;
-                            let wval = body.add_op(wb, Operator::I64Mul, &[lhs, rhs], &[WType::I64]);
+                            let (wval, overflow) = unsigned_overflow_arithmetic(
+                                &mut body, wb, function.dfg.value_ty(*umulo.lhs()), lhs, rhs, true,
+                            )?;
                             value_map.insert(ir_results[0], wval);
                             if ir_results.len() >= 2 {
-                                let zero = body.add_op(wb, Operator::I32Const { value: 0 }, &[], &[WType::I32]);
-                                value_map.insert(ir_results[1], zero);
+                                value_map.insert(ir_results[1], overflow);
                             }
                         }
                     }
