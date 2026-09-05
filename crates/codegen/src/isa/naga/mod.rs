@@ -2996,6 +2996,31 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some(extract) =
+        <&sonatina_ir::inst::data::ExtractValue as InstDowncast>::downcast(inst_set, inst_data)
+    {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let Some(index) = immediate_index_u32(function, *extract.idx()) else {
+                *mem_error = Some("naga: aggregate SSA projection requires a constant index".to_owned());
+                return false;
+            };
+            let Some(base) =
+                resolve_naga_value(*extract.dest(), function, word, value_map, phi_locals, func)
+            else {
+                *mem_error = Some("naga: aggregate SSA projection has an unresolved base".to_owned());
+                return false;
+            };
+            let value = func.expressions.append(
+                naga::Expression::AccessIndex { base, index },
+                naga::Span::UNDEFINED,
+            );
+            target.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(value, value)),
+                naga::Span::UNDEFINED,
+            );
+            value_map.insert(result, value);
+            return true;
+        }
     } else if let Some(alloca) =
         <&sonatina_ir::inst::data::Alloca as InstDowncast>::downcast(inst_set, inst_data)
     {
@@ -6220,6 +6245,7 @@ fn spirv_instruction_is_lowered(
         || <&sonatina_ir::inst::cast::Trunc as InstDowncast>::downcast(is, inst).is_some()
         || <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(is, inst).is_some()
         || <&data::Alloca as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ExtractValue as InstDowncast>::downcast(is, inst).is_some()
         || <&data::Gep as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAlloc as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
