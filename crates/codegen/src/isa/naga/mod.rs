@@ -7317,6 +7317,7 @@ struct NagaTypedLocalReport {
 impl NagaTypedLocalReport {
     /// Type interning can succeed independently of a function's use closure
     /// or budget. The cache alone must never authorize the rejected function.
+    #[cfg(test)]
     fn into_complete(self) -> Result<
         std::collections::HashMap<sonatina_ir::Type, NagaTypedLocalType>, String,
     > {
@@ -8731,7 +8732,15 @@ fn prepare_naga_entry(
         f32_type,
         bool_type,
         &mut naga_mod.types,
-    ).into_complete()?;
+    );
+    // Root validity is mandatory before entry preparation. Helper failures
+    // join physical ABI planning, which closes rejection over callers while
+    // retaining independent helpers. An interned type is not a legality fact.
+    if let Some((_, error)) = typed_local_types.rejections.iter()
+        .find(|(function, _)| *function == first_func)
+    {
+        return Err(error.clone());
+    }
 
     // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
     // fail closed on any signedness-sensitive op (Sar / signed compares / signed
