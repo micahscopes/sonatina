@@ -152,7 +152,7 @@ impl EntryHelperContext {
         let variants = super::helper_resource_variants(
             module, call_order, entry, external_roots, &resources,
             &logical_results, live_arguments,
-        )?;
+        )?.into_complete()?;
         let memory = super::helper_private_memory_abis(module, call_order, entry)?;
         if memory.values().any(|abi| abi.heap) && !entry_owns_arena {
             return Err(
