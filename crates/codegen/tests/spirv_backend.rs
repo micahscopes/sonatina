@@ -7209,6 +7209,64 @@ fn grid_conditional_break_cascade_compiles_browser_wgsl() {
 }
 
 #[test]
+fn grid_trapping_header_checked_success_corridor_compiles() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let sig = Signature::new_single(
+        "grid_trapping_header", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    );
+    let fr = mb.declare_function(sig).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let latch = fb.append_block();
+    let guard = fb.append_block();
+    let success = fb.append_block();
+    let trap = fb.append_block();
+    fb.switch_to_block(entry);
+    let x = fb.args()[0];
+    let y = fb.args()[1];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    let limit = fb.make_imm_value(16i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let safe = fb.insert_inst(cmp::Lt::new(is, i, limit), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, safe, body, trap));
+    fb.switch_to_block(body);
+    let again = fb.insert_inst(cmp::Lt::new(is, i, x), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, again, latch, guard));
+    fb.switch_to_block(latch);
+    let next = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next, latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(guard);
+    let safe_y = fb.insert_inst(cmp::Lt::new(is, y, limit), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, safe_y, success, trap));
+    fb.switch_to_block(success);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.switch_to_block(trap);
+    fb.insert_inst_no_result(control_flow::Unreachable::new(is));
+    fb.seal_all(); fb.finish();
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(8,8,1)
+        .compile_module(&mb.build()).expect("header traps and checked success returns must coexist");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let module = naga::front::wgsl::parse_str(wgsl).expect("WGSL must reparse");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&module).expect("browser capability validation");
+    // Grid status is a per-invocation binding, not the scalar `layout.trap`
+    // slot. Check the actual grid ABI rather than requiring a scalar layout.
+    assert!(artifact.layout.bindings.iter().any(|b| b.name == "trap"),
+        "the per-invocation trap binding must remain observable");
+    assert!(wgsl.contains("fe_trapped"), "the trap accumulator must remain present");
+}
+
+#[test]
 fn grid_multi_exit_f32_phi_executes_on_lavapipe() {
     let module = build_grid_multi_exit_f32_phi_module();
     let artifact = SpirvBackend::new()
