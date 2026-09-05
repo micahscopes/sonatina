@@ -235,6 +235,12 @@ fn spirv_explicit_entry_ignores_declaration_order() {
         ).validate(&reparsed).unwrap();
     }
     let target = ShaderTargetContract::new(ShaderEnvironment::WebGpu, [ShaderEncoding::Wgsl]).unwrap();
+    let legacy = NagaBackend::new().analyze_entry_helpers(&module, decoy)
+        .expect("legacy i64 entry analysis preserves its existing word envelope");
+    assert!(legacy.callable.is_empty());
+    assert!(legacy.rejected.is_empty());
+    assert!(NagaBackend::new().with_grid().analyze_entry_helpers(&module, decoy).is_err(),
+        "legacy query still enforces the selected grid envelope");
     let errors = NagaBackend::new().compile_for_target(&module, ShaderEntries::Single(decoy), &target)
         .err().expect("the WebGPU profile must reject the i64 entry before emission");
     assert!(errors.iter().any(|error| matches!(error, sonatina_codegen::isa::naga::SpirvError::Validation(_))));
