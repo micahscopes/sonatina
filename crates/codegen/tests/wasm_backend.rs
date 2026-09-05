@@ -221,7 +221,9 @@ fn wasm_scalar_global_support_does_not_perturb_default_bytes() {
         .bytes;
     assert_eq!(
         hex::encode(bytes),
-        "0061736d0100000001010002010003010004010005050101018002060100070a01066d656d6f727902000901000a01000b01000008046e616d65010100"
+        // The default memory has no artificial maximum (1fb9968e). Keep
+        // this empty-module golden aligned with that separately tested policy.
+        "0061736d010000000101000201000301000401000503010001060100070a01066d656d6f727902000901000a01000b01000008046e616d65010100"
     );
 }
 
