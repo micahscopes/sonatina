@@ -597,6 +597,41 @@ pub fn run_function_passes_on(module: &Module, funcs: &[FuncRef], passes: &[Pass
     );
 }
 
+/// A pass boundary within one caller-owned observation scope.
+/// Indices are local to this pass sequence, not durable compiler identities.
+#[derive(Clone, Copy, Debug)]
+pub struct PassObservation {
+    pub index: usize,
+    pub pass: Pass,
+    pub changed: Option<bool>,
+}
+
+/// Optional observation at the actual pass-driver boundaries. Implementations
+/// must not mutate the module or select compiler policy. Recording failures
+/// belong to the caller's observation status, not the optimization result.
+pub trait PassObserver {
+    fn before_pass(&mut self, event: PassObservation, module: &Module);
+    fn after_pass(&mut self, event: PassObservation, module: &Module);
+}
+
+/// Run the same pass sequence and analysis lifetime as the unobserved entrypoint.
+/// Observing never splits a round into independently initialized pass runs.
+pub fn run_function_passes_on_observed(
+    module: &Module,
+    funcs: &[FuncRef],
+    passes: &[Pass],
+    observer: &mut dyn PassObserver,
+) {
+    let mut func_behavior_dirty = true;
+    run_function_pass_round_observed(
+        module,
+        passes,
+        &mut func_behavior_dirty,
+        FuncPassOverrides { funcs: Some(funcs), ..FuncPassOverrides::default() },
+        Some(observer),
+    );
+}
+
 #[derive(Default, Clone, Copy)]
 pub(crate) struct FuncPassOverrides<'a> {
     pub(crate) funcs: Option<&'a [FuncRef]>,
@@ -610,8 +645,21 @@ pub(crate) fn run_function_pass_round(
     func_behavior_dirty: &mut bool,
     overrides: FuncPassOverrides<'_>,
 ) {
+    run_function_pass_round_observed(module, passes, func_behavior_dirty, overrides, None);
+}
+
+fn run_function_pass_round_observed(
+    module: &Module,
+    passes: &[Pass],
+    func_behavior_dirty: &mut bool,
+    overrides: FuncPassOverrides<'_>,
+    mut observer: Option<&mut dyn PassObserver>,
+) {
     let mut round_facts = RoundFacts::default();
-    for &pass in passes {
+    for (index, &pass) in passes.iter().enumerate() {
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.before_pass(PassObservation { index, pass, changed: None }, module);
+        }
         let trace = std::env::var_os("SONATINA_OPT_TRACE").is_some();
         let started = Instant::now();
         if trace {
@@ -632,6 +680,9 @@ pub(crate) fn run_function_pass_round(
         }
         if result.changed && result.invalidates_object_facts {
             round_facts.clear();
+        }
+        if let Some(observer) = observer.as_deref_mut() {
+            observer.after_pass(PassObservation { index, pass, changed: Some(result.changed) }, module);
         }
         if trace {
             let (functions, blocks, instructions, values) = module_ir_size(module);
@@ -2775,6 +2826,41 @@ func public %other(v0.i1, v1.i32) -> i32 {
                 "unselected entry should retain its call graph:\n{dumped}"
             );
         });
+    }
+
+    #[test]
+    fn observed_pass_round_preserves_output_and_order() {
+        #[derive(Default)]
+        struct Observer(Vec<(usize, &'static str, bool)>);
+        impl PassObserver for Observer {
+            fn before_pass(&mut self, event: PassObservation, _: &Module) {
+                assert_eq!(event.changed, None);
+                self.0.push((event.index, event.pass.as_str(), false));
+            }
+            fn after_pass(&mut self, event: PassObservation, _: &Module) {
+                assert!(event.changed.is_some());
+                self.0.push((event.index, event.pass.as_str(), true));
+            }
+        }
+        let plain = build_test_module();
+        let observed = build_test_module();
+        let passes = [Pass::CfgCleanup, Pass::Sccp, Pass::ScalarCanonicalize];
+        let mut observer = Observer::default();
+        run_function_passes_on(&plain, &plain.funcs(), &passes);
+        run_function_passes_on_observed(&observed, &observed.funcs(), &passes, &mut observer);
+        for (left, right) in plain.funcs().into_iter().zip(observed.funcs()) {
+            let dump = |module: &Module, function| module.func_store.view(function, |body| {
+                FuncWriter::new(function, body).dump_string()
+            });
+            assert_eq!(dump(&plain, left), dump(&observed, right));
+        }
+        let expected = passes.iter().enumerate().flat_map(|(index, pass)| {
+            [(index, pass.as_str(), false), (index, pass.as_str(), true)]
+        }).collect::<Vec<_>>();
+        assert_eq!(observer.0, expected);
+        observer.0.clear();
+        run_function_passes_on_observed(&observed, &observed.funcs(), &[], &mut observer);
+        assert!(observer.0.is_empty());
     }
 
     #[test]
