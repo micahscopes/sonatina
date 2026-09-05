@@ -275,12 +275,6 @@ fn prepare_raster_entries(
     // derived from that suffix position instead of guessed from scalar types.
     let mut resource_state_positions = Vec::with_capacity(external_resources.len());
     for resource in external_resources {
-        if resource.access != Access::Read {
-            return Err(format!(
-                "spirv raster: external resource {} must be read-only",
-                resource.name,
-            ));
-        }
         let Some(state_position) = resource
             .arg_index
             .checked_sub(context_count as u32)
@@ -382,6 +376,20 @@ fn prepare_raster_entries(
         .collect::<Vec<_>>();
     let (emitted_external_resources, external_resource_stages): (Vec<_>, Vec<_>) =
         emitted_external_resources.into_iter().unzip();
+
+    // Access restrictions belong to the emitted stage interface. An actor may
+    // own compute-only writable/atomic storage that neither raster root reaches.
+    // Still validate every declared argument position above, and reject writable
+    // resources used by either stage rather than coercing their access to Read.
+    if let Some(resource) = emitted_external_resources
+        .iter()
+        .find(|resource| resource.access != Access::Read)
+    {
+        return Err(format!(
+            "spirv raster: external resource {} must be read-only",
+            resource.name,
+        ));
+    }
 
     // Fe retains only the scalar, memory-free portion of the helper graph.
     // Object indexing/projection/load remains in the paired stage roots and
