@@ -2,6 +2,9 @@
 pub mod cranelift;
 pub mod evm;
 
+#[cfg(any(feature = "cranelift", feature = "wasm", feature = "spirv-backend"))]
+pub(crate) mod overflow;
+
 #[cfg(feature = "cranelift")]
 pub mod cranelift;
 

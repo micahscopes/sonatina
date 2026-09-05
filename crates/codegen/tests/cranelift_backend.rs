@@ -33,6 +33,196 @@ fn native_module_builder() -> ModuleBuilder {
 }
 
 #[test]
+fn cranelift_integer_overflow_matches_wide_oracle() {
+    let operations = ["uadd", "usub", "umul", "sadd", "ssub", "smul"];
+    for (ty, bits) in [(Type::I1, 1), (Type::I8, 8), (Type::I16, 16), (Type::I32, 32), (Type::I64, 64)] {
+        let isa = native_isa();
+        let is = isa.inst_set();
+        let mb = native_module_builder();
+        // Scalar exports avoid depending on a Rust tuple ABI for two-result
+        // native functions. Both instruction results are observed separately.
+        for name in operations {
+            for lane in 0..2 {
+                let function = mb.declare_function(Signature::new_single(
+                    &format!("{name}_{lane}"), Linkage::Public, &[Type::I64, Type::I64], Type::I64,
+                )).unwrap();
+                let mut fb = mb.func_builder::<InstInserter>(function);
+                let entry = fb.append_block();
+                fb.switch_to_block(entry);
+                let mut args = [fb.args()[0], fb.args()[1]];
+                if ty != Type::I64 {
+                    for arg in &mut args { *arg = fb.insert_inst(cast::Trunc::new(is, *arg, ty), ty); }
+                }
+                let [lhs, rhs] = args;
+                let result_types = [ty, Type::I1];
+                let results = match name {
+                    "uadd" => fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &result_types),
+                    "usub" => fb.insert_inst_results(arith::Usubo::new(is, lhs, rhs), &result_types),
+                    "umul" => fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &result_types),
+                    "sadd" => fb.insert_inst_results(arith::Saddo::new(is, lhs, rhs), &result_types),
+                    "ssub" => fb.insert_inst_results(arith::Ssubo::new(is, lhs, rhs), &result_types),
+                    "smul" => fb.insert_inst_results(arith::Smulo::new(is, lhs, rhs), &result_types),
+                    _ => unreachable!(),
+                };
+                let value = if result_types[lane] == Type::I64 { results[lane] } else {
+                    fb.insert_inst(cast::Zext::new(is, results[lane], Type::I64), Type::I64)
+                };
+                fb.insert_return(value);
+                fb.seal_all();
+                fb.finish();
+            }
+        }
+        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        let mask = u64::MAX >> (64 - bits);
+        let sign = mask / 2 + 1;
+        let mut cases = vec![(0, 0), (0, mask), (mask, 0), (mask, 1), (1, mask),
+            (mask, 2), (mask, mask), (sign, mask), (mask, sign), (sign, 0),
+            (0, sign), (sign, 1), (sign, sign), (sign - 1, 1), (sign - 1, mask),
+            (sign / 2, 2), (6, 7)];
+        let mut seed = 0x7439_ef02_a5bd_812cu64;
+        for _ in 0..256 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let lhs = seed;
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            cases.push((lhs, seed));
+        }
+        for name in operations {
+            type Probe = unsafe extern "C" fn(u64, u64) -> u64;
+            let value: Probe = unsafe { std::mem::transmute(artifact.get_func_ptr::<Probe>(&format!("{name}_0")).unwrap()) };
+            let overflow: Probe = unsafe { std::mem::transmute(artifact.get_func_ptr::<Probe>(&format!("{name}_1")).unwrap()) };
+            for &(lhs, rhs) in &cases {
+                let (lhs, rhs) = (lhs & mask, rhs & mask);
+                let expected = if name.starts_with('s') {
+                    let signed = |x: u64| if x & sign != 0 { x as i128 - (mask as i128 + 1) } else { x as i128 };
+                    let (a, b) = (signed(lhs), signed(rhs));
+                    let exact = match name { "sadd" => a + b, "ssub" => a - b, "smul" => a * b, _ => unreachable!() };
+                    ((exact as u64) & mask, u64::from(exact < -(sign as i128) || exact >= sign as i128))
+                } else {
+                    let (a, b) = (lhs as u128, rhs as u128);
+                    let exact = match name { "uadd" => a + b, "usub" => a.wrapping_sub(b), "umul" => a * b, _ => unreachable!() };
+                    ((exact as u64) & mask, u64::from(exact > mask as u128))
+                };
+                assert_eq!(unsafe { (value(lhs, rhs), overflow(lhs, rhs)) }, expected, "{ty:?} {name}({lhs}, {rhs})");
+            }
+        }
+    }
+}
+
+#[test]
+fn cranelift_i128_overflow_preserves_both_words_and_flag() {
+    let operations = ["uadd", "usub", "umul", "sadd", "ssub", "smul"];
+    let isa = native_isa();
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    for name in operations {
+        for lane in 0..3 {
+            let function = mb.declare_function(Signature::new_single(
+                &format!("{name}_{lane}"), Linkage::Public, &[Type::I64; 4], Type::I64,
+            )).unwrap();
+            let mut fb = mb.func_builder::<InstInserter>(function);
+            let entry = fb.append_block();
+            fb.switch_to_block(entry);
+            let shift = fb.make_imm_value(sonatina_ir::Immediate::I128(64));
+            let mut operands = Vec::new();
+            for pair in 0..2 {
+                let lo = fb.insert_inst(cast::Zext::new(is, fb.args()[pair * 2], Type::I128), Type::I128);
+                let hi = fb.insert_inst(cast::Zext::new(is, fb.args()[pair * 2 + 1], Type::I128), Type::I128);
+                let hi = fb.insert_inst(arith::Shl::new(is, shift, hi), Type::I128);
+                operands.push(fb.insert_inst(logic::Or::new(is, lo, hi), Type::I128));
+            }
+            let (lhs, rhs) = (operands[0], operands[1]);
+            let types = [Type::I128, Type::I1];
+            let results = match name {
+                "uadd" => fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &types),
+                "usub" => fb.insert_inst_results(arith::Usubo::new(is, lhs, rhs), &types),
+                "umul" => fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &types),
+                "sadd" => fb.insert_inst_results(arith::Saddo::new(is, lhs, rhs), &types),
+                "ssub" => fb.insert_inst_results(arith::Ssubo::new(is, lhs, rhs), &types),
+                "smul" => fb.insert_inst_results(arith::Smulo::new(is, lhs, rhs), &types),
+                _ => unreachable!(),
+            };
+            let value = match lane {
+                0 => fb.insert_inst(cast::Trunc::new(is, results[0], Type::I64), Type::I64),
+                1 => {
+                    let hi = fb.insert_inst(arith::Shr::new(is, shift, results[0]), Type::I128);
+                    fb.insert_inst(cast::Trunc::new(is, hi, Type::I64), Type::I64)
+                }
+                _ => fb.insert_inst(cast::Zext::new(is, results[1], Type::I64), Type::I64),
+            };
+            fb.insert_return(value);
+            fb.seal_all();
+            fb.finish();
+        }
+    }
+    let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+    let mut values = vec![0u128, 1, 2, u64::MAX as u128, u128::MAX, 1u128 << 127, (1u128 << 127) - 1];
+    let mut random = 0x1234_5678_9abc_def0u64;
+    for _ in 0..64 {
+        random = random.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let lo = random;
+        random = random.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        values.push(lo as u128 | ((random as u128) << 64));
+    }
+    for name in operations {
+        type Probe = unsafe extern "C" fn(u64, u64, u64, u64) -> u64;
+        let probes: Vec<Probe> = (0..3).map(|lane| unsafe {
+            std::mem::transmute(artifact.get_func_ptr::<Probe>(&format!("{name}_{lane}")).unwrap())
+        }).collect();
+        for &lhs in &values {
+            for &rhs in &values {
+                let expected = match name {
+                    "uadd" => lhs.overflowing_add(rhs),
+                    "usub" => lhs.overflowing_sub(rhs),
+                    "umul" => lhs.overflowing_mul(rhs),
+                    name => {
+                        let (value, flag) = match name {
+                            "sadd" => (lhs as i128).overflowing_add(rhs as i128),
+                            "ssub" => (lhs as i128).overflowing_sub(rhs as i128),
+                            "smul" => (lhs as i128).overflowing_mul(rhs as i128),
+                            _ => unreachable!(),
+                        };
+                        (value as u128, flag)
+                    }
+                };
+                let actual: Vec<u64> = probes.iter().map(|probe| unsafe { probe(lhs as u64, (lhs >> 64) as u64, rhs as u64, (rhs >> 64) as u64) }).collect();
+                assert_eq!((actual[0] as u128 | ((actual[1] as u128) << 64), actual[2]), (expected.0, u64::from(expected.1)), "{name}({lhs}, {rhs})");
+            }
+        }
+    }
+}
+
+#[test]
+fn cranelift_i128_constants_preserve_both_words() {
+    for bits in [0u128, u128::MAX, 1 << 127, 0x123456789abcdef0_fedcba9876543210] {
+        let isa = native_isa();
+        let is = isa.inst_set();
+        let mb = native_module_builder();
+        for lane in 0..2 {
+            let function = mb.declare_function(Signature::new_single(
+                &format!("word_{lane}"), Linkage::Public, &[], Type::I64,
+            )).unwrap();
+            let mut fb = mb.func_builder::<InstInserter>(function);
+            let entry = fb.append_block();
+            fb.switch_to_block(entry);
+            let value = fb.make_imm_value(sonatina_ir::Immediate::I128(bits as i128));
+            let shift = fb.make_imm_value(sonatina_ir::Immediate::I128(lane * 64));
+            let value = fb.insert_inst(arith::Shr::new(is, shift, value), Type::I128);
+            let word = fb.insert_inst(cast::Trunc::new(is, value, Type::I64), Type::I64);
+            fb.insert_return(word);
+            fb.seal_all();
+            fb.finish();
+        }
+        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        for lane in 0..2 {
+            let probe: unsafe extern "C" fn() -> u64 = unsafe {
+                std::mem::transmute(artifact.get_func_ptr::<unsafe extern "C" fn() -> u64>(&format!("word_{lane}")).unwrap())
+            };
+            assert_eq!(unsafe { probe() }, (bits >> (lane * 64)) as u64);
+        }
+    }
+}
+
+#[test]
 fn cranelift_add_two_i64s() {
     let isa = native_isa();
     let is = isa.inst_set();
@@ -1749,22 +1939,13 @@ fn cranelift_mem_alloc_dynamic_pointer_round_up_idiom_executes() {
     assert_eq!(f(), 0x5a5a, "store/load through the rounded-up pointer must round-trip correctly");
 }
 
-/// Codex bug 1's analog (heap-exhaustion aliasing), the compile-time half:
+/// The compile-time allocation-size gate:
 /// a `MemAllocDynamic` whose size is not a compile-time constant is
 /// unsupported (cranelift stack slots are sized at IR-construction time),
 /// and must fail closed rather than silently guessing a size.
 ///
-/// `CraneliftBackend::compile_module` does NOT propagate a per-function
-/// translation error as a module-level `Err` (`translate_module`'s
-/// established, pre-existing convention: skip that one definition, log it,
-/// keep compiling everything else -- exactly what
-/// `native.rs::compile_and_verify_definitions` on the fe-codegen side
-/// exists to turn into a hard failure at the wrapper level). So "fails
-/// closed" here is verified the SAME way that wrapper verifies it: the
-/// skipped function is declared but never defined, and
-/// `get_finalized_function` panics for a declared-but-skipped definition
-/// (an upstream cranelift-jit assertion, not a Sonatina-side panic) --
-/// caught via `catch_unwind`, matching the established pattern.
+/// A rejected definition must return a named translation error before JIT
+/// finalization, not an artifact containing an undefined function.
 #[test]
 fn cranelift_mem_alloc_non_constant_size_fails_closed() {
     let isa = native_isa();
@@ -1786,24 +1967,10 @@ fn cranelift_mem_alloc_non_constant_size_fails_closed() {
 
     let module = mb.build();
     let backend = CraneliftBackend::new();
-    let artifact = backend
-        .compile_module(&module)
-        .expect("compile_module itself succeeds; the ONE bad definition is skipped, not hard-failed");
-    let defined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        artifact.get_func_ptr::<fn(i32) -> i32>("dyn_size")
-    }))
-    .ok()
-    .flatten();
-    assert!(
-        defined.is_none(),
-        "a non-constant MemAllocDynamic size must fail closed: `dyn_size` must be \
-         declared-but-undefined (skipped), never a callable pointer"
-    );
-    eprintln!(
-        "non-constant MemAllocDynamic size correctly fails closed: the function was skipped \
-         (declared, never defined), the same postcondition native.rs::compile_and_verify_\
-         definitions checks for"
-    );
+    let errors = backend.compile_module(&module).err().expect("invalid allocation must reject the module");
+    let message = format!("{errors:?}");
+    assert!(message.contains("dyn_size"), "{message}");
+    assert!(message.contains("non-constant size"), "{message}");
 }
 
 /// Cross-backend consistency guard (not a native memory-safety concern: a
@@ -1854,23 +2021,10 @@ fn cranelift_mem_alloc_inside_loop_fails_closed() {
 
     let module = mb.build();
     let backend = CraneliftBackend::new();
-    let artifact = backend
-        .compile_module(&module)
-        .expect("compile_module itself succeeds; the ONE bad definition is skipped, not hard-failed");
-    let defined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        artifact.get_func_ptr::<fn() -> i32>("loop_alloc")
-    }))
-    .ok()
-    .flatten();
-    assert!(
-        defined.is_none(),
-        "MemAllocDynamic inside a loop must fail closed: `loop_alloc` must be \
-         declared-but-undefined (skipped), never a callable pointer"
-    );
-    eprintln!(
-        "loop-carried allocation correctly fails closed on native: the function was skipped \
-         (declared, never defined)"
-    );
+    let errors = backend.compile_module(&module).err().expect("invalid allocation must reject the module");
+    let message = format!("{errors:?}");
+    assert!(message.contains("loop_alloc"), "{message}");
+    assert!(message.contains("inside a loop"), "{message}");
 }
 
 /// The native analog of the adversarial review's Finding A: a function that
