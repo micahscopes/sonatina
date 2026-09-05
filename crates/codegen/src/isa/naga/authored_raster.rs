@@ -554,7 +554,7 @@ fn append_scalar_helpers(
     let resource_capabilities = NagaResourceCapabilities::new();
     let logical_results = super::helper_naga_logical_result_abis(
         module, &call_order, roots, &resource_capabilities,
-    )?;
+    ).into_complete()?;
     let mut naga_functions = NagaFunctionMap::new();
     let plans = super::helper_plan::plan_helper_abis(
         module,
