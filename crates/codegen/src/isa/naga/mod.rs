@@ -5141,6 +5141,54 @@ fn allocate_return_transport(
     })
 }
 
+/// Complete a returning exit after its exact predecessor phi transfer.
+/// Every exit shape must transport the result before breaking out of the loop.
+#[cfg(feature = "spirv-backend")]
+fn emit_loop_exit_return(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    word: WordKind,
+    exit: sonatina_ir::BlockId,
+    return_local: naga::Handle<naga::LocalVariable>,
+    did_return_local: naga::Handle<naga::LocalVariable>,
+    func: &mut naga::Function,
+    target: &mut naga::Block,
+    value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
+    phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
+    result_expr: &mut Option<naga::Handle<naga::Expression>>,
+    return_abi: Option<&NagaResultAbi>,
+    naga_functions: &NagaFunctionMap,
+    mem_ctx: Option<MemCtx>,
+) -> Result<bool, String> {
+    if !block_has_return(exit, function, inst_set) {
+        return Ok(false);
+    }
+    emit_phi_loads_for_block(function, inst_set, exit, func, target, value_map, phi_locals);
+    let mut mem_error = None;
+    emit_block_to_target(
+        function, inst_set, word, exit, func, target, value_map, phi_locals,
+        result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error,
+    );
+    if let Some(message) = mem_error {
+        return Err(message);
+    }
+    if let Some(value) = *result_expr {
+        let pointer = func.expressions.append(
+            naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED,
+        );
+        target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+    }
+    let value = func.expressions.append(
+        naga::Expression::Literal(naga::Literal::Bool(true)), naga::Span::UNDEFINED,
+    );
+    let pointer = func.expressions.append(
+        naga::Expression::LocalVariable(did_return_local), naga::Span::UNDEFINED,
+    );
+    target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+    Ok(true)
+}
+
+
 #[cfg(feature = "spirv-backend")]
 fn emit_regions_in_loop(
     function: &sonatina_ir::Function,
@@ -5279,9 +5327,19 @@ fn emit_regions_in_loop(
                         // exact exit-phi transfer above, then terminate every
                         // still-falling-through arm with a Naga `Break`.
                         if matches!(then_outcome, RegionOutcome::Fallthrough(_)) {
+                            *may_return |= emit_loop_exit_return(
+                                function, inst_set, word, *merge, return_local, did_return_local,
+                                func, &mut accept, &mut accept_values, phi_locals, result_expr,
+                                return_abi, naga_functions, mem_ctx,
+                            )?;
                             accept.push(naga::Statement::Break, naga::Span::UNDEFINED);
                         }
                         if matches!(else_outcome, RegionOutcome::Fallthrough(_)) {
+                            *may_return |= emit_loop_exit_return(
+                                function, inst_set, word, *merge, return_local, did_return_local,
+                                func, &mut reject, &mut reject_values, phi_locals, result_expr,
+                                return_abi, naga_functions, mem_ctx,
+                            )?;
                             reject.push(naga::Statement::Break, naga::Span::UNDEFINED);
                         }
                         target.push(
@@ -5371,42 +5429,11 @@ fn emit_regions_in_loop(
                 emit_exact_phi_edge(
                     function, inst_set, word, *from, *exit, func, target, value_map, phi_locals,
                 )?;
-                if block_has_return(*exit, function, inst_set) {
-                    emit_phi_loads_for_block(
-                        function, inst_set, *exit, func, target, value_map, phi_locals,
-                    );
-                    let mut mem_error = None;
-                    emit_block_to_target(
-                        function, inst_set, word, *exit, func, target, value_map, phi_locals,
-                        result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error,
-                    );
-                    if let Some(msg) = mem_error.take() {
-                        return Err(msg);
-                    }
-                    if let Some(value) = *result_expr {
-                        let pointer = func.expressions.append(
-                            naga::Expression::LocalVariable(return_local),
-                            naga::Span::UNDEFINED,
-                        );
-                        target.push(
-                            naga::Statement::Store { pointer, value },
-                            naga::Span::UNDEFINED,
-                        );
-                    }
-                    let returned = func.expressions.append(
-                        naga::Expression::Literal(naga::Literal::Bool(true)),
-                        naga::Span::UNDEFINED,
-                    );
-                    let pointer = func.expressions.append(
-                        naga::Expression::LocalVariable(did_return_local),
-                        naga::Span::UNDEFINED,
-                    );
-                    target.push(
-                        naga::Statement::Store { pointer, value: returned },
-                        naga::Span::UNDEFINED,
-                    );
-                    *may_return = true;
-                }
+                *may_return |= emit_loop_exit_return(
+                    function, inst_set, word, *exit, return_local, did_return_local,
+                    func, target, value_map, phi_locals, result_expr, return_abi,
+                    naga_functions, mem_ctx,
+                )?;
                 target.push(naga::Statement::Break, naga::Span::UNDEFINED);
                 return Ok(RegionOutcome::Terminal);
             }
@@ -5641,34 +5668,11 @@ fn emit_recursive_loop_region(
     emit_exact_phi_edge(
         function, inst_set, word, header, exit, func, &mut exit_arm, &mut exit_values, phi_locals,
     )?;
-    if block_has_return(exit, function, inst_set) {
-        emit_phi_loads_for_block(
-            function, inst_set, exit, func, &mut exit_arm, &mut exit_values, phi_locals,
-        );
-        let mut mem_error = None;
-        emit_block_to_target(
-            function, inst_set, word, exit, func, &mut exit_arm, &mut exit_values,
-            phi_locals, &mut nested_result_expr, return_abi, naga_functions, mem_ctx,
-            &mut mem_error,
-        );
-        if let Some(msg) = mem_error.take() {
-            return Err(msg);
-        }
-        if let Some(value) = nested_result_expr {
-            let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
-            exit_arm.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
-        }
-        let returned = func.expressions.append(
-            naga::Expression::Literal(naga::Literal::Bool(true)),
-            naga::Span::UNDEFINED,
-        );
-        let pointer = func.expressions.append(
-            naga::Expression::LocalVariable(did_return_local),
-            naga::Span::UNDEFINED,
-        );
-        exit_arm.push(naga::Statement::Store { pointer, value: returned }, naga::Span::UNDEFINED);
-        may_return = true;
-    }
+    may_return |= emit_loop_exit_return(
+        function, inst_set, word, exit, return_local, did_return_local,
+        func, &mut exit_arm, &mut exit_values, phi_locals, &mut nested_result_expr,
+        return_abi, naga_functions, mem_ctx,
+    )?;
     for &(result, local) in &header_carry_locals {
         let value = *value_map.get(&result)
             .ok_or_else(|| format!("spirv: loop header result {result:?} was not emitted"))?;
