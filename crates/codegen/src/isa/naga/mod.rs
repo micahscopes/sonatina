@@ -20,6 +20,9 @@ use crate::optim::dead_arg::analyze_live_arguments;
 #[cfg(feature = "spirv-backend")]
 mod authored_raster;
 
+#[cfg(feature = "spirv-backend")]
+mod helper_plan;
+
 #[derive(Debug)]
 pub enum SpirvError {
     UnsupportedTarget(String),
@@ -9087,135 +9090,98 @@ fn translate_to_naga(
 
     let mut naga_functions =
         NagaFunctionMap::with_typed_local_types(typed_local_types);
+    let helper_plans = helper_plan::plan_helper_abis(
+        module,
+        &call_order,
+        first_func,
+        word,
+        word_type,
+        f32_type,
+        bool_type,
+        &helper_resource_capabilities,
+        &helper_logical_result_abis,
+        &helper_resource_variants,
+        &helper_memory_abis,
+        &live_arguments,
+        &naga_functions,
+        &mut naga_mod.types,
+    )?;
     let mut lowered_variants = std::collections::HashMap::<
         NagaFunctionVariant,
         NagaFunctionInfo,
     >::new();
-    for helper_ref in call_order
-        .iter()
-        .copied()
-        .filter(|function_ref| *function_ref != first_func)
+    for helper_plan::PlannedHelperAbi {
+        variant: helper_variant,
+        arguments: argument_abi,
+        packed_arguments,
+        result: result_abi,
+        memory: helper_memory_abi,
+    } in helper_plans
     {
-        let helper_memory_abi = helper_memory_abis.get(&helper_ref).copied().ok_or_else(|| {
-            format!(
-                "spirv: helper {helper_ref:?} has no derived private-memory ABI. Fail closed."
-            )
-        })?;
+        let helper_ref = helper_variant.function;
+        let variant_index = helper_variant.ordinal as usize;
         let helper_signature = module
             .ctx
             .get_sig(helper_ref)
             .ok_or_else(|| format!("spirv: helper {helper_ref:?} has no signature"))?;
-        let result_abi = helper_naga_result_abi(
+        let resource_variants = helper_resource_variants.variants(helper_ref);
+        let resource_bindings = &resource_variants[variant_index];
+        naga_functions.replace_call_sites(helper_variant_call_sites(
+            helper_variant,
+            &helper_resource_variants,
+            &lowered_variants,
+        )?);
+        let mut helper = lower_naga_helper(
             module,
             helper_ref,
             word,
             word_type,
             f32_type,
             bool_type,
+            &argument_abi,
+            packed_arguments.as_ref(),
+            &result_abi,
+            helper_memory_abi,
+            helper_memory_types,
+            private_heap_words,
             &helper_resource_capabilities,
             &helper_logical_result_abis,
             &naga_functions,
-            &mut naga_mod.types,
-        )?;
-        let resource_variants = helper_resource_variants.variants(helper_ref);
-        if resource_variants.is_empty() {
-            return Err(format!(
-                "spirv: helper `{}` has no entry-rooted resource variant. Fail closed.",
+        )
+        .map_err(|error| {
+            format!(
+                "spirv: helper `{}` resource variant {variant_index} lowering failed: {error}",
+                helper_signature.name(),
+            )
+        })?;
+        if resource_variants.len() > 1 {
+            helper.name = Some(format!(
+                "{}_resource_variant_{variant_index}",
                 helper_signature.name(),
             ));
         }
-        for (variant_index, resource_bindings) in resource_variants.iter().enumerate() {
-            let helper_variant = NagaFunctionVariant {
-                function: helper_ref,
-                ordinal: u32::try_from(variant_index).map_err(|_| {
-                    format!(
-                        "spirv: helper `{}` has more resource variants than fit in u32. Fail closed.",
-                        helper_signature.name(),
-                    )
-                })?,
-            };
-            naga_functions.replace_call_sites(helper_variant_call_sites(
-                helper_variant,
-                &helper_resource_variants,
-                &lowered_variants,
-            )?);
-            let mut argument_abi = helper_naga_argument_abi(
-                module,
-                helper_ref,
-                &helper_signature,
-                word,
-                word_type,
-                f32_type,
-                bool_type,
-                &helper_resource_capabilities,
-                resource_bindings,
-                &live_arguments,
-                &naga_functions,
-            )?;
-            let packed_arguments = pack_wide_naga_helper_arguments(
-                module,
-                &helper_signature,
-                word,
-                word_type,
-                f32_type,
-                bool_type,
-                helper_memory_abi,
-                &mut argument_abi,
-                &naga_functions,
-                &mut naga_mod.types,
-            )?;
-            let mut helper = lower_naga_helper(
-                module,
-                helper_ref,
-                word,
-                word_type,
-                f32_type,
-                bool_type,
-                &argument_abi,
-                packed_arguments.as_ref(),
-                &result_abi,
-                helper_memory_abi,
-                helper_memory_types,
-                private_heap_words,
-                &helper_resource_capabilities,
-                &helper_logical_result_abis,
-                &naga_functions,
-            )
-            .map_err(|error| {
-                format!(
-                    "spirv: helper `{}` resource variant {variant_index} lowering failed: {error}",
-                    helper_signature.name(),
-                )
-            })?;
-            if resource_variants.len() > 1 {
-                helper.name = Some(format!(
-                    "{}_resource_variant_{variant_index}",
-                    helper_signature.name(),
-                ));
-            }
-            let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
-            if trace {
-                let resources = resource_bindings
-                    .iter()
-                    .filter_map(|binding| binding.map(naga::Handle::index))
-                    .collect::<Vec<_>>();
-                eprintln!(
-                    "sonatina spirv: lowered helper, naga_handle={}, sonatina_ref={helper_ref:?}, name={}, resource_variant={variant_index}, resources={resources:?}",
-                    handle.index(),
-                    helper_signature.name(),
-                );
-            }
-            lowered_variants.insert(
-                helper_variant,
-                NagaFunctionInfo {
-                    handle,
-                    argument_abi,
-                    packed_arguments,
-                    result_abi: result_abi.clone(),
-                    memory_abi: helper_memory_abi,
-                },
+        let handle = naga_mod.functions.append(helper, naga::Span::UNDEFINED);
+        if trace {
+            let resources = resource_bindings
+                .iter()
+                .filter_map(|binding| binding.map(naga::Handle::index))
+                .collect::<Vec<_>>();
+            eprintln!(
+                "sonatina spirv: lowered helper, naga_handle={}, sonatina_ref={helper_ref:?}, name={}, resource_variant={variant_index}, resources={resources:?}",
+                handle.index(),
+                helper_signature.name(),
             );
         }
+        lowered_variants.insert(
+            helper_variant,
+            NagaFunctionInfo {
+                handle,
+                argument_abi,
+                packed_arguments,
+                result_abi,
+                memory_abi: helper_memory_abi,
+            },
+        );
     }
     naga_functions.replace_call_sites(helper_variant_call_sites(
         helper_resource_variants.entry,
