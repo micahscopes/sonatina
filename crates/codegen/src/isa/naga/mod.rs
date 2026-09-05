@@ -5981,12 +5981,17 @@ fn emit_recursive_loop_region(
         naga::Span::UNDEFINED,
     );
     let mut header_carry_locals = Vec::new();
-    for inst_id in function.layout.iter_inst(header) {
-        let inst = function.dfg.inst(inst_id);
-        if <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(inst_set, inst).is_some() {
-            continue;
-        }
-        let Some(result) = function.dfg.inst_result(inst_id) else { continue };
+    // Checked arithmetic and multi-result calls can define several header
+    // values. Transport each result with its own type across the loop scope.
+    let header_results = function.layout.iter_inst(header)
+        .filter(|&inst_id| {
+            <&sonatina_ir::inst::control_flow::Phi as InstDowncast>::downcast(
+                inst_set, function.dfg.inst(inst_id),
+            ).is_none()
+        })
+        .flat_map(|inst_id| function.dfg.inst_results(inst_id).iter()
+            .copied().map(move |result| (inst_id, result)));
+    for (inst_id, result) in header_results {
         let result_ty = function.dfg.value_ty(result);
         let rematerializable_pointer = result_ty.resolve_compound(function.ctx()).is_some_and(|ty| {
             matches!(ty, sonatina_ir::types::CompoundType::Ptr(_))
@@ -6134,8 +6139,8 @@ fn emit_recursive_loop_region(
     // that legally uses those SSA values, so replace every loop-scoped handle
     // with a fresh outer-block Load from its typed phi local.
     for inst_id in function.layout.iter_inst(header) {
-        if let Some(result) = function.dfg.inst_result(inst_id) {
-            value_map.remove(&result);
+        for result in function.dfg.inst_results(inst_id) {
+            value_map.remove(result);
         }
     }
     let mut outer_phi_loads = naga::Block::new();

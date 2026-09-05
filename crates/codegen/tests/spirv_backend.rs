@@ -7210,6 +7210,15 @@ fn grid_conditional_break_cascade_compiles_browser_wgsl() {
 
 #[test]
 fn grid_trapping_header_checked_success_corridor_compiles() {
+    check_grid_trapping_header(false);
+}
+
+#[test]
+fn grid_multi_result_header_checked_success_corridor_compiles() {
+    check_grid_trapping_header(true);
+}
+
+fn check_grid_trapping_header(multi_result: bool) {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
     ));
@@ -7237,7 +7246,14 @@ fn grid_trapping_header_checked_success_corridor_compiles() {
     fb.switch_to_block(header);
     let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
     let safe = fb.insert_inst(cmp::Lt::new(is, i, limit), Type::I1);
-    fb.insert_inst_no_result(control_flow::Br::new(is, safe, body, trap));
+    let returned = if multi_result {
+        let results = fb.insert_inst_results(arith::Uaddo::new(is, i, y), &[Type::I32, Type::I1]);
+        fb.insert_inst_no_result(control_flow::Br::new(is, results[1], trap, body));
+        results[0]
+    } else {
+        fb.insert_inst_no_result(control_flow::Br::new(is, safe, body, trap));
+        i
+    };
     fb.switch_to_block(body);
     let again = fb.insert_inst(cmp::Lt::new(is, i, x), Type::I1);
     fb.insert_inst_no_result(control_flow::Br::new(is, again, latch, guard));
@@ -7249,7 +7265,7 @@ fn grid_trapping_header_checked_success_corridor_compiles() {
     let safe_y = fb.insert_inst(cmp::Lt::new(is, y, limit), Type::I1);
     fb.insert_inst_no_result(control_flow::Br::new(is, safe_y, success, trap));
     fb.switch_to_block(success);
-    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, returned));
     fb.switch_to_block(trap);
     fb.insert_inst_no_result(control_flow::Unreachable::new(is));
     fb.seal_all(); fb.finish();
