@@ -24,7 +24,7 @@ mod authored_raster;
 mod helper_plan;
 
 #[cfg(feature = "spirv-backend")]
-pub use helper_plan::{HelperBodyPlan, analyze_helper_body};
+pub use helper_plan::{HelperBodyPlan, ShaderCallableHelper, ShaderHelperAnalysis, analyze_helper_body};
 
 #[derive(Debug)]
 pub enum SpirvError {
@@ -740,16 +740,66 @@ impl NagaBackend {
             &self.builtin_arguments, self.heap_words, target)
     }
 
-    /// Compile a self-contained request. No legacy backend configuration is read.
-    pub fn compile_request(
+    /// Analyze contextual helper ABIs without emitting function bodies or shader
+    /// text. Entry interface, storage and body-mode validity are prerequisites.
+    /// Unsupported helpers remain individual rejections, including their
+    /// dependent callers. This is not an authorization to compile a partial
+    /// program, nor a promise that arbitrary invalid roots can be legalized by
+    /// inlining. Requery after transforming the module.
+    pub fn analyze_request_helpers(
         module: &Module,
         request: &ShaderCompileRequest<'_>,
-    ) -> Result<ShaderArtifact, Vec<SpirvError>> {
+    ) -> Result<ShaderHelperAnalysis, Vec<SpirvError>> {
+        Self::validate_request_target(module, request)?;
+        let analyze = || -> Result<ShaderHelperAnalysis, String> {
+            if let ShaderPipeline::Raster { vertex, fragment } = request.pipeline {
+                return authored_raster::analyze_helpers(
+                    module, vertex, fragment, request.resources, request.builtin_arguments,
+                );
+            }
+            let interface = analyze_naga_entry_interface(
+                module, request.pipeline, request.resources, request.builtin_arguments, false,
+            )?;
+            let render = matches!(request.pipeline, ShaderPipeline::Fullscreen { .. });
+            let prepared = prepare_naga_entry(
+                module, interface.first_func, interface.word,
+                if render { SpirvShaderStage::Fragment } else { SpirvShaderStage::Compute },
+                &interface.emitted_external_resources, &interface.live_arguments,
+                request.private_heap_words, false, std::time::Instant::now(),
+            )?;
+            validate_naga_entry_mode(
+                request.pipeline, interface.word, interface.workgroup_size,
+                &prepared.body, &interface.emitted_external_resources,
+            )?;
+            Ok(prepared.helpers.helpers.into_analysis())
+        };
+        analyze().map_err(|error| vec![SpirvError::Translation(error)])
+    }
+
+    fn validate_request_target(
+        module: &Module,
+        request: &ShaderCompileRequest<'_>,
+    ) -> Result<(), Vec<SpirvError>> {
         if module.ctx.triple.architecture != sonatina_triple::Architecture::Shader {
             return Err(vec![SpirvError::UnsupportedTarget(
                 "an explicit shader target requires a Shader ISA module".to_owned(),
             )]);
         }
+        if request.target.environment() != ShaderEnvironment::WebGpu {
+            return Err(vec![SpirvError::UnsupportedTarget(format!(
+                "shader environment {:?} has no implemented capability profile",
+                request.target.environment(),
+            ))]);
+        }
+        Ok(())
+    }
+
+    /// Compile a self-contained request. No legacy backend configuration is read.
+    pub fn compile_request(
+        module: &Module,
+        request: &ShaderCompileRequest<'_>,
+    ) -> Result<ShaderArtifact, Vec<SpirvError>> {
+        Self::validate_request_target(module, request)?;
         Self::compile_pipeline(module, request.pipeline, request.resources,
             request.builtin_arguments, request.private_heap_words, Some(request.target))
     }
@@ -11242,7 +11292,7 @@ func private %leaf() -> i32 {
     #[test]
     fn entry_preparation_retains_independent_helpers_after_abi_rejection() {
         let parsed = sonatina_parser::parse_module(r#"
-target = "wasm32-unknown-native"
+target = "shader-unknown-unknown"
 func public %entry() -> i32 {
     block0:
         v0.i32 = call %parent;
@@ -11282,6 +11332,23 @@ func private %leaf() -> i32 {
             .any(|(function, _)| *function == find("parent")));
         assert!(prepared.helpers.into_complete().is_err(),
             "a partial report must never authorize emission");
+        let target = super::ShaderTargetContract::new(
+            super::ShaderEnvironment::WebGpu, [super::ShaderEncoding::Wgsl],
+        ).unwrap();
+        let request = super::ShaderCompileRequest::new(&target,
+            super::ShaderPipeline::LegacyScalar {
+                entry: find("entry"), workgroup_size: [1, 1, 1],
+            });
+        let analysis = super::NagaBackend::analyze_request_helpers(module, &request)
+            .expect("public contextual analysis retains partial decisions");
+        assert_eq!(analysis.callable.len(), 1);
+        assert_eq!(analysis.callable[0].function, find("leaf"));
+        assert_eq!(analysis.callable[0].variants, 1);
+        assert_eq!(analysis.callable[0].instruction_count, 1);
+        assert_eq!(analysis.callable[0].maximum_physical_parameters, 0);
+        assert_eq!(analysis.rejected.len(), 2);
+        assert!(super::NagaBackend::compile_request(module, &request).is_err(),
+            "observing callable siblings must not admit a rejected program");
     }
 
     fn naga_function_with_parameters(

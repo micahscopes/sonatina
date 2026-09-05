@@ -145,7 +145,46 @@ pub(super) struct HelperAbiReport {
     pub rejections: Vec<(FuncRef, String)>,
 }
 
+/// Observational helper decisions for one immutable shader request. These are
+/// not transferable certificates: compilation rederives legality after edits.
+#[derive(Debug)]
+pub struct ShaderHelperAnalysis {
+    pub callable: Vec<ShaderCallableHelper>,
+    pub rejected: Vec<(FuncRef, String)>,
+}
+
+#[derive(Debug)]
+pub struct ShaderCallableHelper {
+    pub function: FuncRef,
+    pub variants: usize,
+    pub instruction_count: usize,
+    pub accesses_resource: bool,
+    pub maximum_physical_parameters: usize,
+}
+
 impl HelperAbiReport {
+    pub fn into_analysis(self) -> ShaderHelperAnalysis {
+        let mut callable: Vec<ShaderCallableHelper> = Vec::new();
+        for plan in self.plans {
+            if let Some(summary) = callable.iter_mut()
+                .find(|summary| summary.function == plan.variant.function)
+            {
+                summary.variants += 1;
+                summary.maximum_physical_parameters = summary.maximum_physical_parameters
+                    .max(plan.parameters.arguments.len());
+            } else {
+                callable.push(ShaderCallableHelper {
+                    function: plan.variant.function,
+                    variants: 1,
+                    instruction_count: plan.body.instruction_count(),
+                    accesses_resource: plan.body.accesses_resource(),
+                    maximum_physical_parameters: plan.parameters.arguments.len(),
+                });
+            }
+        }
+        ShaderHelperAnalysis { callable, rejected: self.rejections }
+    }
+
     /// Final emission requires every selected helper. Keep the existing first
     /// diagnostic ordering, and never emit only the successful subset.
     pub fn into_complete(self) -> Result<Vec<PlannedHelperAbi>, String> {
