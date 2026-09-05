@@ -1537,6 +1537,85 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
 }
 
 #[test]
+fn spirv_loop_success_and_exhaustion_join_with_aggregate_phi() {
+    // A successful search skips the exhaustion block. Both paths feed one
+    // aggregate result, then a shared decision consumes it (Quilting's split).
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair = mb.declare_struct_type("SearchResult", &[Type::I32, Type::I1], false);
+    let word_pointer = mb.ptr_type(Type::I32);
+    let entry = mb.declare_function(Signature::new_single(
+        "entry", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    )).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(entry);
+    let start = fb.append_block();
+    let header = fb.append_block();
+    let body = fb.append_block();
+    let latch = fb.append_block();
+    let exhausted = fb.append_block();
+    let join = fb.append_block();
+    let success = fb.append_block();
+    let failure = fb.append_block();
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    let three = fb.make_imm_value(3i32);
+    let hundred = fb.make_imm_value(100i32);
+    let missing = fb.make_imm_value(77i32);
+    let yes = fb.make_imm_value(true);
+    let no = fb.make_imm_value(false);
+    let blank = fb.make_undef_value(pair);
+    let target = fb.args()[0];
+    fb.switch_to_block(start);
+    let effect = fb.insert_inst(data::Alloca::new(is, Type::I32), word_pointer);
+    fb.insert_inst_no_result(data::Mstore::new(is, effect, zero, Type::I32));
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, start)]), Type::I32);
+    let more = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, more, body, exhausted));
+    fb.switch_to_block(body);
+    let value = fb.insert_inst(arith::Add::new(is, i, hundred), Type::I32);
+    let found = fb.insert_inst(data::InsertValue::new(is, blank, zero, value), pair);
+    let found = fb.insert_inst(data::InsertValue::new(is, found, one, yes), pair);
+    let matches = fb.insert_inst(cmp::Eq::new(is, i, target), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, matches, join, latch));
+    fb.switch_to_block(latch);
+    let next = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    fb.append_phi_arg(i, next, latch);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(exhausted);
+    let exhausted_effect = fb.make_imm_value(9000i32);
+    fb.insert_inst_no_result(data::Mstore::new(is, effect, exhausted_effect, Type::I32));
+    let absent = fb.insert_inst(data::InsertValue::new(is, blank, zero, missing), pair);
+    let absent = fb.insert_inst(data::InsertValue::new(is, absent, one, no), pair);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, join));
+    fb.switch_to_block(join);
+    let result = fb.insert_inst(control_flow::Phi::new(is, vec![(found, body), (absent, exhausted)]), pair);
+    let value = fb.insert_inst(data::ExtractValue::new(is, result, zero), Type::I32);
+    let valid = fb.insert_inst(data::ExtractValue::new(is, result, one), Type::I1);
+    let effect = fb.insert_inst(data::Mload::new(is, effect, Type::I32), Type::I32);
+    let ten = fb.make_imm_value(10i32);
+    let iteration = fb.insert_inst(arith::Mul::new(is, i, ten), Type::I32);
+    let value = fb.insert_inst(arith::Add::new(is, value, effect), Type::I32);
+    let value = fb.insert_inst(arith::Add::new(is, value, iteration), Type::I32);
+    fb.insert_inst_no_result(control_flow::Br::new(is, valid, success, failure));
+    fb.switch_to_block(success);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+    fb.switch_to_block(failure);
+    let fallback = fb.insert_inst(arith::Add::new(is, value, one), Type::I32);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, fallback));
+    fb.seal_all();
+    fb.finish();
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(1, 1, 1)
+        .compile_module(&mb.build()).expect("search exits must preserve their exact aggregate result");
+    assert_eq!(run_grid_u32(artifact.wgsl.as_deref().unwrap(), 4, 1, 1, 1, &[]),
+        vec![100, 111, 122, 9108], "fallback side effects run only on exhaustion; iteration and aggregate values survive both exits");
+}
+
+#[test]
 fn spirv_aggregate_loop_phis_preserve_parallel_snapshots() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
