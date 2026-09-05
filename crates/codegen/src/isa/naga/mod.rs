@@ -7264,6 +7264,26 @@ fn intern_naga_typed_local_type(
 }
 
 #[cfg(feature = "spirv-backend")]
+struct NagaTypedLocalReport {
+    types: std::collections::HashMap<sonatina_ir::Type, NagaTypedLocalType>,
+    rejections: Vec<(sonatina_ir::module::FuncRef, String)>,
+}
+
+#[cfg(feature = "spirv-backend")]
+impl NagaTypedLocalReport {
+    /// Type interning can succeed independently of a function's use closure
+    /// or budget. The cache alone must never authorize the rejected function.
+    fn into_complete(self) -> Result<
+        std::collections::HashMap<sonatina_ir::Type, NagaTypedLocalType>, String,
+    > {
+        match self.rejections.into_iter().next() {
+            Some((_, error)) => Err(error),
+            None => Ok(self.types),
+        }
+    }
+}
+
+#[cfg(feature = "spirv-backend")]
 fn collect_naga_typed_local_types(
     module: &Module,
     call_order: &[sonatina_ir::module::FuncRef],
@@ -7272,69 +7292,73 @@ fn collect_naga_typed_local_types(
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
     types: &mut naga::UniqueArena<naga::Type>,
-) -> Result<
-    std::collections::HashMap<sonatina_ir::Type, NagaTypedLocalType>,
-    String,
-> {
+) -> NagaTypedLocalReport {
     let mut cache = std::collections::HashMap::new();
+    let mut rejections = Vec::new();
     for &function_ref in call_order {
-        let mut private_bytes = 0u32;
-        let mut private_allocations = Vec::new();
-        let closure = verify_naga_typed_local_use_closure(module, function_ref)?;
-        for ty in closure.borrowed_pointer_types {
-            intern_naga_typed_local_type(
-                module,
-                ty,
-                word,
-                word_type,
-                f32_type,
-                bool_type,
-                types,
-                &mut cache,
-            )?;
-        }
-        for ty in closure.allocation_types {
-            let local = intern_naga_typed_local_type(
-                module,
-                ty,
-                word,
-                word_type,
-                f32_type,
-                bool_type,
-                types,
-                &mut cache,
-            )?;
-            private_bytes = private_bytes.checked_add(local.size).ok_or_else(|| {
-                format!(
-                    "spirv: typed private storage size overflows u32 in {function_ref:?}. Fail closed."
-                )
-            })?;
-            let name = types[local.handle]
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("{ty:?}"));
-            private_allocations.push((name, local.size));
-        }
-        if private_bytes > MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION {
-            private_allocations.sort_by(|left, right| {
-                right
-                    .1
-                    .cmp(&left.1)
-                    .then_with(|| left.0.cmp(&right.0))
-            });
-            let largest = private_allocations
-                .iter()
-                .take(8)
-                .map(|(name, size)| format!("{name}={size}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "spirv: typed private storage in {function_ref:?} requires {private_bytes} bytes across {} allocations, over the conservative {MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION}-byte per-function budget; largest allocations: {largest}. Fail closed.",
-                private_allocations.len(),
-            ));
+        let outcome = (|| -> Result<(), String> {
+            let mut private_bytes = 0u32;
+            let mut private_allocations = Vec::new();
+            let closure = verify_naga_typed_local_use_closure(module, function_ref)?;
+            for ty in closure.borrowed_pointer_types {
+                intern_naga_typed_local_type(
+                    module,
+                    ty,
+                    word,
+                    word_type,
+                    f32_type,
+                    bool_type,
+                    types,
+                    &mut cache,
+                )?;
+            }
+            for ty in closure.allocation_types {
+                let local = intern_naga_typed_local_type(
+                    module,
+                    ty,
+                    word,
+                    word_type,
+                    f32_type,
+                    bool_type,
+                    types,
+                    &mut cache,
+                )?;
+                private_bytes = private_bytes.checked_add(local.size).ok_or_else(|| {
+                    format!(
+                        "spirv: typed private storage size overflows u32 in {function_ref:?}. Fail closed."
+                    )
+                })?;
+                let name = types[local.handle]
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{ty:?}"));
+                private_allocations.push((name, local.size));
+            }
+            if private_bytes > MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION {
+                private_allocations.sort_by(|left, right| {
+                    right
+                        .1
+                        .cmp(&left.1)
+                        .then_with(|| left.0.cmp(&right.0))
+                });
+                let largest = private_allocations
+                    .iter()
+                    .take(8)
+                    .map(|(name, size)| format!("{name}={size}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "spirv: typed private storage in {function_ref:?} requires {private_bytes} bytes across {} allocations, over the conservative {MAX_NAGA_TYPED_PRIVATE_BYTES_PER_FUNCTION}-byte per-function budget; largest allocations: {largest}. Fail closed.",
+                    private_allocations.len(),
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            rejections.push((function_ref, error));
         }
     }
-    Ok(cache)
+    NagaTypedLocalReport { types: cache, rejections }
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -8663,7 +8687,7 @@ fn prepare_naga_entry(
         f32_type,
         bool_type,
         &mut naga_mod.types,
-    )?;
+    ).into_complete()?;
 
     // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
     // fail closed on any signedness-sensitive op (Sar / signed compares / signed
@@ -10776,6 +10800,44 @@ fn translate_to_naga(
 #[cfg(all(test, feature = "spirv-backend"))]
 mod tests {
     use super::{MAX_WGSL_FUNCTION_PARAMETERS, validate_naga_portable_wgsl_limits};
+
+    #[test]
+    fn typed_local_report_retains_types_after_an_unsupported_local() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+func private %bad() -> i32 {
+    block0:
+        v0.*i256 = alloca i256;
+        return 0.i32;
+}
+func private %good() -> i32 {
+    block0:
+        v0.*f32 = alloca f32;
+        return 1.i32;
+}
+"#).expect("typed-local report fixture parses");
+        let module = &parsed.module;
+        let find = |name| module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == name)
+        }).expect("fixture function exists");
+        let bad = find("bad");
+        let good = find("good");
+        let mut types = naga::UniqueArena::new();
+        let mut scalar = |kind, width| types.insert(naga::Type {
+            name: None, inner: naga::TypeInner::Scalar(naga::Scalar { kind, width }),
+        }, naga::Span::UNDEFINED);
+        let word = scalar(naga::ScalarKind::Uint, 4);
+        let float = scalar(naga::ScalarKind::Float, 4);
+        let boolean = scalar(naga::ScalarKind::Bool, 1);
+        let report = super::collect_naga_typed_local_types(
+            module, &[bad, good], super::WordKind::U32, word, float, boolean, &mut types,
+        );
+        assert_eq!(report.rejections.len(), 1);
+        assert_eq!(report.rejections[0].0, bad);
+        assert!(report.types.contains_key(&sonatina_ir::Type::F32),
+            "a rejected local must not hide a later function's valid type");
+        assert!(report.into_complete().is_err(), "partial type maps cannot authorize emission");
+    }
 
     #[test]
     fn entry_preparation_derives_helper_abi_without_emitting_bodies() {
