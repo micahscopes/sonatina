@@ -6,6 +6,7 @@ pub mod cranelift;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
+pub mod naga;
 pub mod spirv;
 
 /// Compute the element size (stride, in bytes) for an aggregate object type.
