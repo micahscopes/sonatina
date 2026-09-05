@@ -141,4 +141,47 @@ func public %entry(v0.objref<[i32; 4]>) {
         assert_eq!(unchanged.wgsl, plain.wgsl);
         assert_eq!(unchanged.words, plain.words);
     }
+
+    #[test]
+    fn graph_failure_mixed_invocations_keep_private_trap_lanes() {
+        let source = r#"
+target = "shader-unknown-unknown"
+func public %entry(v0.objref<[i32; 4]>, v1.i32) {
+    block0:
+        v2.objref<i32> = obj.index v0 v1;
+        v3.i32 = obj.load v2;
+        v4.i1 = eq v3 0.i32;
+        br v4 block1 block2;
+    block1:
+        unreachable;
+    block2:
+        v5.i32 = add v1 2.i32;
+        v6.objref<i32> = obj.index v0 v5;
+        obj.store v6 33.i32;
+        return;
+}
+"#;
+        let module = sonatina_parser::parse_module(source).unwrap().module;
+        let target = ShaderTargetContract::new(ShaderEnvironment::WebGpu,
+            [ShaderEncoding::Wgsl, ShaderEncoding::Spirv]).unwrap();
+        let resources = [SpirvExternalResource {
+            arg_index: 0, group: 0, binding: 0, name: "data".into(), access: Access::ReadWrite,
+            element: SpirvResourceElement::Scalar(SpirvScalarKind::U32), stride: 4, length: 4,
+        }];
+        let builtins = [crate::isa::naga::SpirvBuiltinArgument {
+            arg_index: 1, source: crate::isa::naga::SpirvBuiltinSource::GlobalInvocationIdX,
+        }];
+        let mut request = ShaderCompileRequest::new(&target, ShaderPipeline::Compute {
+            entry: module.funcs()[0], workgroup_size: [2, 1, 1], dispatch_grid: [1, 1, 1],
+        });
+        request.resources = &resources;
+        request.builtin_arguments = &builtins;
+        request.graph_failure = Some(GraphFailureBinding { group: 0, binding: 2 });
+        let artifact = NagaBackend::compile_request(&module, &request).unwrap();
+        assert_eq!(artifact.layout.trap.unwrap().width, 8);
+        assert_eq!(artifact.layout.bindings.iter().find(|b| b.binding == 2).unwrap().span, 4);
+        if let Some(path) = std::env::var_os("SONATINA_GRAPH_FAILURE_MULTI_WGSL") {
+            std::fs::write(path, artifact.wgsl.as_ref().unwrap()).unwrap();
+        }
+    }
 }
