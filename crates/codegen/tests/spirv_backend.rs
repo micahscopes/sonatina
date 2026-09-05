@@ -5431,8 +5431,9 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         })
         .with_external_resource(resource(2, 0, "vertex_values"))
         .with_external_resource(resource(3, 1, "fragment_values"))
-        .with_external_resource(resource(4, 2, "unused_values"))
-        .compile_module(&mb.build())
+        .with_external_resource(resource(4, 2, "unused_values"));
+    let module = mb.build();
+    let artifact = artifact.compile_module(&module)
         .expect("paired raster stages should share only their live resource union");
 
     let bindings = artifact
@@ -5505,6 +5506,51 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
         .expect("named fragment entry");
     assert!(fragment.contains("fragment_values"), "{fragment}");
     assert!(!fragment.contains("vertex_values"), "{fragment}");
+
+    // A compute-only claim buffer remains in the actor signature, but must not
+    // be admitted to (or rejected as part of) an unrelated raster interface.
+    // Also exercise ordinary writable storage: this is a liveness rule, not an
+    // atomic-specific exception.
+    for element in [
+        SpirvResourceElement::Scalar(SpirvScalarKind::U32),
+        SpirvResourceElement::AtomicU32,
+    ] {
+        for writable_arg in [2, 3, 4] {
+            let external = [(2, "vertex_values"), (3, "fragment_values"), (4, "unused_values")]
+                .map(|(arg, name)| {
+                    let mut descriptor = resource(arg, arg - 2, name);
+                    if arg == writable_arg {
+                        descriptor.access = Access::ReadWrite;
+                        descriptor.element = element.clone();
+                    }
+                    descriptor
+                });
+            let mut backend = SpirvBackend::new()
+                .with_authored_raster("vs_resource_identity_0", "fs_resource_identity_0")
+                .with_builtin_argument(SpirvBuiltinArgument {
+                    arg_index: 0, source: SpirvBuiltinSource::VertexIndex,
+                })
+                .with_builtin_argument(SpirvBuiltinArgument {
+                    arg_index: 1, source: SpirvBuiltinSource::InstanceIndex,
+                });
+            for descriptor in external { backend = backend.with_external_resource(descriptor); }
+            let result = backend.compile_module(&module);
+            if writable_arg == 4 {
+                let pruned = result.expect("dormant writable resources must be pruned before raster access checks");
+                let pruned_bindings = pruned.layout.bindings.iter().map(|binding| (
+                    binding.name.as_str(), binding.binding, binding.resource_arg_index,
+                    binding.stages.clone(),
+                )).collect::<Vec<_>>();
+                assert_eq!(pruned_bindings, bindings);
+                assert_eq!(pruned.wgsl, artifact.wgsl);
+            } else {
+                let name = if writable_arg == 2 { "vertex_values" } else { "fragment_values" };
+                let errors = result.err().expect("live writable resources must still fail closed");
+                let error = format!("{errors:?}");
+                assert!(error.contains(&format!("external resource {name} must be read-only")), "{error}");
+            }
+        }
+    }
 }
 
 #[test]
