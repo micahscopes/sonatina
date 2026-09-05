@@ -1737,6 +1737,55 @@ fn spirv_constructs_aggregate_ssa_without_allocations() {
 }
 
 #[test]
+fn spirv_zero_aggregate_construction_stays_compact() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty = mb.declare_struct_type("ZeroPair", &[Type::I32, Type::I32], false);
+    let entry = mb.declare_function(Signature::new_single(
+        "entry", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    )).unwrap();
+    let helper = mb.declare_function(Signature::new_single(
+        "zero_pair", Linkage::Private, &[], pair_ty,
+    )).unwrap();
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        let initial = fb.make_undef_value(pair_ty);
+        let first = fb.insert_inst(data::InsertValue::new(is, initial, zero, zero), pair_ty);
+        let pair = fb.insert_inst(data::InsertValue::new(is, first, one, zero), pair_ty);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, pair));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let pair = fb.insert_inst(control_flow::Call::new(is, helper, Default::default()), pair_ty);
+        let zero = fb.make_imm_value(0i32);
+        let value = fb.insert_inst(data::ExtractValue::new(is, pair, zero), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+        fb.seal_all();
+        fb.finish();
+    }
+    let artifact = SpirvBackend::new().compile_module(&mb.build()).unwrap();
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    let parsed = naga::front::wgsl::parse_str(wgsl).unwrap();
+    let helper = parsed.functions.iter().find_map(|(_, function)|
+        (function.name.as_deref() == Some("zero_pair")).then_some(function)).unwrap();
+    assert!(helper.expressions.iter().all(|(_, expression)|
+        !matches!(expression, naga::Expression::Compose { .. } | naga::Expression::AccessIndex { .. })),
+        "zero initialization must not rebuild fields");
+    assert_eq!(run_grid_u32(wgsl, 1, 1, 1, 1, &[]), vec![0]);
+}
+
+#[test]
 fn spirv_private_helper_returns_whole_typed_value() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,

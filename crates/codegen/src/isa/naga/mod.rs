@@ -1081,6 +1081,16 @@ fn resolve_naga_value(
 /// single-expression range (house style; mirrors the `F32ToU32` cast
 /// lowering below).
 #[cfg(feature = "spirv-backend")]
+fn naga_expression_is_exact_zero(expression: &naga::Expression) -> bool {
+    match expression {
+        naga::Expression::ZeroValue(_) => true,
+        naga::Expression::Literal(naga::Literal::U32(0) | naga::Literal::I32(0)
+            | naga::Literal::I64(0) | naga::Literal::Bool(false)) => true,
+        naga::Expression::Literal(naga::Literal::F32(value)) => value.to_bits() == 0,
+        _ => false,
+    }
+}
+
 fn emit_expr(
     func: &mut naga::Function,
     target: &mut naga::Block,
@@ -3039,6 +3049,23 @@ fn emit_single_inst(
                 *mem_error = Some("naga: aggregate SSA insertion has an unresolved value".into());
                 return false;
             };
+            // Inserting zero into an already-zero aggregate preserves the
+            // entire value. Keep nested zero initialization compact instead
+            // of projecting and rebuilding every field. Negative floating
+            // zero is not interchangeable with positive zero here.
+            if matches!(func.expressions[base], naga::Expression::ZeroValue(_))
+                && naga_expression_is_exact_zero(&func.expressions[replacement])
+                && match ty.resolve_compound(function.ctx()) {
+                    Some(sonatina_ir::types::CompoundType::Struct(data)) =>
+                        data.fields[index as usize] == function.dfg.value_ty(*insert.value()),
+                    Some(sonatina_ir::types::CompoundType::Array { elem, .. }) =>
+                        elem == function.dfg.value_ty(*insert.value()),
+                    _ => false,
+                }
+            {
+                value_map.insert(result, base);
+                return true;
+            }
             // Reuse an already composed value's components. A chain of field
             // updates must not repeatedly project and reconstruct its ancestry.
             let mut components = match &func.expressions[base] {
@@ -11357,6 +11384,17 @@ fn translate_to_naga(
 
 #[cfg(all(test, feature = "spirv-backend"))]
 mod tests {
+    #[test]
+    fn aggregate_zero_fold_preserves_signed_zero_and_nonzero_values() {
+        use naga::{Expression::Literal, Literal::*};
+        for value in [U32(0), I32(0), I64(0), Bool(false), F32(0.0)] {
+            assert!(super::naga_expression_is_exact_zero(&Literal(value)));
+        }
+        for value in [U32(1), I32(-1), I64(1), Bool(true), F32(-0.0), F32(f32::NAN)] {
+            assert!(!super::naga_expression_is_exact_zero(&Literal(value)));
+        }
+    }
+
     use super::{MAX_WGSL_FUNCTION_PARAMETERS, validate_naga_portable_wgsl_limits};
 
     #[test]
