@@ -8134,302 +8134,28 @@ fn compute_builtin_slot(source: SpirvBuiltinSource) -> Option<(usize, Option<u32
 }
 
 #[cfg(feature = "spirv-backend")]
-fn translate_to_naga(
+struct NagaEntryBodyPlan {
+    parameter_count: usize,
+    has_object_allocation: bool,
+    uses_arena: bool,
+    may_trap: bool,
+    arena_high_water_bytes: u64,
+}
+
+/// Derive entry instruction and arena facts without constructing a Naga body.
+/// Typed-local closure and contextual helper ABI preparation remain separate.
+#[cfg(feature = "spirv-backend")]
+fn analyze_naga_entry_body(
     module: &Module,
-    pipeline: ShaderPipeline,
-    external_resources: &[SpirvExternalResource],
-    builtin_arguments: &[SpirvBuiltinArgument],
+    first_func: sonatina_ir::module::FuncRef,
+    word: WordKind,
     heap_words: u32,
-) -> Result<(naga::Module, SpirvLayout), String> {
-    use std::collections::HashMap;
-    let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
-    let started = std::time::Instant::now();
-
-    let (first_func, workgroup_size, dispatch_grid) = match pipeline {
-        ShaderPipeline::Raster { vertex, fragment } => {
-            return authored_raster::translate_entries(
-                module, vertex, fragment, external_resources, builtin_arguments,
-            );
-        }
-        ShaderPipeline::Compute { entry, workgroup_size, dispatch_grid } =>
-            (entry, workgroup_size, dispatch_grid),
-        ShaderPipeline::Fullscreen { entry } => (entry, [0, 0, 0], [1, 1, 1]),
-        ShaderPipeline::LegacyScalar { entry, workgroup_size }
-        | ShaderPipeline::LegacyGrid { entry, workgroup_size } =>
-            (entry, workgroup_size, [1, 1, 1]),
-    };
-    // Derived predicates describe one already-selected pipeline. They cannot
-    // represent conflicting modes and do not choose the compilation target.
-    let grid = matches!(pipeline, ShaderPipeline::LegacyGrid { .. });
-    let render = matches!(pipeline, ShaderPipeline::Fullscreen { .. });
-    let compute = matches!(pipeline, ShaderPipeline::Compute { .. });
-    if !module.funcs().contains(&first_func) {
-        return Err(format!("spirv: selected entry {first_func:?} is not defined in this module"));
-    }
-
-    let sig = module
-        .ctx
-        .get_sig(first_func)
-        .ok_or_else(|| "spirv: selected entry has no declared signature".to_string())?;
-
-    let word = match sig.single_ret_ty() {
-        Some(sonatina_ir::Type::I32) => WordKind::U32,
-        Some(sonatina_ir::Type::I64) => WordKind::I64,
-        Some(other) => {
-            return Err(format!(
-                "spirv: unsupported kernel return type {other:?}; only i32 (u32 word) \
-                 and i64 words are supported"
-            ));
-        }
-        None if compute && sig.returns_unit() => WordKind::U32,
-        None => {
-            return Err(
-                "spirv: kernel has no single return value; the word width cannot be derived"
-                    .to_string(),
-            );
-        }
-    };
-
-    if !external_resources.is_empty() && !(compute || render) {
-        return Err(
-            "spirv: external resources require explicit compute or render mode"
-                .to_string(),
-        );
-    }
-    if !builtin_arguments.is_empty() && !compute {
-        return Err("spirv: explicit builtin arguments currently require compute mode".to_string());
-    }
-    if compute && !sig.returns_unit() {
-        return Err(
-            "spirv compute: explicit compute stages must return unit; results belong in external resources"
-                .to_string(),
-        );
-    }
-    let compute_invocation_extent = if compute {
-        if workgroup_size.contains(&0) || dispatch_grid.contains(&0) {
-            return Err(
-                "spirv compute: workgroup and dispatch dimensions must be nonzero".to_string(),
-            );
-        }
-        [
-            workgroup_size[0]
-                .checked_mul(dispatch_grid[0])
-                .ok_or_else(|| "spirv compute: x invocation extent overflows u32".to_string())?,
-            workgroup_size[1]
-                .checked_mul(dispatch_grid[1])
-                .ok_or_else(|| "spirv compute: y invocation extent overflows u32".to_string())?,
-            workgroup_size[2]
-                .checked_mul(dispatch_grid[2])
-                .ok_or_else(|| "spirv compute: z invocation extent overflows u32".to_string())?,
-        ]
-    } else {
-        [1, 1, 1]
-    };
-    let compute_invocation_count = compute_invocation_extent
-        .into_iter()
-        .try_fold(1u32, |count, extent| count.checked_mul(extent))
-        .ok_or_else(|| "spirv compute: total invocation count overflows u32".to_string())?;
-    let compute_trap_span = compute_invocation_count
-        .checked_mul(4)
-        .ok_or_else(|| "spirv compute: trap channel byte span overflows u32".to_string())?;
-
-    let mut resource_arg_indices = std::collections::HashSet::new();
-    for (position, resource) in external_resources.iter().enumerate() {
-        if resource.group != 0 || resource.binding != position as u32 {
-            return Err(format!(
-                "spirv: external resources must occupy contiguous group 0 bindings in declaration order; resource {} requested @group({}) @binding({})",
-                resource.name, resource.group, resource.binding
-            ));
-        }
-        if resource.length == 0 {
-            return Err(format!(
-                "spirv: external resource {} must have a nonzero length",
-                resource.name
-            ));
-        }
-        let arg_index = resource.arg_index as usize;
-        if arg_index >= sig.args().len() {
-            return Err(format!(
-                "spirv: external resource {} refers to missing kernel arg {}",
-                resource.name, resource.arg_index
-            ));
-        }
-        if !resource_arg_indices.insert(arg_index) {
-            return Err(format!(
-                "spirv: kernel arg {} is rooted by more than one external resource",
-                resource.arg_index
-            ));
-        }
-    }
-
-    // The source ABI keeps every declared resource argument so unused object
-    // references are never mistaken for scalar parameter storage. The physical
-    // shader interface, however, contains only resources that can reach the
-    // selected entry's results or effects. Compact bindings are safe because
-    // the layout preserves each resource's stable name and logical arg index.
-    let live_arguments = analyze_live_arguments(module);
-    let live_mask = live_arguments.get(&first_func).ok_or_else(|| {
-        format!(
-            "spirv: live-argument analysis has no entry for `{}`",
-            sig.name()
-        )
-    })?;
-    let emitted_external_resources = external_resources
-        .iter()
-        .filter(|resource| {
-            live_mask
-                .get(resource.arg_index as usize)
-                .copied()
-                .unwrap_or(true)
-        })
-        .cloned()
-        .enumerate()
-        .map(|(binding, mut resource)| {
-            resource.group = 0;
-            resource.binding = binding as u32;
-            resource
-        })
-        .collect::<Vec<_>>();
-    if trace && emitted_external_resources.len() != external_resources.len() {
-        eprintln!(
-            "sonatina spirv: pruned external resources, entry={}, declared={}, emitted={}, names=[{}]",
-            sig.name(),
-            external_resources.len(),
-            emitted_external_resources.len(),
-            emitted_external_resources
-                .iter()
-                .map(|resource| resource.name.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-    }
-
-    let mut builtin_arg_indices = std::collections::HashSet::new();
-    let mut builtin_sources = std::collections::HashSet::new();
-    for argument in builtin_arguments {
-        let arg_index = argument.arg_index as usize;
-        let Some(&arg_ty) = sig.args().get(arg_index) else {
-            return Err(format!(
-                "spirv compute: builtin {:?} refers to missing kernel arg {}",
-                argument.source, argument.arg_index
-            ));
-        };
-        if resource_arg_indices.contains(&arg_index) {
-            return Err(format!(
-                "spirv compute: kernel arg {} cannot be both an external resource and builtin {:?}",
-                argument.arg_index, argument.source
-            ));
-        }
-        if !builtin_arg_indices.insert(arg_index) {
-            return Err(format!(
-                "spirv compute: kernel arg {} is supplied by more than one builtin",
-                argument.arg_index
-            ));
-        }
-        if !builtin_sources.insert(argument.source) {
-            return Err(format!(
-                "spirv compute: builtin {:?} is mapped more than once",
-                argument.source
-            ));
-        }
-        if compute_builtin_slot(argument.source).is_none() {
-            return Err(format!(
-                "spirv compute: builtin {:?} is not valid for a compute stage",
-                argument.source
-            ));
-        }
-        if arg_ty != sonatina_ir::Type::I32 {
-            return Err(format!(
-                "spirv compute: builtin {:?} requires an i32/u32 carrier at arg {}, got {arg_ty:?}",
-                argument.source, argument.arg_index
-            ));
-        }
-    }
-
-    for (i, &arg_ty) in sig.args().iter().enumerate() {
-        if resource_arg_indices.contains(&i) || builtin_arg_indices.contains(&i) {
-            continue;
-        }
-        if word == WordKind::I64 && arg_ty != sonatina_ir::Type::I64 {
-            return Err(format!(
-                "spirv i64: kernel arg {i} has type {arg_ty:?}; i64 kernels require homogeneous i64 arguments"
-            ));
-        }
-        if !matches!(arg_ty, sonatina_ir::Type::I1 | sonatina_ir::Type::I32 | sonatina_ir::Type::I64 | sonatina_ir::Type::F32) {
-            return Err(format!("spirv: kernel arg {i} has unsupported type {arg_ty:?}"));
-        }
-        if matches!(word, WordKind::U32) && arg_ty == sonatina_ir::Type::I64 {
-            return Err(format!("spirv u32: kernel arg {i} is i64, which requires SHADER_INT64"));
-        }
-        let is_storage_arg = !(grid || render) || i >= 2;
-        if is_storage_arg && arg_ty == sonatina_ir::Type::I1 {
-            return Err(format!(
-                "spirv: kernel arg {i} is i1; boolean storage-buffer arguments are unsupported"
-            ));
-        }
-    }
-    if (grid || render) && sig.args().get(0..2) != Some(&[sonatina_ir::Type::I32, sonatina_ir::Type::I32]) {
-        return Err("spirv grid/render: coordinate args 0 and 1 must both be i32".to_string());
-    }
-
-    let word_width = word.width_bytes();
-
-    let mut naga_mod = naga::Module::default();
-
-    let word_type = naga_mod.types.insert(
-        naga::Type {
-            name: None,
-            inner: naga::TypeInner::Scalar(naga::Scalar {
-                kind: match word {
-                    WordKind::U32 => naga::ScalarKind::Uint,
-                    WordKind::I64 => naga::ScalarKind::Sint,
-                },
-                width: word_width as u8,
-            }),
-        },
-        naga::Span::UNDEFINED,
-    );
-    let f32_type = naga_mod.types.insert(
-        naga::Type {
-            name: None,
-            inner: naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Float,
-                width: 4,
-            }),
-        },
-        naga::Span::UNDEFINED,
-    );
-    let bool_type = naga_mod.types.insert(
-        naga::Type {
-            name: None,
-            inner: naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Bool,
-                width: 1,
-            }),
-        },
-        naga::Span::UNDEFINED,
-    );
-
-    let call_order = reachable_call_postorder(module, first_func)?;
-    let typed_local_types = collect_naga_typed_local_types(
-        module,
-        &call_order,
-        word,
-        word_type,
-        f32_type,
-        bool_type,
-        &mut naga_mod.types,
-    )?;
-
-    // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
-    // fail closed on any signedness-sensitive op (Sar / signed compares / signed
-    // div|mod): Sonatina integers are signless, so u32 is exact for wrapping
-    // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
-    // silently emit the signed WGSL operator.
-    let phase = std::time::Instant::now();
-    let (param_count, has_obj_alloc, has_mem, has_unreachable, mem_heap_bytes) = module
+) -> Result<NagaEntryBodyPlan, String> {
+    let sig = module.ctx.get_sig(first_func)
+        .ok_or_else(|| format!("spirv: entry {first_func:?} has no signature"))?;
+    module
         .func_store
-        .try_view(first_func, |f| -> Result<(usize, bool, bool, bool, u64), String> {
+        .try_view(first_func, |f| -> Result<NagaEntryBodyPlan, String> {
             let pc = f.arg_values.len();
             let is = f.inst_set();
             let mut has_alloc = false;
@@ -8849,9 +8575,319 @@ fn translate_to_naga(
                     ));
                 }
             }
-            Ok((pc, has_alloc, has_mem, has_unreachable, mem_heap_bytes))
+            Ok(NagaEntryBodyPlan {
+                parameter_count: pc,
+                has_object_allocation: has_alloc,
+                uses_arena: has_mem,
+                may_trap: has_unreachable,
+                arena_high_water_bytes: mem_heap_bytes,
+            })
         })
-        .ok_or_else(|| "spirv: first function body is unavailable".to_string())??;
+        .ok_or_else(|| "spirv: first function body is unavailable".to_string())?
+}
+
+
+#[cfg(feature = "spirv-backend")]
+fn translate_to_naga(
+    module: &Module,
+    pipeline: ShaderPipeline,
+    external_resources: &[SpirvExternalResource],
+    builtin_arguments: &[SpirvBuiltinArgument],
+    heap_words: u32,
+) -> Result<(naga::Module, SpirvLayout), String> {
+    use std::collections::HashMap;
+    let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
+    let started = std::time::Instant::now();
+
+    let (first_func, workgroup_size, dispatch_grid) = match pipeline {
+        ShaderPipeline::Raster { vertex, fragment } => {
+            return authored_raster::translate_entries(
+                module, vertex, fragment, external_resources, builtin_arguments,
+            );
+        }
+        ShaderPipeline::Compute { entry, workgroup_size, dispatch_grid } =>
+            (entry, workgroup_size, dispatch_grid),
+        ShaderPipeline::Fullscreen { entry } => (entry, [0, 0, 0], [1, 1, 1]),
+        ShaderPipeline::LegacyScalar { entry, workgroup_size }
+        | ShaderPipeline::LegacyGrid { entry, workgroup_size } =>
+            (entry, workgroup_size, [1, 1, 1]),
+    };
+    // Derived predicates describe one already-selected pipeline. They cannot
+    // represent conflicting modes and do not choose the compilation target.
+    let grid = matches!(pipeline, ShaderPipeline::LegacyGrid { .. });
+    let render = matches!(pipeline, ShaderPipeline::Fullscreen { .. });
+    let compute = matches!(pipeline, ShaderPipeline::Compute { .. });
+    if !module.funcs().contains(&first_func) {
+        return Err(format!("spirv: selected entry {first_func:?} is not defined in this module"));
+    }
+
+    let sig = module
+        .ctx
+        .get_sig(first_func)
+        .ok_or_else(|| "spirv: selected entry has no declared signature".to_string())?;
+
+    let word = match sig.single_ret_ty() {
+        Some(sonatina_ir::Type::I32) => WordKind::U32,
+        Some(sonatina_ir::Type::I64) => WordKind::I64,
+        Some(other) => {
+            return Err(format!(
+                "spirv: unsupported kernel return type {other:?}; only i32 (u32 word) \
+                 and i64 words are supported"
+            ));
+        }
+        None if compute && sig.returns_unit() => WordKind::U32,
+        None => {
+            return Err(
+                "spirv: kernel has no single return value; the word width cannot be derived"
+                    .to_string(),
+            );
+        }
+    };
+
+    if !external_resources.is_empty() && !(compute || render) {
+        return Err(
+            "spirv: external resources require explicit compute or render mode"
+                .to_string(),
+        );
+    }
+    if !builtin_arguments.is_empty() && !compute {
+        return Err("spirv: explicit builtin arguments currently require compute mode".to_string());
+    }
+    if compute && !sig.returns_unit() {
+        return Err(
+            "spirv compute: explicit compute stages must return unit; results belong in external resources"
+                .to_string(),
+        );
+    }
+    let compute_invocation_extent = if compute {
+        if workgroup_size.contains(&0) || dispatch_grid.contains(&0) {
+            return Err(
+                "spirv compute: workgroup and dispatch dimensions must be nonzero".to_string(),
+            );
+        }
+        [
+            workgroup_size[0]
+                .checked_mul(dispatch_grid[0])
+                .ok_or_else(|| "spirv compute: x invocation extent overflows u32".to_string())?,
+            workgroup_size[1]
+                .checked_mul(dispatch_grid[1])
+                .ok_or_else(|| "spirv compute: y invocation extent overflows u32".to_string())?,
+            workgroup_size[2]
+                .checked_mul(dispatch_grid[2])
+                .ok_or_else(|| "spirv compute: z invocation extent overflows u32".to_string())?,
+        ]
+    } else {
+        [1, 1, 1]
+    };
+    let compute_invocation_count = compute_invocation_extent
+        .into_iter()
+        .try_fold(1u32, |count, extent| count.checked_mul(extent))
+        .ok_or_else(|| "spirv compute: total invocation count overflows u32".to_string())?;
+    let compute_trap_span = compute_invocation_count
+        .checked_mul(4)
+        .ok_or_else(|| "spirv compute: trap channel byte span overflows u32".to_string())?;
+
+    let mut resource_arg_indices = std::collections::HashSet::new();
+    for (position, resource) in external_resources.iter().enumerate() {
+        if resource.group != 0 || resource.binding != position as u32 {
+            return Err(format!(
+                "spirv: external resources must occupy contiguous group 0 bindings in declaration order; resource {} requested @group({}) @binding({})",
+                resource.name, resource.group, resource.binding
+            ));
+        }
+        if resource.length == 0 {
+            return Err(format!(
+                "spirv: external resource {} must have a nonzero length",
+                resource.name
+            ));
+        }
+        let arg_index = resource.arg_index as usize;
+        if arg_index >= sig.args().len() {
+            return Err(format!(
+                "spirv: external resource {} refers to missing kernel arg {}",
+                resource.name, resource.arg_index
+            ));
+        }
+        if !resource_arg_indices.insert(arg_index) {
+            return Err(format!(
+                "spirv: kernel arg {} is rooted by more than one external resource",
+                resource.arg_index
+            ));
+        }
+    }
+
+    // The source ABI keeps every declared resource argument so unused object
+    // references are never mistaken for scalar parameter storage. The physical
+    // shader interface, however, contains only resources that can reach the
+    // selected entry's results or effects. Compact bindings are safe because
+    // the layout preserves each resource's stable name and logical arg index.
+    let live_arguments = analyze_live_arguments(module);
+    let live_mask = live_arguments.get(&first_func).ok_or_else(|| {
+        format!(
+            "spirv: live-argument analysis has no entry for `{}`",
+            sig.name()
+        )
+    })?;
+    let emitted_external_resources = external_resources
+        .iter()
+        .filter(|resource| {
+            live_mask
+                .get(resource.arg_index as usize)
+                .copied()
+                .unwrap_or(true)
+        })
+        .cloned()
+        .enumerate()
+        .map(|(binding, mut resource)| {
+            resource.group = 0;
+            resource.binding = binding as u32;
+            resource
+        })
+        .collect::<Vec<_>>();
+    if trace && emitted_external_resources.len() != external_resources.len() {
+        eprintln!(
+            "sonatina spirv: pruned external resources, entry={}, declared={}, emitted={}, names=[{}]",
+            sig.name(),
+            external_resources.len(),
+            emitted_external_resources.len(),
+            emitted_external_resources
+                .iter()
+                .map(|resource| resource.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+
+    let mut builtin_arg_indices = std::collections::HashSet::new();
+    let mut builtin_sources = std::collections::HashSet::new();
+    for argument in builtin_arguments {
+        let arg_index = argument.arg_index as usize;
+        let Some(&arg_ty) = sig.args().get(arg_index) else {
+            return Err(format!(
+                "spirv compute: builtin {:?} refers to missing kernel arg {}",
+                argument.source, argument.arg_index
+            ));
+        };
+        if resource_arg_indices.contains(&arg_index) {
+            return Err(format!(
+                "spirv compute: kernel arg {} cannot be both an external resource and builtin {:?}",
+                argument.arg_index, argument.source
+            ));
+        }
+        if !builtin_arg_indices.insert(arg_index) {
+            return Err(format!(
+                "spirv compute: kernel arg {} is supplied by more than one builtin",
+                argument.arg_index
+            ));
+        }
+        if !builtin_sources.insert(argument.source) {
+            return Err(format!(
+                "spirv compute: builtin {:?} is mapped more than once",
+                argument.source
+            ));
+        }
+        if compute_builtin_slot(argument.source).is_none() {
+            return Err(format!(
+                "spirv compute: builtin {:?} is not valid for a compute stage",
+                argument.source
+            ));
+        }
+        if arg_ty != sonatina_ir::Type::I32 {
+            return Err(format!(
+                "spirv compute: builtin {:?} requires an i32/u32 carrier at arg {}, got {arg_ty:?}",
+                argument.source, argument.arg_index
+            ));
+        }
+    }
+
+    for (i, &arg_ty) in sig.args().iter().enumerate() {
+        if resource_arg_indices.contains(&i) || builtin_arg_indices.contains(&i) {
+            continue;
+        }
+        if word == WordKind::I64 && arg_ty != sonatina_ir::Type::I64 {
+            return Err(format!(
+                "spirv i64: kernel arg {i} has type {arg_ty:?}; i64 kernels require homogeneous i64 arguments"
+            ));
+        }
+        if !matches!(arg_ty, sonatina_ir::Type::I1 | sonatina_ir::Type::I32 | sonatina_ir::Type::I64 | sonatina_ir::Type::F32) {
+            return Err(format!("spirv: kernel arg {i} has unsupported type {arg_ty:?}"));
+        }
+        if matches!(word, WordKind::U32) && arg_ty == sonatina_ir::Type::I64 {
+            return Err(format!("spirv u32: kernel arg {i} is i64, which requires SHADER_INT64"));
+        }
+        let is_storage_arg = !(grid || render) || i >= 2;
+        if is_storage_arg && arg_ty == sonatina_ir::Type::I1 {
+            return Err(format!(
+                "spirv: kernel arg {i} is i1; boolean storage-buffer arguments are unsupported"
+            ));
+        }
+    }
+    if (grid || render) && sig.args().get(0..2) != Some(&[sonatina_ir::Type::I32, sonatina_ir::Type::I32]) {
+        return Err("spirv grid/render: coordinate args 0 and 1 must both be i32".to_string());
+    }
+
+    let word_width = word.width_bytes();
+
+    let mut naga_mod = naga::Module::default();
+
+    let word_type = naga_mod.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: match word {
+                    WordKind::U32 => naga::ScalarKind::Uint,
+                    WordKind::I64 => naga::ScalarKind::Sint,
+                },
+                width: word_width as u8,
+            }),
+        },
+        naga::Span::UNDEFINED,
+    );
+    let f32_type = naga_mod.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Float,
+                width: 4,
+            }),
+        },
+        naga::Span::UNDEFINED,
+    );
+    let bool_type = naga_mod.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Bool,
+                width: 1,
+            }),
+        },
+        naga::Span::UNDEFINED,
+    );
+
+    let call_order = reachable_call_postorder(module, first_func)?;
+    let typed_local_types = collect_naga_typed_local_types(
+        module,
+        &call_order,
+        word,
+        word_type,
+        f32_type,
+        bool_type,
+        &mut naga_mod.types,
+    )?;
+
+    // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
+    // fail closed on any signedness-sensitive op (Sar / signed compares / signed
+    // div|mod): Sonatina integers are signless, so u32 is exact for wrapping
+    // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
+    // silently emit the signed WGSL operator.
+    let phase = std::time::Instant::now();
+    let NagaEntryBodyPlan {
+        parameter_count: param_count,
+        has_object_allocation: has_obj_alloc,
+        uses_arena: has_mem,
+        may_trap: has_unreachable,
+        arena_high_water_bytes: mem_heap_bytes,
+    } = analyze_naga_entry_body(module, first_func, word, heap_words)?;
     if trace {
         eprintln!(
             "sonatina spirv: pre-scan complete, function={}, heap_bytes={}, elapsed_ms={}, total_elapsed_ms={}",
