@@ -263,8 +263,9 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
 
 /// An exhaustion-only block can construct a fallback before joining an early
 /// loop exit. Realize that block on the header's exit edge, not unconditionally
-/// after the loop. Only a single-block corridor with exactly one incoming edge
-/// is admitted here; more general multi-exit loops retain their diagnostics.
+/// after the loop. Other incoming edges may bypass the loop entirely (for
+/// example invalid-input handling). Each such edge still owns its fallback
+/// evaluation and phi transfer. No other edge from inside this loop is admitted.
 pub(crate) fn forwarded_loop_exit(
     function: &Function,
     header: BlockId,
@@ -278,11 +279,21 @@ pub(crate) fn forwarded_loop_exit(
     if in_loop(join) { return None; }
     let mut cfg = ControlFlowGraph::default();
     cfg.compute(function);
-    let mut predecessors = cfg.preds_of(exit);
-    if predecessors.next().copied() != Some(header) || predecessors.next().is_some() {
+    if !cfg.preds_of(exit).any(|pred| *pred == header)
+        || cfg.preds_of(exit).any(|pred| *pred != header && in_loop(*pred))
+    {
         return None;
     }
-    cfg.preds_of(join).any(|pred| *pred != header && in_loop(*pred)).then_some(join)
+    // A successful exit's final constructor need not belong to the loop SCC:
+    // it cannot return to the header. The region emitter includes that block
+    // in its loop body, while LoopTree correctly excludes it. Use dominance
+    // here so both consumers recognize the same join instead of executing
+    // the fallback a second time after a successful break.
+    let mut domtree = DomTree::new();
+    domtree.compute(&cfg);
+    cfg.preds_of(join).any(|pred| {
+        *pred != header && *pred != exit && domtree.dominates(header, *pred)
+    }).then_some(join)
 }
 
 /// A block's classified terminator.
