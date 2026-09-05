@@ -3019,9 +3019,17 @@ fn emit_single_inst(
                 *mem_error = Some("naga: aggregate SSA insertion requires an in-bounds constant index".into());
                 return false;
             };
-            let Some(base) = resolve_naga_value(
-                *insert.dest(), function, word, value_map, phi_locals, func,
-            ) else {
+            let base = if matches!(function.dfg.value(*insert.dest()), sonatina_ir::Value::Undef { .. }) {
+                // Naga has no undefined aggregate value. Choose zero for the
+                // unspecified components, as for its initialized private locals.
+                // Explicitly inserted components always retain their SSA values.
+                Some(func.expressions.append(
+                    naga::Expression::ZeroValue(mapped.handle), naga::Span::UNDEFINED,
+                ))
+            } else {
+                resolve_naga_value(*insert.dest(), function, word, value_map, phi_locals, func)
+            };
+            let Some(base) = base else {
                 *mem_error = Some("naga: aggregate SSA insertion has an unresolved base".into());
                 return false;
             };
@@ -7719,6 +7727,30 @@ fn collect_naga_typed_local_types(
             let mut private_bytes = 0u32;
             let mut private_allocations = Vec::new();
             let closure = verify_naga_typed_local_use_closure(module, function_ref)?;
+            // SSA aggregates need type representations even when no allocation
+            // exists. Interning a value type does not allocate private storage.
+            let value_types = module.func_store.try_view(function_ref, |function| {
+                let mut values = Vec::new();
+                for block in function.layout.iter_block() {
+                    for instruction in function.layout.iter_inst(block) {
+                        for &result in function.dfg.inst_results(instruction) {
+                            let ty = function.dfg.value_ty(result);
+                            if matches!(ty.resolve_compound(function.ctx()),
+                                Some(sonatina_ir::types::CompoundType::Struct(_)
+                                    | sonatina_ir::types::CompoundType::Array { .. }))
+                            {
+                                values.push(ty);
+                            }
+                        }
+                    }
+                }
+                values
+            }).expect("reachable function exists");
+            for ty in value_types {
+                intern_naga_typed_local_type(
+                    module, ty, word, word_type, f32_type, bool_type, types, &mut cache,
+                )?;
+            }
             for ty in closure.borrowed_pointer_types {
                 intern_naga_typed_local_type(
                     module,

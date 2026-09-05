@@ -1537,6 +1537,63 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
 }
 
 #[test]
+fn spirv_constructs_aggregate_ssa_without_allocations() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty = mb.declare_struct_type("SsaPair", &[Type::I32, Type::I32], false);
+    let entry = mb.declare_function(Signature::new_single(
+        "entry", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    )).unwrap();
+    let helper = mb.declare_function(Signature::new_single(
+        "make_pair", Linkage::Private, &[Type::I32], pair_ty,
+    )).unwrap();
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let input = fb.args()[0];
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        let initial = fb.make_undef_value(pair_ty);
+        let first = fb.insert_inst(data::InsertValue::new(is, initial, zero, input), pair_ty);
+        let next = fb.insert_inst(arith::Add::new(is, input, one), Type::I32);
+        let pair = fb.insert_inst(data::InsertValue::new(is, first, one, next), pair_ty);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, pair));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let input = fb.make_imm_value(41i32);
+        let pair = fb.insert_inst(
+            control_flow::Call::new(is, helper, [input].into_iter().collect()), pair_ty,
+        );
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        let left = fb.insert_inst(data::ExtractValue::new(is, pair, zero), Type::I32);
+        let right = fb.insert_inst(data::ExtractValue::new(is, pair, one), Type::I32);
+        let sum = fb.insert_inst(arith::Add::new(is, left, right), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
+        fb.seal_all();
+        fb.finish();
+    }
+    let artifact = SpirvBackend::new().compile_module(&mb.build()).unwrap();
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    let parsed = naga::front::wgsl::parse_str(wgsl).unwrap();
+    let (_, helper) = parsed.functions.iter().find(|(_, function)| {
+        function.name.as_deref().is_some_and(|name| name.contains("make_pair"))
+    }).expect("aggregate constructor stays outlined");
+    assert!(helper.local_variables.is_empty(), "SSA construction must not allocate locals");
+    assert!(!wgsl.contains("fe_heap"));
+    assert_eq!(run_grid_u32(wgsl, 1, 1, 1, 1, &[]), vec![83]);
+}
+
+#[test]
 fn spirv_private_helper_returns_whole_typed_value() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
