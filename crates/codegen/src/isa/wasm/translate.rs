@@ -23,6 +23,7 @@ use sonatina_ir::{
 use super::CanonicalStackMemoryManifest;
 
 use crate::domtree::DomTree;
+use crate::isa::overflow::{OverflowArithmetic, overflow_operands};
 
 fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
     match ty {
@@ -34,30 +35,6 @@ fn sonatina_to_waffle_type(ty: Type) -> Option<WType> {
         Type::Compound(_) => Some(WType::I64),
         _ => None,
     }
-}
-
-#[derive(Clone, Copy)]
-enum OverflowArithmetic { Add, Sub, Mul }
-
-fn overflow_operands(
-    inst_set: &dyn InstSetBase,
-    instruction: &dyn Inst,
-) -> Option<(OverflowArithmetic, bool, ValueId, ValueId)> {
-    use sonatina_ir::inst::arith::{Saddo, Smulo, Ssubo, Uaddo, Umulo, Usubo};
-    macro_rules! recognize {
-        ($kind:ty, $op:ident, $signed:expr) => {
-            if let Some(inst) = <&$kind as InstDowncast>::downcast(inst_set, instruction) {
-                return Some((OverflowArithmetic::$op, $signed, *inst.lhs(), *inst.rhs()));
-            }
-        };
-    }
-    recognize!(Uaddo, Add, false);
-    recognize!(Usubo, Sub, false);
-    recognize!(Umulo, Mul, false);
-    recognize!(Saddo, Add, true);
-    recognize!(Ssubo, Sub, true);
-    recognize!(Smulo, Mul, true);
-    None
 }
 
 /// Preserve both results of unsigned overflow arithmetic. Narrow integers

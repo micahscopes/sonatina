@@ -52,9 +52,7 @@ pub(super) fn translate_module(
         });
         if let Some(result) = translated {
             if let Err(e) = result {
-                // Skip functions with unsupported instructions rather than
-                // failing the whole module. They'll error at call time if needed.
-                eprintln!("[cranelift] skipping function {name}: {e}");
+                return Err(format!("failed to translate function {name}: {e}"));
             }
         }
     }
@@ -737,38 +735,44 @@ fn translate_function(
                         }
                     }
                 }
-            } else if let Some(uaddo) = <&sonatina_ir::inst::arith::Uaddo as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                let lhs = resolve_value(function, *uaddo.lhs(), &value_map, &mut builder)?;
-                let rhs = resolve_value(function, *uaddo.rhs(), &value_map, &mut builder)?;
-                let result_val = builder.ins().iadd(lhs, rhs);
-                let ir_results = function.dfg.inst_results(inst_id);
-                if ir_results.len() >= 1 {
-                    value_map.insert(ir_results[0], result_val);
+            } else if let Some((op, signed, lhs_id, rhs_id)) = crate::isa::overflow::overflow_operands(inst_set, inst_data) {
+                use crate::isa::overflow::OverflowArithmetic;
+                let ty = function.dfg.value_ty(lhs_id);
+                if !matches!(ty, Type::I1 | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128) {
+                    return Err(format!("unsupported native overflow arithmetic type {ty:?}"));
                 }
-                if ir_results.len() >= 2 {
-                    // Overflow: result < lhs (unsigned overflow detection)
-                    let overflow = builder.ins().icmp(IntCC::UnsignedLessThan, result_val, lhs);
-                    value_map.insert(ir_results[1], overflow);
-                }
-            } else if let Some(umulo) = <&sonatina_ir::inst::arith::Umulo as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
-                let lhs = resolve_value(function, *umulo.lhs(), &value_map, &mut builder)?;
-                let rhs = resolve_value(function, *umulo.rhs(), &value_map, &mut builder)?;
-                let result_val = builder.ins().imul(lhs, rhs);
-                let ir_results = function.dfg.inst_results(inst_id);
-                if ir_results.len() >= 1 {
-                    value_map.insert(ir_results[0], result_val);
-                }
-                if ir_results.len() >= 2 {
-                    // Overflow: result/lhs != rhs when lhs != 0; no overflow when lhs == 0
-                    let lhs_ty = builder.func.dfg.value_type(lhs);
-                    let zero = builder.ins().iconst(lhs_ty, 0);
-                    let lhs_nonzero = builder.ins().icmp(IntCC::NotEqual, lhs, zero);
-                    let one = builder.ins().iconst(lhs_ty, 1);
-                    let safe_divisor = builder.ins().select(lhs_nonzero, lhs, one);
-                    let div = builder.ins().udiv(result_val, safe_divisor);
-                    let not_eq = builder.ins().icmp(IntCC::NotEqual, div, rhs);
-                    let overflow = builder.ins().band(not_eq, lhs_nonzero);
-                    value_map.insert(ir_results[1], overflow);
+                let lhs = resolve_value(function, lhs_id, &value_map, &mut builder)?;
+                let rhs = resolve_value(function, rhs_id, &value_map, &mut builder)?;
+                let (value, overflow) = if ty == Type::I1 {
+                    // Cranelift's minimum integer carrier is i8. Compute the
+                    // exact one-bit operation in that carrier, then apply the
+                    // semantic [-1, 0] or [0, 1] range explicitly.
+                    let (lhs, rhs) = if signed {
+                        (builder.ins().ineg(lhs), builder.ins().ineg(rhs))
+                    } else { (lhs, rhs) };
+                    let exact = match op {
+                        OverflowArithmetic::Add => builder.ins().iadd(lhs, rhs),
+                        OverflowArithmetic::Sub => builder.ins().isub(lhs, rhs),
+                        OverflowArithmetic::Mul => builder.ins().imul(lhs, rhs),
+                    };
+                    let below = builder.ins().icmp_imm(IntCC::SignedLessThan, exact, if signed { -1 } else { 0 });
+                    let above = builder.ins().icmp_imm(IntCC::SignedGreaterThan, exact, if signed { 0 } else { 1 });
+                    let overflow = builder.ins().bor(below, above);
+                    (builder.ins().band_imm(exact, 1), overflow)
+                } else if ty == Type::I128 && matches!(op, OverflowArithmetic::Mul) {
+                    i128_overflow_mul(&mut builder, lhs, rhs, signed)
+                } else {
+                    match (op, signed) {
+                        (OverflowArithmetic::Add, false) => builder.ins().uadd_overflow(lhs, rhs),
+                        (OverflowArithmetic::Sub, false) => builder.ins().usub_overflow(lhs, rhs),
+                        (OverflowArithmetic::Mul, false) => builder.ins().umul_overflow(lhs, rhs),
+                        (OverflowArithmetic::Add, true) => builder.ins().sadd_overflow(lhs, rhs),
+                        (OverflowArithmetic::Sub, true) => builder.ins().ssub_overflow(lhs, rhs),
+                        (OverflowArithmetic::Mul, true) => builder.ins().smul_overflow(lhs, rhs),
+                    }
+                };
+                for (result, value) in function.dfg.inst_results(inst_id).iter().zip([value, overflow]) {
+                    value_map.insert(*result, value);
                 }
             } else if let Some(obj_load) = <&sonatina_ir::inst::data::ObjLoad as sonatina_ir::InstDowncast>::downcast(inst_set, inst_data) {
                 let addr = resolve_value(function, *obj_load.object(), &value_map, &mut builder)?;
@@ -1272,11 +1276,14 @@ fn resolve_value(
                     .ins()
                     .f32const(cranelift_codegen::ir::immediates::Ieee32::with_bits(*bits));
                 Ok(val)
-            } else if matches!(imm, Immediate::I256(_) | Immediate::I128(_)) {
-                match imm {
-                    Immediate::I256(i256_val) => Ok(emit_i256_immediate(i256_val, builder)),
-                    _ => Err(format!("unsupported large immediate: {imm:?}")),
-                }
+            } else if let Immediate::I128(bits) = imm {
+                // Preserve both words rather than sign-extending a single
+                // immediate through Cranelift's i64 constant operand.
+                let lo = builder.ins().iconst(clif::types::I64, *bits as i64);
+                let hi = builder.ins().iconst(clif::types::I64, (*bits >> 64) as i64);
+                Ok(builder.ins().iconcat(lo, hi))
+            } else if let Immediate::I256(value) = imm {
+                Ok(emit_i256_immediate(value, builder))
             } else {
                 let clif_ty = sonatina_type_to_clif_or_err(*ty)?;
                 let i64_val = imm_to_i64(imm)?;
@@ -1285,6 +1292,61 @@ fn resolve_value(
             }
         }
         _ => Err(format!("unresolved value v{}", value_id.0)),
+    }
+}
+
+/// Cranelift's overflow multiply stops at i64. Compute the full product
+/// using four 64-bit limb products, preserving the i128 semantic width.
+fn i128_overflow_mul(
+    builder: &mut FunctionBuilder,
+    lhs: clif::Value,
+    rhs: clif::Value,
+    signed: bool,
+) -> (clif::Value, clif::Value) {
+    let negative = if signed {
+        let signs = builder.ins().bxor(lhs, rhs);
+        Some(builder.ins().icmp_imm(IntCC::SignedLessThan, signs, 0))
+    } else { None };
+    let magnitude = |builder: &mut FunctionBuilder, value| {
+        if signed {
+            let is_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, value, 0);
+            let negated = builder.ins().ineg(value);
+            builder.ins().select(is_negative, negated, value)
+        } else { value }
+    };
+    let lhs = magnitude(builder, lhs);
+    let rhs = magnitude(builder, rhs);
+    let (a0, a1) = builder.ins().isplit(lhs);
+    let (b0, b1) = builder.ins().isplit(rhs);
+    let low = builder.ins().imul(a0, b0);
+    let carry = builder.ins().umulhi(a0, b0);
+    let cross0 = builder.ins().imul(a0, b1);
+    let cross0_hi = builder.ins().umulhi(a0, b1);
+    let cross1 = builder.ins().imul(a1, b0);
+    let cross1_hi = builder.ins().umulhi(a1, b0);
+    let (high, carry0) = builder.ins().uadd_overflow(carry, cross0);
+    let (high, carry1) = builder.ins().uadd_overflow(high, cross1);
+    let a1_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, a1, 0);
+    let b1_nonzero = builder.ins().icmp_imm(IntCC::NotEqual, b1, 0);
+    let high_product = builder.ins().band(a1_nonzero, b1_nonzero);
+    let cross_high = builder.ins().bor(cross0_hi, cross1_hi);
+    let cross_overflow = builder.ins().icmp_imm(IntCC::NotEqual, cross_high, 0);
+    let carries = builder.ins().bor(carry0, carry1);
+    let overflow = builder.ins().bor(high_product, cross_overflow);
+    let overflow = builder.ins().bor(overflow, carries);
+    let product = builder.ins().iconcat(low, high);
+    if let Some(negative) = negative {
+        let max_low = builder.ins().iconst(clif::types::I64, -1);
+        let max_high = builder.ins().iconst(clif::types::I64, i64::MAX);
+        let max_positive = builder.ins().iconcat(max_low, max_high);
+        let min_magnitude = builder.ins().iadd_imm(max_positive, 1);
+        let limit = builder.ins().select(negative, min_magnitude, max_positive);
+        let beyond_limit = builder.ins().icmp(IntCC::UnsignedGreaterThan, product, limit);
+        let overflow = builder.ins().bor(overflow, beyond_limit);
+        let negated = builder.ins().ineg(product);
+        (builder.ins().select(negative, negated, product), overflow)
+    } else {
+        (product, overflow)
     }
 }
 
