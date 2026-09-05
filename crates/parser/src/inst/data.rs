@@ -23,6 +23,8 @@ super::impl_inst_build! {ObjLoad, (object: ValueId)}
 super::impl_inst_build! {ObjStore, (object: ValueId, value: ValueId)}
 super::impl_inst_build! {ObjAtomicAdd, (object: ValueId, value: ValueId)}
 super::impl_inst_build! {ObjAtomicUMin, (object: ValueId, value: ValueId)}
+super::impl_inst_build! {ObjAtomicLoad, (object: ValueId)}
+super::impl_inst_build! {ObjAtomicStore, (object: ValueId, value: ValueId)}
 super::impl_inst_build! {ObjInitConst, (object: ValueId, value: ValueId)}
 super::impl_inst_build_common! {EnumMake, build_enum_make}
 super::impl_inst_build! {EnumTag, (value: ValueId)}

@@ -9,7 +9,9 @@ func private %claim(v0.objref<i32>, v1.i32) -> i32 {
     block0:
         v2.i32 = obj.atomic.add v0 v1;
         v3.i32 = obj.atomic.umin v0 v2;
-        return v3;
+        obj.atomic.store v0 v3;
+        v4.i32 = obj.atomic.load v0;
+        return v4;
 }
 "#;
     let config = VerifierConfig::for_level(VerificationLevel::Standard);
@@ -21,6 +23,7 @@ func private %claim(v0.objref<i32>, v1.i32) -> i32 {
         source.replace("v1.i32", "v1.f32"),
         source.replace("v2.i32", "v2.f32"),
         source.replace("v3.i32", "v3.f32"),
+        source.replace("v4.i32", "v4.f32"),
     ] {
         let parsed = parse_module(&invalid).expect("malformed types still parse");
         assert!(!verify_module(&parsed.module, &config).is_ok(), "{invalid}");

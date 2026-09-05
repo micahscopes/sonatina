@@ -231,6 +231,26 @@ pub struct ObjAtomicUMin {
     value: ValueId,
 }
 
+/// Relaxed atomic read of externally synchronized u32 storage. Classified as
+/// an observable state change conservatively: concurrent writes invalidate
+/// local common-subexpression and loop-invariant reasoning even without a
+/// store in this invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(super::SideEffect::Write))]
+#[inst(text = "obj.atomic.load")]
+pub struct ObjAtomicLoad {
+    object: ValueId,
+}
+
+/// Relaxed atomic u32 store; it does not publish unrelated memory writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(super::SideEffect::Write))]
+#[inst(text = "obj.atomic.store")]
+pub struct ObjAtomicStore {
+    object: ValueId,
+    value: ValueId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(side_effect(super::SideEffect::Write))]
 #[inst(text = "obj.init.const")]

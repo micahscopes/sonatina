@@ -1818,33 +1818,50 @@ impl VerifyInst for data::ObjLoad {
 
 /// The IR carrier is signless i32; atomic.umin interprets its bits unsigned.
 /// Physical storage must additionally be atomic-u32, checked by the backend.
-fn verify_atomic_u32_rmw(
+fn verify_atomic_u32_access(
     verifier: &mut FunctionVerifier<'_>,
     inst_id: InstId,
     object: ValueId,
-    value: ValueId,
+    value: Option<ValueId>,
+    returns_value: bool,
 ) {
     let location = verifier.inst_location(inst_id);
     let pointee = verifier.value_ty(object).and_then(|ty| verifier.objref_ty(ty));
-    if pointee != Some(Type::I32) || verifier.value_ty(value) != Some(Type::I32) {
+    if pointee != Some(Type::I32) || value.is_some_and(|value| verifier.value_ty(value) != Some(Type::I32)) {
         verifier.emit(Diagnostic::error(
             DiagnosticCode::InstOperandTypeMismatch,
-            "atomic object RMW requires an i32 object reference and i32 value",
+            "atomic object access requires an i32 object reference and i32 operands",
             location.clone(),
         ));
     }
-    verifier.expect_result_ty(inst_id, Type::I32, location);
+    if returns_value {
+        verifier.expect_result_ty(inst_id, Type::I32, location);
+    } else {
+        verifier.expect_no_result(inst_id, location);
+    }
 }
 
 impl VerifyInst for data::ObjAtomicAdd {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
-        verify_atomic_u32_rmw(verifier, inst_id, *self.object(), *self.value());
+        verify_atomic_u32_access(verifier, inst_id, *self.object(), Some(*self.value()), true);
     }
 }
 
 impl VerifyInst for data::ObjAtomicUMin {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
-        verify_atomic_u32_rmw(verifier, inst_id, *self.object(), *self.value());
+        verify_atomic_u32_access(verifier, inst_id, *self.object(), Some(*self.value()), true);
+    }
+}
+
+impl VerifyInst for data::ObjAtomicLoad {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_atomic_u32_access(verifier, inst_id, *self.object(), None, true);
+    }
+}
+
+impl VerifyInst for data::ObjAtomicStore {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_atomic_u32_access(verifier, inst_id, *self.object(), Some(*self.value()), false);
     }
 }
 

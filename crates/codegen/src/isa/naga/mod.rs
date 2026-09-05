@@ -3157,6 +3157,42 @@ fn emit_single_inst(
                 return true;
             }
         }
+    } else if let Some(load) = <&sonatina_ir::inst::data::ObjAtomicLoad as InstDowncast>::downcast(inst_set, inst_data) {
+        let Some(pointer) = resolve_naga_value(*load.object(), function, word, value_map, phi_locals, func) else {
+            *mem_error = Some("spirv: unresolved atomic object reference".into());
+            return false;
+        };
+        if word != WordKind::U32 || !naga_functions.is_atomic_pointer(pointer, func) {
+            *mem_error = Some("spirv: atomic load requires atomic-u32 storage".into());
+            return false;
+        }
+        let Some(result) = function.dfg.inst_result(inst_id) else {
+            *mem_error = Some("spirv: atomic load requires a result".into());
+            return false;
+        };
+        let loaded = func.expressions.append(naga::Expression::Load { pointer }, naga::Span::UNDEFINED);
+        // Naga otherwise omits unused Load expressions when writing WGSL.
+        // Preserve this IR operation's explicit concurrent observation even
+        // when its value is discarded, just as the optimizer does.
+        func.named_expressions.insert(loaded, "atomic_load".into());
+        target.push(naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)), naga::Span::UNDEFINED);
+        value_map.insert(result, loaded);
+        return true;
+    } else if let Some(store) = <&sonatina_ir::inst::data::ObjAtomicStore as InstDowncast>::downcast(inst_set, inst_data) {
+        let Some(pointer) = resolve_naga_value(*store.object(), function, word, value_map, phi_locals, func) else {
+            *mem_error = Some("spirv: unresolved atomic object reference".into());
+            return false;
+        };
+        if word != WordKind::U32 || !naga_functions.is_atomic_pointer(pointer, func) {
+            *mem_error = Some("spirv: atomic store requires atomic-u32 storage".into());
+            return false;
+        }
+        let Some(value) = resolve_naga_value(*store.value(), function, word, value_map, phi_locals, func) else {
+            *mem_error = Some("spirv: unresolved atomic operand".into());
+            return false;
+        };
+        target.push(naga::Statement::Store { pointer, value }, naga::Span::UNDEFINED);
+        return true;
     } else if let Some((object, value, op)) =
         <&sonatina_ir::inst::data::ObjAtomicAdd as InstDowncast>::downcast(inst_set, inst_data)
             .map(|op| (*op.object(), *op.value(), naga::AtomicFunction::Add))
@@ -3171,6 +3207,10 @@ fn emit_single_inst(
             *mem_error = Some("spirv: unresolved atomic object reference".into());
             return false;
         };
+        if !naga_functions.is_atomic_pointer(pointer, func) {
+            *mem_error = Some("spirv: atomic RMW requires atomic-u32 storage".into());
+            return false;
+        }
         let Some(value) = resolve_naga_value(value, function, word, value_map, phi_locals, func) else {
             *mem_error = Some("spirv: unresolved atomic operand".into());
             return false;
@@ -3189,12 +3229,20 @@ fn emit_single_inst(
     } else if let Some(obj_store) = <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, inst_data) {
         // ObjStore: store value at the pointer (which is an Access expression into the buffer)
         let dest = resolve_naga_value(*obj_store.object(), function, word, value_map, phi_locals, func).unwrap();
+        if naga_functions.is_atomic_pointer(dest, func) {
+            *mem_error = Some("spirv: ordinary store cannot access atomic storage".into());
+            return false;
+        }
         let val = resolve_naga_value(*obj_store.value(), function, word, value_map, phi_locals, func).unwrap();
         target.push(naga::Statement::Store { pointer: dest, value: val }, naga::Span::UNDEFINED);
         return true;
     } else if let Some(obj_load) = <&sonatina_ir::inst::data::ObjLoad as InstDowncast>::downcast(inst_set, inst_data) {
         if let Some(result) = function.dfg.inst_result(inst_id) {
             let ptr = resolve_naga_value(*obj_load.object(), function, word, value_map, phi_locals, func).unwrap();
+            if naga_functions.is_atomic_pointer(ptr, func) {
+                *mem_error = Some("spirv: ordinary load cannot access atomic storage".into());
+                return false;
+            }
             let h = func.expressions.append(
                 naga::Expression::Load { pointer: ptr },
                 naga::Span::UNDEFINED,
@@ -6094,6 +6142,8 @@ fn spirv_instruction_is_lowered(
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAtomicAdd as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAtomicUMin as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjAtomicLoad as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjAtomicStore as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjLoad as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjIndex as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjProj as InstDowncast>::downcast(is, inst).is_some()
@@ -6205,6 +6255,7 @@ const MAX_WGSL_FUNCTION_PARAMETERS: usize = 255;
 #[cfg(feature = "spirv-backend")]
 #[derive(Default)]
 struct NagaFunctionMap {
+    atomic_globals: std::collections::HashSet<naga::Handle<naga::GlobalVariable>>,
     call_sites:
         std::collections::HashMap<sonatina_ir::InstId, NagaFunctionInfo>,
     typed_local_types:
@@ -6226,6 +6277,30 @@ impl NagaFunctionMap {
         Self {
             call_sites: std::collections::HashMap::new(),
             typed_local_types,
+            atomic_globals: Default::default(),
+        }
+    }
+
+    fn set_atomic_resources(
+        &mut self,
+        resources: &[SpirvExternalResource],
+        roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
+    ) {
+        self.atomic_globals = roots.iter().filter_map(|&(argument, global)| {
+            resources.iter().any(|resource| resource.arg_index == argument
+                && resource.element == SpirvResourceElement::AtomicU32).then_some(global)
+        }).collect();
+    }
+
+    // Resource helpers capture the same physical globals as their caller.
+    // Follow projections, never infer atomic access from the four-byte carrier.
+    fn is_atomic_pointer(&self, mut pointer: naga::Handle<naga::Expression>, function: &naga::Function) -> bool {
+        loop {
+            match function.expressions[pointer] {
+                naga::Expression::GlobalVariable(global) => return self.atomic_globals.contains(&global),
+                naga::Expression::Access { base, .. } | naga::Expression::AccessIndex { base, .. } => pointer = base,
+                _ => return false,
+            }
         }
     }
 
@@ -9386,6 +9461,7 @@ fn translate_to_naga(
         private_heap_type,
         needs_trap_channel,
     } = helpers.into_complete()?;
+    naga_functions.set_atomic_resources(&emitted_external_resources, &external_roots);
     let mut lowered_variants = std::collections::HashMap::<
         NagaFunctionVariant,
         NagaFunctionInfo,

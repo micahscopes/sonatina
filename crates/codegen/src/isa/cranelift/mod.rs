@@ -98,6 +98,8 @@ impl Backend for CraneliftBackend {
                     let inst = body.dfg.inst(id);
                     <&data::ObjAtomicAdd as InstDowncast>::downcast(body.inst_set(), inst).is_some()
                         || <&data::ObjAtomicUMin as InstDowncast>::downcast(body.inst_set(), inst).is_some()
+                        || <&data::ObjAtomicLoad as InstDowncast>::downcast(body.inst_set(), inst).is_some()
+                        || <&data::ObjAtomicStore as InstDowncast>::downcast(body.inst_set(), inst).is_some()
                 }))
             });
             if has_atomics {

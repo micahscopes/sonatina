@@ -96,6 +96,8 @@ pub struct NativeInstSet(
     data::ObjStore,
     data::ObjAtomicAdd,
     data::ObjAtomicUMin,
+    data::ObjAtomicLoad,
+    data::ObjAtomicStore,
     data::ObjInitConst,
     data::EnumMake,
     data::EnumTag,

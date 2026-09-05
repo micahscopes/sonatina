@@ -103,6 +103,8 @@ define_inst_set_base! {
         data::ObjStore,
         data::ObjAtomicAdd,
         data::ObjAtomicUMin,
+        data::ObjAtomicLoad,
+        data::ObjAtomicStore,
         data::ObjInitConst,
         data::EnumMake,
         data::EnumTag,
