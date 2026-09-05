@@ -25,6 +25,69 @@ use super::{
 const PHYSICAL_VERTEX_ENTRY: &str = "fe_vertex_main";
 const PHYSICAL_FRAGMENT_ENTRY: &str = "fe_fragment_main";
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raster_helper_preparation_preserves_independent_plans_without_emission() {
+        // Exercise paired-root helper preparation, not the vertex/fragment
+        // interface contract, which translate_entries validates separately.
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+func public %vertex() -> i32 {
+    block0:
+        v0.i32 = call %ancestor;
+        return v0;
+}
+func public %fragment() -> i32 {
+    block0:
+        v0.i32 = call %sibling;
+        return v0;
+}
+func private %ancestor() -> i32 {
+    block0:
+        v0.i256 = call %bad;
+        return 0.i32;
+}
+func private %bad() -> i256 {
+    block0:
+        v0.i32 = call %leaf;
+        return 0.i256;
+}
+func private %leaf() -> i32 {
+    block0:
+        return 17.i32;
+}
+func private %sibling() -> i32 {
+    block0:
+        return 23.i32;
+}
+"#).expect("raster helper fixture parses");
+        let module = &parsed.module;
+        let find = |name| module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == name)
+        }).unwrap();
+        let roots = [find("vertex"), find("fragment")];
+        let mut output = naga::Module::default();
+        let word = scalar_type(&mut output, naga::ScalarKind::Uint, 4);
+        let float = scalar_type(&mut output, naga::ScalarKind::Float, 4);
+        let boolean = scalar_type(&mut output, naga::ScalarKind::Bool, 1);
+        let prepared = prepare_scalar_helpers(
+            module, &roots, &mut output.types, word, float, boolean,
+        ).expect("preparation reports rejected helpers");
+        let rejected = prepared.report.rejections.iter().map(|(f, _)| *f).collect::<Vec<_>>();
+        assert_eq!(rejected, vec![find("bad"), find("ancestor")]);
+        let planned = prepared.report.plans.iter().map(|plan| plan.variant.function).collect::<Vec<_>>();
+        assert_eq!(planned, vec![find("leaf"), find("sibling")]);
+        assert!(output.functions.is_empty());
+        assert!(output.entry_points.is_empty());
+        assert!(prepared.report.into_complete().is_err());
+        assert!(append_scalar_helpers(module, &roots, &mut output, word, float, boolean).is_err());
+        assert!(output.functions.is_empty(), "partial plans must not emit even a valid prefix");
+    }
+}
+
 pub(super) fn translate_entries(
     module: &Module,
     vertex_ref: sonatina_ir::module::FuncRef,
@@ -412,23 +475,21 @@ pub(super) fn translate_entries(
 /// booleans, u32/f32 scalars, flattened multi-results, and no memory effects.
 /// The compiler rejects every wider shape rather than silently inlining it in
 /// the backend or smuggling state through a generated global.
-fn append_scalar_helpers(
+struct PreparedRasterHelpers {
+    functions: NagaFunctionMap,
+    resources: NagaResourceCapabilities,
+    logical_results: super::NagaLogicalResultAbis,
+    report: super::helper_plan::HelperAbiReport,
+}
+
+fn prepare_scalar_helpers(
     module: &Module,
     roots: &[sonatina_ir::module::FuncRef],
-    naga_module: &mut naga::Module,
+    types: &mut naga::UniqueArena<naga::Type>,
     u32_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
-) -> Result<
-    (
-        NagaFunctionMap,
-        HashMap<
-            sonatina_ir::module::FuncRef,
-            HashMap<sonatina_ir::InstId, NagaFunctionInfo>,
-        >,
-    ),
-    String,
-> {
+) -> Result<PreparedRasterHelpers, String> {
     use sonatina_ir::InstDowncast;
 
     let root_set = roots.iter().copied().collect::<std::collections::HashSet<_>>();
@@ -446,78 +507,131 @@ fn append_scalar_helpers(
     let mut resource_bindings = super::NagaResourceVariantBindings::new();
     let mut memory_abis = HashMap::new();
     let mut live_arguments = super::NagaLiveArguments::default();
+    let mut rejections = Vec::new();
     for &function_ref in call_order.iter().filter(|function| !root_set.contains(function)) {
-        let signature = module
-            .ctx
-            .get_sig(function_ref)
-            .ok_or_else(|| format!("spirv raster: helper {function_ref:?} has no signature"))?;
-        if !signature.args().iter().copied().all(scalar)
-            || !signature.ret_tys().iter().copied().all(scalar)
-        {
-            return Err(format!(
-                "spirv raster: helper `{}` crosses the scalar helper ABI with {:?} -> {:?}; fail closed",
-                signature.name(),
-                signature.args(),
-                signature.ret_tys(),
-            ));
-        }
-        module
-            .func_store
-            .try_view(function_ref, |function| -> Result<(), String> {
-                for block in function.layout.iter_block() {
-                    for instruction in function.layout.iter_inst(block) {
-                        let data = function.dfg.inst(instruction);
-                        if data.declared_effect_hint().has_memory_effect()
-                            && function.dfg.call_info(instruction).is_none()
-                        {
-                            return Err(format!(
-                                "spirv raster: helper `{}` has memory effect `{}` outside the scalar helper ABI; fail closed",
-                                signature.name(),
-                                data.as_text(),
-                            ));
-                        }
-                        if function
-                            .dfg
-                            .inst_results(instruction)
-                            .iter()
-                            .copied()
-                            .any(|value| !scalar(function.dfg.value_ty(value)))
-                            || data
-                                .collect_values()
-                                .into_iter()
+        let outcome = (|| -> Result<(), String> {
+            let signature = module
+                .ctx
+                .get_sig(function_ref)
+                .ok_or_else(|| format!("spirv raster: helper {function_ref:?} has no signature"))?;
+            if !signature.args().iter().copied().all(scalar)
+                || !signature.ret_tys().iter().copied().all(scalar)
+            {
+                return Err(format!(
+                    "spirv raster: helper `{}` crosses the scalar helper ABI with {:?} -> {:?}; fail closed",
+                    signature.name(),
+                    signature.args(),
+                    signature.ret_tys(),
+                ));
+            }
+            module
+                .func_store
+                .try_view(function_ref, |function| -> Result<(), String> {
+                    for block in function.layout.iter_block() {
+                        for instruction in function.layout.iter_inst(block) {
+                            let data = function.dfg.inst(instruction);
+                            if data.declared_effect_hint().has_memory_effect()
+                                && function.dfg.call_info(instruction).is_none()
+                            {
+                                return Err(format!(
+                                    "spirv raster: helper `{}` has memory effect `{}` outside the scalar helper ABI; fail closed",
+                                    signature.name(),
+                                    data.as_text(),
+                                ));
+                            }
+                            if function
+                                .dfg
+                                .inst_results(instruction)
+                                .iter()
+                                .copied()
                                 .any(|value| !scalar(function.dfg.value_ty(value)))
-                        {
-                            return Err(format!(
-                                "spirv raster: helper `{}` contains a non-scalar value outside the scalar helper ABI; fail closed",
-                                signature.name(),
-                            ));
-                        }
-                        if <&sonatina_ir::inst::control_flow::CallIndirect as InstDowncast>::downcast(
-                            function.inst_set(),
-                            data,
-                        )
-                        .is_some()
-                        {
-                            return Err(format!(
-                                "spirv raster: helper `{}` contains an indirect call; fail closed",
-                                signature.name(),
-                            ));
+                                || data
+                                    .collect_values()
+                                    .into_iter()
+                                    .any(|value| !scalar(function.dfg.value_ty(value)))
+                            {
+                                return Err(format!(
+                                    "spirv raster: helper `{}` contains a non-scalar value outside the scalar helper ABI; fail closed",
+                                    signature.name(),
+                                ));
+                            }
+                            if <&sonatina_ir::inst::control_flow::CallIndirect as InstDowncast>::downcast(
+                                function.inst_set(),
+                                data,
+                            )
+                            .is_some()
+                            {
+                                return Err(format!(
+                                    "spirv raster: helper `{}` contains an indirect call; fail closed",
+                                    signature.name(),
+                                ));
+                            }
                         }
                     }
-                }
-                Ok(())
-            })
-            .ok_or_else(|| {
-                format!("spirv raster: helper `{}` has no body", signature.name())
-            })??;
-        // This validated context has no resource or memory transport and
-        // retains every scalar argument. It supplies facts to the common ABI
-        // planner rather than constructing a separate physical convention.
-        resource_bindings.insert(function_ref, vec![vec![None; signature.args().len()]]);
-        memory_abis.insert(function_ref, NagaMemoryAbi::default());
-        live_arguments.insert(function_ref, vec![true; signature.args().len()]);
+                    Ok(())
+                })
+                .ok_or_else(|| {
+                    format!("spirv raster: helper `{}` has no body", signature.name())
+                })??;
+            // This validated context has no resource or memory transport and
+            // retains every scalar argument. It supplies facts to the common ABI
+            // planner rather than constructing a separate physical convention.
+            resource_bindings.insert(function_ref, vec![vec![None; signature.args().len()]]);
+            memory_abis.insert(function_ref, NagaMemoryAbi::default());
+            live_arguments.insert(function_ref, vec![true; signature.args().len()]);
+            Ok(())
+        })();
+        if let Err(error) = outcome {
+            rejections.push((function_ref, error));
+        }
     }
 
+    let resource_capabilities = NagaResourceCapabilities::new();
+    let logical_results = super::helper_naga_logical_result_abis(
+        module, &call_order, roots, &resource_capabilities,
+    ).into_complete()?;
+    let naga_functions = NagaFunctionMap::new();
+    let plans = super::helper_plan::plan_helper_abis(
+        module,
+        &call_order,
+        roots,
+        WordKind::U32,
+        u32_type,
+        f32_type,
+        bool_type,
+        &resource_capabilities,
+        &logical_results,
+        &resource_bindings,
+        &memory_abis,
+        NagaMemoryAbiTypes::default(),
+        &live_arguments,
+        &naga_functions,
+        &rejections,
+        types,
+    );
+    Ok(PreparedRasterHelpers {
+        functions: naga_functions, resources: resource_capabilities,
+        logical_results, report: plans,
+    })
+}
+
+fn append_scalar_helpers(
+    module: &Module,
+    roots: &[sonatina_ir::module::FuncRef],
+    naga_module: &mut naga::Module,
+    u32_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+) -> Result<
+    (
+        NagaFunctionMap,
+        HashMap<
+            sonatina_ir::module::FuncRef,
+            HashMap<sonatina_ir::InstId, NagaFunctionInfo>,
+        >,
+    ),
+    String,
+> {
     fn call_sites(
         module: &Module,
         functions: impl IntoIterator<Item = sonatina_ir::module::FuncRef>,
@@ -551,29 +665,11 @@ fn append_scalar_helpers(
         Ok(sites)
     }
 
-    let resource_capabilities = NagaResourceCapabilities::new();
-    let logical_results = super::helper_naga_logical_result_abis(
-        module, &call_order, roots, &resource_capabilities,
-    ).into_complete()?;
-    let mut naga_functions = NagaFunctionMap::new();
-    let plans = super::helper_plan::plan_helper_abis(
-        module,
-        &call_order,
-        roots,
-        WordKind::U32,
-        u32_type,
-        f32_type,
-        bool_type,
-        &resource_capabilities,
-        &logical_results,
-        &resource_bindings,
-        &memory_abis,
-        NagaMemoryAbiTypes::default(),
-        &live_arguments,
-        &naga_functions,
-        &[],
-        &mut naga_module.types,
-    ).into_complete()?;
+    let PreparedRasterHelpers {
+        functions: mut naga_functions, resources: resource_capabilities,
+        logical_results, report,
+    } = prepare_scalar_helpers(module, roots, &mut naga_module.types, u32_type, f32_type, bool_type)?;
+    let plans = report.into_complete()?;
     let mut lowered = HashMap::<sonatina_ir::module::FuncRef, NagaFunctionInfo>::new();
     for super::helper_plan::PlannedHelperAbi {
         variant,
