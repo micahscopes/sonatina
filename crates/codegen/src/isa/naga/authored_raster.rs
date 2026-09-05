@@ -86,15 +86,66 @@ func private %sibling() -> i32 {
         assert!(append_scalar_helpers(module, &roots, &mut output, word, float, boolean).is_err());
         assert!(output.functions.is_empty(), "partial plans must not emit even a valid prefix");
     }
+
+    #[test]
+    fn raster_entry_preparation_preserves_state_and_checks_pairing() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+func public %vertex(v0.i32, v1.f32, v2.i32) -> (f32, f32, f32, f32, f32) {
+    block0:
+        return (v1, 0x00000000.f32, 0x00000000.f32, 0x3f800000.f32, v1);
+}
+func public %fragment(v0.f32, v1.f32, v2.i32) -> i32 {
+    block0:
+        return v2;
+}
+func public %mismatch(v0.f32, v1.i32, v2.f32) -> i32 {
+    block0:
+        return v1;
+}
+"#).expect("paired-entry fixture parses");
+        let module = &parsed.module;
+        let find = |name| module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == name)
+        }).unwrap();
+        let vertex = find("vertex");
+        let fragment = find("fragment");
+        let prepared = prepare_raster_entries(module, vertex, fragment, &[], &[])
+            .expect("paired entry preparation");
+        assert_eq!(prepared.context_count, 1);
+        assert_eq!(prepared.varying_count, 1);
+        assert_eq!(prepared.scalar_state, vec![(0, Type::F32), (1, Type::I32)]);
+        assert_eq!(prepared.state_stages, vec![SpirvShaderStage::Vertex, SpirvShaderStage::Fragment]);
+        assert_eq!(prepared.builtin_arguments[0].source, SpirvBuiltinSource::VertexIndex);
+        assert!(prepared.emitted_external_resources.is_empty());
+        assert!(prepare_raster_entries(module, vertex, vertex, &[], &[])
+            .err().unwrap().contains("must be distinct"));
+        assert!(prepare_raster_entries(module, vertex, find("mismatch"), &[], &[])
+            .err().unwrap().contains("actor-state suffixes differ"));
+        assert!(prepare_raster_entries(module, vertex, fragment, &[], &[SpirvBuiltinArgument {
+            arg_index: 0, source: SpirvBuiltinSource::InstanceIndex,
+        }]).err().unwrap().contains("builtin context"));
+    }
 }
 
-pub(super) fn translate_entries(
+struct RasterEntryPreparation {
+    pipeline: SpirvRasterPipeline,
+    builtin_arguments: Vec<SpirvBuiltinArgument>,
+    context_count: usize,
+    varying_count: usize,
+    scalar_state: Vec<(usize, Type)>,
+    state_stages: Vec<SpirvShaderStage>,
+    emitted_external_resources: Vec<SpirvExternalResource>,
+    external_resource_stages: Vec<Vec<SpirvShaderStage>>,
+}
+
+fn prepare_raster_entries(
     module: &Module,
     vertex_ref: sonatina_ir::module::FuncRef,
     fragment_ref: sonatina_ir::module::FuncRef,
     external_resources: &[SpirvExternalResource],
     builtin_arguments: &[SpirvBuiltinArgument],
-) -> Result<(naga::Module, SpirvLayout), String> {
+) -> Result<RasterEntryPreparation, String> {
     if vertex_ref == fragment_ref {
         return Err("spirv raster: vertex and fragment entries must be distinct".to_string());
     }
@@ -110,7 +161,7 @@ pub(super) fn translate_entries(
         .ok_or_else(|| "spirv raster: fragment entry has no signature".to_string())?;
     // Names are diagnostic and emitted-symbol metadata only. Stage identity was
     // selected and checked above using the module's function handles.
-    let pipeline = &SpirvRasterPipeline {
+    let pipeline = SpirvRasterPipeline {
         vertex_entry: vertex_sig.name().to_owned(),
         fragment_entry: fragment_sig.name().to_owned(),
     };
@@ -360,6 +411,27 @@ pub(super) fn translate_entries(
             Ok(())
         }).ok_or_else(|| format!("spirv raster: {stage} body is unavailable"))??;
     }
+    Ok(RasterEntryPreparation {
+        pipeline, context_count, varying_count, scalar_state, state_stages,
+        emitted_external_resources, external_resource_stages,
+        builtin_arguments: builtin_arguments.to_vec(),
+    })
+}
+
+pub(super) fn translate_entries(
+    module: &Module,
+    vertex_ref: sonatina_ir::module::FuncRef,
+    fragment_ref: sonatina_ir::module::FuncRef,
+    external_resources: &[SpirvExternalResource],
+    builtin_arguments: &[SpirvBuiltinArgument],
+) -> Result<(naga::Module, SpirvLayout), String> {
+    let RasterEntryPreparation {
+        pipeline, context_count, varying_count, scalar_state, state_stages,
+        emitted_external_resources, external_resource_stages,
+        builtin_arguments,
+    } = prepare_raster_entries(module, vertex_ref, fragment_ref, external_resources, builtin_arguments)?;
+    let pipeline = &pipeline;
+    let builtin_arguments = builtin_arguments.as_slice();
 
     let mut naga_mod = naga::Module::default();
     let u32_type = scalar_type(&mut naga_mod, naga::ScalarKind::Uint, 4);
