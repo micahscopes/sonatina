@@ -293,6 +293,10 @@ pub(crate) fn forwarded_loop_exit(
     domtree.compute(&cfg);
     cfg.preds_of(join).any(|pred| {
         *pred != header && *pred != exit && domtree.dominates(header, *pred)
+            // A subsequent loop's latch is not an early exit of this loop.
+            // Its join dominates it; forwarding would strand preheader values
+            // inside the preceding loop's exit arm.
+            && !domtree.dominates(join, *pred)
     }).then_some(join)
 }
 
