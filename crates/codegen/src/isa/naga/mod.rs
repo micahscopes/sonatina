@@ -8881,13 +8881,14 @@ fn translate_to_naga(
     // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
     // silently emit the signed WGSL operator.
     let phase = std::time::Instant::now();
+    let entry_body_plan = analyze_naga_entry_body(module, first_func, word, heap_words)?;
     let NagaEntryBodyPlan {
         parameter_count: param_count,
         has_object_allocation: has_obj_alloc,
         uses_arena: has_mem,
         may_trap: has_unreachable,
         arena_high_water_bytes: mem_heap_bytes,
-    } = analyze_naga_entry_body(module, first_func, word, heap_words)?;
+    } = entry_body_plan;
     if trace {
         eprintln!(
             "sonatina spirv: pre-scan complete, function={}, heap_bytes={}, elapsed_ms={}, total_elapsed_ms={}",
@@ -8933,12 +8934,7 @@ fn translate_to_naga(
         word_type,
         f32_type,
     )?;
-    let helper_plan::EntryHelperContext {
-        resources: helper_resource_capabilities,
-        logical_results: helper_logical_result_abis,
-        variants: helper_resource_variants,
-        memory: helper_memory_abis,
-    } = helper_plan::EntryHelperContext::derive(
+    let helper_context = helper_plan::EntryHelperContext::derive(
         module,
         &call_order,
         first_func,
@@ -8946,89 +8942,21 @@ fn translate_to_naga(
         &live_arguments,
         has_mem,
     )?;
-    let helper_memory = helper_memory_abis.values().any(|abi| abi.heap);
-    let helper_trap = helper_memory_abis.values().any(|abi| abi.trap);
-    let needs_trap_channel = has_mem || has_unreachable || helper_trap;
-    let private_heap_type = if has_mem {
-        let heap_len = std::num::NonZeroU32::new(private_heap_words)
-            .ok_or_else(|| "spirv: derived private heap must be nonzero".to_string())?;
-        Some(naga_mod.types.insert(
-            naga::Type {
-                name: Some("FeHeap".into()),
-                inner: naga::TypeInner::Array {
-                    base: word_type,
-                    size: naga::ArraySize::Constant(heap_len),
-                    stride: 4,
-                },
-            },
-            naga::Span::UNDEFINED,
-        ))
-    } else {
-        None
-    };
-    let helper_memory_types = NagaMemoryAbiTypes {
-        heap: if helper_memory {
-            Some(naga_mod.types.insert(
-                naga::Type {
-                    name: None,
-                    inner: naga::TypeInner::Pointer {
-                        base: private_heap_type.expect("helper memory requires an entry heap"),
-                        space: naga::AddressSpace::Function,
-                    },
-                },
-                naga::Span::UNDEFINED,
-            ))
-        } else {
-            None
+    let helper_plan::PreparedEntryHelpers {
+        context: helper_plan::EntryHelperContext {
+            resources: helper_resource_capabilities,
+            logical_results: helper_logical_result_abis,
+            variants: helper_resource_variants,
+            memory: _,
         },
-        word: if helper_memory {
-            Some(naga_mod.types.insert(
-                naga::Type {
-                    name: None,
-                    inner: naga::TypeInner::Pointer {
-                        base: word_type,
-                        space: naga::AddressSpace::Function,
-                    },
-                },
-                naga::Span::UNDEFINED,
-            ))
-        } else {
-            None
-        },
-        trap: if helper_trap {
-            Some(naga_mod.types.insert(
-                naga::Type {
-                    name: None,
-                    inner: naga::TypeInner::Pointer {
-                        base: bool_type,
-                        space: naga::AddressSpace::Function,
-                    },
-                },
-                naga::Span::UNDEFINED,
-            ))
-        } else {
-            None
-        },
-    };
-
-    let mut naga_functions =
-        NagaFunctionMap::with_typed_local_types(typed_local_types);
-    let helper_plans = helper_plan::plan_helper_abis(
-        module,
-        &call_order,
-        &[first_func],
-        word,
-        word_type,
-        f32_type,
-        bool_type,
-        &helper_resource_capabilities,
-        &helper_logical_result_abis,
-        &helper_resource_variants.bindings,
-        &helper_memory_abis,
-        helper_memory_types,
-        &live_arguments,
-        &naga_functions,
-        &mut naga_mod.types,
+        plans: helper_plans,
+        functions: mut naga_functions,
+        private_heap_type,
+        needs_trap_channel,
+    } = helper_plan::prepare_entry_helpers(
+        module, &call_order, first_func, word, word_type, f32_type, bool_type,
+        helper_context, &entry_body_plan, private_heap_words, &live_arguments,
+        typed_local_types, &mut naga_mod.types,
     )?;
     let mut lowered_variants = std::collections::HashMap::<
         NagaFunctionVariant,

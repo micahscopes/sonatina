@@ -71,6 +71,124 @@ impl EntryHelperContext {
     }
 }
 
+
+pub(super) struct PreparedEntryHelpers {
+    pub context: EntryHelperContext,
+    pub plans: Vec<PlannedHelperAbi>,
+    pub functions: NagaFunctionMap,
+    pub private_heap_type: Option<naga::Handle<naga::Type>>,
+    pub needs_trap_channel: bool,
+}
+
+/// Prepare memory transport and physical helper ABIs together. No instruction
+/// bodies or shader writers run here; emission consumes this derived result.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_entry_helpers(
+    module: &Module,
+    call_order: &[FuncRef],
+    first_func: FuncRef,
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    context: EntryHelperContext,
+    entry: &super::NagaEntryBodyPlan,
+    private_heap_words: u32,
+    live_arguments: &NagaLiveArguments,
+    typed_local_types: HashMap<sonatina_ir::Type, super::NagaTypedLocalType>,
+    types: &mut naga::UniqueArena<naga::Type>,
+) -> Result<PreparedEntryHelpers, String> {
+    let helper_memory = context.memory.values().any(|abi| abi.heap);
+    let helper_trap = context.memory.values().any(|abi| abi.trap);
+    let needs_trap_channel = entry.uses_arena || entry.may_trap || helper_trap;
+    let private_heap_type = if entry.uses_arena {
+        let heap_len = std::num::NonZeroU32::new(private_heap_words)
+            .ok_or_else(|| "spirv: derived private heap must be nonzero".to_string())?;
+        Some(types.insert(
+            naga::Type {
+                name: Some("FeHeap".into()),
+                inner: naga::TypeInner::Array {
+                    base: word_type,
+                    size: naga::ArraySize::Constant(heap_len),
+                    stride: 4,
+                },
+            },
+            naga::Span::UNDEFINED,
+        ))
+    } else {
+        None
+    };
+    let helper_memory_types = NagaMemoryAbiTypes {
+        heap: if helper_memory {
+            Some(types.insert(
+                naga::Type {
+                    name: None,
+                    inner: naga::TypeInner::Pointer {
+                        base: private_heap_type.expect("helper memory requires an entry heap"),
+                        space: naga::AddressSpace::Function,
+                    },
+                },
+                naga::Span::UNDEFINED,
+            ))
+        } else {
+            None
+        },
+        word: if helper_memory {
+            Some(types.insert(
+                naga::Type {
+                    name: None,
+                    inner: naga::TypeInner::Pointer {
+                        base: word_type,
+                        space: naga::AddressSpace::Function,
+                    },
+                },
+                naga::Span::UNDEFINED,
+            ))
+        } else {
+            None
+        },
+        trap: if helper_trap {
+            Some(types.insert(
+                naga::Type {
+                    name: None,
+                    inner: naga::TypeInner::Pointer {
+                        base: bool_type,
+                        space: naga::AddressSpace::Function,
+                    },
+                },
+                naga::Span::UNDEFINED,
+            ))
+        } else {
+            None
+        },
+    };
+
+    let naga_functions =
+        NagaFunctionMap::with_typed_local_types(typed_local_types);
+    let helper_plans = plan_helper_abis(
+        module,
+        call_order,
+        &[first_func],
+        word,
+        word_type,
+        f32_type,
+        bool_type,
+        &context.resources,
+        &context.logical_results,
+        &context.variants.bindings,
+        &context.memory,
+        helper_memory_types,
+        live_arguments,
+        &naga_functions,
+        types,
+    )?;
+
+    Ok(PreparedEntryHelpers {
+        context, plans: helper_plans, functions: naga_functions,
+        private_heap_type, needs_trap_channel,
+    })
+}
+
 /// Instruction/control-flow eligibility only, not a complete callable ABI.
 /// Resource identity, types, argument packing, and transitive memory transport
 /// still require the contextual planner. Recompute after changing the module.
