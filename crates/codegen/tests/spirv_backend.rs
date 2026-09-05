@@ -1,4 +1,5 @@
 use sonatina_codegen::Backend;
+use sonatina_codegen::isa::naga::NagaBackend;
 use sonatina_codegen::isa::spirv::{
     Access, LayoutMode, Role, SpirvBackend, SpirvBindingMember, SpirvBuiltinArgument,
     SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout,
@@ -196,7 +197,7 @@ fn spirv_explicit_entry_ignores_declaration_order() {
         fb.finish();
     }
     let module = mb.build();
-    for backend in [SpirvBackend::new(), SpirvBackend::new().with_render()] {
+    for backend in [NagaBackend::new(), NagaBackend::new().with_render()] {
         let artifact = backend.compile_entry(&module, selected)
             .expect("the explicitly selected entry must supply both signature and body");
         assert_eq!(artifact.layout.word, WordKind::U32);

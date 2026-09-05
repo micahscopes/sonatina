@@ -1,7 +1,8 @@
-//! SPIR-V backend: Sonatina IR → SPIR-V compute shader modules via Naga.
+//! Naga backend: Sonatina IR to shader modules.
 //!
 //! Translates Sonatina IR to Naga's expression DAG + statement tree IR,
-//! then Naga emits SPIR-V. Optionally produces WGSL for debugging.
+//! then emits SPIR-V and browser WGSL from that validated representation.
+//! The historical `spirv-backend` feature name is retained during migration.
 
 use sonatina_ir::Module;
 
@@ -285,7 +286,7 @@ pub struct SpirvRasterPipeline {
     pub fragment_entry: String,
 }
 
-pub struct SpirvArtifact {
+pub struct ShaderArtifact {
     pub words: Vec<u32>,
     /// WGSL source for wgpu execution (available when spirv-backend feature is on)
     pub wgsl: Option<String>,
@@ -295,13 +296,13 @@ pub struct SpirvArtifact {
     pub layout: SpirvLayout,
 }
 
-impl SpirvArtifact {
+impl ShaderArtifact {
     pub fn as_bytes(&self) -> Vec<u8> {
         self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 }
 
-pub struct SpirvBackend {
+pub struct NagaBackend {
     pub workgroup_size: [u32; 3],
     /// Fixed dispatch grid in workgroups. Explicit compute uses this together
     /// with `workgroup_size` to size compiler-owned per-invocation channels.
@@ -348,7 +349,7 @@ enum ShaderEntries {
     },
 }
 
-impl SpirvBackend {
+impl NagaBackend {
     pub fn new() -> Self {
         Self {
             workgroup_size: [64, 1, 1],
@@ -604,8 +605,8 @@ fn validate_naga_portable_wgsl_limits(module: &naga::Module) -> Result<(), Strin
     Ok(())
 }
 
-impl Backend for SpirvBackend {
-    type Artifact = SpirvArtifact;
+impl Backend for NagaBackend {
+    type Artifact = ShaderArtifact;
     type Error = SpirvError;
 
     #[cfg(not(feature = "spirv-backend"))]
@@ -622,14 +623,14 @@ impl Backend for SpirvBackend {
 }
 
 #[cfg(feature = "spirv-backend")]
-impl SpirvBackend {
+impl NagaBackend {
     /// Compile a specific entry in this module, independently of declaration order.
     /// Paired authored raster uses its pipeline interface instead.
     pub fn compile_entry(
         &self,
         module: &Module,
         entry: sonatina_ir::module::FuncRef,
-    ) -> Result<SpirvArtifact, Vec<SpirvError>> {
+    ) -> Result<ShaderArtifact, Vec<SpirvError>> {
         self.compile_module_for_entry(module, Some(ShaderEntries::Single(entry)))
     }
 
@@ -640,7 +641,7 @@ impl SpirvBackend {
         module: &Module,
         vertex: sonatina_ir::module::FuncRef,
         fragment: sonatina_ir::module::FuncRef,
-    ) -> Result<SpirvArtifact, Vec<SpirvError>> {
+    ) -> Result<ShaderArtifact, Vec<SpirvError>> {
         self.compile_module_for_entry(module, Some(ShaderEntries::Raster { vertex, fragment }))
     }
 
@@ -648,7 +649,7 @@ impl SpirvBackend {
         &self,
         module: &Module,
         entry: Option<ShaderEntries>,
-    ) -> Result<SpirvArtifact, Vec<SpirvError>> {
+    ) -> Result<ShaderArtifact, Vec<SpirvError>> {
         let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
         let started = std::time::Instant::now();
         let (mut naga_mod, layout) = translate_to_naga(
@@ -817,7 +818,7 @@ impl SpirvBackend {
             );
         }
 
-        Ok(SpirvArtifact { words, wgsl, layout })
+        Ok(ShaderArtifact { words, wgsl, layout })
     }
 }
 

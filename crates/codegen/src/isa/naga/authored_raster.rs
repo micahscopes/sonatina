@@ -1,3 +1,5 @@
+//! Source-authored raster realization in the shared Naga backend.
+
 use std::collections::HashMap;
 
 use sonatina_ir::{Function, InstDowncast, Module, Type, Value};
