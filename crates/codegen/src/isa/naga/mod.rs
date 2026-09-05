@@ -2996,6 +2996,62 @@ fn emit_single_inst(
             value_map.insert(result, h);
             return true;
         }
+    } else if let Some(insert) =
+        <&sonatina_ir::inst::data::InsertValue as InstDowncast>::downcast(inst_set, inst_data)
+    {
+        if let Some(result) = function.dfg.inst_result(inst_id) {
+            let ty = function.dfg.value_ty(result);
+            let Some(mapped) = naga_functions.typed_local_type(ty) else {
+                *mem_error = Some("naga: aggregate SSA construction has no validated type".into());
+                return false;
+            };
+            let count = match ty.resolve_compound(function.ctx()) {
+                Some(sonatina_ir::types::CompoundType::Struct(data)) => data.fields.len(),
+                Some(sonatina_ir::types::CompoundType::Array { len, .. }) => len,
+                _ => {
+                    *mem_error = Some("naga: aggregate SSA construction requires a struct or array".into());
+                    return false;
+                }
+            };
+            let Some(index) = immediate_index_u32(function, *insert.idx())
+                .filter(|index| (*index as usize) < count)
+            else {
+                *mem_error = Some("naga: aggregate SSA insertion requires an in-bounds constant index".into());
+                return false;
+            };
+            let Some(base) = resolve_naga_value(
+                *insert.dest(), function, word, value_map, phi_locals, func,
+            ) else {
+                *mem_error = Some("naga: aggregate SSA insertion has an unresolved base".into());
+                return false;
+            };
+            let Some(replacement) = resolve_naga_value(
+                *insert.value(), function, word, value_map, phi_locals, func,
+            ) else {
+                *mem_error = Some("naga: aggregate SSA insertion has an unresolved value".into());
+                return false;
+            };
+            // Reuse an already composed value's components. A chain of field
+            // updates must not repeatedly project and reconstruct its ancestry.
+            let mut components = match &func.expressions[base] {
+                naga::Expression::Compose { components, .. } => components.clone(),
+                _ => (0..count).map(|field| {
+                    if field == index as usize {
+                        replacement
+                    } else {
+                        emit_expr(func, target, naga::Expression::AccessIndex {
+                            base, index: field as u32,
+                        })
+                    }
+                }).collect(),
+            };
+            components[index as usize] = replacement;
+            let value = emit_expr(func, target, naga::Expression::Compose {
+                ty: mapped.handle, components,
+            });
+            value_map.insert(result, value);
+            return true;
+        }
     } else if let Some(extract) =
         <&sonatina_ir::inst::data::ExtractValue as InstDowncast>::downcast(inst_set, inst_data)
     {
@@ -6246,6 +6302,7 @@ fn spirv_instruction_is_lowered(
         || <&sonatina_ir::inst::cast::Bitcast as InstDowncast>::downcast(is, inst).is_some()
         || <&data::Alloca as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ExtractValue as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::InsertValue as InstDowncast>::downcast(is, inst).is_some()
         || <&data::Gep as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAlloc as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()

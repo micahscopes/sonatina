@@ -1581,11 +1581,14 @@ fn spirv_private_helper_returns_whole_typed_value() {
         fb.insert_inst_no_result(data::Mstore::new(is, original_first, after, Type::I32));
         fb.insert_inst_no_result(data::Mstore::new(is, saved, snapshot, pair_ty));
         let projected = fb.insert_inst(data::ExtractValue::new(is, snapshot, zero), Type::I32);
+        let updated = fb.insert_inst(data::InsertValue::new(is, snapshot, zero, after), pair_ty);
+        let updated_first = fb.insert_inst(data::ExtractValue::new(is, updated, zero), Type::I32);
         let saved_first = fb.insert_inst(
             data::Gep::new(is, [saved, zero, zero].into_iter().collect()), word_ptr,
         );
         let loaded = fb.insert_inst(data::Mload::new(is, saved_first, Type::I32), Type::I32);
         let value = fb.insert_inst(arith::Add::new(is, projected, loaded), Type::I32);
+        let value = fb.insert_inst(arith::Add::new(is, value, updated_first), Type::I32);
         fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
         fb.seal_all();
         fb.finish();
@@ -1605,7 +1608,7 @@ fn spirv_private_helper_returns_whole_typed_value() {
         naga::TypeInner::Struct { .. },
     ));
     assert!(!wgsl.contains("fe_heap"));
-    assert_eq!(run_grid_u32(wgsl, 1, 1, 1, 1, &[]), vec![84],
+    assert_eq!(run_grid_u32(wgsl, 1, 1, 1, 1, &[]), vec![183],
         "mutating the original to 99 must not change the returned snapshot");
 }
 
