@@ -193,6 +193,7 @@ impl EntryHelperContextReport {
 }
 
 impl EntryHelperContext {
+    #[cfg(test)]
     pub fn derive(
         module: &Module,
         call_order: &[FuncRef],
@@ -237,6 +238,26 @@ pub(super) struct PreparedEntryHelpers {
     pub needs_trap_channel: bool,
 }
 
+pub(super) struct EntryHelperSelectionReport {
+    pub context: EntryHelperContextReport,
+    pub helpers: HelperAbiReport,
+    functions: NagaFunctionMap,
+    private_heap_type: Option<naga::Handle<naga::Type>>,
+    needs_trap_channel: bool,
+}
+
+impl EntryHelperSelectionReport {
+    pub fn into_complete(self) -> Result<PreparedEntryHelpers, String> {
+        let context = self.context.into_complete()?;
+        let plans = self.helpers.into_complete()?;
+        Ok(PreparedEntryHelpers {
+            context, plans, functions: self.functions,
+            private_heap_type: self.private_heap_type,
+            needs_trap_channel: self.needs_trap_channel,
+        })
+    }
+}
+
 /// Prepare memory transport and physical helper ABIs together. No instruction
 /// bodies or shader writers run here; emission consumes this derived result.
 #[allow(clippy::too_many_arguments)]
@@ -248,15 +269,28 @@ pub(super) fn prepare_entry_helpers(
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
     bool_type: naga::Handle<naga::Type>,
-    context: EntryHelperContext,
+    context: EntryHelperContextReport,
     entry: &super::NagaEntryBodyPlan,
     private_heap_words: u32,
     live_arguments: &NagaLiveArguments,
     typed_locals: super::NagaTypedLocalReport,
     types: &mut naga::UniqueArena<naga::Type>,
-) -> Result<PreparedEntryHelpers, String> {
-    let helper_memory = context.memory.values().any(|abi| abi.heap);
-    let helper_trap = context.memory.values().any(|abi| abi.trap);
+) -> Result<EntryHelperSelectionReport, String> {
+    let memory = context.memory.as_ref().map_err(Clone::clone)?;
+    let helper_memory = memory.values().any(|abi| abi.heap);
+    let helper_trap = memory.values().any(|abi| abi.trap);
+    let mut prerequisites = context.logical_results.rejections.clone();
+    prerequisites.extend(context.variants.rejections.iter().cloned());
+    prerequisites.extend(typed_locals.rejections);
+    if !entry.uses_arena {
+        for &function in call_order {
+            if memory.get(&function).is_some_and(|abi| abi.heap) {
+                prerequisites.push((function,
+                    "spirv: helper requires a private arena but the entry owns no proven allocation. Fail closed."
+                        .to_string()));
+            }
+        }
+    }
     let needs_trap_channel = entry.uses_arena || entry.may_trap || helper_trap;
     let private_heap_type = if entry.uses_arena {
         let heap_len = std::num::NonZeroU32::new(private_heap_words)
@@ -276,12 +310,12 @@ pub(super) fn prepare_entry_helpers(
         None
     };
     let helper_memory_types = NagaMemoryAbiTypes {
-        heap: if helper_memory {
+        heap: if let Some(heap) = private_heap_type.filter(|_| helper_memory) {
             Some(types.insert(
                 naga::Type {
                     name: None,
                     inner: naga::TypeInner::Pointer {
-                        base: private_heap_type.expect("helper memory requires an entry heap"),
+                        base: heap,
                         space: naga::AddressSpace::Function,
                     },
                 },
@@ -290,7 +324,7 @@ pub(super) fn prepare_entry_helpers(
         } else {
             None
         },
-        word: if helper_memory {
+        word: if helper_memory && private_heap_type.is_some() {
             Some(types.insert(
                 naga::Type {
                     name: None,
@@ -331,18 +365,18 @@ pub(super) fn prepare_entry_helpers(
         f32_type,
         bool_type,
         &context.resources,
-        &context.logical_results,
-        &context.variants.bindings,
-        &context.memory,
+        &context.logical_results.results,
+        &context.variants.variants.bindings,
+        memory,
         helper_memory_types,
         live_arguments,
         &naga_functions,
-        &typed_locals.rejections,
+        &prerequisites,
         types,
-    ).into_complete()?;
+    );
 
-    Ok(PreparedEntryHelpers {
-        context, plans: helper_plans, functions: naga_functions,
+    Ok(EntryHelperSelectionReport {
+        context, helpers: helper_plans, functions: naga_functions,
         private_heap_type, needs_trap_channel,
     })
 }
@@ -442,13 +476,14 @@ pub(super) fn plan_helper_abis(
     memory_types: NagaMemoryAbiTypes,
     live_arguments: &NagaLiveArguments,
     functions: &NagaFunctionMap,
-    local_rejections: &[(FuncRef, String)],
+    prerequisite_rejections: &[(FuncRef, String)],
     types: &mut naga::UniqueArena<naga::Type>,
 ) -> HelperAbiReport {
     let mut report = HelperAbiReport { plans: Vec::new(), rejections: Vec::new() };
-    let local_rejections = local_rejections.iter()
-        .map(|(function, error)| (*function, error))
-        .collect::<HashMap<_, _>>();
+    let mut prerequisite_errors = HashMap::new();
+    for (function, error) in prerequisite_rejections {
+        prerequisite_errors.entry(*function).or_insert(error);
+    }
     let mut callable = std::collections::HashSet::new();
     for function in call_order
         .iter()
@@ -458,7 +493,7 @@ pub(super) fn plan_helper_abis(
         // A rejected resource variant rejects the whole helper. Do not expose
         // a prefix of its variants as a callable function.
         let outcome = (|| -> Result<Vec<PlannedHelperAbi>, String> {
-            if let Some(error) = local_rejections.get(&function) {
+            if let Some(error) = prerequisite_errors.get(&function) {
                 return Err((*error).clone());
             }
             let mut plans = Vec::new();
