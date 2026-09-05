@@ -7898,7 +7898,7 @@ fn lower_naga_helper(
     packed_arguments: Option<&NagaPackedArguments>,
     result_abi: &NagaResultAbi,
     memory_abi: NagaMemoryAbi,
-    memory_types: NagaMemoryAbiTypes,
+    parameters: helper_plan::PhysicalHelperParameters,
     heap_words: u32,
     resource_capabilities: &NagaResourceCapabilities,
     logical_result_abis: &NagaLogicalResultAbis,
@@ -7908,84 +7908,10 @@ fn lower_naga_helper(
         .ctx
         .get_sig(function_ref)
         .ok_or_else(|| format!("spirv: helper {function_ref:?} has no signature"))?;
-    if argument_abi.len() != signature.args().len() {
-        return Err(format!(
-            "spirv: helper `{}` has {} logical arguments but {} ABI entries. Fail closed.",
-            signature.name(),
-            signature.args().len(),
-            argument_abi.len(),
-        ));
-    }
-    let mut arguments = Vec::new();
-    if let Some(packed) = packed_arguments {
-        if packed.physical_index != 0 {
-            return Err(format!(
-                "spirv: helper `{}` has noncanonical packed argument index {}. Fail closed.",
-                signature.name(),
-                packed.physical_index,
-            ));
-        }
-        arguments.push(naga::FunctionArgument {
-            name: Some("fe_arguments".to_string()),
-            ty: packed.ty,
-            binding: None,
-        });
-    }
-    for (logical_index, (&ty, source)) in signature.args().iter().zip(argument_abi).enumerate() {
-        let physical_index = match source {
-            NagaArgumentSource::Physical(physical_index) => physical_index,
-            NagaArgumentSource::Packed { .. }
-            | NagaArgumentSource::ImplicitResource(_)
-            | NagaArgumentSource::Dead => continue,
-        };
-        if *physical_index as usize != arguments.len() {
-            return Err(format!(
-                "spirv: helper `{}` has a noncanonical physical argument index {physical_index}. Fail closed.",
-                signature.name(),
-            ));
-        }
-        arguments.push(naga::FunctionArgument {
-            name: Some(format!("a{logical_index}")),
-            ty: helper_naga_type(
-                &module.ctx,
-                ty,
-                word,
-                word_type,
-                f32_type,
-                bool_type,
-                &naga_functions.typed_local_types,
-            )?,
-            binding: None,
-        });
-    }
-    let physical_argument_count = arguments.len() as u32;
-    if memory_abi.heap {
-        arguments.push(naga::FunctionArgument {
-            name: Some("fe_heap".to_string()),
-            ty: memory_types.heap.ok_or_else(|| {
-                "spirv: helper private-arena ABI has no heap pointer type. Fail closed."
-                    .to_string()
-            })?,
-            binding: None,
-        });
-        arguments.push(naga::FunctionArgument {
-            name: Some("fe_bump".to_string()),
-            ty: memory_types.word.ok_or_else(|| {
-                "spirv: helper private-arena ABI has no bump pointer type. Fail closed."
-                    .to_string()
-            })?,
-            binding: None,
-        });
-    }
-    if memory_abi.trap {
-        arguments.push(naga::FunctionArgument {
-            name: Some("fe_trapped".to_string()),
-            ty: memory_types.trap.ok_or_else(|| {
-                "spirv: helper trap ABI has no trap pointer type. Fail closed.".to_string()
-            })?,
-            binding: None,
-        });
-    }
+    let helper_plan::PhysicalHelperParameters {
+        arguments,
+        explicit_count: physical_argument_count,
+    } = parameters;
     let result = result_abi
         .physical_type
         .map(|ty| naga::FunctionResult { ty, binding: None });
@@ -9073,6 +8999,7 @@ fn translate_to_naga(
         &helper_logical_result_abis,
         &helper_resource_variants.bindings,
         &helper_memory_abis,
+        helper_memory_types,
         &live_arguments,
         &naga_functions,
         &mut naga_mod.types,
@@ -9088,6 +9015,7 @@ fn translate_to_naga(
         result: result_abi,
         memory: helper_memory_abi,
         body: body_plan,
+        parameters,
     } in helper_plans
     {
         let helper_ref = helper_variant.function;
@@ -9115,7 +9043,7 @@ fn translate_to_naga(
             packed_arguments.as_ref(),
             &result_abi,
             helper_memory_abi,
-            helper_memory_types,
+            parameters,
             private_heap_words,
             &helper_resource_capabilities,
             &helper_logical_result_abis,

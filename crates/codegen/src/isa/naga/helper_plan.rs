@@ -9,9 +9,9 @@ use sonatina_ir::{Module, module::FuncRef};
 
 use super::{
     NagaArgumentSource, NagaFunctionMap, NagaFunctionVariant, NagaLiveArguments,
-    NagaLogicalResultAbis, NagaMemoryAbi, NagaPackedArguments, NagaResourceCapabilities,
-    NagaResourceVariantBindings, NagaResultAbi, WordKind, helper_naga_argument_abi,
-    helper_naga_result_abi, pack_wide_naga_helper_arguments,
+    NagaLogicalResultAbis, NagaMemoryAbi, NagaMemoryAbiTypes, NagaPackedArguments,
+    NagaResourceCapabilities, NagaResourceVariantBindings, NagaResultAbi, WordKind,
+    helper_naga_argument_abi, helper_naga_result_abi, pack_wide_naga_helper_arguments,
 };
 
 pub(super) struct PlannedHelperAbi {
@@ -21,6 +21,14 @@ pub(super) struct PlannedHelperAbi {
     pub result: NagaResultAbi,
     pub memory: NagaMemoryAbi,
     pub body: Arc<HelperBodyPlan>,
+    pub parameters: PhysicalHelperParameters,
+}
+
+/// The complete declared Naga parameters, including hidden memory transport.
+/// Explicit parameters precede the heap/bump/trap suffix used by the emitter.
+pub(super) struct PhysicalHelperParameters {
+    pub arguments: Vec<naga::FunctionArgument>,
+    pub explicit_count: u32,
 }
 
 /// Instruction/control-flow eligibility only, not a complete callable ABI.
@@ -109,6 +117,7 @@ pub(super) fn plan_helper_abis(
     logical_results: &NagaLogicalResultAbis,
     resource_variants: &NagaResourceVariantBindings,
     memory_abis: &HashMap<FuncRef, NagaMemoryAbi>,
+    memory_types: NagaMemoryAbiTypes,
     live_arguments: &NagaLiveArguments,
     functions: &NagaFunctionMap,
     types: &mut naga::UniqueArena<naga::Type>,
@@ -184,6 +193,19 @@ pub(super) fn plan_helper_abis(
                 functions,
                 types,
             )?;
+            let parameters = plan_physical_parameters(
+                module,
+                &signature,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                &arguments,
+                packed_arguments.as_ref(),
+                memory,
+                memory_types,
+                functions,
+            )?;
             plans.push(PlannedHelperAbi {
                 variant,
                 arguments,
@@ -191,8 +213,105 @@ pub(super) fn plan_helper_abis(
                 result: result.clone(),
                 memory,
                 body: Arc::clone(&body),
+                parameters,
             });
         }
     }
     Ok(plans)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_physical_parameters(
+    module: &Module,
+    signature: &sonatina_ir::Signature,
+    word: WordKind,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    argument_abi: &[NagaArgumentSource],
+    packed_arguments: Option<&NagaPackedArguments>,
+    memory_abi: NagaMemoryAbi,
+    memory_types: NagaMemoryAbiTypes,
+    naga_functions: &NagaFunctionMap,
+) -> Result<PhysicalHelperParameters, String> {
+    if argument_abi.len() != signature.args().len() {
+        return Err(format!(
+            "spirv: helper `{}` has {} logical arguments but {} ABI entries. Fail closed.",
+            signature.name(),
+            signature.args().len(),
+            argument_abi.len(),
+        ));
+    }
+    let mut arguments = Vec::new();
+    if let Some(packed) = packed_arguments {
+        if packed.physical_index != 0 {
+            return Err(format!(
+                "spirv: helper `{}` has noncanonical packed argument index {}. Fail closed.",
+                signature.name(),
+                packed.physical_index,
+            ));
+        }
+        arguments.push(naga::FunctionArgument {
+            name: Some("fe_arguments".to_string()),
+            ty: packed.ty,
+            binding: None,
+        });
+    }
+    for (logical_index, (&ty, source)) in signature.args().iter().zip(argument_abi).enumerate() {
+        let physical_index = match source {
+            NagaArgumentSource::Physical(physical_index) => physical_index,
+            NagaArgumentSource::Packed { .. }
+            | NagaArgumentSource::ImplicitResource(_)
+            | NagaArgumentSource::Dead => continue,
+        };
+        if *physical_index as usize != arguments.len() {
+            return Err(format!(
+                "spirv: helper `{}` has a noncanonical physical argument index {physical_index}. Fail closed.",
+                signature.name(),
+            ));
+        }
+        arguments.push(naga::FunctionArgument {
+            name: Some(format!("a{logical_index}")),
+            ty: super::helper_naga_type(
+                &module.ctx,
+                ty,
+                word,
+                word_type,
+                f32_type,
+                bool_type,
+                &naga_functions.typed_local_types,
+            )?,
+            binding: None,
+        });
+    }
+    let physical_argument_count = arguments.len() as u32;
+    if memory_abi.heap {
+        arguments.push(naga::FunctionArgument {
+            name: Some("fe_heap".to_string()),
+            ty: memory_types.heap.ok_or_else(|| {
+                "spirv: helper private-arena ABI has no heap pointer type. Fail closed.".to_string()
+            })?,
+            binding: None,
+        });
+        arguments.push(naga::FunctionArgument {
+            name: Some("fe_bump".to_string()),
+            ty: memory_types.word.ok_or_else(|| {
+                "spirv: helper private-arena ABI has no bump pointer type. Fail closed.".to_string()
+            })?,
+            binding: None,
+        });
+    }
+    if memory_abi.trap {
+        arguments.push(naga::FunctionArgument {
+            name: Some("fe_trapped".to_string()),
+            ty: memory_types.trap.ok_or_else(|| {
+                "spirv: helper trap ABI has no trap pointer type. Fail closed.".to_string()
+            })?,
+            binding: None,
+        });
+    }
+    Ok(PhysicalHelperParameters {
+        arguments,
+        explicit_count: physical_argument_count,
+    })
 }
