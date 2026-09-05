@@ -7,7 +7,7 @@
 use sonatina_ir::Module;
 
 mod target;
-pub use target::{GraphFailureBinding, ShaderCompileRequest, ShaderEncoding, ShaderEnvironment, ShaderPipeline, ShaderTargetContract};
+pub use target::{GraphFailureBinding, ShaderCompileRequest, ShaderEncoding, ShaderEnvironment, ShaderPipeline, ShaderTargetContract, WEBGPU_STORAGE_BUFFERS_PER_STAGE};
 
 #[cfg(feature = "spirv-backend")]
 mod graph_failure;
@@ -980,6 +980,9 @@ impl NagaBackend {
                 return Err(vec![SpirvError::Validation(format!("{error:?}"))]);
             }
         };
+        if target.is_some() {
+            target::validate_resource_limits(&naga_mod, &info).map_err(|error| vec![error])?;
+        }
         if trace {
             eprintln!(
                 "sonatina spirv: validated naga, elapsed_ms={}",
