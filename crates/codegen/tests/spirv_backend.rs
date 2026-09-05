@@ -30,6 +30,58 @@ fn native_module_builder() -> ModuleBuilder {
     ModuleBuilder::new(ctx)
 }
 
+/// Fe's canonical atlas cursor combines a typed storage snapshot, a loop exit
+/// aggregate phi, and conditional fields in the next snapshot. Keep the real
+/// failing lowering input until it can be minimized without losing the defect.
+#[test]
+fn spirv_quad_job_state_aggregate_snapshot_lowers() {
+    for (epoch, maximum, code, expected) in [
+        (11, 8, 0, vec![0,0,0,0,5,1,11,8,1,6]),
+        // 0001 and 0010 are the same quad under rotation; starting at
+        // base-9 code 9 must skip 0010 and accept the next canonical key 0011.
+        (11, 8, 9, vec![0,0,1,1,5,1,11,8,11,6]),
+        (11, 8, 6560, vec![8,8,8,8,5,1,11,8,6561,6]),
+        (11, 8, 6561, vec![u32::MAX,u32::MAX,u32::MAX,u32::MAX,u32::MAX,0,11,8,6561,5]),
+        (11, 9, 17, vec![u32::MAX,u32::MAX,u32::MAX,u32::MAX,u32::MAX,0,11,9,17,5]),
+        (12, 8, 0, vec![0,0,0,0,0,0,12,8,0,5]),
+    ] {
+    // Seed the real record in the shader so the existing one-buffer GPU
+    // oracle can observe success, exhaustion, invalid input and wrong epoch.
+    let initial = format!("    block0:\n\
+        v900.objref<@QuadJobState> = obj.index v0 0.i32;\n\
+        v901.objref<i32> = obj.proj v900 6.i32;\n\
+        obj.store v901 {epoch}.i32;\n\
+        v902.objref<i32> = obj.proj v900 7.i32;\n\
+        obj.store v902 {maximum}.i32;\n\
+        v903.objref<i32> = obj.proj v900 8.i32;\n\
+        obj.store v903 {code}.i32;\n\
+        v904.objref<i32> = obj.proj v900 9.i32;\n\
+        obj.store v904 5.i32;\n");
+    let source = include_str!("fixtures/quad_job_state.sona").replacen("    block0:\n", &initial, 1);
+    let module = sonatina_parser::parse_module(&source).expect("captured IR parses").module;
+    let resource = SpirvExternalResource {
+        arg_index: 0, group: 0, binding: 0, name: "active".into(), access: Access::ReadWrite,
+        element: SpirvResourceElement::Record {
+            fields: (0..10).map(|i| SpirvResourceField {
+                name: format!("field_{i}"), scalar: SpirvScalarKind::U32, offset: i * 4,
+            }).collect(), span: 40,
+        }, stride: 40, length: 1,
+    };
+    let artifact = SpirvBackend::new().with_compute().with_workgroup_size(1,1,1)
+        .with_external_resource(resource).compile_module(&module)
+        .expect("typed atlas cursor must lower without an unresolved aggregate component");
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    if std::env::var_os("SONATINA_QUAD_JOB_WGSL").is_some() {
+        eprintln!("{wgsl}");
+    }
+    let parsed = naga::front::wgsl::parse_str(wgsl).expect("WGSL parses");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&parsed).expect("portable WGSL validates");
+    assert_eq!(run_grid_u32(wgsl,10,1,10,1,&[]),expected,
+        "epoch={epoch}, maximum={maximum}, first code={code}");
+    }
+}
+
 /// Two nested choices share a nonempty continue block, while the third path
 /// takes a different backedge. The shared block is not a merge for every path;
 /// each mutually exclusive occurrence must retain its exact incoming phi.

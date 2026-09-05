@@ -3046,7 +3046,10 @@ fn emit_single_inst(
             let Some(replacement) = resolve_naga_value(
                 *insert.value(), function, word, value_map, phi_locals, func,
             ) else {
-                *mem_error = Some("naga: aggregate SSA insertion has an unresolved value".into());
+                *mem_error = Some(format!(
+                    "naga: aggregate SSA insertion {inst_id:?} has an unresolved value {:?}: {:?}",
+                    insert.value(), function.dfg.value(*insert.value()),
+                ));
                 return false;
             };
             // Inserting zero into an already-zero aggregate preserves the
@@ -4961,6 +4964,28 @@ fn emit_if_region(
     // carry values out of the branch.
     let mut then_values = value_map.clone();
     let mut else_values = value_map.clone();
+    // An arm may enter a block that is also reached by a nested loop exit.
+    // Its phis are not the enclosing if's merge phis: transport this direct
+    // CFG edge before evaluating the arm body. In particular a validation
+    // failure and normal loop exhaustion can share a fallback constructor.
+    for (arm, destination, statements, values) in [
+        (then_branch, *branch.nz_dest(), &mut accept, &mut then_values),
+        (else_branch, *branch.z_dest(), &mut reject, &mut else_values),
+    ] {
+        let entry = match arm.first() {
+            Some(crate::structurize::Region::Block(block)) => Some(*block),
+            Some(crate::structurize::Region::IfThenElse { header, .. }) => Some(*header),
+            // Loop initialization and empty merge arms have their own exact
+            // edge transport below; do not publish their phis twice here.
+            _ => None,
+        };
+        if entry == Some(destination) {
+            ensure_phi_locals(function, inst_set, word, destination, word_type,
+                f32_type, bool_type, func, values, phi_locals, naga_functions)?;
+            emit_exact_phi_edge(function, inst_set, word, *header, destination,
+                func, statements, values, phi_locals)?;
+        }
+    }
     let mut then_returns = false;
     let mut else_returns = false;
     let mut then_edge_emitted = false;
