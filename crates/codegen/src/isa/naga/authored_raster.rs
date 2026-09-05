@@ -556,6 +556,8 @@ fn append_scalar_helpers(
     let mut naga_functions = NagaFunctionMap::new();
     let mut lowered = HashMap::<sonatina_ir::module::FuncRef, NagaFunctionInfo>::new();
     for &function_ref in call_order.iter().filter(|function| !root_set.contains(function)) {
+        let body_plan = super::analyze_helper_body(module, function_ref)
+            .map_err(|error| error.to_string())?;
         naga_functions.replace_call_sites(call_sites(module, [function_ref], &lowered)?);
         let signature = module.ctx.get_sig(function_ref).expect("helper signature checked above");
         let mut argument_abi = signature
@@ -595,6 +597,7 @@ fn append_scalar_helpers(
         let helper = lower_naga_helper(
             module,
             function_ref,
+            &body_plan,
             WordKind::U32,
             u32_type,
             f32_type,

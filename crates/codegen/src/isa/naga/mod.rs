@@ -23,6 +23,9 @@ mod authored_raster;
 #[cfg(feature = "spirv-backend")]
 mod helper_plan;
 
+#[cfg(feature = "spirv-backend")]
+pub use helper_plan::{HelperBodyPlan, analyze_helper_body};
+
 #[derive(Debug)]
 pub enum SpirvError {
     UnsupportedTarget(String),
@@ -7883,6 +7886,7 @@ fn helper_naga_result_type(
 fn lower_naga_helper(
     module: &Module,
     function_ref: sonatina_ir::module::FuncRef,
+    body_plan: &HelperBodyPlan,
     word: WordKind,
     word_type: naga::Handle<naga::Type>,
     f32_type: naga::Handle<naga::Type>,
@@ -7996,32 +8000,6 @@ fn lower_naga_helper(
     let mut lowering_error = None;
     module.func_store.try_view(function_ref, |function| {
         let inst_set = function.inst_set();
-        for block in function.layout.iter_block() {
-            for instruction in function.layout.iter_inst(block) {
-                let instruction_data = function.dfg.inst(instruction);
-                if !spirv_instruction_is_lowered(inst_set, instruction_data) {
-                    lowering_error = Some(format!(
-                        "spirv: instruction `{}` is unsupported in helper `{}`. Fail closed.",
-                        instruction_data.as_text(),
-                        signature.name(),
-                    ));
-                    return;
-                }
-                if <&sonatina_ir::inst::data::MemAllocDynamic as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::MemCheckpoint as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::MemRewind as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::Memcopy as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                    || <&sonatina_ir::inst::data::ObjAlloc as sonatina_ir::InstDowncast>::downcast(inst_set, instruction_data).is_some()
-                {
-                    lowering_error = Some(format!(
-                        "spirv: helper `{}` changes arena lifetime or object lifetime across a call. Fail closed.",
-                        signature.name(),
-                    ));
-                    return;
-                }
-            }
-        }
-
         let mut value_map = std::collections::HashMap::new();
         for (&argument, source) in function.arg_values.iter().zip(argument_abi) {
             let mut packed_emit_start = None;
@@ -8132,17 +8110,7 @@ fn lower_naga_helper(
             None
         };
         let mut phi_locals = std::collections::HashMap::new();
-        let structured = match crate::structurize::structurize_function(function) {
-            Ok(structured) => structured,
-            Err(error) => {
-                lowering_error = Some(structurize_error_with_block_ir(
-                    error,
-                    function_ref,
-                    function,
-                ));
-                return;
-            }
-        };
+        let structured = &body_plan.structured;
         if std::env::var("SONATINA_SPIRV_TRACE_BODY")
             .is_ok_and(|needle| signature.name().contains(&needle))
         {
@@ -9116,6 +9084,7 @@ fn translate_to_naga(
         packed_arguments,
         result: result_abi,
         memory: helper_memory_abi,
+        body: body_plan,
     } in helper_plans
     {
         let helper_ref = helper_variant.function;
@@ -9134,6 +9103,7 @@ fn translate_to_naga(
         let mut helper = lower_naga_helper(
             module,
             helper_ref,
+            &body_plan,
             word,
             word_type,
             f32_type,

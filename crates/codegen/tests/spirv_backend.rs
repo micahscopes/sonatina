@@ -344,8 +344,13 @@ fn spirv_scalar_helper_call_survives_as_a_valid_wgsl_function() {
         fb.finish();
     }
 
+    let module = mb.build();
+    let leaf_plan = sonatina_codegen::isa::naga::analyze_helper_body(&module, leaf_ref)
+        .expect("the body query should admit the same scalar leaf as emission");
+    assert_eq!(leaf_plan.instruction_count(), 2);
+    assert!(!leaf_plan.accesses_resource());
     let artifact = SpirvBackend::new()
-        .compile_module(&mb.build())
+        .compile_module(&module)
         .expect("ordinary scalar helper call should lower without inlining");
     let wgsl = artifact.wgsl.as_deref().expect("WGSL side artifact");
     assert!(
@@ -1510,7 +1515,11 @@ fn spirv_private_arena_helper_cannot_own_an_unaccounted_allocation() {
         fb.finish();
     }
 
-    let errors = match SpirvBackend::new().compile_module(&mb.build()) {
+    let module = mb.build();
+    let body_error = sonatina_codegen::isa::naga::analyze_helper_body(&module, helper_ref)
+        .err().expect("body analysis must reject an unaccounted helper allocation");
+    assert!(body_error.to_string().contains("changes arena lifetime"));
+    let errors = match SpirvBackend::new().compile_module(&module) {
         Ok(_) => panic!("an outlined helper allocation is outside the entry high-water proof"),
         Err(errors) => errors,
     };
@@ -2144,8 +2153,15 @@ fn spirv_external_resource_helper_derives_multiple_contextual_variants() {
 
 #[test]
 fn spirv_external_resource_helper_rejects_an_unresolved_resource_join() {
+    let module = ambiguous_resource_helper_module(ResourceHelperCalls::Joined);
+    let helper = module.funcs().into_iter().find(|&function| {
+        module.ctx.func_sig(function, |signature| signature.name() == "ambiguous_resource_helper")
+    }).expect("resource fixture helper");
+    let body = sonatina_codegen::isa::naga::analyze_helper_body(&module, helper)
+        .expect("body eligibility alone must not pretend to prove resource identity");
+    assert!(body.accesses_resource());
     let errors = match ambiguous_resource_backend()
-        .compile_module(&ambiguous_resource_helper_module(ResourceHelperCalls::Joined))
+        .compile_module(&module)
     {
         Ok(_) => panic!("a runtime join of distinct resource identities must fail closed"),
         Err(errors) => errors,

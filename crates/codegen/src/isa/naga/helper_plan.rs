@@ -3,7 +3,7 @@
 //! These are derived views tied to the current module and Naga type arena,
 //! not serialized certificates or a second representation of control flow.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use sonatina_ir::{Module, module::FuncRef};
 
@@ -20,6 +20,77 @@ pub(super) struct PlannedHelperAbi {
     pub packed_arguments: Option<NagaPackedArguments>,
     pub result: NagaResultAbi,
     pub memory: NagaMemoryAbi,
+    pub body: Arc<HelperBodyPlan>,
+}
+
+/// Instruction/control-flow eligibility only, not a complete callable ABI.
+/// Resource identity, types, argument packing, and transitive memory transport
+/// still require the contextual planner. Recompute after changing the module.
+pub struct HelperBodyPlan {
+    pub(super) structured: crate::structurize::StructuredCfg,
+    instruction_count: usize,
+    accesses_resource: bool,
+}
+
+impl HelperBodyPlan {
+    pub fn instruction_count(&self) -> usize {
+        self.instruction_count
+    }
+
+    pub fn accesses_resource(&self) -> bool {
+        self.accesses_resource
+    }
+}
+
+/// Query the same body closure consumed by helper emission. The backend does
+/// not accept this value as an external certificate; compilation rederives it.
+pub fn analyze_helper_body(
+    module: &Module,
+    function: FuncRef,
+) -> Result<HelperBodyPlan, super::SpirvError> {
+    derive_helper_body(module, function).map_err(super::SpirvError::Translation)
+}
+
+fn derive_helper_body(module: &Module, function_ref: FuncRef) -> Result<HelperBodyPlan, String> {
+    use sonatina_ir::{InstDowncast, inst::data};
+
+    let signature = module
+        .ctx
+        .get_sig(function_ref)
+        .ok_or_else(|| format!("spirv: helper {function_ref:?} has no signature"))?;
+    module.func_store.try_view(function_ref, |function| {
+        let inst_set = function.inst_set();
+        let mut instruction_count = 0;
+        let mut accesses_resource = false;
+        for block in function.layout.iter_block() {
+            for instruction in function.layout.iter_inst(block) {
+                instruction_count += 1;
+                let inst = function.dfg.inst(instruction);
+                if !super::spirv_instruction_is_lowered(inst_set, inst) {
+                    return Err(format!(
+                        "spirv: instruction `{}` is unsupported in helper `{}`. Fail closed.",
+                        inst.as_text(), signature.name(),
+                    ));
+                }
+                if <&data::MemAllocDynamic as InstDowncast>::downcast(inst_set, inst).is_some()
+                    || <&data::MemCheckpoint as InstDowncast>::downcast(inst_set, inst).is_some()
+                    || <&data::MemRewind as InstDowncast>::downcast(inst_set, inst).is_some()
+                    || <&data::Memcopy as InstDowncast>::downcast(inst_set, inst).is_some()
+                    || <&data::ObjAlloc as InstDowncast>::downcast(inst_set, inst).is_some()
+                {
+                    return Err(format!(
+                        "spirv: helper `{}` changes arena lifetime or object lifetime across a call. Fail closed.",
+                        signature.name(),
+                    ));
+                }
+                accesses_resource |= <&data::ObjLoad as InstDowncast>::downcast(inst_set, inst).is_some()
+                    || <&data::ObjStore as InstDowncast>::downcast(inst_set, inst).is_some();
+            }
+        }
+        let structured = crate::structurize::structurize_function(function)
+            .map_err(|error| super::structurize_error_with_block_ir(error, function_ref, function))?;
+        Ok(HelperBodyPlan { structured, instruction_count, accesses_resource })
+    }).ok_or_else(|| format!("spirv: helper {function_ref:?} has no body. Fail closed."))?
 }
 
 /// Preserve call-postorder and resource-variant order. All type interning and
@@ -55,6 +126,7 @@ pub(super) fn plan_helper_abis(
             .ctx
             .get_sig(function)
             .ok_or_else(|| format!("spirv: helper {function:?} has no signature"))?;
+        let body = Arc::new(derive_helper_body(module, function)?);
         let result = helper_naga_result_abi(
             module,
             function,
@@ -115,6 +187,7 @@ pub(super) fn plan_helper_abis(
                 packed_arguments,
                 result: result.clone(),
                 memory,
+                body: Arc::clone(&body),
             });
         }
     }
