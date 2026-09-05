@@ -1537,6 +1537,77 @@ fn spirv_typed_local_can_be_borrowed_by_a_private_helper() {
 }
 
 #[test]
+fn spirv_private_helper_returns_whole_typed_value() {
+    let isa = Native::new(TargetTriple::new(
+        Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
+    ));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let pair_ty = mb.declare_struct_type("ReturnedPair", &[Type::I32, Type::I32], false);
+    let pair_ptr = mb.ptr_type(pair_ty);
+    let word_ptr = mb.ptr_type(Type::I32);
+    let entry = mb.declare_function(Signature::new_single(
+        "entry", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    )).unwrap();
+    let helper = mb.declare_function(Signature::new_single(
+        "snapshot_pair", Linkage::Private, &[pair_ptr], pair_ty,
+    )).unwrap();
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let pointer = fb.args()[0];
+        let value = fb.insert_inst(data::Mload::new(is, pointer, pair_ty), pair_ty);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let original = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr);
+        let saved = fb.insert_inst(data::Alloca::new(is, pair_ty), pair_ptr);
+        let zero = fb.make_imm_value(0i32);
+        let original_first = fb.insert_inst(
+            data::Gep::new(is, [original, zero, zero].into_iter().collect()), word_ptr,
+        );
+        let before = fb.make_imm_value(42i32);
+        fb.insert_inst_no_result(data::Mstore::new(is, original_first, before, Type::I32));
+        let snapshot = fb.insert_inst(
+            control_flow::Call::new(is, helper, [original].into_iter().collect()), pair_ty,
+        );
+        let after = fb.make_imm_value(99i32);
+        fb.insert_inst_no_result(data::Mstore::new(is, original_first, after, Type::I32));
+        fb.insert_inst_no_result(data::Mstore::new(is, saved, snapshot, pair_ty));
+        let saved_first = fb.insert_inst(
+            data::Gep::new(is, [saved, zero, zero].into_iter().collect()), word_ptr,
+        );
+        let value = fb.insert_inst(data::Mload::new(is, saved_first, Type::I32), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+        fb.seal_all();
+        fb.finish();
+    }
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(1, 1, 1).compile_module(&mb.build())
+        .expect("whole aggregate values should cross private helper results");
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    let parsed = naga::front::wgsl::parse_str(wgsl).unwrap();
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty(),
+    ).validate(&parsed).unwrap();
+    let helper = parsed.functions.iter().map(|(_, function)| function)
+        .find(|function| function.name.as_deref() == Some("snapshot_pair"))
+        .expect("aggregate-return helper must remain outlined");
+    assert!(matches!(
+        parsed.types[helper.result.as_ref().unwrap().ty].inner,
+        naga::TypeInner::Struct { .. },
+    ));
+    assert!(!wgsl.contains("fe_heap"));
+    assert_eq!(run_grid_u32(wgsl, 1, 1, 1, 1, &[]), vec![42],
+        "mutating the original to 99 must not change the returned snapshot");
+}
+
+#[test]
 fn spirv_typed_local_rejects_bytewise_copy() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64,
