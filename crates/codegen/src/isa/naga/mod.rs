@@ -751,24 +751,49 @@ impl NagaBackend {
         request: &ShaderCompileRequest<'_>,
     ) -> Result<ShaderHelperAnalysis, Vec<SpirvError>> {
         Self::validate_request_target(module, request)?;
+        Self::analyze_pipeline_helpers(module, request.pipeline, request.resources,
+            request.builtin_arguments, request.private_heap_words)
+    }
+
+    /// Compatibility entry analysis uses exactly the envelope resolved by
+    /// `compile_entry`, including legacy word modes. It is not a fallback from
+    /// a rejected explicit target contract.
+    pub fn analyze_entry_helpers(
+        &self,
+        module: &Module,
+        entry: sonatina_ir::module::FuncRef,
+    ) -> Result<ShaderHelperAnalysis, Vec<SpirvError>> {
+        let pipeline = self.resolve_legacy_pipeline(module, Some(ShaderEntries::Single(entry)))
+            .map_err(|error| vec![SpirvError::Translation(error)])?;
+        Self::analyze_pipeline_helpers(module, pipeline, &self.external_resources,
+            &self.builtin_arguments, self.heap_words)
+    }
+
+    fn analyze_pipeline_helpers(
+        module: &Module,
+        pipeline: ShaderPipeline,
+        resources: &[SpirvExternalResource],
+        builtin_arguments: &[SpirvBuiltinArgument],
+        heap_words: u32,
+    ) -> Result<ShaderHelperAnalysis, Vec<SpirvError>> {
         let analyze = || -> Result<ShaderHelperAnalysis, String> {
-            if let ShaderPipeline::Raster { vertex, fragment } = request.pipeline {
+            if let ShaderPipeline::Raster { vertex, fragment } = pipeline {
                 return authored_raster::analyze_helpers(
-                    module, vertex, fragment, request.resources, request.builtin_arguments,
+                    module, vertex, fragment, resources, builtin_arguments,
                 );
             }
             let interface = analyze_naga_entry_interface(
-                module, request.pipeline, request.resources, request.builtin_arguments, false,
+                module, pipeline, resources, builtin_arguments, false,
             )?;
-            let render = matches!(request.pipeline, ShaderPipeline::Fullscreen { .. });
+            let render = matches!(pipeline, ShaderPipeline::Fullscreen { .. });
             let prepared = prepare_naga_entry(
                 module, interface.first_func, interface.word,
                 if render { SpirvShaderStage::Fragment } else { SpirvShaderStage::Compute },
                 &interface.emitted_external_resources, &interface.live_arguments,
-                request.private_heap_words, false, std::time::Instant::now(),
+                heap_words, false, std::time::Instant::now(),
             )?;
             validate_naga_entry_mode(
-                request.pipeline, interface.word, interface.workgroup_size,
+                pipeline, interface.word, interface.workgroup_size,
                 &prepared.body, &interface.emitted_external_resources,
             )?;
             Ok(prepared.helpers.helpers.into_analysis())
