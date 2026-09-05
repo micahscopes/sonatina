@@ -1,6 +1,33 @@
 //! Checked environment and output selection, independent of shader stage.
 
 use super::SpirvError;
+use sonatina_ir::module::FuncRef;
+
+/// Semantic pipeline selection. Legacy envelopes are named adapters, not
+/// additional hardware shader stages.
+#[derive(Debug, Clone, Copy)]
+pub enum ShaderPipeline {
+    Compute { entry: FuncRef, workgroup_size: [u32; 3], dispatch_grid: [u32; 3] },
+    Raster { vertex: FuncRef, fragment: FuncRef },
+    Fullscreen { entry: FuncRef },
+    LegacyScalar { entry: FuncRef, workgroup_size: [u32; 3] },
+    LegacyGrid { entry: FuncRef, workgroup_size: [u32; 3] },
+}
+
+/// Complete shader request with no ambient backend stage-selection flags.
+pub struct ShaderCompileRequest<'a> {
+    pub target: &'a ShaderTargetContract,
+    pub pipeline: ShaderPipeline,
+    pub resources: &'a [super::SpirvExternalResource],
+    pub builtin_arguments: &'a [super::SpirvBuiltinArgument],
+    pub private_heap_words: u32,
+}
+
+impl<'a> ShaderCompileRequest<'a> {
+    pub fn new(target: &'a ShaderTargetContract, pipeline: ShaderPipeline) -> Self {
+        Self { target, pipeline, resources: &[], builtin_arguments: &[], private_heap_words: 8192 }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShaderEnvironment {

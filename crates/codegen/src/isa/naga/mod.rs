@@ -7,7 +7,7 @@
 use sonatina_ir::Module;
 
 mod target;
-pub use target::{ShaderEncoding, ShaderEnvironment, ShaderTargetContract};
+pub use target::{ShaderCompileRequest, ShaderEncoding, ShaderEnvironment, ShaderPipeline, ShaderTargetContract};
 
 #[cfg(feature = "spirv-backend")]
 use sonatina_ir::ir_writer::FuncWriter;
@@ -665,10 +665,95 @@ impl NagaBackend {
         self.compile_module_for_entry(module, Some(entries), Some(target))
     }
 
+    fn resolve_legacy_pipeline(
+        &self,
+        module: &Module,
+        entry: Option<ShaderEntries>,
+    ) -> Result<ShaderPipeline, String> {
+        if let Some(ShaderEntries::Raster { vertex, fragment }) = entry {
+            if self.authored_raster.is_some() || self.grid || self.render || self.compute {
+                return Err("spirv raster: explicit raster entries cannot be combined with another entry mode".to_owned());
+            }
+            if self.dispatch_grid != [1, 1, 1] {
+                return Err("spirv raster: a fixed dispatch grid is invalid for authored raster".to_owned());
+            }
+            return Ok(ShaderPipeline::Raster { vertex, fragment });
+        }
+        if let Some(raster) = &self.authored_raster {
+            if entry.is_some() {
+                return Err("spirv raster: an individual entry cannot override the paired raster interface".to_owned());
+            }
+            if self.grid || self.render || self.compute {
+                return Err("spirv raster: authored raster, grid, fullscreen render, and compute modes are mutually exclusive".to_owned());
+            }
+            if self.dispatch_grid != [1, 1, 1] {
+                return Err("spirv raster: a fixed dispatch grid is invalid for authored raster".to_owned());
+            }
+            let find_entry = |stage: &str, name: &str| {
+                module.funcs().into_iter().find(|function| {
+                    module.ctx.get_sig(*function).is_some_and(|sig| sig.name() == name)
+                }).ok_or_else(|| format!("spirv raster: {stage} entry `{name}` is absent"))
+            };
+            return Ok(ShaderPipeline::Raster {
+                vertex: find_entry("vertex", &raster.vertex_entry)?,
+                fragment: find_entry("fragment", &raster.fragment_entry)?,
+            });
+        }
+        if [self.grid, self.render, self.compute].into_iter().filter(|value| *value).count() > 1 {
+            return Err("spirv: grid, render, and explicit compute modes are mutually exclusive".to_owned());
+        }
+        if !self.compute && self.dispatch_grid != [1, 1, 1] {
+            return Err("spirv: a fixed dispatch grid currently requires explicit compute mode".to_owned());
+        }
+        let entry = match entry {
+            Some(ShaderEntries::Single(entry)) => entry,
+            Some(ShaderEntries::Raster { .. }) => unreachable!("raster resolved above"),
+            None => *module.funcs().first()
+                .ok_or_else(|| "spirv: module has no functions to translate".to_owned())?,
+        };
+        Ok(if self.compute {
+            ShaderPipeline::Compute { entry, workgroup_size: self.workgroup_size, dispatch_grid: self.dispatch_grid }
+        } else if self.render {
+            ShaderPipeline::Fullscreen { entry }
+        } else if self.grid {
+            ShaderPipeline::LegacyGrid { entry, workgroup_size: self.workgroup_size }
+        } else {
+            ShaderPipeline::LegacyScalar { entry, workgroup_size: self.workgroup_size }
+        })
+    }
+
     fn compile_module_for_entry(
         &self,
         module: &Module,
         entry: Option<ShaderEntries>,
+        target: Option<&ShaderTargetContract>,
+    ) -> Result<ShaderArtifact, Vec<SpirvError>> {
+        let pipeline = self.resolve_legacy_pipeline(module, entry)
+            .map_err(|error| vec![SpirvError::Translation(error)])?;
+        Self::compile_pipeline(module, pipeline, &self.external_resources,
+            &self.builtin_arguments, self.heap_words, target)
+    }
+
+    /// Compile a self-contained request. No legacy backend configuration is read.
+    pub fn compile_request(
+        module: &Module,
+        request: &ShaderCompileRequest<'_>,
+    ) -> Result<ShaderArtifact, Vec<SpirvError>> {
+        if module.ctx.triple.architecture != sonatina_triple::Architecture::Shader {
+            return Err(vec![SpirvError::UnsupportedTarget(
+                "an explicit shader target requires a Shader ISA module".to_owned(),
+            )]);
+        }
+        Self::compile_pipeline(module, request.pipeline, request.resources,
+            request.builtin_arguments, request.private_heap_words, Some(request.target))
+    }
+
+    fn compile_pipeline(
+        module: &Module,
+        pipeline: ShaderPipeline,
+        resources: &[SpirvExternalResource],
+        builtin_arguments: &[SpirvBuiltinArgument],
+        heap_words: u32,
         target: Option<&ShaderTargetContract>,
     ) -> Result<ShaderArtifact, Vec<SpirvError>> {
         let capabilities = match target.map(ShaderTargetContract::environment) {
@@ -682,16 +767,10 @@ impl NagaBackend {
         let started = std::time::Instant::now();
         let (mut naga_mod, layout) = translate_to_naga(
             module,
-            entry,
-            self.workgroup_size,
-            self.grid,
-            self.render,
-            self.compute,
-            self.dispatch_grid,
-            self.authored_raster.as_ref(),
-            &self.external_resources,
-            &self.builtin_arguments,
-            self.heap_words,
+            pipeline,
+            resources,
+            builtin_arguments,
+            heap_words,
         )
         .map_err(|e| vec![SpirvError::Translation(e)])?;
         let compacted_equality_ladders = compact_naga_control(&mut naga_mod);
@@ -8153,13 +8232,7 @@ fn compute_builtin_slot(source: SpirvBuiltinSource) -> Option<(usize, Option<u32
 #[cfg(feature = "spirv-backend")]
 fn translate_to_naga(
     module: &Module,
-    entry: Option<ShaderEntries>,
-    workgroup_size: [u32; 3],
-    grid: bool,
-    render: bool,
-    compute: bool,
-    dispatch_grid: [u32; 3],
-    authored_raster: Option<&SpirvRasterPipeline>,
+    pipeline: ShaderPipeline,
     external_resources: &[SpirvExternalResource],
     builtin_arguments: &[SpirvBuiltinArgument],
     heap_words: u32,
@@ -8168,51 +8241,27 @@ fn translate_to_naga(
     let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
     let started = std::time::Instant::now();
 
-    if let Some(ShaderEntries::Raster { vertex, fragment }) = entry {
-        if authored_raster.is_some() || grid || render || compute {
-            return Err("spirv raster: explicit raster entries cannot be combined with another entry mode".to_string());
+    let (first_func, workgroup_size, dispatch_grid) = match pipeline {
+        ShaderPipeline::Raster { vertex, fragment } => {
+            return authored_raster::translate_entries(
+                module, vertex, fragment, external_resources, builtin_arguments,
+            );
         }
-        if dispatch_grid != [1, 1, 1] {
-            return Err("spirv raster: a fixed dispatch grid is invalid for authored raster".to_string());
-        }
-        return authored_raster::translate_entries(
-            module, vertex, fragment, external_resources, builtin_arguments,
-        );
-    }
-
-    if let Some(raster) = authored_raster {
-        if entry.is_some() {
-            return Err("spirv raster: an individual entry cannot override the paired raster interface".to_string());
-        }
-        if grid || render || compute {
-            return Err("spirv raster: authored raster, grid, fullscreen render, and compute modes are mutually exclusive".to_string());
-        }
-        if dispatch_grid != [1, 1, 1] {
-            return Err("spirv raster: a fixed dispatch grid is invalid for authored raster".to_string());
-        }
-        return authored_raster::translate(
-            module,
-            raster,
-            external_resources,
-            builtin_arguments,
-        );
-    }
-
-    // Content-derived word scalar: the kernel's own Sonatina return type is the
-    // word-width SSOT (no hardwire, no config knob). I32 -> u32 (browser profile,
-    // no SHADER_INT64); I64 -> i64 (the original path, bit-for-bit). Anything else,
-    // a missing return, or a mixed-width argument fails closed.
-    let funcs_peek = module.funcs();
-    let first_func = match entry {
-        Some(ShaderEntries::Single(entry)) if funcs_peek.contains(&entry) => entry,
-        Some(ShaderEntries::Single(entry)) => return Err(format!(
-            "spirv: selected entry {entry:?} is not defined in this module"
-        )),
-        Some(ShaderEntries::Raster { .. }) => unreachable!("raster entries handled above"),
-        None => *funcs_peek
-            .first()
-            .ok_or_else(|| "spirv: module has no functions to translate".to_string())?,
+        ShaderPipeline::Compute { entry, workgroup_size, dispatch_grid } =>
+            (entry, workgroup_size, dispatch_grid),
+        ShaderPipeline::Fullscreen { entry } => (entry, [0, 0, 0], [1, 1, 1]),
+        ShaderPipeline::LegacyScalar { entry, workgroup_size }
+        | ShaderPipeline::LegacyGrid { entry, workgroup_size } =>
+            (entry, workgroup_size, [1, 1, 1]),
     };
+    // Derived predicates describe one already-selected pipeline. They cannot
+    // represent conflicting modes and do not choose the compilation target.
+    let grid = matches!(pipeline, ShaderPipeline::LegacyGrid { .. });
+    let render = matches!(pipeline, ShaderPipeline::Fullscreen { .. });
+    let compute = matches!(pipeline, ShaderPipeline::Compute { .. });
+    if !module.funcs().contains(&first_func) {
+        return Err(format!("spirv: selected entry {first_func:?} is not defined in this module"));
+    }
 
     let sig = module
         .ctx
@@ -8237,12 +8286,6 @@ fn translate_to_naga(
         }
     };
 
-    if [grid, render, compute].into_iter().filter(|enabled| *enabled).count() > 1 {
-        return Err(
-            "spirv: grid, render, and explicit compute modes are mutually exclusive"
-                .to_string(),
-        );
-    }
     if !external_resources.is_empty() && !(compute || render) {
         return Err(
             "spirv: external resources require explicit compute or render mode"
@@ -8257,9 +8300,6 @@ fn translate_to_naga(
             "spirv compute: explicit compute stages must return unit; results belong in external resources"
                 .to_string(),
         );
-    }
-    if !compute && dispatch_grid != [1, 1, 1] {
-        return Err("spirv: a fixed dispatch grid currently requires explicit compute mode".to_string());
     }
     let compute_invocation_extent = if compute {
         if workgroup_size.contains(&0) || dispatch_grid.contains(&0) {
