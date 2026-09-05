@@ -111,6 +111,65 @@ fn spirv_shared_nonempty_continue_arm_preserves_phi_edges() {
     }
 }
 
+/// Finishing a nested search resumes the surrounding iteration. Its exit is
+/// the outer header, not the outer exit, even when the search sits in an arm.
+#[test]
+fn spirv_nested_search_resumes_outer_iteration() {
+    let isa = Native::new(TargetTriple::new(Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let fr = mb.declare_function(Signature::new_single(
+        "nested_search", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    )).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let outer = fb.append_block();
+    let choose = fb.append_block();
+    let inner = fb.append_block();
+    let step = fb.append_block();
+    let alternate = fb.append_block();
+    let exit = fb.append_block();
+    let limit = fb.args()[0];
+    let width = fb.args()[1];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    fb.switch_to_block(entry);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer));
+    fb.switch_to_block(outer);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let more = fb.insert_inst(cmp::Lt::new(is, i, limit), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, more, choose, exit));
+    fb.switch_to_block(choose);
+    let next = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    let search = fb.insert_inst(cmp::Lt::new(is, zero, width), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, search, inner, alternate));
+    fb.switch_to_block(inner);
+    let j = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, choose)]), Type::I32);
+    let scanning = fb.insert_inst(cmp::Lt::new(is, j, width), Type::I1);
+    fb.append_phi_arg(i, next, inner);
+    fb.insert_inst_no_result(control_flow::Br::new(is, scanning, step, outer));
+    fb.switch_to_block(step);
+    let next_j = fb.insert_inst(arith::Add::new(is, j, one), Type::I32);
+    fb.append_phi_arg(j, next_j, step);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, inner));
+    fb.switch_to_block(alternate);
+    fb.append_phi_arg(i, next, alternate);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, outer));
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all(); fb.finish();
+    let module = mb.build();
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 1)
+        .compile_module(&module).unwrap();
+    let output = run_grid_u32(artifact.wgsl.as_deref().unwrap(), 16, 8, 8, 8, &[]);
+    for width in 0..8u32 {
+        for limit in 0..16u32 {
+            assert_eq!(output[(width * 16 + limit) as usize], limit,
+                "nested search: limit={limit}, width={width}");
+        }
+    }
+}
+
 fn atomic_claim_module() -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native));
     let is = isa.inst_set();

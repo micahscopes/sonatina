@@ -5609,10 +5609,23 @@ fn emit_regions_in_loop(
                     naga_functions, mem_ctx,
                 )?;
                 let inner_exit = structured_loop_exit(function, inst_set, *header, body)?;
+                // A nested iterator can finish directly at this loop's header.
+                // Its exit already transported the exact backedge phis. This
+                // is a continue, not a fallthrough that an enclosing selection
+                // may forward to its (possibly outer-exit) postdominator.
+                let resumes_iteration = inner_exit == loop_header;
+                if resumes_iteration && region_index + 1 != regions.len() {
+                    return Err(format!(
+                        "spirv: nested loop {header:?} resumes {loop_header:?} but has trailing regions"
+                    ));
+                }
                 if let Some(inner_return) = inner_return {
                     let remaining = &regions[region_index + 1..];
                     let mut continuation = naga::Block::new();
-                    let continuation_outcome = if remaining.is_empty() {
+                    let continuation_outcome = if resumes_iteration {
+                        continuation.push(naga::Statement::Continue, naga::Span::UNDEFINED);
+                        RegionOutcome::Terminal
+                    } else if remaining.is_empty() {
                         RegionOutcome::Fallthrough(inner_exit)
                     } else {
                         emit_regions_in_loop(
@@ -5662,6 +5675,10 @@ fn emit_regions_in_loop(
                     );
                     *may_return = true;
                     return Ok(continuation_outcome);
+                }
+                if resumes_iteration {
+                    target.push(naga::Statement::Continue, naga::Span::UNDEFINED);
+                    return Ok(RegionOutcome::Terminal);
                 }
                 outcome = Some(RegionOutcome::Fallthrough(inner_exit));
             }
