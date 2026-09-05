@@ -7,7 +7,10 @@
 use sonatina_ir::Module;
 
 mod target;
-pub use target::{ShaderCompileRequest, ShaderEncoding, ShaderEnvironment, ShaderPipeline, ShaderTargetContract};
+pub use target::{GraphFailureBinding, ShaderCompileRequest, ShaderEncoding, ShaderEnvironment, ShaderPipeline, ShaderTargetContract};
+
+#[cfg(feature = "spirv-backend")]
+mod graph_failure;
 
 #[cfg(feature = "spirv-backend")]
 use sonatina_ir::ir_writer::FuncWriter;
@@ -285,6 +288,8 @@ pub struct SpirvLayout {
     /// retains one word. Grid exposes the whole binding rather than a single
     /// result descriptor. Kernels without a reachable trap omit the channel.
     pub trap: Option<SpirvResult>,
+    /// Epoch-scoped atomic failure channel, distinct from invocation results.
+    pub graph_failure: Option<GraphFailureBinding>,
     /// Render mode: the `@vertex` entry point name (`None` for compute modes).
     pub vertex_entry: Option<String>,
     /// Render mode: the `@fragment` entry point name (`None` for compute modes).
@@ -742,7 +747,7 @@ impl NagaBackend {
         let pipeline = self.resolve_legacy_pipeline(module, entry)
             .map_err(|error| vec![SpirvError::Translation(error)])?;
         Self::compile_pipeline(module, pipeline, &self.external_resources,
-            &self.builtin_arguments, self.heap_words, target)
+            &self.builtin_arguments, self.heap_words, target, None)
     }
 
     /// Analyze contextual helper ABIs without emitting function bodies or shader
@@ -831,7 +836,7 @@ impl NagaBackend {
     ) -> Result<ShaderArtifact, Vec<SpirvError>> {
         Self::validate_request_target(module, request)?;
         Self::compile_pipeline(module, request.pipeline, request.resources,
-            request.builtin_arguments, request.private_heap_words, Some(request.target))
+            request.builtin_arguments, request.private_heap_words, Some(request.target), request.graph_failure)
     }
 
     fn compile_pipeline(
@@ -841,6 +846,7 @@ impl NagaBackend {
         builtin_arguments: &[SpirvBuiltinArgument],
         heap_words: u32,
         target: Option<&ShaderTargetContract>,
+        graph_failure: Option<GraphFailureBinding>,
     ) -> Result<ShaderArtifact, Vec<SpirvError>> {
         let capabilities = match target.map(ShaderTargetContract::environment) {
             Some(ShaderEnvironment::WebGpu) => naga::valid::Capabilities::empty(),
@@ -857,6 +863,7 @@ impl NagaBackend {
             resources,
             builtin_arguments,
             heap_words,
+            graph_failure,
         )
         .map_err(|e| vec![SpirvError::Translation(e)])?;
         let compacted_equality_ladders = compact_naga_control(&mut naga_mod);
@@ -9686,10 +9693,15 @@ fn translate_to_naga(
     external_resources: &[SpirvExternalResource],
     builtin_arguments: &[SpirvBuiltinArgument],
     heap_words: u32,
+    graph_failure: Option<GraphFailureBinding>,
 ) -> Result<(naga::Module, SpirvLayout), String> {
     use std::collections::HashMap;
     let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
     let started = std::time::Instant::now();
+
+    if graph_failure.is_some() && !matches!(pipeline, ShaderPipeline::Compute { .. }) {
+        return Err("graph failure scope currently requires explicit compute".into());
+    }
 
     if let ShaderPipeline::Raster { vertex, fragment } = pipeline {
         return authored_raster::translate_entries(
@@ -10241,6 +10253,9 @@ fn translate_to_naga(
             emit_trap_store(&mut func, &mut tail, mem_ctx, trap_var, trap_index);
             func.body.extend_block(tail);
         }
+        if let Some(binding) = graph_failure {
+            graph_failure::wrap_compute_entry(&mut naga_mod, &mut func, mem_ctx, binding)?;
+        }
         naga_mod.entry_points.push(naga::EntryPoint {
             name: "main".into(),
             stage: naga::ShaderStage::Compute,
@@ -10254,6 +10269,15 @@ fn translate_to_naga(
         });
 
         let mut bindings = external_layout_bindings;
+        if let Some(binding) = graph_failure {
+            bindings.push(SpirvBinding {
+                group: binding.group, binding: binding.binding,
+                name: "graph_failure".into(), access: Access::ReadWrite,
+                role: Role::Output, stages: vec![SpirvShaderStage::Compute],
+                stride: 4, span: 4, members: Vec::new(),
+                resource_element: None, resource_length: None, resource_arg_index: None,
+            });
+        }
         if parameter_var.is_some() {
             bindings.push(SpirvBinding {
                 group: 0,
@@ -10303,6 +10327,7 @@ fn translate_to_naga(
                     })
                     .collect(),
                 result: None,
+                graph_failure,
                 trap: needs_trap_channel.then_some(SpirvResult {
                     group: 0,
                     binding: trap_binding,
@@ -10712,6 +10737,7 @@ fn translate_to_naga(
             // Render mode fails closed on has_mem (checked above): never a
             // trap channel here.
             trap: None,
+            graph_failure: None,
             vertex_entry: Some("vs_fullscreen".to_string()),
             fragment_entry: Some("fs_main".to_string()),
             color_target_format: Some("rgba8unorm".to_string()),
@@ -11397,6 +11423,7 @@ fn translate_to_naga(
         } else {
             None
         },
+        graph_failure: None,
         // Compute modes (Scalar/Grid/Batch) have no vertex/fragment stages and no
         // color target.
         vertex_entry: None,
@@ -11506,7 +11533,7 @@ func private %unsupported() -> i256 {
         };
         assert!(super::analyze_naga_entry_interface(module, pipeline, &[], &[builtin], false)
             .err().unwrap().contains("missing kernel arg"));
-        assert!(super::translate_to_naga(module, pipeline, &[], &[], 8192).is_err(),
+        assert!(super::translate_to_naga(module, pipeline, &[], &[], 8192, None).is_err(),
             "valid entry interface does not authorize an unsupported physical helper ABI");
     }
 

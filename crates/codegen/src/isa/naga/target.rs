@@ -21,11 +21,20 @@ pub struct ShaderCompileRequest<'a> {
     pub resources: &'a [super::SpirvExternalResource],
     pub builtin_arguments: &'a [super::SpirvBuiltinArgument],
     pub private_heap_words: u32,
+    /// Shared, zero-initialized atomic status for one graph execution epoch.
+    /// The caller owns reset between epochs, never between dependent dispatches.
+    pub graph_failure: Option<GraphFailureBinding>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphFailureBinding {
+    pub group: u32,
+    pub binding: u32,
 }
 
 impl<'a> ShaderCompileRequest<'a> {
     pub fn new(target: &'a ShaderTargetContract, pipeline: ShaderPipeline) -> Self {
-        Self { target, pipeline, resources: &[], builtin_arguments: &[], private_heap_words: 8192 }
+        Self { target, pipeline, resources: &[], builtin_arguments: &[], private_heap_words: 8192, graph_failure: None }
     }
 }
 

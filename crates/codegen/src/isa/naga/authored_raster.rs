@@ -587,6 +587,7 @@ pub(super) fn translate_entries(
             .collect(),
         result: None,
         trap: None,
+        graph_failure: None,
         vertex_entry: Some(PHYSICAL_VERTEX_ENTRY.to_string()),
         fragment_entry: Some(PHYSICAL_FRAGMENT_ENTRY.to_string()),
         color_target_format: Some("rgba8unorm".to_string()),
