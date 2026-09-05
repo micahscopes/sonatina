@@ -8668,12 +8668,13 @@ struct PreparedNagaEntry {
     private_heap_words: u32,
     external_roots: Vec<(u32, naga::Handle<naga::GlobalVariable>)>,
     external_layout_bindings: Vec<SpirvBinding>,
-    helpers: helper_plan::PreparedEntryHelpers,
+    helpers: helper_plan::EntryHelperSelectionReport,
 }
 
 /// Share typed-local, resource, arena, and physical-call preparation between
-/// future contextual queries and emission. Entry interface validation remains
-/// a prerequisite; this is not yet an outlining-selection query.
+/// contextual queries and emission. Preserve per-helper rejections until the
+/// emission boundary instead of discarding independent plans at the first
+/// unsupported helper. Entry interface validation remains a prerequisite.
 #[cfg(feature = "spirv-backend")]
 #[allow(clippy::too_many_arguments)]
 fn prepare_naga_entry(
@@ -8801,7 +8802,7 @@ fn prepare_naga_entry(
         module, &call_order, first_func, word, word_type, f32_type, bool_type,
         helper_context, &entry_body_plan, private_heap_words, live_arguments,
         typed_local_types, &mut naga_mod.types,
-    )?.into_complete()?;
+    )?;
     Ok(PreparedNagaEntry {
         module: naga_mod, word_type, f32_type, bool_type, body: entry_body_plan,
         private_heap_words, external_roots, external_layout_bindings, helpers,
@@ -9238,19 +9239,20 @@ fn translate_to_naga(
         private_heap_words,
         external_roots,
         external_layout_bindings,
-        helpers: helper_plan::PreparedEntryHelpers {
-            context: helper_plan::EntryHelperContext {
-                resources: helper_resource_capabilities,
-                logical_results: helper_logical_result_abis,
-                variants: helper_resource_variants,
-                memory: _,
-            },
-            plans: helper_plans,
-            functions: mut naga_functions,
-            private_heap_type,
-            needs_trap_channel,
-        },
+        helpers,
     } = prepared;
+    let helper_plan::PreparedEntryHelpers {
+        context: helper_plan::EntryHelperContext {
+            resources: helper_resource_capabilities,
+            logical_results: helper_logical_result_abis,
+            variants: helper_resource_variants,
+            memory: _,
+        },
+        plans: helper_plans,
+        functions: mut naga_functions,
+        private_heap_type,
+        needs_trap_channel,
+    } = helpers.into_complete()?;
     let mut lowered_variants = std::collections::HashMap::<
         NagaFunctionVariant,
         NagaFunctionInfo,
@@ -11225,14 +11227,61 @@ func private %leaf() -> i32 {
 
         assert!(prepared.module.functions.is_empty(), "preparation must not emit helper bodies");
         assert!(prepared.module.entry_points.is_empty(), "preparation must not emit an entry body");
-        assert_eq!(prepared.helpers.plans.len(), 1);
-        let helper = &prepared.helpers.plans[0];
+        assert!(prepared.helpers.helpers.rejections.is_empty());
+        let helpers = prepared.helpers.into_complete().expect("complete helper selection");
+        assert_eq!(helpers.plans.len(), 1);
+        let helper = &helpers.plans[0];
         assert_eq!(helper.variant.function, leaf);
         assert!(helper.parameters.arguments.is_empty());
         assert_eq!(helper.body.instruction_count(), 1);
         assert_eq!(prepared.private_heap_words, 0, "capacity is not a heap allocation");
-        assert!(prepared.helpers.private_heap_type.is_none());
-        assert!(!prepared.helpers.needs_trap_channel);
+        assert!(helpers.private_heap_type.is_none());
+        assert!(!helpers.needs_trap_channel);
+    }
+
+    #[test]
+    fn entry_preparation_retains_independent_helpers_after_abi_rejection() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+func public %entry() -> i32 {
+    block0:
+        v0.i32 = call %parent;
+        v1.i32 = call %leaf;
+        return v1;
+}
+func private %parent() -> i32 {
+    block0:
+        v0.i256 = call %wide;
+        return 0.i32;
+}
+func private %wide() -> i256 {
+    block0:
+        return 17.i256;
+}
+func private %leaf() -> i32 {
+    block0:
+        return 23.i32;
+}
+"#).expect("partial entry fixture parses");
+        let module = &parsed.module;
+        let find = |name| module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == name)
+        }).unwrap();
+        let prepared = super::prepare_naga_entry(
+            module, find("entry"), super::WordKind::U32, super::SpirvShaderStage::Compute,
+            &[], &super::analyze_live_arguments(module), 8192, false,
+            std::time::Instant::now(),
+        ).expect("helper rejection must not discard the entry report");
+        assert!(prepared.module.functions.is_empty());
+        assert!(prepared.module.entry_points.is_empty());
+        assert_eq!(prepared.helpers.helpers.plans.len(), 1);
+        assert_eq!(prepared.helpers.helpers.plans[0].variant.function, find("leaf"));
+        assert!(prepared.helpers.helpers.rejections.iter()
+            .any(|(function, _)| *function == find("wide")));
+        assert!(prepared.helpers.helpers.rejections.iter()
+            .any(|(function, _)| *function == find("parent")));
+        assert!(prepared.helpers.into_complete().is_err(),
+            "a partial report must never authorize emission");
     }
 
     fn naga_function_with_parameters(
