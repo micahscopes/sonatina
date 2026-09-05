@@ -8588,6 +8588,150 @@ fn analyze_naga_entry_body(
 
 
 #[cfg(feature = "spirv-backend")]
+/// Entry-rooted preparation, with no emitted function bodies. Handles belong
+/// to this module's arenas; the result is a derived view, not a certificate.
+struct PreparedNagaEntry {
+    module: naga::Module,
+    word_type: naga::Handle<naga::Type>,
+    f32_type: naga::Handle<naga::Type>,
+    bool_type: naga::Handle<naga::Type>,
+    body: NagaEntryBodyPlan,
+    private_heap_words: u32,
+    external_roots: Vec<(u32, naga::Handle<naga::GlobalVariable>)>,
+    external_layout_bindings: Vec<SpirvBinding>,
+    helpers: helper_plan::PreparedEntryHelpers,
+}
+
+/// Share typed-local, resource, arena, and physical-call preparation between
+/// future contextual queries and emission. Entry interface validation remains
+/// a prerequisite; this is not yet an outlining-selection query.
+#[cfg(feature = "spirv-backend")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_naga_entry(
+    module: &Module,
+    first_func: sonatina_ir::module::FuncRef,
+    word: WordKind,
+    stage: SpirvShaderStage,
+    emitted_external_resources: &[SpirvExternalResource],
+    live_arguments: &NagaLiveArguments,
+    heap_words: u32,
+    trace: bool,
+    started: std::time::Instant,
+) -> Result<PreparedNagaEntry, String> {
+    let mut naga_mod = naga::Module::default();
+
+    let word_type = naga_mod.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: match word {
+                    WordKind::U32 => naga::ScalarKind::Uint,
+                    WordKind::I64 => naga::ScalarKind::Sint,
+                },
+                width: word.width_bytes() as u8,
+            }),
+        },
+        naga::Span::UNDEFINED,
+    );
+    let f32_type = naga_mod.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Float,
+                width: 4,
+            }),
+        },
+        naga::Span::UNDEFINED,
+    );
+    let bool_type = naga_mod.types.insert(
+        naga::Type {
+            name: None,
+            inner: naga::TypeInner::Scalar(naga::Scalar {
+                kind: naga::ScalarKind::Bool,
+                width: 1,
+            }),
+        },
+        naga::Span::UNDEFINED,
+    );
+
+    let call_order = reachable_call_postorder(module, first_func)?;
+    let typed_local_types = collect_naga_typed_local_types(
+        module,
+        &call_order,
+        word,
+        word_type,
+        f32_type,
+        bool_type,
+        &mut naga_mod.types,
+    )?;
+
+    // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
+    // fail closed on any signedness-sensitive op (Sar / signed compares / signed
+    // div|mod): Sonatina integers are signless, so u32 is exact for wrapping
+    // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
+    // silently emit the signed WGSL operator.
+    let phase = std::time::Instant::now();
+    let entry_body_plan = analyze_naga_entry_body(module, first_func, word, heap_words)?;
+    let has_mem = entry_body_plan.uses_arena;
+    let mem_heap_bytes = entry_body_plan.arena_high_water_bytes;
+    if trace {
+        eprintln!(
+            "sonatina spirv: pre-scan complete, function={}, heap_bytes={}, elapsed_ms={}, total_elapsed_ms={}",
+            module.ctx.func_sig(first_func, |sig| sig.name().to_owned()),
+            mem_heap_bytes,
+            phase.elapsed().as_millis(),
+            started.elapsed().as_millis()
+        );
+    }
+
+    // `heap_words` is a fail-closed capacity, not an allocation request. The
+    // pre-scan above has already proved the exact static upper bound for this
+    // call-free entry, so materialize only that many private words. Emitting
+    // the full default capacity for every invocation turns a small local
+    // array into 32 KiB of private storage and multiplies that cost by the
+    // workgroup width. This was enough to make otherwise modest Fe workgroup
+    // kernels pathological for browser shader compilers.
+    let private_heap_words = if has_mem {
+        u32::try_from(mem_heap_bytes.div_ceil(4))
+            .map_err(|_| {
+                format!(
+                    "spirv: static private heap requirement ({mem_heap_bytes} bytes) does not fit in u32 words"
+                )
+            })?
+            .max(1)
+    } else {
+        0
+    };
+
+    let external_resource_stages = vec![vec![stage]; emitted_external_resources.len()];
+    let (external_roots, external_layout_bindings) = append_external_resources(
+        &mut naga_mod,
+        emitted_external_resources,
+        &external_resource_stages,
+        word,
+        word_type,
+        f32_type,
+    )?;
+    let helper_context = helper_plan::EntryHelperContext::derive(
+        module,
+        &call_order,
+        first_func,
+        &external_roots,
+        live_arguments,
+        has_mem,
+    )?;
+    let helpers = helper_plan::prepare_entry_helpers(
+        module, &call_order, first_func, word, word_type, f32_type, bool_type,
+        helper_context, &entry_body_plan, private_heap_words, live_arguments,
+        typed_local_types, &mut naga_mod.types,
+    )?;
+    Ok(PreparedNagaEntry {
+        module: naga_mod, word_type, f32_type, bool_type, body: entry_body_plan,
+        private_heap_words, external_roots, external_layout_bindings, helpers,
+    })
+}
+
+#[cfg(feature = "spirv-backend")]
 fn translate_to_naga(
     module: &Module,
     pipeline: ShaderPipeline,
@@ -8828,135 +8972,37 @@ fn translate_to_naga(
 
     let word_width = word.width_bytes();
 
-    let mut naga_mod = naga::Module::default();
-
-    let word_type = naga_mod.types.insert(
-        naga::Type {
-            name: None,
-            inner: naga::TypeInner::Scalar(naga::Scalar {
-                kind: match word {
-                    WordKind::U32 => naga::ScalarKind::Uint,
-                    WordKind::I64 => naga::ScalarKind::Sint,
-                },
-                width: word_width as u8,
-            }),
-        },
-        naga::Span::UNDEFINED,
-    );
-    let f32_type = naga_mod.types.insert(
-        naga::Type {
-            name: None,
-            inner: naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Float,
-                width: 4,
-            }),
-        },
-        naga::Span::UNDEFINED,
-    );
-    let bool_type = naga_mod.types.insert(
-        naga::Type {
-            name: None,
-            inner: naga::TypeInner::Scalar(naga::Scalar {
-                kind: naga::ScalarKind::Bool,
-                width: 1,
-            }),
-        },
-        naga::Span::UNDEFINED,
-    );
-
-    let call_order = reachable_call_postorder(module, first_func)?;
-    let typed_local_types = collect_naga_typed_local_types(
-        module,
-        &call_order,
-        word,
+    let PreparedNagaEntry {
+        module: mut naga_mod,
         word_type,
         f32_type,
         bool_type,
-        &mut naga_mod.types,
-    )?;
-
-    // Scan the first function for ObjAlloc (output mode). Under a u32 word, also
-    // fail closed on any signedness-sensitive op (Sar / signed compares / signed
-    // div|mod): Sonatina integers are signless, so u32 is exact for wrapping
-    // Add/Sub/Mul but WRONG for these until a sign mapping is designed. We never
-    // silently emit the signed WGSL operator.
-    let phase = std::time::Instant::now();
-    let entry_body_plan = analyze_naga_entry_body(module, first_func, word, heap_words)?;
-    let NagaEntryBodyPlan {
-        parameter_count: param_count,
-        has_object_allocation: has_obj_alloc,
-        uses_arena: has_mem,
-        may_trap: has_unreachable,
-        arena_high_water_bytes: mem_heap_bytes,
-    } = entry_body_plan;
-    if trace {
-        eprintln!(
-            "sonatina spirv: pre-scan complete, function={}, heap_bytes={}, elapsed_ms={}, total_elapsed_ms={}",
-            sig.name(),
-            mem_heap_bytes,
-            phase.elapsed().as_millis(),
-            started.elapsed().as_millis()
-        );
-    }
-
-    // `heap_words` is a fail-closed capacity, not an allocation request. The
-    // pre-scan above has already proved the exact static upper bound for this
-    // call-free entry, so materialize only that many private words. Emitting
-    // the full default capacity for every invocation turns a small local
-    // array into 32 KiB of private storage and multiplies that cost by the
-    // workgroup width. This was enough to make otherwise modest Fe workgroup
-    // kernels pathological for browser shader compilers.
-    let private_heap_words = if has_mem {
-        u32::try_from(mem_heap_bytes.div_ceil(4))
-            .map_err(|_| {
-                format!(
-                    "spirv: static private heap requirement ({mem_heap_bytes} bytes) does not fit in u32 words"
-                )
-            })?
-            .max(1)
-    } else {
-        0
-    };
-
-    let external_resource_stages = vec![
-        vec![if render {
-            SpirvShaderStage::Fragment
-        } else {
-            SpirvShaderStage::Compute
-        }];
-        emitted_external_resources.len()
-    ];
-    let (external_roots, external_layout_bindings) = append_external_resources(
-        &mut naga_mod,
-        &emitted_external_resources,
-        &external_resource_stages,
-        word,
-        word_type,
-        f32_type,
-    )?;
-    let helper_context = helper_plan::EntryHelperContext::derive(
-        module,
-        &call_order,
-        first_func,
-        &external_roots,
-        &live_arguments,
-        has_mem,
-    )?;
-    let helper_plan::PreparedEntryHelpers {
-        context: helper_plan::EntryHelperContext {
-            resources: helper_resource_capabilities,
-            logical_results: helper_logical_result_abis,
-            variants: helper_resource_variants,
-            memory: _,
+        body: NagaEntryBodyPlan {
+            parameter_count: param_count,
+            has_object_allocation: has_obj_alloc,
+            uses_arena: has_mem,
+            may_trap: has_unreachable,
+            arena_high_water_bytes: _,
         },
-        plans: helper_plans,
-        functions: mut naga_functions,
-        private_heap_type,
-        needs_trap_channel,
-    } = helper_plan::prepare_entry_helpers(
-        module, &call_order, first_func, word, word_type, f32_type, bool_type,
-        helper_context, &entry_body_plan, private_heap_words, &live_arguments,
-        typed_local_types, &mut naga_mod.types,
+        private_heap_words,
+        external_roots,
+        external_layout_bindings,
+        helpers: helper_plan::PreparedEntryHelpers {
+            context: helper_plan::EntryHelperContext {
+                resources: helper_resource_capabilities,
+                logical_results: helper_logical_result_abis,
+                variants: helper_resource_variants,
+                memory: _,
+            },
+            plans: helper_plans,
+            functions: mut naga_functions,
+            private_heap_type,
+            needs_trap_channel,
+        },
+    } = prepare_naga_entry(
+        module, first_func, word,
+        if render { SpirvShaderStage::Fragment } else { SpirvShaderStage::Compute },
+        &emitted_external_resources, &live_arguments, heap_words, trace, started,
     )?;
     let mut lowered_variants = std::collections::HashMap::<
         NagaFunctionVariant,
