@@ -208,6 +208,29 @@ pub struct ObjStore {
     value: ValueId,
 }
 
+/// Relaxed device-scope atomic operations on externally synchronized u32
+/// storage. They are not ordinary object loads/stores: even an unused result
+/// must not allow an optimizer to erase, duplicate, or coalesce the operation.
+/// Backends without atomic object storage must reject them, never lower them
+/// to an unsynchronized read/modify/write sequence.
+/// Atomically add modulo 2^32, returning the value before the addition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(super::SideEffect::Write))]
+#[inst(text = "obj.atomic.add")]
+pub struct ObjAtomicAdd {
+    object: ValueId,
+    value: ValueId,
+}
+
+/// Atomically take the unsigned minimum, returning the previous value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
+#[inst(side_effect(super::SideEffect::Write))]
+#[inst(text = "obj.atomic.umin")]
+pub struct ObjAtomicUMin {
+    object: ValueId,
+    value: ValueId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Inst)]
 #[inst(side_effect(super::SideEffect::Write))]
 #[inst(text = "obj.init.const")]

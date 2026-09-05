@@ -30,6 +30,99 @@ fn native_module_builder() -> ModuleBuilder {
     ModuleBuilder::new(ctx)
 }
 
+fn atomic_claim_module() -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array = mb.declare_array_type(Type::I32, 4);
+    let resource = mb.objref_type(array);
+    let slot_ty = mb.objref_type(Type::I32);
+    let entry = mb.declare_function(Signature::new_unit("atomic_claim", Linkage::Public, &[resource, Type::I32])).unwrap();
+    let helper = mb.declare_function(Signature::new_single("claim_one", Linkage::Private, &[resource, Type::I32], Type::I32)).unwrap();
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        let count = fb.insert_inst(data::ObjIndex::new(is, fb.args()[0], zero), slot_ty);
+        let _ticket = fb.insert_inst(data::ObjAtomicAdd::new(is, count, one), Type::I32);
+        let claim = fb.insert_inst(data::ObjIndex::new(is, fb.args()[0], one), slot_ty);
+        let previous = fb.insert_inst(data::ObjAtomicUMin::new(is, claim, fb.args()[1]), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, previous));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let first = fb.insert_inst(control_flow::Call::new(is, helper, fb.args().iter().copied().collect()), Type::I32);
+        let _second = fb.insert_inst(control_flow::Call::new(is, helper, [fb.args()[0], first].into_iter().collect()), Type::I32);
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+    mb.build()
+}
+
+fn atomic_claim_resource(element: SpirvResourceElement, access: Access) -> SpirvExternalResource {
+    SpirvExternalResource { arg_index: 0, group: 0, binding: 0, name: "claims".into(), access, element, stride: 4, length: 4 }
+}
+
+#[test]
+fn atomic_object_rmw_preserves_helper_identity_and_emits_portable_atomics() {
+    let module = atomic_claim_module();
+    sonatina_codegen::optim::pipeline::run_function_passes_on(
+        &module, &module.funcs(),
+        &[sonatina_codegen::optim::pipeline::Pass::Gvn, sonatina_codegen::optim::pipeline::Pass::Adce],
+    );
+    let artifact = SpirvBackend::new().with_compute().with_workgroup_size(64, 1, 1)
+        .with_builtin_argument(SpirvBuiltinArgument { arg_index: 1, source: SpirvBuiltinSource::GlobalInvocationIdX })
+        .with_external_resource(atomic_claim_resource(SpirvResourceElement::AtomicU32, Access::ReadWrite))
+        .compile_module(&module).expect("atomic helper compilation");
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    assert!(wgsl.contains("array<atomic<u32>>"), "{wgsl}");
+    assert!(wgsl.contains("atomicAdd("), "{wgsl}");
+    assert!(wgsl.contains("atomicMin("), "{wgsl}");
+    assert!(wgsl.matches("claim_one(").count() >= 3, "both helper calls survive: {wgsl}");
+    assert_eq!(artifact.layout.bindings.iter().filter(|b| b.role == Role::Resource).count(), 1);
+    let module = naga::front::wgsl::parse_str(wgsl).expect("atomic WGSL reparses");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&module).expect("no elevated atomic capabilities required");
+    // Optional diagnostic transport for browser contention checks. This is the
+    // compiled artifact, not a second hand-written shader implementation.
+    if std::env::var_os("SONATINA_PRINT_ATOMIC_WGSL").is_some() {
+        println!("ATOMIC_WGSL_BEGIN\n{wgsl}\nATOMIC_WGSL_END");
+    }
+}
+
+#[test]
+fn atomic_object_rmw_rejects_plain_and_readonly_storage() {
+    for (element, access) in [
+        (SpirvResourceElement::Scalar(SpirvScalarKind::U32), Access::ReadWrite),
+        (SpirvResourceElement::AtomicU32, Access::Read),
+    ] {
+        let errors = match SpirvBackend::new().with_compute()
+            .with_external_resource(atomic_claim_resource(element, access))
+            .compile_module(&atomic_claim_module()) {
+                Ok(_) => panic!("invalid atomic storage compiled"),
+                Err(errors) => errors,
+            };
+        let message = errors.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+        assert!(message.to_lowercase().contains("atomic"), "{message}");
+    }
+}
+
+#[test]
+fn atomic_object_rmw_is_not_silently_emulated_on_unsynchronized_backends() {
+    let module = atomic_claim_module();
+    let native = sonatina_codegen::isa::cranelift::CraneliftBackend::new().compile_module(&module);
+    let Err(errors) = native else { panic!("unsupported native object atomics compiled") };
+    assert!(errors.iter().any(|error| error.to_string().contains("atomic object storage")));
+    assert!(sonatina_codegen::isa::wasm::WasmBackend::new().compile_module(&module).is_err());
+}
+
 fn spirv_rejection(module: &sonatina_ir::Module, expectation: &str) -> String {
     match SpirvBackend::new().compile_module(module) {
         Ok(_) => panic!("{expectation}"),

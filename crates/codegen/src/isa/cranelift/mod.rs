@@ -88,6 +88,24 @@ impl Backend for CraneliftBackend {
     type Error = CraneliftError;
 
     fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
+        // This backend does not yet define synchronization/address-space
+        // semantics for object atomics. Reject before the legacy translator's
+        // per-function skip path can leave an apparently successful artifact.
+        for function in module.funcs() {
+            let has_atomics = module.func_store.view(function, |body| {
+                body.layout.iter_block().any(|block| body.layout.iter_inst(block).any(|id| {
+                    use sonatina_ir::{InstDowncast, inst::data};
+                    let inst = body.dfg.inst(id);
+                    <&data::ObjAtomicAdd as InstDowncast>::downcast(body.inst_set(), inst).is_some()
+                        || <&data::ObjAtomicUMin as InstDowncast>::downcast(body.inst_set(), inst).is_some()
+                }))
+            });
+            if has_atomics {
+                return Err(vec![CraneliftError::UnsupportedTarget(
+                    "atomic object storage is not implemented by CraneliftBackend".into(),
+                )]);
+            }
+        }
         let triple = module.ctx.triple;
         if !matches!(triple.architecture, Architecture::X86_64 | Architecture::Aarch64) {
             return Err(vec![CraneliftError::UnsupportedTarget(format!(

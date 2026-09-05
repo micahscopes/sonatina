@@ -1816,6 +1816,38 @@ impl VerifyInst for data::ObjLoad {
     }
 }
 
+/// The IR carrier is signless i32; atomic.umin interprets its bits unsigned.
+/// Physical storage must additionally be atomic-u32, checked by the backend.
+fn verify_atomic_u32_rmw(
+    verifier: &mut FunctionVerifier<'_>,
+    inst_id: InstId,
+    object: ValueId,
+    value: ValueId,
+) {
+    let location = verifier.inst_location(inst_id);
+    let pointee = verifier.value_ty(object).and_then(|ty| verifier.objref_ty(ty));
+    if pointee != Some(Type::I32) || verifier.value_ty(value) != Some(Type::I32) {
+        verifier.emit(Diagnostic::error(
+            DiagnosticCode::InstOperandTypeMismatch,
+            "atomic object RMW requires an i32 object reference and i32 value",
+            location.clone(),
+        ));
+    }
+    verifier.expect_result_ty(inst_id, Type::I32, location);
+}
+
+impl VerifyInst for data::ObjAtomicAdd {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_atomic_u32_rmw(verifier, inst_id, *self.object(), *self.value());
+    }
+}
+
+impl VerifyInst for data::ObjAtomicUMin {
+    fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
+        verify_atomic_u32_rmw(verifier, inst_id, *self.object(), *self.value());
+    }
+}
+
 impl VerifyInst for data::ObjStore {
     fn verify_inst(&self, verifier: &mut FunctionVerifier<'_>, inst_id: InstId) {
         let location = verifier.inst_location(inst_id);

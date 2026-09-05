@@ -371,6 +371,23 @@ mod tests {
     }
 
     #[test]
+    fn unused_atomic_results_do_not_erase_or_merge_atomic_updates() {
+        let source = r#"
+target = "wasm32-unknown-native"
+func public %claim(v0.objref<i32>, v1.i32) {
+    block0:
+        v2.i32 = obj.atomic.add v0 v1;
+        v3.i32 = obj.atomic.add v0 v1;
+        v4.i32 = obj.atomic.umin v0 v1;
+        return;
+}
+"#;
+        let (_, dumped) = run_default_adce(source);
+        assert_eq!(dumped.matches("obj.atomic.add").count(), 2, "{dumped}");
+        assert_eq!(dumped.matches("obj.atomic.umin").count(), 1, "{dumped}");
+    }
+
+    #[test]
     fn keeps_phi_entry_pred_edge_live() {
         let source = r#"
 target = "evm-ethereum-osaka"

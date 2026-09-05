@@ -153,6 +153,9 @@ pub struct SpirvResourceField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpirvResourceElement {
     Scalar(SpirvScalarKind),
+    /// Portable device-scope atomic storage; ordinary scalar storage is not
+    /// interchangeable even though both use four bytes per element.
+    AtomicU32,
     Record {
         fields: Vec<SpirvResourceField>,
         span: u32,
@@ -1161,6 +1164,22 @@ pub(super) fn append_external_resources(
         }
 
         let (element_type, element_span) = match &resource.element {
+            SpirvResourceElement::AtomicU32 => {
+                if resource.access != Access::ReadWrite {
+                    return Err(format!(
+                        "spirv: atomic resource {} requires read_write storage",
+                        resource.name,
+                    ));
+                }
+                let ty = naga_mod.types.insert(
+                    naga::Type {
+                        name: None,
+                        inner: naga::TypeInner::Atomic(naga::Scalar::U32),
+                    },
+                    naga::Span::UNDEFINED,
+                );
+                (ty, 4)
+            }
             SpirvResourceElement::Scalar(scalar) => {
                 (admitted_scalar(*scalar, word_type, f32_type)?, 4)
             }
@@ -2313,6 +2332,7 @@ fn emit_single_inst(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
     word: WordKind,
+    word_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     target: &mut naga::Block,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
@@ -3137,6 +3157,35 @@ fn emit_single_inst(
                 return true;
             }
         }
+    } else if let Some((object, value, op)) =
+        <&sonatina_ir::inst::data::ObjAtomicAdd as InstDowncast>::downcast(inst_set, inst_data)
+            .map(|op| (*op.object(), *op.value(), naga::AtomicFunction::Add))
+            .or_else(|| <&sonatina_ir::inst::data::ObjAtomicUMin as InstDowncast>::downcast(inst_set, inst_data)
+                .map(|op| (*op.object(), *op.value(), naga::AtomicFunction::Min)))
+    {
+        if word != WordKind::U32 {
+            *mem_error = Some("spirv: atomic object RMW requires the u32 browser carrier".into());
+            return false;
+        }
+        let Some(pointer) = resolve_naga_value(object, function, word, value_map, phi_locals, func) else {
+            *mem_error = Some("spirv: unresolved atomic object reference".into());
+            return false;
+        };
+        let Some(value) = resolve_naga_value(value, function, word, value_map, phi_locals, func) else {
+            *mem_error = Some("spirv: unresolved atomic operand".into());
+            return false;
+        };
+        let result = function.dfg.inst_result(inst_id).map(|id| {
+            let expr = func.expressions.append(
+                naga::Expression::AtomicResult { ty: word_type, comparison: false },
+                naga::Span::UNDEFINED,
+            );
+            value_map.insert(id, expr);
+            expr
+        });
+        // AtomicResult enters scope through this statement, never Emit.
+        target.push(naga::Statement::Atomic { pointer, fun: op, value, result }, naga::Span::UNDEFINED);
+        return true;
     } else if let Some(obj_store) = <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, inst_data) {
         // ObjStore: store value at the pointer (which is an Access expression into the buffer)
         let dest = resolve_naga_value(*obj_store.object(), function, word, value_map, phi_locals, func).unwrap();
@@ -3168,11 +3217,14 @@ fn emit_single_inst(
                 naga::Span::UNDEFINED,
             );
             target.push(naga::Statement::Emit(naga::Range::new_from_bounds(i32_idx, i32_idx)), naga::Span::UNDEFINED);
-            // Access returns a pointer, so no Emit is needed (like LocalVariable/GlobalVariable)
+            // Computed pointers are expressions too. In particular Atomic
+            // requires its Access operand to be in scope; a GlobalVariable's
+            // implicit scope does not extend to an un-emitted Access chain.
             let h = func.expressions.append(
                 naga::Expression::Access { base, index: i32_idx },
                 naga::Span::UNDEFINED,
             );
+            target.push(naga::Statement::Emit(naga::Range::new_from_bounds(h, h)), naga::Span::UNDEFINED);
             value_map.insert(result, h);
             return true;
         }
@@ -4107,6 +4159,7 @@ fn emit_block_to_target(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
     word: WordKind,
+    word_type: naga::Handle<naga::Type>,
     block: sonatina_ir::BlockId,
     func: &mut naga::Function,
     target: &mut naga::Block,
@@ -4124,6 +4177,7 @@ fn emit_block_to_target(
             function,
             inst_set,
             word,
+            word_type,
             func,
             target,
             value_map,
@@ -4149,7 +4203,7 @@ fn emit_naga_block_instructions(
     inst_set: &dyn sonatina_ir::InstSetBase,
     word: WordKind,
     block: sonatina_ir::BlockId,
-    _word_type: naga::Handle<naga::Type>,
+    word_type: naga::Handle<naga::Type>,
     func: &mut naga::Function,
     value_map: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
     phi_locals: &mut std::collections::HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
@@ -4165,6 +4219,7 @@ fn emit_naga_block_instructions(
         function,
         inst_set,
         word,
+        word_type,
         block,
         func,
         &mut target,
@@ -4689,7 +4744,7 @@ fn emit_if_region(
     );
     let mut ignored_result = None;
     let mut mem_error = None;
-    emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, &mut ignored_result, return_abi, naga_functions, mem_ctx, &mut mem_error);
+    emit_block_to_target(function, inst_set, word, word_type, *header, func, target, value_map, phi_locals, &mut ignored_result, return_abi, naga_functions, mem_ctx, &mut mem_error);
     if let Some(msg) = mem_error.take() {
         return Err(msg);
     }
@@ -4851,7 +4906,7 @@ fn emit_non_loop_regions(
                 emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
                 let mut block_result = None;
                 let mut mem_error = None;
-                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, &mut block_result, return_abi, naga_functions, mem_ctx, &mut mem_error);
+                emit_block_to_target(function, inst_set, word, word_type, *block, func, target, value_map, phi_locals, &mut block_result, return_abi, naga_functions, mem_ctx, &mut mem_error);
                 if let Some(msg) = mem_error.take() {
                     return Err(msg);
                 }
@@ -5223,6 +5278,7 @@ fn emit_loop_exit_return(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
     word: WordKind,
+    word_type: naga::Handle<naga::Type>,
     exit: sonatina_ir::BlockId,
     return_local: naga::Handle<naga::LocalVariable>,
     did_return_local: naga::Handle<naga::LocalVariable>,
@@ -5241,7 +5297,7 @@ fn emit_loop_exit_return(
     emit_phi_loads_for_block(function, inst_set, exit, func, target, value_map, phi_locals);
     let mut mem_error = None;
     emit_block_to_target(
-        function, inst_set, word, exit, func, target, value_map, phi_locals,
+        function, inst_set, word, word_type, exit, func, target, value_map, phi_locals,
         result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error,
     );
     if let Some(message) = mem_error {
@@ -5294,7 +5350,7 @@ fn emit_regions_in_loop(
             crate::structurize::Region::Block(block) => {
                 emit_phi_loads_for_block(function, inst_set, *block, func, target, value_map, phi_locals);
                 let mut mem_error = None;
-                emit_block_to_target(function, inst_set, word, *block, func, target, value_map, phi_locals, result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error);
+                emit_block_to_target(function, inst_set, word, word_type, *block, func, target, value_map, phi_locals, result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error);
                 if let Some(msg) = mem_error.take() {
                     return Err(msg);
                 }
@@ -5361,7 +5417,7 @@ fn emit_regions_in_loop(
                     function, inst_set, *header, func, target, value_map, phi_locals,
                 );
                 let mut mem_error = None;
-                emit_block_to_target(function, inst_set, word, *header, func, target, value_map, phi_locals, result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error);
+                emit_block_to_target(function, inst_set, word, word_type, *header, func, target, value_map, phi_locals, result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error);
                 if let Some(msg) = mem_error.take() {
                     return Err(msg);
                 }
@@ -5403,7 +5459,7 @@ fn emit_regions_in_loop(
                         // still-falling-through arm with a Naga `Break`.
                         if matches!(then_outcome, RegionOutcome::Fallthrough(_)) {
                             *may_return |= emit_loop_exit_return(
-                                function, inst_set, word, *merge, return_local, did_return_local,
+                                function, inst_set, word, word_type, *merge, return_local, did_return_local,
                                 func, &mut accept, &mut accept_values, phi_locals, result_expr,
                                 return_abi, naga_functions, mem_ctx,
                             )?;
@@ -5411,7 +5467,7 @@ fn emit_regions_in_loop(
                         }
                         if matches!(else_outcome, RegionOutcome::Fallthrough(_)) {
                             *may_return |= emit_loop_exit_return(
-                                function, inst_set, word, *merge, return_local, did_return_local,
+                                function, inst_set, word, word_type, *merge, return_local, did_return_local,
                                 func, &mut reject, &mut reject_values, phi_locals, result_expr,
                                 return_abi, naga_functions, mem_ctx,
                             )?;
@@ -5505,7 +5561,7 @@ fn emit_regions_in_loop(
                     function, inst_set, word, *from, *exit, func, target, value_map, phi_locals,
                 )?;
                 *may_return |= emit_loop_exit_return(
-                    function, inst_set, word, *exit, return_local, did_return_local,
+                    function, inst_set, word, word_type, *exit, return_local, did_return_local,
                     func, target, value_map, phi_locals, result_expr, return_abi,
                     naga_functions, mem_ctx,
                 )?;
@@ -5686,7 +5742,7 @@ fn emit_recursive_loop_region(
     emit_phi_loads_for_block(function, inst_set, header, func, &mut loop_body, value_map, phi_locals);
     let mut mem_error = None;
     emit_block_to_target(
-        function, inst_set, word, header, func, &mut loop_body, value_map,
+        function, inst_set, word, word_type, header, func, &mut loop_body, value_map,
         phi_locals, &mut nested_result_expr, return_abi, naga_functions, mem_ctx, &mut mem_error,
     );
     if let Some(msg) = mem_error.take() {
@@ -5744,7 +5800,7 @@ fn emit_recursive_loop_region(
         function, inst_set, word, header, exit, func, &mut exit_arm, &mut exit_values, phi_locals,
     )?;
     may_return |= emit_loop_exit_return(
-        function, inst_set, word, exit, return_local, did_return_local,
+        function, inst_set, word, word_type, exit, return_local, did_return_local,
         func, &mut exit_arm, &mut exit_values, phi_locals, &mut nested_result_expr,
         return_abi, naga_functions, mem_ctx,
     )?;
@@ -6036,6 +6092,8 @@ fn spirv_instruction_is_lowered(
         || <&data::Gep as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAlloc as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjStore as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjAtomicAdd as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjAtomicUMin as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjLoad as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjIndex as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjProj as InstDowncast>::downcast(is, inst).is_some()
