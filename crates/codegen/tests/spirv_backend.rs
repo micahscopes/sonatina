@@ -70,6 +70,87 @@ fn atomic_claim_resource(element: SpirvResourceElement, access: Access) -> Spirv
     SpirvExternalResource { arg_index: 0, group: 0, binding: 0, name: "claims".into(), access, element, stride: 4, length: 4 }
 }
 
+fn atomic_access_module(atomic_load: bool, atomic_store: bool) -> sonatina_ir::Module {
+    let isa = Native::new(TargetTriple::new(Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let array = mb.declare_array_type(Type::I32, 4);
+    let resource = mb.objref_type(array);
+    let slot_ty = mb.objref_type(Type::I32);
+    let entry = mb.declare_function(Signature::new_unit("atomic_access", Linkage::Public, &[resource])).unwrap();
+    let helper = mb.declare_function(Signature::new_unit("access_one", Linkage::Private, &[resource])).unwrap();
+    {
+        let mut fb = mb.func_builder::<InstInserter>(helper);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        let zero = fb.make_imm_value(0i32);
+        let slot = fb.insert_inst(data::ObjIndex::new(is, fb.args()[0], zero), slot_ty);
+        let value = if atomic_load {
+            // Both reads observe concurrent invocations, even when the first
+            // result is unused. GVN/ADCE must not merge or erase them.
+            let _unused = fb.insert_inst(data::ObjAtomicLoad::new(is, slot), Type::I32);
+            fb.insert_inst(data::ObjAtomicLoad::new(is, slot), Type::I32)
+        } else {
+            fb.insert_inst(data::ObjLoad::new(is, slot), Type::I32)
+        };
+        if atomic_store {
+            fb.insert_inst_no_result(data::ObjAtomicStore::new(is, slot, value));
+        } else {
+            fb.insert_inst_no_result(data::ObjStore::new(is, slot, value));
+        }
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+    {
+        let mut fb = mb.func_builder::<InstInserter>(entry);
+        let block = fb.append_block();
+        fb.switch_to_block(block);
+        fb.insert_inst_no_result(control_flow::Call::new(is, helper, fb.args().iter().copied().collect()));
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+        fb.seal_all();
+        fb.finish();
+    }
+    mb.build()
+}
+
+#[test]
+fn atomic_object_load_store_preserve_observations_through_helpers_and_optimization() {
+    let module = atomic_access_module(true, true);
+    sonatina_codegen::optim::pipeline::run_function_passes_on(
+        &module, &module.funcs(),
+        &[sonatina_codegen::optim::pipeline::Pass::Gvn, sonatina_codegen::optim::pipeline::Pass::Adce],
+    );
+    let artifact = SpirvBackend::new().with_compute()
+        .with_external_resource(atomic_claim_resource(SpirvResourceElement::AtomicU32, Access::ReadWrite))
+        .compile_module(&module).expect("atomic load/store helper compilation");
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    assert_eq!(wgsl.matches("atomicLoad(").count(), 2, "{wgsl}");
+    assert_eq!(wgsl.matches("atomicStore(").count(), 1, "{wgsl}");
+    assert!(!wgsl.contains("atomicAdd("), "no RMW emulation: {wgsl}");
+    let parsed = naga::front::wgsl::parse_str(wgsl).unwrap();
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&parsed).expect("portable atomic load/store WGSL");
+    assert!(sonatina_codegen::isa::cranelift::CraneliftBackend::new().compile_module(&module).is_err());
+    assert!(sonatina_codegen::isa::wasm::WasmBackend::new().compile_module(&module).is_err());
+}
+
+#[test]
+fn atomic_object_access_policy_is_checked_in_both_directions() {
+    for (load, store, element) in [
+        (true, false, SpirvResourceElement::Scalar(SpirvScalarKind::U32)),
+        (false, true, SpirvResourceElement::Scalar(SpirvScalarKind::U32)),
+        (false, true, SpirvResourceElement::AtomicU32),
+        (true, false, SpirvResourceElement::AtomicU32),
+    ] {
+        let result = SpirvBackend::new().with_compute()
+            .with_external_resource(atomic_claim_resource(element, Access::ReadWrite))
+            .compile_module(&atomic_access_module(load, store));
+        let Err(errors) = result else { panic!("mixed atomic/ordinary access compiled") };
+        assert!(errors.iter().any(|error| error.to_string().contains("atomic")), "{errors:?}");
+    }
+}
+
 #[test]
 fn atomic_object_rmw_preserves_helper_identity_and_emits_portable_atomics() {
     let module = atomic_claim_module();

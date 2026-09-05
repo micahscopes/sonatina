@@ -414,6 +414,8 @@ fn prepare_raster_entries(
                         <&sonatina_ir::inst::data::ObjLoad as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjAtomicAdd as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjAtomicUMin as InstDowncast>::downcast(inst_set, data).is_some()
+                        || <&sonatina_ir::inst::data::ObjAtomicLoad as InstDowncast>::downcast(inst_set, data).is_some()
+                        || <&sonatina_ir::inst::data::ObjAtomicStore as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjIndex as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjProj as InstDowncast>::downcast(inst_set, data).is_some();
@@ -517,6 +519,7 @@ pub(super) fn translate_entries(
         f32_type,
         bool_type,
     )?;
+    naga_functions.set_atomic_resources(&emitted_external_resources, &external_roots);
     naga_functions.replace_call_sites(
         root_call_sites.remove(&vertex_ref).ok_or_else(|| {
             "spirv raster: vertex root has no derived helper call-site map".to_string()

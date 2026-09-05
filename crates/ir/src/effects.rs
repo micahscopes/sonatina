@@ -635,6 +635,8 @@ fn classify_declared_effects_with<S: EffectSink>(
 
     if <&data::ObjAtomicAdd as InstDowncast>::downcast(is, inst).is_some()
         || <&data::ObjAtomicUMin as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjAtomicLoad as InstDowncast>::downcast(is, inst).is_some()
+        || <&data::ObjAtomicStore as InstDowncast>::downcast(is, inst).is_some()
     {
         // Atomic operations observe concurrent invocations, not merely the
         // local memory SSA state. Retain and order every operation.
