@@ -82,6 +82,50 @@ fn spirv_quad_job_state_aggregate_snapshot_lowers() {
     }
 }
 
+#[test]
+fn grid_sequential_loops_keep_preheader_helper_value() {
+    // The second loop's backedge must not make the intervening preheader
+    // look like an exhaustion-only forwarder belonging to the first loop.
+    let source = r#"
+target = "shader-unknown-unknown"
+func public %entry(v0.i32, v1.i32) -> i32 {
+    block0:
+        jump block1;
+    block1:
+        v2.i32 = phi (0.i32 block0) (v4 block2);
+        v3.i1 = lt v2 v0;
+        br v3 block2 block3;
+    block2:
+        v4.i32 = add v2 1.i32;
+        jump block1;
+    block3:
+        v5.i32 = call %offset v2;
+        jump block4;
+    block4:
+        v6.i32 = phi (0.i32 block3) (v9 block5);
+        v7.i32 = phi (0.i32 block3) (v10 block5);
+        v8.i1 = lt v6 2.i32;
+        br v8 block5 block6;
+    block5:
+        v9.i32 = add v6 1.i32;
+        v10.i32 = add v7 v5;
+        jump block4;
+    block6:
+        return v7;
+}
+func inline(never) private %offset(v0.i32) -> i32 {
+    block0:
+        v1.i32 = add v0 7.i32;
+        return v1;
+}
+"#;
+    let module = sonatina_parser::parse_module(source).unwrap().module;
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(1, 1, 1)
+        .compile_module(&module).expect("sequential loop preheader must remain outside both loops");
+    assert_eq!(run_grid_u32(artifact.wgsl.as_deref().unwrap(), 4, 1, 1, 1, &[]),
+        vec![14, 16, 18, 20]);
+}
+
 /// Two nested choices share a nonempty continue block, while the third path
 /// takes a different backedge. The shared block is not a merge for every path;
 /// each mutually exclusive occurrence must retain its exact incoming phi.
