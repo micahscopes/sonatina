@@ -595,6 +595,23 @@ struct PreparedRasterHelpers {
     report: super::helper_plan::HelperAbiReport,
 }
 
+pub(super) fn analyze_helpers(
+    module: &Module,
+    vertex: sonatina_ir::module::FuncRef,
+    fragment: sonatina_ir::module::FuncRef,
+    resources: &[SpirvExternalResource],
+    builtins: &[SpirvBuiltinArgument],
+) -> Result<super::ShaderHelperAnalysis, String> {
+    let _entries = prepare_raster_entries(module, vertex, fragment, resources, builtins)?;
+    let mut types = naga::Module::default();
+    let word = scalar_type(&mut types, naga::ScalarKind::Uint, 4);
+    let float = scalar_type(&mut types, naga::ScalarKind::Float, 4);
+    let boolean = scalar_type(&mut types, naga::ScalarKind::Bool, 1);
+    Ok(prepare_scalar_helpers(
+        module, &[vertex, fragment], &mut types.types, word, float, boolean,
+    )?.report.into_analysis())
+}
+
 fn prepare_scalar_helpers(
     module: &Module,
     roots: &[sonatina_ir::module::FuncRef],

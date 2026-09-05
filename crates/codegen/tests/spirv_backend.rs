@@ -5428,6 +5428,12 @@ fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
         [ShaderEncoding::Wgsl, ShaderEncoding::Spirv]).unwrap();
     let request = ShaderCompileRequest::new(&target,
         ShaderPipeline::Raster { vertex: vertex_ref, fragment: fragment_ref });
+    let analysis = NagaBackend::analyze_request_helpers(&module, &request)
+        .expect("paired raster uses contextual helper analysis");
+    assert!(analysis.rejected.is_empty());
+    assert_eq!(analysis.callable.len(), 1);
+    assert_eq!(analysis.callable[0].function, pair_ref);
+    assert_eq!(analysis.callable[0].variants, 1);
     let requested = NagaBackend::compile_request(&module, &request)
         .expect("the typed raster request must share the same lowering");
     assert_eq!(requested.wgsl, artifact.wgsl);
