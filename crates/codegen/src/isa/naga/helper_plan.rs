@@ -9,7 +9,16 @@ mod tests {
 
     #[test]
     fn helper_report_preserves_children_and_siblings_of_rejected_parent() {
-        let parsed = sonatina_parser::parse_module(r#"
+        check_rejected_parent(false);
+    }
+
+    #[test]
+    fn helper_report_closes_typed_storage_rejections_over_callers() {
+        check_rejected_parent(true);
+    }
+
+    fn check_rejected_parent(oversized_typed_local: bool) {
+        let source = r#"
 target = "wasm32-unknown-native"
 
 func public %entry() -> i32 {
@@ -36,7 +45,19 @@ func private %sibling() -> i32 {
     block0:
         return 23.i32;
 }
-"#).expect("partial ABI fixture parses");
+"#;
+        let source = if oversized_typed_local {
+            // Keep a scalar ABI, but give the parent a valid typed allocation
+            // exceeding the private-storage budget. Type interning succeeds;
+            // only the per-function validation outcome prevents admission.
+            source.replace("i256", "i32").replace(
+                "v0.i32 = call %leaf;",
+                "v1.*[i32; 5000] = alloca [i32; 5000];\n        v0.i32 = call %leaf;",
+            )
+        } else {
+            source.to_owned()
+        };
+        let parsed = sonatina_parser::parse_module(&source).expect("partial ABI fixture parses");
         let module = &parsed.module;
         let find = |name| module.funcs().into_iter().find(|&function| {
             module.ctx.func_sig(function, |signature| signature.name() == name)
@@ -59,15 +80,26 @@ func private %sibling() -> i32 {
         let word = scalar(naga::ScalarKind::Uint, 4);
         let float = scalar(naga::ScalarKind::Float, 4);
         let boolean = scalar(naga::ScalarKind::Bool, 1);
+        let locals = super::super::collect_naga_typed_local_types(
+            module, &order, WordKind::U32, word, float, boolean, &mut types,
+        );
+        if oversized_typed_local {
+            assert_eq!(locals.rejections.len(), 1);
+            assert_eq!(locals.rejections[0].0, parent);
+            assert!(!locals.types.is_empty(), "interning must not authorize an over-budget local");
+        }
+        let functions = NagaFunctionMap::with_typed_local_types(locals.types);
         let report = plan_helper_abis(
             module, &order, &[entry], WordKind::U32, word, float, boolean,
             &context.resources, &context.logical_results, &context.variants.bindings,
             &context.memory, NagaMemoryAbiTypes::default(), &live,
-            &NagaFunctionMap::new(), &mut types,
+            &functions, &locals.rejections, &mut types,
         );
         assert_eq!(report.rejections.len(), 2);
         assert_eq!(report.rejections[0].0, parent);
-        assert!(report.rejections[0].1.contains("unsupported"));
+        assert!(report.rejections[0].1.contains(
+            if oversized_typed_local { "private storage" } else { "unsupported" }
+        ));
         assert_eq!(report.rejections[1].0, ancestor);
         assert!(report.rejections[1].1.contains("rejected or unplanned callee"));
         let planned = report.plans.iter().map(|plan| plan.variant.function).collect::<Vec<_>>();
@@ -220,7 +252,7 @@ pub(super) fn prepare_entry_helpers(
     entry: &super::NagaEntryBodyPlan,
     private_heap_words: u32,
     live_arguments: &NagaLiveArguments,
-    typed_local_types: HashMap<sonatina_ir::Type, super::NagaTypedLocalType>,
+    typed_locals: super::NagaTypedLocalReport,
     types: &mut naga::UniqueArena<naga::Type>,
 ) -> Result<PreparedEntryHelpers, String> {
     let helper_memory = context.memory.values().any(|abi| abi.heap);
@@ -289,7 +321,7 @@ pub(super) fn prepare_entry_helpers(
     };
 
     let naga_functions =
-        NagaFunctionMap::with_typed_local_types(typed_local_types);
+        NagaFunctionMap::with_typed_local_types(typed_locals.types);
     let helper_plans = plan_helper_abis(
         module,
         call_order,
@@ -305,6 +337,7 @@ pub(super) fn prepare_entry_helpers(
         helper_memory_types,
         live_arguments,
         &naga_functions,
+        &typed_locals.rejections,
         types,
     ).into_complete()?;
 
@@ -409,9 +442,13 @@ pub(super) fn plan_helper_abis(
     memory_types: NagaMemoryAbiTypes,
     live_arguments: &NagaLiveArguments,
     functions: &NagaFunctionMap,
+    local_rejections: &[(FuncRef, String)],
     types: &mut naga::UniqueArena<naga::Type>,
 ) -> HelperAbiReport {
     let mut report = HelperAbiReport { plans: Vec::new(), rejections: Vec::new() };
+    let local_rejections = local_rejections.iter()
+        .map(|(function, error)| (*function, error))
+        .collect::<HashMap<_, _>>();
     let mut callable = std::collections::HashSet::new();
     for function in call_order
         .iter()
@@ -421,6 +458,9 @@ pub(super) fn plan_helper_abis(
         // A rejected resource variant rejects the whole helper. Do not expose
         // a prefix of its variants as a callable function.
         let outcome = (|| -> Result<Vec<PlannedHelperAbi>, String> {
+            if let Some(error) = local_rejections.get(&function) {
+                return Err((*error).clone());
+            }
             let mut plans = Vec::new();
             let memory = memory_abis.get(&function).copied().ok_or_else(|| {
                 format!("spirv: helper {function:?} has no derived private-memory ABI. Fail closed.")
