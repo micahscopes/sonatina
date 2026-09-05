@@ -6182,6 +6182,48 @@ fn authored_raster_prunes_resources_and_preserves_instance_local_identity() {
 }
 
 #[test]
+fn authored_raster_preserves_pure_aggregate_values_and_helpers() {
+    let parsed = sonatina_parser::parse_module(r#"
+target = "shader-unknown-unknown"
+type @Pair = {f32, f32};
+func private %pair_identity(v0.@Pair) -> @Pair {
+    block0:
+        return v0;
+}
+func public %vertex(v0.i32) -> (f32, f32, f32, f32, f32) {
+    block0:
+        v1.@Pair = insert_value undef.@Pair 0.i32 0x00000000.f32;
+        v2.@Pair = insert_value v1 1.i32 0x3f800000.f32;
+        v3.@Pair = call %pair_identity v2;
+        v4.f32 = extract_value v3 0.i32;
+        v5.f32 = extract_value v3 1.i32;
+        return (v4, v4, v4, v5, v5);
+}
+func public %fragment(v0.f32) -> i32 {
+    block0:
+        v1.@Pair = insert_value undef.@Pair 0.i32 v0;
+        v2.@Pair = insert_value v1 1.i32 0x00000000.f32;
+        v3.@Pair = call %pair_identity v2;
+        v4.f32 = extract_value v3 0.i32;
+        v5.i32 = bitcast v4 i32;
+        return v5;
+}
+"#).expect("raster aggregate fixture parses");
+    let artifact = SpirvBackend::new().with_authored_raster("vertex", "fragment")
+        .compile_module(&parsed.module).expect("raster shares compute's typed SSA products");
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    let module = naga::front::wgsl::parse_str(wgsl).unwrap();
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&module).expect("portable raster aggregate module validates");
+    let helper = module.functions.iter().map(|(_, f)| f)
+        .find(|f| f.name.as_deref() == Some("pair_identity")).unwrap();
+    assert!(matches!(module.types[helper.arguments[0].ty].inner, naga::TypeInner::Struct { .. }));
+    assert!(matches!(module.types[helper.result.as_ref().unwrap().ty].inner, naga::TypeInner::Struct { .. }));
+    assert_eq!(module.entry_points.len(), 2);
+    assert!(!wgsl.contains("fe_heap"), "pure values must not reintroduce a private arena");
+}
+
+#[test]
 fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
     let isa = sonatina_ir::isa::shader::Shader::new(
         TargetTriple::parse("shader-unknown-unknown").unwrap(),
