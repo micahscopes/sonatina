@@ -10777,6 +10777,46 @@ fn translate_to_naga(
 mod tests {
     use super::{MAX_WGSL_FUNCTION_PARAMETERS, validate_naga_portable_wgsl_limits};
 
+    #[test]
+    fn entry_preparation_derives_helper_abi_without_emitting_bodies() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "wasm32-unknown-native"
+
+func public %entry() -> i32 {
+    block0:
+        v0.i32 = call %leaf;
+        return v0;
+}
+
+func private %leaf() -> i32 {
+    block0:
+        return 17.i32;
+}
+"#).expect("preparation fixture parses");
+        let module = &parsed.module;
+        let find = |name| module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == name)
+        }).expect("fixture function exists");
+        let entry = find("entry");
+        let leaf = find("leaf");
+        let prepared = super::prepare_naga_entry(
+            module, entry, super::WordKind::U32, super::SpirvShaderStage::Compute,
+            &[], &super::analyze_live_arguments(module), 8192, false,
+            std::time::Instant::now(),
+        ).expect("shared contextual preparation succeeds");
+
+        assert!(prepared.module.functions.is_empty(), "preparation must not emit helper bodies");
+        assert!(prepared.module.entry_points.is_empty(), "preparation must not emit an entry body");
+        assert_eq!(prepared.helpers.plans.len(), 1);
+        let helper = &prepared.helpers.plans[0];
+        assert_eq!(helper.variant.function, leaf);
+        assert!(helper.parameters.arguments.is_empty());
+        assert_eq!(helper.body.instruction_count(), 1);
+        assert_eq!(prepared.private_heap_words, 0, "capacity is not a heap allocation");
+        assert!(prepared.helpers.private_heap_type.is_none());
+        assert!(!prepared.helpers.needs_trap_channel);
+    }
+
     fn naga_function_with_parameters(
         name: &str,
         count: usize,
