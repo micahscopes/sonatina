@@ -10915,6 +10915,14 @@ func private %leaf(v0.objref<[i32; 8]>) -> i32 {
         assert_eq!(report.variants.variants(good), &[vec![Some(first)]]);
         assert_eq!(report.variants.variants(leaf), &[vec![Some(first)]]);
         assert!(report.into_complete().is_err(), "partial identities cannot authorize emission");
+        let context = super::helper_plan::EntryHelperContext::analyze(
+            module, &order, entry, &[(0, first), (1, second)], &live, false,
+        ).expect("helper rejection must remain observable in contextual analysis");
+        assert!(context.logical_results.rejections.is_empty());
+        assert_eq!(context.variants.rejections.len(), 1);
+        assert_eq!(context.variants.rejections[0].0, bad);
+        assert!(context.memory.as_ref().expect("independent memory analysis").contains_key(&leaf));
+        assert!(context.into_complete().is_err(), "emission consumes the same complete-context gate");
         assert!(super::helper_resource_variants(
             module, &order, entry, &[(0, first), (0, second)],
             &resources, &logical, &live,

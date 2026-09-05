@@ -134,6 +134,32 @@ pub(super) struct EntryHelperContext {
     pub memory: HashMap<FuncRef, NagaMemoryAbi>,
 }
 
+/// Context analysis retains each phase's evidence, even when another phase
+/// rejects a helper. Only `into_complete` produces an emission-ready context.
+/// All facts belong to this module revision and its entry-rooted globals.
+pub(super) struct EntryHelperContextReport {
+    pub resources: NagaResourceCapabilities,
+    pub logical_results: super::NagaLogicalResultReport,
+    pub variants: super::NagaResourceVariantReport,
+    pub memory: Result<HashMap<FuncRef, NagaMemoryAbi>, String>,
+    entry_owns_arena: bool,
+}
+
+impl EntryHelperContextReport {
+    pub fn into_complete(self) -> Result<EntryHelperContext, String> {
+        let logical_results = self.logical_results.into_complete()?;
+        let variants = self.variants.into_complete()?;
+        let memory = self.memory?;
+        if memory.values().any(|abi| abi.heap) && !self.entry_owns_arena {
+            return Err(
+                "spirv: a reachable helper accesses the private arena, but the entry function owns no proven arena allocation. Fail closed."
+                    .to_string(),
+            );
+        }
+        Ok(EntryHelperContext { resources: self.resources, logical_results, variants, memory })
+    }
+}
+
 impl EntryHelperContext {
     pub fn derive(
         module: &Module,
@@ -143,24 +169,30 @@ impl EntryHelperContext {
         live_arguments: &NagaLiveArguments,
         entry_owns_arena: bool,
     ) -> Result<Self, String> {
+        Self::analyze(module, call_order, entry, external_roots, live_arguments, entry_owns_arena)?
+            .into_complete()
+    }
+
+    pub fn analyze(
+        module: &Module,
+        call_order: &[FuncRef],
+        entry: FuncRef,
+        external_roots: &[(u32, naga::Handle<naga::GlobalVariable>)],
+        live_arguments: &NagaLiveArguments,
+        entry_owns_arena: bool,
+    ) -> Result<EntryHelperContextReport, String> {
         let signature = module.ctx.get_sig(entry)
             .ok_or_else(|| format!("spirv: entry {entry:?} has no signature"))?;
         let resources = super::helper_resource_capabilities(module, &signature, external_roots)?;
         let logical_results = super::helper_naga_logical_result_abis(
             module, call_order, &[entry], &resources,
-        ).into_complete()?;
+        );
         let variants = super::helper_resource_variants(
             module, call_order, entry, external_roots, &resources,
-            &logical_results, live_arguments,
-        )?.into_complete()?;
-        let memory = super::helper_private_memory_abis(module, call_order, entry)?;
-        if memory.values().any(|abi| abi.heap) && !entry_owns_arena {
-            return Err(
-                "spirv: a reachable helper accesses the private arena, but the entry function owns no proven arena allocation. Fail closed."
-                    .to_string(),
-            );
-        }
-        Ok(Self { resources, logical_results, variants, memory })
+            &logical_results.results, live_arguments,
+        )?;
+        let memory = super::helper_private_memory_abis(module, call_order, entry);
+        Ok(EntryHelperContextReport { resources, logical_results, variants, memory, entry_owns_arena })
     }
 }
 
