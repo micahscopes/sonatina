@@ -232,6 +232,20 @@ impl Backend for CraneliftObjectBackend {
 }
 
 fn legalize_module(module: &Module) -> Result<(), String> {
+    for function in module.funcs() {
+        let has_atomics = module.func_store.view(function, |body| {
+            body.layout.iter_block().any(|block| body.layout.iter_inst(block).any(|id| {
+                use sonatina_ir::{InstDowncast, inst::data};
+                let inst = body.dfg.inst(id);
+                <&data::ObjAtomicAdd as InstDowncast>::downcast(body.inst_set(), inst).is_some()
+                    || <&data::ObjAtomicUMin as InstDowncast>::downcast(body.inst_set(), inst).is_some()
+            }))
+        });
+        if has_atomics {
+            return Err("atomic object storage is not implemented by Cranelift".into());
+        }
+    }
+
     EnumLowerToProduct.run(module);
     for func in module.funcs() {
         let report = verify_function_signature(&module.ctx, func, &VerifierConfig::default());

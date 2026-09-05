@@ -412,6 +412,8 @@ fn prepare_raster_entries(
                     }
                     let has_external_object_effect =
                         <&sonatina_ir::inst::data::ObjLoad as InstDowncast>::downcast(inst_set, data).is_some()
+                        || <&sonatina_ir::inst::data::ObjAtomicAdd as InstDowncast>::downcast(inst_set, data).is_some()
+                        || <&sonatina_ir::inst::data::ObjAtomicUMin as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjStore as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjIndex as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::ObjProj as InstDowncast>::downcast(inst_set, data).is_some();

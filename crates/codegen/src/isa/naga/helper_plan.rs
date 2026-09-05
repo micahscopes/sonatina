@@ -486,6 +486,8 @@ fn derive_helper_body(module: &Module, function_ref: FuncRef) -> Result<HelperBo
                     ));
                 }
                 accesses_resource |= <&data::ObjLoad as InstDowncast>::downcast(inst_set, inst).is_some()
+                    || <&data::ObjAtomicAdd as InstDowncast>::downcast(inst_set, inst).is_some()
+                    || <&data::ObjAtomicUMin as InstDowncast>::downcast(inst_set, inst).is_some()
                     || <&data::ObjStore as InstDowncast>::downcast(inst_set, inst).is_some();
             }
         }
