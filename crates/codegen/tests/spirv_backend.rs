@@ -6176,7 +6176,8 @@ fn grid_direct_return_multi_exit_f32_phi_executes_on_lavapipe() {
                 2 => 52,
                 _ => 3 + 10 * x,
             };
-            assert_eq!(output[(y * 8 + x) as usize], expected, "direct-return exit at ({x}, {y})");
+            assert_eq!(output[(y * 8 + x) as usize], expected,
+                "direct-return exit at ({x}, {y}); emitted WGSL:\n{wgsl}");
         }
     }
 }
