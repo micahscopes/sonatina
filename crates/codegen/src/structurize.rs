@@ -557,6 +557,25 @@ impl Structurer<'_> {
                 cur = None;
                 continue;
             }
+            // Nested selections may share a nonempty backedge arm without
+            // sharing their other continuation. Such an arm is terminal for
+            // this iteration, not a join that every sibling must reach.
+            // Reuse its original block identity at mutually exclusive tree
+            // positions, just as for direct merge arms above. The emitter
+            // transports incoming phis on the original predecessor edges,
+            // then emits this block's exact header-phi edge and Continue.
+            // Never clone an active block or a backedge to a different loop.
+            if !active.contains(&b)
+                && consumed.contains(&b)
+                && cur_loop.is_some_and(|lp| {
+                    self.in_loop(b, lp)
+                        && self.is_direct_merge_arm(b, self.loop_tree.loop_header(lp))
+                })
+            {
+                regions.push(Region::Block(b));
+                cur = None;
+                continue;
+            }
             if !active.contains(&b) && consumed.contains(&b) && self.is_shared_terminal_forwarder(b)
             {
                 let Term::Jump(terminal) = self.term(b) else {
