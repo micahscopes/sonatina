@@ -373,7 +373,15 @@ impl Structurer<'_> {
             if let Some(&result) = memo.get(&block) {
                 return result;
             }
-            if s.in_loop(block, lp) || s.is_canonical_loop_exit(lp, block) {
+            // Checked arithmetic can put the shared terminal trap directly
+            // on the header's outside edge. It is not a live fallthrough:
+            // an outside corridor that either returns or reaches that trap
+            // still terminates on every path. Keep ordinary canonical exits
+            // excluded, including mixed break/return corridors.
+            if s.in_loop(block, lp)
+                || (s.is_canonical_loop_exit(lp, block)
+                    && !matches!(s.term(block), Term::Unreachable))
+            {
                 return false;
             }
             if !visiting.insert(block) {
@@ -3035,6 +3043,41 @@ mod tests {
             error.contains("noncanonical exit") && error.contains("expected the header exit"),
             "expected a named noncanonical-exit error, got: {error}",
         );
+    }
+
+    #[test]
+    fn trapping_loop_header_allows_checked_success_return_corridor() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_unit("trapping_header_success", Linkage::Public, &[Type::I1]);
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let header = fb.append_block();
+        let body = fb.append_block();
+        let latch = fb.append_block();
+        let success_guard = fb.append_block();
+        let success = fb.append_block();
+        let trap = fb.append_block();
+        fb.switch_to_block(entry);
+        let cond = fb.args()[0];
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(header);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, body));
+        fb.switch_to_block(body);
+        fb.insert_inst_no_result(Br::new(is, cond, latch, success_guard));
+        fb.switch_to_block(latch);
+        fb.insert_inst_no_result(Jump::new(is, header));
+        fb.switch_to_block(success_guard);
+        fb.insert_inst_no_result(Br::new(is, cond, trap, success));
+        fb.switch_to_block(success);
+        fb.insert_inst_no_result(Return::new_unit(is));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+        let module = mb.build();
+        module.func_store.view(fr, |func| structurize_function(func))
+            .expect("a terminal header trap must not masquerade as a live fallthrough");
     }
 
     #[test]
