@@ -593,12 +593,13 @@ pub(super) fn translate_entries(
     }))
 }
 
-/// Materialize the ordinary scalar helper closure shared by both raster stages.
+/// Materialize the pure value helper closure shared by both raster stages.
 ///
 /// WebGPU functions cannot receive storage-resource pointers, so resource
 /// identity remains a property of the paired entry roots. This first authored
 /// raster helper ABI is intentionally smaller than the general compute ABI:
-/// booleans, u32/f32 scalars, flattened multi-results, and no memory effects.
+/// booleans, u32/f32 scalars, validated aggregate values, multi-results,
+/// and no memory effects. Aggregate representation is shared with compute.
 /// The compiler rejects every wider shape rather than silently inlining it in
 /// the backend or smuggling state through a generated global.
 struct PreparedRasterHelpers {
@@ -646,19 +647,31 @@ fn prepare_scalar_helpers(
         }
     }
 
-    let scalar = |ty: Type| matches!(ty, Type::I1 | Type::I32 | Type::F32);
+    // Pure raster products use the same representation as compute products;
+    // registering a value type must not require allocating private storage.
+    let typed_locals = super::collect_naga_typed_local_types(
+        module, &call_order, WordKind::U32, u32_type, f32_type, bool_type, types,
+    );
+    if let Some((_, error)) = typed_locals.rejections.iter().find(|(f, _)| root_set.contains(f)) {
+        return Err(error.clone());
+    }
+    let value_type = |ty: Type| matches!(ty, Type::I1 | Type::I32 | Type::F32)
+        || (matches!(ty.resolve_compound(&module.ctx),
+            Some(sonatina_ir::types::CompoundType::Struct(_)
+                | sonatina_ir::types::CompoundType::Array { .. }))
+            && typed_locals.types.contains_key(&ty));
     let mut resource_bindings = super::NagaResourceVariantBindings::new();
     let mut memory_abis = HashMap::new();
     let mut live_arguments = super::NagaLiveArguments::default();
-    let mut rejections = Vec::new();
+    let mut rejections = typed_locals.rejections.clone();
     for &function_ref in call_order.iter().filter(|function| !root_set.contains(function)) {
         let outcome = (|| -> Result<(), String> {
             let signature = module
                 .ctx
                 .get_sig(function_ref)
                 .ok_or_else(|| format!("spirv raster: helper {function_ref:?} has no signature"))?;
-            if !signature.args().iter().copied().all(scalar)
-                || !signature.ret_tys().iter().copied().all(scalar)
+            if !signature.args().iter().copied().all(value_type)
+                || !signature.ret_tys().iter().copied().all(value_type)
             {
                 return Err(format!(
                     "spirv raster: helper `{}` crosses the scalar helper ABI with {:?} -> {:?}; fail closed",
@@ -687,11 +700,11 @@ fn prepare_scalar_helpers(
                                 .inst_results(instruction)
                                 .iter()
                                 .copied()
-                                .any(|value| !scalar(function.dfg.value_ty(value)))
+                                .any(|value| !value_type(function.dfg.value_ty(value)))
                                 || data
                                     .collect_values()
                                     .into_iter()
-                                    .any(|value| !scalar(function.dfg.value_ty(value)))
+                                    .any(|value| !value_type(function.dfg.value_ty(value)))
                             {
                                 return Err(format!(
                                     "spirv raster: helper `{}` contains a non-scalar value outside the scalar helper ABI; fail closed",
@@ -717,7 +730,7 @@ fn prepare_scalar_helpers(
                     format!("spirv raster: helper `{}` has no body", signature.name())
                 })??;
             // This validated context has no resource or memory transport and
-            // retains every scalar argument. It supplies facts to the common ABI
+            // retains every value argument. It supplies facts to the common ABI
             // planner rather than constructing a separate physical convention.
             resource_bindings.insert(function_ref, vec![vec![None; signature.args().len()]]);
             memory_abis.insert(function_ref, NagaMemoryAbi::default());
@@ -733,7 +746,7 @@ fn prepare_scalar_helpers(
     let logical_results = super::helper_naga_logical_result_abis(
         module, &call_order, roots, &resource_capabilities,
     ).into_complete()?;
-    let naga_functions = NagaFunctionMap::new();
+    let naga_functions = NagaFunctionMap::with_typed_local_types(typed_locals.types);
     let plans = super::helper_plan::plan_helper_abis(
         module,
         &call_order,
