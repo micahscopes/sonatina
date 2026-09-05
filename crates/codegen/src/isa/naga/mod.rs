@@ -5438,6 +5438,22 @@ fn emit_regions_in_loop(
                             target.push(naga::Statement::Continue, naga::Span::UNDEFINED);
                             return Ok(RegionOutcome::Terminal);
                         }
+                        // A forwarder can reach a shared continue arm inside
+                        // this sequence, rather than directly from an If.
+                        // Its edge is not owned by an enclosing merge.
+                        let destination = *jump.dest();
+                        if matches!(regions.get(region_index + 1), Some(crate::structurize::Region::Block(b)) if *b == destination)
+                            && function.layout.iter_inst(destination).any(|iid| {
+                                <&sonatina_ir::inst::control_flow::Jump as InstDowncast>::downcast(
+                                    inst_set, function.dfg.inst(iid),
+                                ).is_some_and(|next| *next.dest() == loop_header)
+                            })
+                        {
+                            ensure_phi_locals(function, inst_set, word, destination, word_type,
+                                f32_type, bool_type, func, value_map, phi_locals)?;
+                            emit_exact_phi_edge(function, inst_set, word, *block, destination,
+                                func, target, value_map, phi_locals)?;
+                        }
                     } else if <&sonatina_ir::inst::control_flow::Return as InstDowncast>::downcast(inst_set, inst).is_some() {
                         if let Some(value) = *result_expr {
                             let pointer = func.expressions.append(naga::Expression::LocalVariable(return_local), naga::Span::UNDEFINED);
@@ -5505,6 +5521,28 @@ fn emit_regions_in_loop(
                 let mut reject = naga::Block::new();
                 let mut accept_values = value_map.clone();
                 let mut reject_values = value_map.clone();
+                // A shared direct-to-header arm is terminal for the current
+                // iteration, so it may occur inside several exclusive arms
+                // rather than as their merge. Transport its incoming phis
+                // before evaluating its body; merge transport below cannot
+                // own this edge because the arm ends with Continue.
+                for (arm, destination, statements, values) in [
+                    (then_branch, *branch.nz_dest(), &mut accept, &mut accept_values),
+                    (else_branch, *branch.z_dest(), &mut reject, &mut reject_values),
+                ] {
+                    if matches!(arm.first(), Some(crate::structurize::Region::Block(b)) if *b == destination)
+                        && function.layout.iter_inst(destination).any(|iid| {
+                            <&sonatina_ir::inst::control_flow::Jump as InstDowncast>::downcast(
+                                inst_set, function.dfg.inst(iid),
+                            ).is_some_and(|jump| *jump.dest() == loop_header)
+                        })
+                    {
+                        ensure_phi_locals(function, inst_set, word, destination, word_type,
+                            f32_type, bool_type, func, values, phi_locals)?;
+                        emit_exact_phi_edge(function, inst_set, word, *header, destination,
+                            func, statements, values, phi_locals)?;
+                    }
+                }
                 let then_outcome = if then_branch.is_empty() { RegionOutcome::Fallthrough(*header) } else {
                     emit_regions_in_loop(function, inst_set, word, then_branch, loop_header, loop_exit, word_type, f32_type, bool_type, return_local, did_return_local, may_return, func, &mut accept, &mut accept_values, phi_locals, result_expr, return_abi, naga_functions, mem_ctx)?
                 };

@@ -30,6 +30,87 @@ fn native_module_builder() -> ModuleBuilder {
     ModuleBuilder::new(ctx)
 }
 
+/// Two nested choices share a nonempty continue block, while the third path
+/// takes a different backedge. The shared block is not a merge for every path;
+/// each mutually exclusive occurrence must retain its exact incoming phi.
+#[test]
+fn spirv_shared_nonempty_continue_arm_preserves_phi_edges() {
+    for forwarded in [false, true] {
+    let isa = Native::new(TargetTriple::new(Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native));
+    let is = isa.inst_set();
+    let mb = native_module_builder();
+    let fr = mb.declare_function(Signature::new_single(
+        "shared_continue", Linkage::Public, &[Type::I32, Type::I32], Type::I32,
+    )).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(fr);
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let first = fb.append_block();
+    let second = fb.append_block();
+    let shared = fb.append_block();
+    let alternate = fb.append_block();
+    let exit = fb.append_block();
+    let first_pred = if forwarded { fb.append_block() } else { first };
+    let second_pred = if forwarded { fb.append_block() } else { second };
+    let limit = fb.args()[0];
+    let choice = fb.args()[1];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    let two = fb.make_imm_value(2i32);
+    let three = fb.make_imm_value(3i32);
+    fb.switch_to_block(entry);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(header);
+    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let more = fb.insert_inst(cmp::Lt::new(is, i, limit), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, more, first, exit));
+    fb.switch_to_block(first);
+    let a = fb.insert_inst(cmp::Eq::new(is, choice, zero), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, a, if forwarded { first_pred } else { shared }, second));
+    fb.switch_to_block(second);
+    let b = fb.insert_inst(cmp::Eq::new(is, choice, one), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, b, if forwarded { second_pred } else { shared }, alternate));
+    if forwarded {
+        fb.switch_to_block(first_pred);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, shared));
+        fb.switch_to_block(second_pred);
+        fb.insert_inst_no_result(control_flow::Jump::new(is, shared));
+    }
+    fb.switch_to_block(shared);
+    let increment = fb.insert_inst(control_flow::Phi::new(is, vec![(one, first_pred), (two, second_pred)]), Type::I32);
+    let next = fb.insert_inst(arith::Add::new(is, i, increment), Type::I32);
+    fb.append_phi_arg(i, next, shared);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(alternate);
+    let next_alt = fb.insert_inst(arith::Add::new(is, i, three), Type::I32);
+    fb.append_phi_arg(i, next_alt, alternate);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(exit);
+    fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
+    fb.seal_all();
+    fb.finish();
+    let module = mb.build();
+    let artifact = SpirvBackend::new().compile_module(&module)
+        .expect("shared continue blocks are mutually exclusive, not irreducible cycles");
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    let parsed = naga::front::wgsl::parse_str(wgsl).unwrap();
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+        .validate(&parsed).unwrap();
+    assert!(wgsl.contains("continue"));
+    let grid = SpirvBackend::new().with_grid().with_workgroup_size(8, 8, 1)
+        .compile_module(&module).unwrap();
+    let output = run_grid_u32(grid.wgsl.as_deref().unwrap(), 16, 8, 8, 8, &[]);
+    for choice in 0..8u32 {
+        let increment = if choice == 0 { 1 } else if choice == 1 { 2 } else { 3 };
+        for limit in 0..16u32 {
+            let expected = limit.div_ceil(increment) * increment;
+            assert_eq!(output[(choice * 16 + limit) as usize], expected,
+                "shared continue: limit={limit}, choice={choice}, forwarded={forwarded}");
+        }
+    }
+    }
+}
+
 fn atomic_claim_module() -> sonatina_ir::Module {
     let isa = Native::new(TargetTriple::new(Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native));
     let is = isa.inst_set();
