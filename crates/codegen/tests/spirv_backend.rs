@@ -5750,6 +5750,40 @@ fn normalized_switch_shared_phi_executes_on_lavapipe() {
             body.inst_set(), body.dfg.inst(terminator),
         ).is_some(), "analysis and compilation must not mutate caller-owned IR");
     });
+
+    // Change only the default edge to a trap. Cases must retain their values
+    // and the default must not become a successful zero-valued return.
+    module.func_store.modify(function, |body| {
+        let trap = body.dfg.make_block();
+        body.layout.append_block(trap);
+        let unreachable = body.dfg.make_inst(control_flow::Unreachable::new(is));
+        body.layout.append_inst(unreachable, trap);
+        let terminator = body.layout.last_inst_of(entry).unwrap();
+        body.dfg.replace_inst(terminator, Box::new(control_flow::BrTable::new(
+            is, selector, Some(trap), vec![(zero, join), (one, join), (two, special)],
+        )));
+    });
+    let trapped = SpirvBackend::new().with_grid().with_workgroup_size(8, 1, 1)
+        .compile_module(&module).expect("switch trap default must lower");
+    assert!(trapped.layout.bindings.iter().any(|binding| binding.name == "trap"));
+    module.func_store.modify(function, |body| {
+        sonatina_codegen::transform::switch::lower_switches(body).unwrap();
+    });
+    let wasm = sonatina_codegen::isa::wasm::WasmBackend::new()
+        .compile_module(&module).expect("switch trap default must lower to Wasm");
+    let engine = wasmtime::Engine::default();
+    let executable = wasmtime::Module::new(&engine, &wasm.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &executable, &[]).unwrap();
+    let execute = instance.get_typed_func::<(i32, i32, i32, i32), i32>(
+        &mut store, "switch_grid",
+    ).unwrap();
+    for (input, expected) in [(0, 40), (1, 40), (2, 7)] {
+        assert_eq!(execute.call(&mut store, (input, 0, 8, 1)).unwrap(), expected);
+    }
+    for input in 3..8 {
+        assert!(execute.call(&mut store, (input, 0, 8, 1)).is_err());
+    }
 }
 
 #[test]
