@@ -1237,7 +1237,7 @@ impl Structurer<'_> {
             if block == target {
                 return true;
             }
-            if s.returns(block) {
+            if s.returns(block) && s.is_shared_bare_terminal(block) {
                 return true;
             }
             if block != start && target_downstream.contains(&block) {
@@ -1246,6 +1246,12 @@ impl Structurer<'_> {
                 // terminal corridor, so `target` cannot be this selection's
                 // merge.
                 return false;
+            }
+            // A return block that owns values or phis is also a live join.
+            // Unlike a bare terminal, reaching it can demonstrate a bypass
+            // of an earlier proposed merge, so test that relation first.
+            if s.returns(block) {
+                return true;
             }
             if let Some(result) = memo.get(&block) {
                 return *result;
