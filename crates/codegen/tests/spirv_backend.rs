@@ -5292,6 +5292,13 @@ fn external_mixed_resource(arg_index: u32, access: Access) -> SpirvExternalResou
 /// Hard-fails if no adapter is available: this is an EXECUTED gate (lavapipe is
 /// present in CI), not validate-only.
 fn run_grid_u32(wgsl: &str, width: u32, height: u32, wgx: u32, wgy: u32, input: &[u8]) -> Vec<u32> {
+    run_grid_u32_with_traps(wgsl, width, height, wgx, wgy, input, None).0
+}
+
+fn run_grid_u32_with_traps(
+    wgsl: &str, width: u32, height: u32, wgx: u32, wgy: u32,
+    input: &[u8], trap_binding: Option<u32>,
+) -> (Vec<u32>, Vec<u32>) {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::LowPower,
@@ -5316,9 +5323,7 @@ fn run_grid_u32(wgsl: &str, width: u32, height: u32, wgx: u32, wgy: u32, input: 
     // The gradient kernel never reads `input`, so an auto-derived layout would
     // strip binding 1; declaring both explicitly binds the dummy input exactly
     // like the scalar keystone's unused input.
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("grid_bgl"),
-        entries: &[
+    let mut layout_entries = vec![
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -5339,7 +5344,23 @@ fn run_grid_u32(wgsl: &str, width: u32, height: u32, wgx: u32, wgy: u32, input: 
                 },
                 count: None,
             },
-        ],
+        ];
+    if let Some(binding) = trap_binding {
+        assert!(binding > 1, "trap binding must not alias input or output");
+        layout_entries.push(wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
+    }
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("grid_bgl"),
+        entries: &layout_entries,
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("grid_pl"),
@@ -5372,19 +5393,29 @@ fn run_grid_u32(wgsl: &str, width: u32, height: u32, wgx: u32, wgy: u32, input: 
     if !input.is_empty() {
         queue.write_buffer(&input_buf, 0, input);
     }
+    let trap_buf = trap_binding.map(|_| device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("grid trap readback source"),
+        size: output_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    }));
     let staging_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: output_size,
+        size: output_size * if trap_buf.is_some() { 2 } else { 1 },
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let mut bindings = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: output_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: input_buf.as_entire_binding() },
+        ];
+    if let (Some(binding), Some(buffer)) = (trap_binding, &trap_buf) {
+        bindings.push(wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() });
+    }
     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: output_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: input_buf.as_entire_binding() },
-        ],
+        entries: &bindings,
     });
 
     let mut enc = device.create_command_encoder(&Default::default());
@@ -5395,6 +5426,9 @@ fn run_grid_u32(wgsl: &str, width: u32, height: u32, wgx: u32, wgy: u32, input: 
         p.dispatch_workgroups(width / wgx, height / wgy, 1);
     }
     enc.copy_buffer_to_buffer(&output_buf, 0, &staging_buf, 0, output_size);
+    if let Some(buffer) = &trap_buf {
+        enc.copy_buffer_to_buffer(buffer, 0, &staging_buf, output_size, output_size);
+    }
     queue.submit(Some(enc.finish()));
 
     let slice = staging_buf.slice(..);
@@ -5406,13 +5440,14 @@ fn run_grid_u32(wgsl: &str, width: u32, height: u32, wgx: u32, wgy: u32, input: 
     });
     rx.recv().unwrap().unwrap();
     let data = slice.get_mapped_range();
-    let out: Vec<u32> = data
+    let mut out: Vec<u32> = data
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
         .collect();
     drop(data);
     staging_buf.unmap();
-    out
+    let traps = out.split_off((width * height) as usize);
+    (out, traps)
 }
 
 fn expect_grid_err(module: &sonatina_ir::Module, backend: SpirvBackend) -> String {
@@ -5765,7 +5800,15 @@ fn normalized_switch_shared_phi_executes_on_lavapipe() {
     });
     let trapped = SpirvBackend::new().with_grid().with_workgroup_size(8, 1, 1)
         .compile_module(&module).expect("switch trap default must lower");
-    assert!(trapped.layout.bindings.iter().any(|binding| binding.name == "trap"));
+    let trap_binding = trapped.layout.bindings.iter()
+        .find(|binding| binding.name == "trap").expect("observable trap binding");
+    assert_eq!(trap_binding.group, 0);
+    let (values, traps) = run_grid_u32_with_traps(
+        trapped.wgsl.as_deref().unwrap(), 8, 1, 8, 1, &[], Some(trap_binding.binding),
+    );
+    assert_eq!(&values[..3], &[40, 40, 7]);
+    assert_eq!(&traps[..3], &[0, 0, 0]);
+    assert!(traps[3..].iter().all(|status| *status != 0), "{traps:?}");
     module.func_store.modify(function, |body| {
         sonatina_codegen::transform::switch::lower_switches(body).unwrap();
     });
