@@ -826,6 +826,7 @@ impl NagaBackend {
                 request.target.environment(),
             ))]);
         }
+        request.target.validate_pipeline(request.pipeline).map_err(|error| vec![error])?;
         Ok(())
     }
 
@@ -11447,6 +11448,58 @@ fn translate_to_naga(
 
 #[cfg(all(test, feature = "spirv-backend"))]
 mod tests {
+    #[test]
+    fn webgpu_dispatch_limits_precede_helper_lowering() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "shader-unknown-unknown"
+func public %entry() {
+    block0:
+        v0.i256 = call %unsupported;
+        return;
+}
+func private %unsupported() -> i256 {
+    block0:
+        return 0.i256;
+}
+"#).unwrap();
+        let entry = parsed.module.funcs()[0];
+        let target = super::ShaderTargetContract::new(
+            super::ShaderEnvironment::WebGpu, [super::ShaderEncoding::Spirv],
+        ).unwrap();
+        for (workgroup_size, dispatch_grid, diagnostic) in [
+            ([0, 1, 1], [1, 1, 1], "axis 0"),
+            ([257, 1, 1], [1, 1, 1], "axis 0"),
+            ([1, 257, 1], [1, 1, 1], "axis 1"),
+            ([1, 1, 65], [1, 1, 1], "axis 2"),
+            ([256, 2, 1], [1, 1, 1], "512 invocations"),
+            ([u32::MAX, u32::MAX, u32::MAX], [1, 1, 1], "axis 0"),
+            ([1, 1, 1], [65536, 1, 1], "dispatch axis 0"),
+            ([1, 1, 1], [1, 65536, 1], "dispatch axis 1"),
+            ([1, 1, 1], [1, 1, 65536], "dispatch axis 2"),
+        ] {
+            let request = super::ShaderCompileRequest::new(&target,
+                super::ShaderPipeline::Compute { entry, workgroup_size, dispatch_grid });
+            let compile = super::NagaBackend::compile_request(&parsed.module, &request).err().unwrap();
+            let analyze = super::NagaBackend::analyze_request_helpers(&parsed.module, &request).err().unwrap();
+            for errors in [compile, analyze] {
+                assert_eq!(errors.len(), 1);
+                assert!(matches!(&errors[0], super::SpirvError::UnsupportedTarget(message)
+                    if message.contains(diagnostic)), "{errors:?}");
+            }
+        }
+        for workgroup_size in [[256, 1, 1], [1, 256, 1], [1, 1, 64], [8, 8, 4]] {
+            for pipeline in [
+                super::ShaderPipeline::Compute { entry, workgroup_size, dispatch_grid: [65535, 1, 1] },
+                super::ShaderPipeline::LegacyScalar { entry, workgroup_size },
+                super::ShaderPipeline::LegacyGrid { entry, workgroup_size },
+            ] {
+                target.validate_pipeline(pipeline).unwrap();
+            }
+        }
+        target.validate_pipeline(super::ShaderPipeline::Fullscreen { entry }).unwrap();
+        target.validate_pipeline(super::ShaderPipeline::Raster { vertex: entry, fragment: entry }).unwrap();
+    }
+
     #[test]
     fn legacy_native_i64_does_not_imply_webgpu_capability() {
         let parsed = sonatina_parser::parse_module(r#"
