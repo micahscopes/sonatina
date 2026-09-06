@@ -102,7 +102,7 @@ pub fn eliminate_dominated_expressions(
 // Conservative forward taint, including phi cycles. Each value is queued once;
 // no expression is recursively expanded. Partial aggregate initialization may
 // overtaint later extracts, which is preferable to commoning an undef choice.
-fn undef_dependent_values(func: &Function) -> FxHashSet<ValueId> {
+pub(super) fn undef_dependent_values(func: &Function) -> FxHashSet<ValueId> {
     let mut tainted: FxHashSet<_> = func
         .dfg
         .values_iter()
