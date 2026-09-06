@@ -1038,6 +1038,26 @@ impl Structurer<'_> {
                 if let Some(stop) = enclosing_stop
                     && self.is_local_merge_candidate(stop, cur_loop)
                 {
+                    // A direct continue corridor may own state updates before
+                    // the backedge. Preserve those in its arm, but do not pick
+                    // that corridor as the join of a sibling that reaches the
+                    // parent's live stop. The next iteration is not a bypass
+                    // of this iteration's continuation.
+                    if let Some(lp) = cur_loop {
+                        let header = self.loop_tree.loop_header(lp);
+                        if self.is_direct_merge_arm(z, header)
+                            && self.reaches_before_loop_header(nz, stop, cur_loop)
+                            && self.all_nonterminal_paths_reach(nz, stop, cur_loop)
+                        {
+                            return Ok(Some(stop));
+                        }
+                        if self.is_direct_merge_arm(nz, header)
+                            && self.reaches_before_loop_header(z, stop, cur_loop)
+                            && self.all_nonterminal_paths_reach(z, stop, cur_loop)
+                        {
+                            return Ok(Some(stop));
+                        }
+                    }
                     if self.returns(z) && self.all_nonterminal_paths_reach(nz, stop, cur_loop) {
                         return Ok(Some(stop));
                     }
@@ -1099,6 +1119,20 @@ impl Structurer<'_> {
                         // one region.
                         if let Some(merge) = self.nearest_nonterminal_merge(nz, z, cur_loop) {
                             return Ok(Some(merge));
+                        }
+                        // A nested arm may continue the enclosing loop while
+                        // its sibling reaches the parent's live continuation.
+                        // Keep that stop explicit: otherwise the nested arm
+                        // consumes it and the parent emits the same tail again.
+                        if let Some(stop) = enclosing_stop
+                            && cur_loop.is_some()
+                            && self.is_local_merge_candidate(stop, cur_loop)
+                            && (self.reaches_before_loop_header(nz, stop, cur_loop)
+                                || self.reaches_before_loop_header(z, stop, cur_loop))
+                            && self.all_nonterminal_paths_reach(nz, stop, cur_loop)
+                            && self.all_nonterminal_paths_reach(z, stop, cur_loop)
+                        {
+                            return Ok(Some(stop));
                         }
                         if let Some(stop) = enclosing_stop
                             && self.reaches_before_loop_header(nz, stop, cur_loop)
@@ -1237,6 +1271,14 @@ impl Structurer<'_> {
             if block == target {
                 return true;
             }
+            // Completing this iteration is terminal for an in-loop merge.
+            // Test before downstream reachability: the candidate's own paths
+            // may also continue, but that does not make another continue a
+            // live bypass. Its predecessor and phi transfer remain represented
+            // by the original jump or LoopContinue region.
+            if Some(block) == loop_header {
+                return true;
+            }
             if s.returns(block) && s.is_shared_bare_terminal(block) {
                 return true;
             }
@@ -1255,9 +1297,6 @@ impl Structurer<'_> {
             }
             if let Some(result) = memo.get(&block) {
                 return *result;
-            }
-            if Some(block) == loop_header {
-                return false;
             }
             if !visiting.insert(block) {
                 // A backedge inside a nested SCC does not escape the proposed
@@ -2497,6 +2536,61 @@ mod tests {
             region,
             Region::IfThenElse { merge: Some(found), .. } if *found == merge
         )));
+    }
+
+    /// A continue ends this iteration just as a return ends the function:
+    /// neither should force the other live arm's work to be duplicated.
+    #[test]
+    fn guarded_continue_does_not_duplicate_live_iteration_tail() {
+        let source = r#"
+target = "shader-unknown-unknown"
+func public %guarded_continue(v0.i1, v1.i1, v2.i1) -> i32 {
+    block0:
+        jump block1;
+    block1:
+        v3.i32 = phi (0.i32 block0) (v4 block4) (v5 block5);
+        v6.i1 = lt v3 4.i32;
+        br v6 block2 block6;
+    block2:
+        br v0 block3 block5;
+    block3:
+        br v1 block4 block8;
+    block8:
+        br v2 block4 block5;
+    block4:
+        v4.i32 = add v3 1.i32;
+        jump block1;
+    block5:
+        v5.i32 = add v3 2.i32;
+        br v2 block1 block7;
+    block6:
+        return v3;
+    block7:
+        return v5;
+}
+"#;
+        let module = sonatina_parser::parse_module(source).unwrap().module;
+        let function = module.funcs()[0];
+        let structured = structurize(&module, function);
+        fn owners(regions: &[Region], id: u32) -> usize {
+            regions.iter().map(|region| match region {
+                Region::Block(block) => usize::from(block.as_u32() == id),
+                Region::IfThenElse { header, then_branch, else_branch, .. } => {
+                    usize::from(header.as_u32() == id)
+                        + owners(then_branch, id) + owners(else_branch, id)
+                }
+                Region::Loop { header, body } => {
+                    usize::from(header.as_u32() == id) + owners(body, id)
+                }
+                Region::LoopExit { .. } | Region::LoopContinue { .. } => 0,
+            }).sum()
+        }
+        // The two guards may share copies of the state-updating continue
+        // corridor. The live work and its return must not be copied into it.
+        for id in [5, 7] {
+            assert_eq!(owners(&structured.regions, id), 1,
+                "live block {id} must have one owner: {:?}", structured.regions);
+        }
     }
 
     /// A nested checked branch can have a closer loop latch even when both the

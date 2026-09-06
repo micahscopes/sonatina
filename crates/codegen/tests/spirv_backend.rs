@@ -9120,6 +9120,51 @@ func public %nearest_phi_merge(v0.i32) -> i32 {
         .expect("the nearest live phi merge should structure before the enclosing stop");
 }
 
+#[test]
+fn spirv_guarded_continue_validates_loop_carried_values() {
+    let source = r#"
+target = "shader-unknown-unknown"
+func public %guarded_continue(v0.i32, v1.i32) -> i32 {
+    block0:
+        v2.i32 = and v0 1.i32;
+        v3.i32 = and v0 2.i32;
+        v4.i32 = and v0 4.i32;
+        v5.i1 = ne v2 0.i32;
+        v6.i1 = ne v3 0.i32;
+        v7.i1 = ne v4 0.i32;
+        jump block1;
+    block1:
+        v8.i32 = phi (0.i32 block0) (v9 block4) (v10 block5);
+        v11.i1 = lt v8 4.i32;
+        br v11 block2 block6;
+    block2:
+        br v5 block3 block5;
+    block3:
+        br v6 block4 block8;
+    block8:
+        br v7 block4 block5;
+    block4:
+        v9.i32 = add v8 1.i32;
+        jump block1;
+    block5:
+        v10.i32 = add v8 2.i32;
+        br v7 block1 block7;
+    block6:
+        return v8;
+    block7:
+        return v10;
+}
+"#;
+    let module = sonatina_parser::parse_module(source).unwrap().module;
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(8, 1, 1)
+        .compile_module(&module).expect("guarded continue must lower with loop phi transport");
+    let wgsl = artifact.wgsl.as_deref().expect("WGSL");
+    let reparsed = naga::front::wgsl::parse_str(wgsl).expect("guarded continue WGSL must parse");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty()).validate(&reparsed)
+        .expect("guarded continue WGSL must validate without optional features");
+}
+
 fn spirv_error(source: &str, backend: SpirvBackend) -> String {
     let module = sonatina_parser::parse_module(source).expect("regression source should parse").module;
     match backend.compile_module(&module) {
