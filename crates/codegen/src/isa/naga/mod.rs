@@ -853,7 +853,10 @@ impl NagaBackend {
             Some(environment) => return Err(vec![SpirvError::UnsupportedTarget(format!(
                 "shader environment {environment:?} has no implemented capability profile"
             ))]),
-            None => naga::valid::Capabilities::all(),
+            // The compatibility envelope admits native i64 words, not every
+            // optional Naga feature. New emitted capabilities must enter an
+            // explicit target profile with their own execution gates.
+            None => naga::valid::Capabilities::SHADER_INT64,
         };
         let trace = std::env::var_os("SONATINA_SPIRV_TRACE").is_some();
         let started = std::time::Instant::now();
@@ -11444,6 +11447,32 @@ fn translate_to_naga(
 
 #[cfg(all(test, feature = "spirv-backend"))]
 mod tests {
+    #[test]
+    fn legacy_native_i64_does_not_imply_webgpu_capability() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "shader-unknown-unknown"
+func public %entry(v0.i64) -> i64 {
+    block0:
+        v1.i64 = add v0 1.i64;
+        return v1;
+}
+"#).unwrap();
+        let entry = parsed.module.funcs()[0];
+        let legacy = super::NagaBackend::new().compile_entry(&parsed.module, entry)
+            .expect("legacy native integer envelope must remain supported");
+        assert!(!legacy.words.is_empty());
+        let target = super::ShaderTargetContract::new(
+            super::ShaderEnvironment::WebGpu,
+            [super::ShaderEncoding::Spirv],
+        ).unwrap();
+        let request = super::ShaderCompileRequest::new(&target,
+            super::ShaderPipeline::LegacyScalar { entry, workgroup_size: [1, 1, 1] });
+        let errors = super::NagaBackend::compile_request(&parsed.module, &request)
+            .err().expect("SPIR-V encoding must not grant WebGPU native i64");
+        assert!(errors.iter().any(|error| matches!(error, super::SpirvError::Validation(_))),
+            "native width must fail target validation: {errors:?}");
+    }
+
     #[test]
     fn aggregate_zero_fold_preserves_signed_zero_and_nonzero_values() {
         use naga::{Expression::Literal, Literal::*};
