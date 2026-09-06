@@ -3118,6 +3118,15 @@ fn emit_single_inst(
                 *mem_error = Some("naga: aggregate SSA projection has an unresolved base".to_owned());
                 return false;
             };
+            // Struct/array Compose components are already evaluated SSA
+            // values. Forwarding one preserves its snapshot, including loads
+            // that preceded later stores; never resolve its source again.
+            if let naga::Expression::Compose { components, .. } = &func.expressions[base]
+                && let Some(component) = components.get(index as usize)
+            {
+                value_map.insert(result, *component);
+                return true;
+            }
             let value = func.expressions.append(
                 naga::Expression::AccessIndex { base, index },
                 naga::Span::UNDEFINED,
