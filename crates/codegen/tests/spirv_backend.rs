@@ -5752,6 +5752,75 @@ fn normalized_switch_shared_phi_executes_on_lavapipe() {
     });
 }
 
+#[test]
+fn normalized_switch_helper_executes_and_reports_its_own_failure() {
+    let builder = native_module_builder();
+    let entry = builder.declare_function(Signature::new(
+        "switch_caller", Linkage::Public, &[Type::I32; 4], &[Type::I32],
+    )).unwrap();
+    let helper = builder.declare_function(Signature::new(
+        "switch_callee", Linkage::Private, &[Type::I32], &[Type::I32],
+    )).unwrap();
+    let mut fb = builder.func_builder::<InstInserter>(helper);
+    let is = fb.inst_set();
+    let dispatch = fb.append_block();
+    let selected = fb.append_block();
+    let fallback = fb.append_block();
+    let join = fb.append_block();
+    fb.switch_to_block(dispatch);
+    let input = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    fb.insert_inst_no_result(control_flow::BrTable::new(
+        is, input, Some(fallback), vec![(zero, selected), (one, selected)],
+    ));
+    fb.switch_to_block(selected);
+    let ten = fb.make_imm_value(10i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, join));
+    fb.switch_to_block(fallback);
+    let twenty = fb.make_imm_value(20i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, join));
+    fb.switch_to_block(join);
+    let result = fb.insert_inst(control_flow::Phi::new(
+        is, vec![(ten, selected), (twenty, fallback)],
+    ), Type::I32);
+    fb.insert_return(result);
+    fb.seal_all();
+    fb.finish();
+    let mut fb = builder.func_builder::<InstInserter>(entry);
+    let block = fb.append_block();
+    fb.switch_to_block(block);
+    let result = fb.insert_inst(control_flow::Call::new(
+        is, helper, [fb.args()[0]].into_iter().collect(),
+    ), Type::I32);
+    fb.insert_return(result);
+    fb.seal_all();
+    fb.finish();
+    let module = builder.build();
+    let backend = SpirvBackend::new().with_grid().with_workgroup_size(8, 1, 1);
+    backend.analyze_entry_helpers(&module, entry).unwrap();
+    let artifact = backend.compile_module(&module).unwrap();
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    assert_eq!(wgsl.matches("fn switch_callee(").count(), 1);
+    assert_eq!(run_grid_u32(wgsl, 8, 1, 8, 1, &[]),
+        vec![10, 10, 20, 20, 20, 20, 20, 20]);
+
+    module.func_store.modify(helper, |body| {
+        let terminator = body.layout.last_inst_of(dispatch).unwrap();
+        body.dfg.replace_inst(terminator, Box::new(control_flow::BrTable::new(
+            is, input, None, vec![(zero, selected), (one, selected)],
+        )));
+    });
+    let error = format!("{:?}", backend.compile_module(&module)
+        .err().expect("default-less helper must fail compilation"));
+    assert!(error.contains("switch_callee"), "{error}");
+    assert!(error.contains("requires an explicit default"), "{error}");
+    let error = format!("{:?}", backend.analyze_entry_helpers(&module, entry)
+        .err().expect("default-less helper must fail analysis"));
+    assert!(error.contains("switch_callee"), "{error}");
+    assert!(error.contains("requires an explicit default"), "{error}");
+}
+
 /// Repeated switch cases share a continuation inside a loop, while default
 /// exits it. The eventual return must not displace the iteration-local merge
 /// or consume that merge inside a nested selection.
@@ -5782,7 +5851,12 @@ fn normalized_switch_loop_exit_executes_on_lavapipe() {
         is, iteration, Some(exit), vec![(zero, latch), (one, latch)],
     ));
     fb.switch_to_block(latch);
-    let next = fb.insert_inst(arith::Add::new(is, iteration, one), Type::I32);
+    // Require predecessor transport here so normalization must retain its
+    // shared edge block even when phi-free targets bypass such blocks.
+    let selected_iteration = fb.insert_inst(control_flow::Phi::new(
+        is, vec![(iteration, dispatch)],
+    ), Type::I32);
+    let next = fb.insert_inst(arith::Add::new(is, selected_iteration, one), Type::I32);
     fb.insert_inst_no_result(control_flow::Jump::new(is, header));
     fb.switch_to_block(exit);
     fb.insert_return(iteration);

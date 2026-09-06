@@ -6890,7 +6890,13 @@ fn normalize_shader_switches(module: &Module, pipeline: ShaderPipeline) -> Resul
     if !has_switch { return Ok(None); }
     let normalized = module.clone_for_funcs(&functions);
     for function in functions {
-        normalized.func_store.modify(function, crate::transform::switch::lower_switches)?;
+        normalized.func_store.modify(function, crate::transform::switch::lower_switches)
+            .map_err(|error| {
+                let name = module.ctx.get_sig(function)
+                    .map(|signature| signature.name().to_string())
+                    .unwrap_or_else(|| format!("{function:?}"));
+                format!("shader switch normalization failed in `{name}` ({function:?}): {error}")
+            })?;
     }
     Ok(Some(normalized))
 }

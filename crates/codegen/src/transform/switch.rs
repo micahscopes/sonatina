@@ -9,8 +9,10 @@ use sonatina_ir::{
 };
 
 /// Preserve ordered cases and one predecessor identity per original switch
-/// edge. Edge blocks keep repeated destinations from duplicating or losing phi
-/// inputs. Unsupported default-less tables fail before changing the function.
+/// edge where a destination has phi inputs. Edge blocks keep repeated
+/// destinations from duplicating or losing those inputs; other destinations
+/// need no forwarding block. Unsupported default-less tables fail before
+/// changing the function.
 /// The caller must provide verified SSA and an ISA supporting Eq, Br and Jump.
 pub fn lower_switches(function: &mut Function) -> Result<usize, String> {
     let is = function.inst_set();
@@ -43,11 +45,19 @@ pub fn lower_switches(function: &mut Function) -> Result<usize, String> {
             if edges.iter().any(|(target, _)| *target == destination) {
                 continue;
             }
+            let instructions = function.layout.iter_inst(destination).collect::<Vec<_>>();
+            let needs_edge = instructions.iter().any(|inst| {
+                <&Phi as InstDowncast>::downcast(is, function.dfg.inst(*inst))
+                    .is_some_and(|phi| phi.args().iter().any(|(_, pred)| *pred == source))
+            });
+            if !needs_edge {
+                edges.push((destination, destination));
+                continue;
+            }
             let edge = function.dfg.make_block();
             function.layout.append_block(edge);
             let jump = function.dfg.make_inst(Jump::new(is, destination));
             function.layout.append_inst(jump, edge);
-            let instructions = function.layout.iter_inst(destination).collect::<Vec<_>>();
             for inst in instructions {
                 let Some(phi) = <&Phi as InstDowncast>::downcast(is, function.dfg.inst(inst))
                 else {
@@ -217,6 +227,9 @@ mod tests {
         let module = builder.build();
         module.func_store.modify(function, |body| {
             assert_eq!(lower_switches(body).unwrap(), 1);
+            // Three original blocks, two comparison blocks, and only one
+            // edge block for the phi-bearing destination.
+            assert_eq!(body.layout.iter_block().count(), 6);
             let mut cfg = ControlFlowGraph::default();
             cfg.compute(body);
             let phi_inst = body.layout.first_inst_of(join).unwrap();
