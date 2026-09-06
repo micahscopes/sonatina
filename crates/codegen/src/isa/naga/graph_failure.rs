@@ -140,6 +140,43 @@ func public %entry(v0.objref<[i32; 4]>) {
         let unchanged = NagaBackend::compile_request(&module, &request).unwrap();
         assert_eq!(unchanged.wgsl, plain.wgsl);
         assert_eq!(unchanged.words, plain.words);
+
+        // A counter distinguishes a suppressed repeated dispatch from an
+        // idempotent store. Emit both scoped and unscoped versions from the
+        // same input so the browser oracle has a negative control.
+        let counter_source = r#"
+target = "shader-unknown-unknown"
+func public %entry(v0.objref<[i32; 4]>) {
+    block0:
+        v1.objref<i32> = obj.index v0 3.i32;
+        v2.i32 = obj.load v1;
+        v3.i32 = add v2 1.i32;
+        obj.store v1 v3;
+        v4.objref<i32> = obj.index v0 0.i32;
+        v5.i32 = obj.load v4;
+        v6.i1 = eq v5 0.i32;
+        br v6 block1 block2;
+    block1:
+        unreachable;
+    block2:
+        return;
+}
+"#;
+        let counter = sonatina_parser::parse_module(counter_source).unwrap().module;
+        request.pipeline = ShaderPipeline::Compute {
+            entry: counter.funcs()[0], workgroup_size: [1, 1, 1], dispatch_grid: [1, 1, 1],
+        };
+        for scoped in [false, true] {
+            request.graph_failure = scoped.then_some(binding);
+            let artifact = NagaBackend::compile_request(&counter, &request).unwrap();
+            assert_eq!(artifact.layout.graph_failure.is_some(), scoped);
+            if let Some(directory) = std::env::var_os("SONATINA_GRAPH_FAILURE_COUNTER_DIR") {
+                let directory = std::path::Path::new(&directory);
+                std::fs::create_dir_all(directory).unwrap();
+                std::fs::write(directory.join(if scoped { "scoped.wgsl" } else { "plain.wgsl" }),
+                    artifact.wgsl.as_ref().unwrap()).unwrap();
+            }
+        }
     }
 
     #[test]
