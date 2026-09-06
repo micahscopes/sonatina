@@ -1105,6 +1105,7 @@ fn naga_expression_is_exact_zero(expression: &naga::Expression) -> bool {
     }
 }
 
+#[cfg(feature = "spirv-backend")]
 fn emit_expr(
     func: &mut naga::Function,
     target: &mut naga::Block,
