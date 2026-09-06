@@ -15,10 +15,9 @@ fn instruction_count(func: &Function) -> usize {
 
 fn main() {
     let args: Vec<_> = env::args().collect();
-    assert_eq!(
-        args.len(),
-        3,
-        "usage: dominator_cse_probe INPUT.sona FUNCTION"
+    assert!(
+        args.len() == 3 || (args.len() == 4 && args[3] == "--conditional-bridges"),
+        "usage: dominator_cse_probe INPUT.sona FUNCTION [--conditional-bridges]"
     );
     let source = fs::read_to_string(&args[1]).expect("read IR capture");
     let module = sonatina_parser::parse_module(&source)
@@ -67,5 +66,29 @@ fn main() {
             args[2], instructions_before, instructions_after,
             stats.removed_instructions, stats.reused_values,
             stats.peak_available_expressions, analysis_us, cse_us, placeholder_count);
+        if args.len() == 4 {
+            use sonatina_codegen::{cfg_edit::{CfgEditor, CleanupMode}, structurize::structurize_function};
+            let structure_before = structurize_function(func).map(|s| s.stats());
+            let instructions_before = instruction_count(func);
+            let mut folded = 0;
+            let mut editor = CfgEditor::new(func, CleanupMode::Strict);
+            loop {
+                let blocks: Vec<_> = editor.func().layout.iter_block().collect();
+                let mut changed = false;
+                for block in blocks {
+                    if editor.fold_conditional_bridge(block) {
+                        folded += 1;
+                        changed = true;
+                    }
+                }
+                if !changed { break; }
+            }
+            let func = editor.func();
+            let after = verify_function(&module.ctx, id, func, &config);
+            assert!(!after.has_errors(), "invalid branch-fold output: {after:?}");
+            println!("conditional_bridges={} instructions_before={} instructions_after={} verified=true", folded, instructions_before, instruction_count(func));
+            println!("structure_before={structure_before:?}");
+            println!("structure_after={:?}", structurize_function(func).map(|s| s.stats()));
+        }
     });
 }

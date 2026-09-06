@@ -509,6 +509,103 @@ impl<'f> CfgEditor<'f> {
         true
     }
 
+    /// Combine a branch-only short-circuit corridor when both conditions are
+    /// already available. No operation is speculated or moved. Shared-target
+    /// phi inputs must agree, since the two incoming edges become one.
+    pub fn fold_conditional_bridge(&mut self, block: BlockId) -> bool {
+        use sonatina_ir::inst::{cmp::IsZero, control_flow::Br, downcast, logic::Or};
+
+        if !self.func.layout.is_block_inserted(block)
+            || self.func.layout.entry_block() == Some(block)
+        {
+            return false;
+        }
+        let Some(term) = self.func.layout.last_inst_of(block) else {
+            return false;
+        };
+        if self.func.layout.first_inst_of(block) != Some(term) {
+            return false;
+        }
+        let Some(inner) = downcast::<&Br>(self.func.inst_set(), self.func.dfg.inst(term)) else {
+            return false;
+        };
+        let (inner_cond, inner_nz, inner_z) = (*inner.cond(), *inner.nz_dest(), *inner.z_dest());
+        let preds: Vec<_> = self.cfg.preds_of(block).copied().collect();
+        let [parent] = preds.as_slice() else {
+            return false;
+        };
+        let parent = *parent;
+        if parent == block {
+            return false;
+        }
+        let Some(parent_term) = self.func.layout.last_inst_of(parent) else {
+            return false;
+        };
+        let Some(outer) = downcast::<&Br>(self.func.inst_set(), self.func.dfg.inst(parent_term))
+        else {
+            return false;
+        };
+        let (outer_cond, outer_nz, outer_z) = (*outer.cond(), *outer.nz_dest(), *outer.z_dest());
+        let shared = if outer_nz == block {
+            outer_z
+        } else if outer_z == block {
+            outer_nz
+        } else {
+            return false;
+        };
+        let other = if inner_nz == shared {
+            inner_z
+        } else if inner_z == shared {
+            inner_nz
+        } else {
+            return false;
+        };
+        if [shared, other].iter().any(|b| *b == block || *b == parent)
+            || shared == other
+            || self.func.dfg.value_ty(inner_cond) != Type::I1
+            || self.func.dfg.value_ty(outer_cond) != Type::I1
+            || self.func.inst_set().has_or().is_none()
+            || self.func.inst_set().has_is_zero().is_none()
+        {
+            return false;
+        }
+        for phi in iter_phis_in_block(self.func, shared) {
+            let args = self.func.dfg.cast_phi(phi).unwrap().args();
+            let from_parent = args.iter().find(|(_, b)| *b == parent).map(|(v, _)| *v);
+            let from_bridge = args.iter().find(|(_, b)| *b == block).map(|(v, _)| *v);
+            if from_parent.is_none() || from_parent != from_bridge {
+                return false;
+            }
+        }
+        // Normalize both conditions to "take the shared successor".
+        let mut a = outer_cond;
+        let mut b = inner_cond;
+        if outer_nz != shared {
+            let inst = IsZero::new_unchecked(self.func.inst_set(), a);
+            a = insert_boolean_before(self.func, parent_term, Box::new(inst));
+        }
+        if inner_nz != shared {
+            let inst = IsZero::new_unchecked(self.func.inst_set(), b);
+            b = insert_boolean_before(self.func, parent_term, Box::new(inst));
+        }
+        let inst = Or::new_unchecked(self.func.inst_set(), a, b);
+        let combined = insert_boolean_before(self.func, parent_term, Box::new(inst));
+        self.func.dfg.replace_inst(
+            parent_term,
+            Box::new(Br::new_unchecked(
+                self.func.inst_set(),
+                combined,
+                shared,
+                other,
+            )),
+        );
+        remove_phi_incoming_from(self.func, shared, block);
+        replace_phi_incoming_block(self.func, other, block, parent);
+        InstInserter::at_location(CursorLocation::BlockTop(block)).remove_block(self.func);
+        self.recompute_cfg();
+        true
+    }
+
     pub fn forward_bridge_block(&mut self, block: BlockId) -> bool {
         if !self.func.layout.is_block_inserted(block)
             || self.func.layout.entry_block() == Some(block)
@@ -986,6 +1083,18 @@ fn append_phi_inputs_for_new_pred(
     }
 }
 
+fn insert_boolean_before(func: &mut Function, before: InstId, inst: Box<dyn Inst>) -> ValueId {
+    let inst = func.dfg.make_inst_dyn(inst);
+    let value = func.dfg.make_value(Value::Inst {
+        inst,
+        result_idx: 0,
+        ty: Type::I1,
+    });
+    func.dfg.attach_result(inst, value);
+    func.layout.insert_inst_before(inst, before);
+    value
+}
+
 fn iter_phis_in_block(func: &Function, block: BlockId) -> impl Iterator<Item = InstId> + '_ {
     let mut next_inst = func.layout.first_inst_of(block);
     std::iter::from_fn(move || {
@@ -1159,6 +1268,113 @@ mod tests {
 
     fn parse_test_module(src: &str) -> Module {
         parse_module(src).expect("parse should succeed").module
+    }
+
+    #[test]
+    fn conditional_bridge_preserves_all_polarities_and_phi_values() {
+        for outer_shared_true in [false, true] {
+            for inner_shared_true in [false, true] {
+                let outer = if outer_shared_true {
+                    "block2 block1"
+                } else {
+                    "block1 block2"
+                };
+                let inner = if inner_shared_true {
+                    "block2 block3"
+                } else {
+                    "block3 block2"
+                };
+                let source = format!(
+                    r#"
+target = "wasm32-unknown-native"
+func public %test(v0.i1, v1.i1) -> i32 {{
+ block0:
+  br v0 {outer};
+ block1:
+  br v1 {inner};
+ block2:
+  v2.i32 = phi (7.i32 block0) (7.i32 block1);
+  return v2;
+ block3:
+  v3.i32 = phi (9.i32 block1);
+  return v3;
+}}
+"#
+                );
+                let module = parse_test_module(&source);
+                let id = module.funcs()[0];
+                let config = sonatina_verifier::VerifierConfig::for_level(
+                    sonatina_verifier::VerificationLevel::Full,
+                );
+                assert!(!sonatina_verifier::verify_module(&module, &config).has_errors());
+                module.func_store.modify(id, |func| {
+                    let mut editor = CfgEditor::new(func, CleanupMode::Strict);
+                    assert!(editor.fold_conditional_bridge(sonatina_ir::BlockId(1)));
+                    assert!(!editor.fold_conditional_bridge(sonatina_ir::BlockId(1)));
+                });
+                let report = sonatina_verifier::verify_module(&module, &config);
+                assert!(!report.has_errors(), "{report:?}");
+                #[cfg(feature = "wasm")]
+                {
+                    use crate::Backend;
+                    let artifact = crate::isa::wasm::WasmBackend::new()
+                        .compile_module(&module)
+                        .unwrap();
+                    let engine = wasmtime::Engine::default();
+                    let executable = wasmtime::Module::new(&engine, artifact.bytes).unwrap();
+                    let mut store = wasmtime::Store::new(&engine, ());
+                    let instance = wasmtime::Instance::new(&mut store, &executable, &[]).unwrap();
+                    let call = instance
+                        .get_typed_func::<(i32, i32), i32>(&mut store, "test")
+                        .unwrap();
+                    for a in [false, true] {
+                        for b in [false, true] {
+                            let expected = if a == outer_shared_true || b == inner_shared_true {
+                                7
+                            } else {
+                                9
+                            };
+                            assert_eq!(
+                                call.call(&mut store, (a as i32, b as i32)).unwrap(),
+                                expected
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_bridge_rejects_distinct_phi_inputs_and_computation() {
+        for (middle, incoming) in [
+            ("br v1 block2 block3;", "8"),
+            ("v4.i1 = is_zero v1;\n  br v4 block2 block3;", "7"),
+        ] {
+            let source = format!(
+                r#"
+target = "evm-ethereum-osaka"
+func public %test(v0.i1, v1.i1) -> i32 {{
+ block0:
+  br v0 block2 block1;
+ block1:
+  {middle}
+ block2:
+  v2.i32 = phi (7.i32 block0) ({incoming}.i32 block1);
+  return v2;
+ block3:
+  return 9.i32;
+}}
+"#
+            );
+            let module = parse_test_module(&source);
+            module.func_store.modify(module.funcs()[0], |func| {
+                assert!(
+                    !CfgEditor::new(func, CleanupMode::Strict)
+                        .fold_conditional_bridge(sonatina_ir::BlockId(1))
+                );
+            });
+        }
     }
 
     #[test]

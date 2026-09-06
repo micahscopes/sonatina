@@ -74,6 +74,7 @@ fn merge_linear_blocks(editor: &mut CfgEditor) -> bool {
                 continue;
             }
             if editor.fold_trampoline_block(block)
+                || editor.fold_conditional_bridge(block)
                 || editor.forward_bridge_block(block)
                 || editor.merge_linear_successor(block)
             {
