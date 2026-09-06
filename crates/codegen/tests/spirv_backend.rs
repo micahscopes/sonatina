@@ -5873,6 +5873,24 @@ fn normalized_switch_loop_exit_executes_on_lavapipe() {
         .compile_module(&module).expect("switch default must retain the canonical loop exit");
     assert_eq!(run_grid_u32(artifact.wgsl.as_deref().unwrap(), 8, 1, 8, 1, &[]),
         vec![0, 1, 2, 2, 2, 2, 2, 2]);
+
+    // Execute the normalized CFG through the separate Wasm/Waffle path too,
+    // rather than treating GPU-only coverage as CPU parity.
+    module.func_store.modify(function, |body| {
+        assert_eq!(sonatina_codegen::transform::switch::lower_switches(body).unwrap(), 1);
+    });
+    let wasm = sonatina_codegen::isa::wasm::WasmBackend::new()
+        .compile_module(&module).expect("normalized loop must retain Wasm behavior");
+    let engine = wasmtime::Engine::default();
+    let executable = wasmtime::Module::new(&engine, &wasm.bytes).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = wasmtime::Instance::new(&mut store, &executable, &[]).unwrap();
+    let execute = instance.get_typed_func::<(i32, i32, i32, i32), i32>(
+        &mut store, "switch_loop",
+    ).unwrap();
+    for bound in 0..8 {
+        assert_eq!(execute.call(&mut store, (bound, 0, 8, 1)).unwrap(), bound.min(2));
+    }
 }
 
 /// Execute a top-level conditional and its merge phi. Both arms are exercised

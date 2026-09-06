@@ -1,5 +1,5 @@
-//! Control flow structuring pass for targets that require structured control flow
-//! (Wasm, Naga). Converts a supported reducible CFG into a nested region tree
+//! Control flow structuring pass used by the Naga backend. The current Wasm
+//! backend uses Waffle instead. Converts a supported reducible CFG into a nested region tree
 //! (Block / Loop / IfThenElse) via a Ramsey-style dominator-tree walk (Norman
 //! Ramsey, "Beyond Relooper", ICFP 2022), which the existing DomTree + LoopTree
 //! analyses already supply as input.
