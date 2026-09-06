@@ -8,6 +8,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn helper_analysis_reports_prepared_region_occurrences() {
+        let parsed = sonatina_parser::parse_module(r#"
+target = "shader-unknown-unknown"
+func public %entry(v0.i32, v1.i32) -> i32 {
+    block0:
+        v2.i32 = call %choose v0;
+        return v2;
+}
+func private %choose(v0.i32) -> i32 {
+    block0:
+        v1.i1 = eq v0 0.i32;
+        br v1 block1 block2;
+    block1:
+        return 17.i32;
+    block2:
+        return 23.i32;
+}
+"#).unwrap();
+        let module = &parsed.module;
+        let find = |name| module.funcs().into_iter().find(|&function| {
+            module.ctx.func_sig(function, |signature| signature.name() == name)
+        }).unwrap();
+        let helper = find("choose");
+        let expected = derive_helper_body(module, helper).unwrap().structured.stats();
+        let analysis = super::super::NagaBackend::new()
+            .analyze_entry_helpers(module, find("entry")).unwrap();
+        assert!(analysis.rejected.is_empty());
+        let summary = analysis.callable.iter().find(|item| item.function == helper).unwrap();
+        assert_eq!(summary.structured, expected);
+        assert_eq!(summary.structured.referenced_blocks, 3);
+        assert_eq!(summary.structured.block_occurrences, 3);
+        assert_eq!(summary.structured.duplicated_block_occurrences, 0);
+        assert_eq!(summary.structured.conditionals, 1);
+    }
+
+    #[test]
     fn helper_report_preserves_children_and_siblings_of_rejected_parent() {
         check_rejected_parent(false);
     }
@@ -158,6 +194,10 @@ pub struct ShaderCallableHelper {
     pub function: FuncRef,
     pub variants: usize,
     pub instruction_count: usize,
+    /// Per logical helper body, not multiplied by resource-specialized variants.
+    /// Measured on the prepared region tree consumed by helper emission, before
+    /// Naga control compaction. These are static occurrences, not execution counts.
+    pub structured: crate::structurize::StructuredCfgStats,
     pub accesses_resource: bool,
     pub maximum_physical_parameters: usize,
 }
@@ -177,6 +217,7 @@ impl HelperAbiReport {
                     function: plan.variant.function,
                     variants: 1,
                     instruction_count: plan.body.instruction_count(),
+                    structured: plan.body.structured.stats(),
                     accesses_resource: plan.body.accesses_resource(),
                     maximum_physical_parameters: plan.parameters.arguments.len(),
                 });
