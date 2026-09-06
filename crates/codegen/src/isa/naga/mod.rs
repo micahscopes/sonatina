@@ -599,6 +599,15 @@ fn compact_naga_control(module: &mut naga::Module) -> usize {
     compacted
 }
 
+/// Run only on a validated module. Preserve declared interfaces and named
+/// objects: this removes unused expressions, not resources or effectful
+/// statements. In particular, Emit ranges are not liveness roots, while
+/// calls, stores, atomics and their operands remain roots in Naga's tracer.
+#[cfg(feature = "spirv-backend")]
+fn compact_naga_expressions(module: &mut naga::Module) {
+    naga::compact::compact(module, naga::compact::KeepUnused::Yes);
+}
+
 #[cfg(feature = "spirv-backend")]
 fn validate_naga_portable_wgsl_limits(module: &naga::Module) -> Result<(), String> {
     let validate_function = |kind: &str, name: &str, function: &naga::Function| {
@@ -894,8 +903,8 @@ impl NagaBackend {
             capabilities,
         )
         .validate(&naga_mod);
-        let info = match validation {
-            Ok(info) => info,
+        match validation {
+            Ok(_) => {},
             Err(error) => {
                 if trace {
                     eprintln!("sonatina spirv: naga validation failed: {error:?}");
@@ -990,6 +999,16 @@ impl NagaBackend {
                 return Err(vec![SpirvError::Validation(format!("{error:?}"))]);
             }
         };
+        // Lowering can introduce pure aggregate constructions after Sonatina's
+        // last DCE pass. Compact only after validation (Naga's precondition),
+        // then rebuild validation information because expression handles move.
+        compact_naga_expressions(&mut naga_mod);
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(), capabilities,
+        ).validate(&naga_mod)
+            .map_err(|error| vec![SpirvError::Validation(format!(
+                "Naga expression compaction produced invalid output: {error:?}"
+            ))])?;
         if target.is_some() {
             target::validate_resource_limits(&naga_mod, &info).map_err(|error| vec![error])?;
         }
@@ -11506,6 +11525,56 @@ fn translate_to_naga(
 
 #[cfg(all(test, feature = "spirv-backend"))]
 mod tests {
+    #[test]
+    fn naga_expression_cleanup_preserves_effects_and_interfaces() {
+        let mut module = naga::front::wgsl::parse_str(r#"
+struct Coords { x: u32, y: u32, z: u32 }
+@group(0) @binding(0) var<storage, read_write> counter: atomic<u32>;
+@group(0) @binding(1) var<storage, read_write> receipt: u32;
+@group(0) @binding(2) var<storage, read> unused_resource: u32;
+fn effect() -> u32 {
+    receipt = 42u;
+    return 7u;
+}
+@compute @workgroup_size(1)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let dead = Coords(id.x, id.y, id.z);
+    let live = Coords(1u, 2u, 3u);
+    let ignored = effect();
+    let previous = atomicAdd(&counter, 1u);
+    if live.x == 1u { receipt = live.z; }
+}
+"#).unwrap();
+        // The backend's synthetic constructions have no authored names.
+        // Remove names in this parser-built fixture to reproduce that case;
+        // production cleanup must not discard authored diagnostic names.
+        module.entry_points[0].function.named_expressions.clear();
+        let validate = |module: &naga::Module| {
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty()).validate(module).unwrap()
+        };
+        validate(&module);
+        let count_composes = |module: &naga::Module| module.entry_points[0]
+            .function.expressions.iter().filter(|(_, expression)|
+                matches!(expression, naga::Expression::Compose { .. })).count();
+        let before = count_composes(&module);
+        let globals = module.global_variables.len();
+        let arguments = module.entry_points[0].function.arguments.len();
+        super::compact_naga_expressions(&mut module);
+        let info = validate(&module);
+        assert_eq!(count_composes(&module) + 1, before,
+            "remove only the unused struct construction");
+        assert_eq!(module.global_variables.len(), globals);
+        assert_eq!(module.entry_points[0].function.arguments.len(), arguments);
+        let output = naga::back::wgsl::write_string(&module, &info,
+            naga::back::wgsl::WriterFlags::empty()).unwrap();
+        assert_eq!(output.matches("effect()").count(), 2,
+            "both helper declaration and effectful call survive");
+        assert!(output.contains("atomicAdd("));
+        assert!(output.contains("receipt = 42u"));
+        assert!(output.contains("unused_resource"));
+    }
+
     #[test]
     fn webgpu_dispatch_limits_precede_helper_lowering() {
         let parsed = sonatina_parser::parse_module(r#"
