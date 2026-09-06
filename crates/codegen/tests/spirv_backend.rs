@@ -5553,6 +5553,10 @@ fn grid_overflow_arithmetic_executes_on_lavapipe() {
                 .compile_module(&mb.build())
                 .unwrap();
             assert!(!artifact.words.is_empty(), "SPIR-V must also be emitted");
+            if bits == 32 {
+                assert!(!artifact.wgsl.as_ref().unwrap().contains("& 4294967295u"),
+                    "full-width u32 arithmetic must not mask away nonexistent high bits");
+            }
             for (lhs_seed, rhs_seed) in [
                 (0u32, 0u32),
                 (0, u32::MAX),

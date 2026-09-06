@@ -63,6 +63,21 @@ pub(super) fn emit(
             )
         };
     }
+    // Arithmetic already wraps at the unsigned carrier width. A mask is
+    // necessary only when the source integer is narrower than that carrier.
+    let carrier_bits = match word {
+        WordKind::U32 => 32,
+        WordKind::I64 => 64,
+    };
+    macro_rules! truncate {
+        ($value:expr) => {
+            if bits < carrier_bits {
+                binary!(And, $value, mask)
+            } else {
+                $value
+            }
+        };
+    }
     let mut unsigned = |value| {
         let value = if bits == 1 {
             select!(value, one, zero)
@@ -79,7 +94,7 @@ pub(super) fn emit(
         } else {
             value
         };
-        binary!(And, value, mask)
+        truncate!(value)
     };
     let lhs = unsigned(lhs);
     let rhs = unsigned(rhs);
@@ -88,7 +103,7 @@ pub(super) fn emit(
         OverflowArithmetic::Sub => binary!(Subtract, lhs, rhs),
         OverflowArithmetic::Mul => binary!(Multiply, lhs, rhs),
     };
-    let result = binary!(And, raw, mask);
+    let result = truncate!(raw);
     let flag = match (op, signed) {
         (OverflowArithmetic::Add, false) => {
             let room = binary!(Subtract, mask, rhs);
@@ -113,9 +128,9 @@ pub(super) fn emit(
                 let rhs_negative = binary!(NotEqual, rhs_sign, zero);
                 let negative = binary!(NotEqual, lhs_negative, rhs_negative);
                 let lhs_negated = binary!(Subtract, zero, lhs);
-                let lhs_negated = binary!(And, lhs_negated, mask);
+                let lhs_negated = truncate!(lhs_negated);
                 let rhs_negated = binary!(Subtract, zero, rhs);
-                let rhs_negated = binary!(And, rhs_negated, mask);
+                let rhs_negated = truncate!(rhs_negated);
                 let a = select!(lhs_negative, lhs_negated, lhs);
                 let b = select!(rhs_negative, rhs_negated, rhs);
                 let positive_limit = binary!(Subtract, sign, one);
