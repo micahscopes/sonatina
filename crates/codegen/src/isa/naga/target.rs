@@ -168,6 +168,43 @@ impl ShaderTargetContract {
         &self.encodings
     }
 
+    /// Validate the core WebGPU profile before helper analysis or body lowering.
+    /// These are portable defaults, not inferred limits of the host adapter.
+    /// https://gpuweb.github.io/gpuweb/#limits
+    pub(super) fn validate_pipeline(&self, pipeline: ShaderPipeline) -> Result<(), SpirvError> {
+        let (workgroup, dispatch) = match pipeline {
+            ShaderPipeline::Compute { workgroup_size, dispatch_grid, .. } =>
+                (workgroup_size, Some(dispatch_grid)),
+            ShaderPipeline::LegacyScalar { workgroup_size, .. }
+            | ShaderPipeline::LegacyGrid { workgroup_size, .. } => (workgroup_size, None),
+            ShaderPipeline::Raster { .. } | ShaderPipeline::Fullscreen { .. } => return Ok(()),
+        };
+        for (axis, (size, limit)) in workgroup.into_iter().zip([256, 256, 64]).enumerate() {
+            if size == 0 || size > limit {
+                return Err(SpirvError::UnsupportedTarget(format!(
+                    "WebGPU core workgroup axis {axis} has size {size}; expected 1..={limit}"
+                )));
+            }
+        }
+        // Axis checks bound this product and prevent arithmetic overflow.
+        let invocations: u32 = workgroup.into_iter().product();
+        if invocations > 256 {
+            return Err(SpirvError::UnsupportedTarget(format!(
+                "WebGPU core workgroup has {invocations} invocations; limit is 256"
+            )));
+        }
+        if let Some(dispatch) = dispatch {
+            for (axis, count) in dispatch.into_iter().enumerate() {
+                if count > 65535 {
+                    return Err(SpirvError::UnsupportedTarget(format!(
+                        "WebGPU core dispatch axis {axis} has {count} workgroups; limit is 65535"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn requests(&self, encoding: ShaderEncoding) -> bool {
         self.encodings.contains(&encoding)
     }
