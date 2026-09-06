@@ -1,5 +1,5 @@
 //! Control flow structuring pass for targets that require structured control flow
-//! (WASM, SPIR-V). Converts an arbitrary reducible CFG into a nested region tree
+//! (Wasm, Naga). Converts a supported reducible CFG into a nested region tree
 //! (Block / Loop / IfThenElse) via a Ramsey-style dominator-tree walk (Norman
 //! Ramsey, "Beyond Relooper", ICFP 2022), which the existing DomTree + LoopTree
 //! analyses already supply as input.
@@ -7,8 +7,33 @@
 //! This pass operates on Sonatina IR post-optimization and produces a
 //! [`StructuredCfg`] annotation that structured-CF backends consume. It is
 //! fail-closed: any shape it cannot classify (irreducible residue, a switch,
-//! an ambiguous merge, a loop with no recognizable header exit) returns a named
+//! an ambiguous merge, or a noncanonical loop exit) returns a named
 //! `Err`, never a silently dropped branch.
+//!
+//! # Input and output contract
+//!
+//! Input is well-formed, post-optimization Sonatina SSA. Reducibility alone is
+//! not sufficient for admission. Reachable blocks use `Jump`, `Br`, `Return`,
+//! or `Unreachable`; `BrTable` is not normalized by this pass. Diamonds,
+//! one-sided terminal arms, and nested branches require an identifiable live
+//! continuation or terminal split. Natural loops admit header branches with
+//! one in-loop successor and one exit, or jump headers where the recursive
+//! walk can classify the body. Conditional headers with two in-loop successors
+//! are rejected. Nonterminal loop-body exits must resolve to the canonical
+//! header exit. Return corridors remain distinct from canonical break paths;
+//! mixed break/return corridors are not generally admitted.
+//!
+//! The output is a derived view, not rewritten SSA. Every reachable block must
+//! be consumed. Shared corridors may occur more than once in the region tree;
+//! [`StructuredCfg::stats`] measures this expansion. `LoopExit` and
+//! `LoopContinue` retain source and destination block identities so emitters
+//! can perform exact predecessor-phi transport. Emitters still own instruction
+//! legality, return values, and trap semantics; successful structuring alone
+//! does not certify an executable target artifact.
+//!
+//! This is a supported closure, not a complete CFG normalization pipeline.
+//! In particular, callers must not infer switch support or arbitrary reducible
+//! loop support from a successful neighboring fixture.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -212,7 +237,7 @@ impl PostDominators {
 
 /// Compute structured control flow for a function.
 ///
-/// Requires a reducible CFG (which Fe always produces). Returns an error
+/// Requires a well-formed CFG within the supported closure above. Returns an error
 /// for irreducible control flow or any shape outside the supported closure.
 pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String> {
     let mut cfg = ControlFlowGraph::default();
