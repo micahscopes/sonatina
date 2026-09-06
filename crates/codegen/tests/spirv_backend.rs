@@ -5831,7 +5831,10 @@ fn normalized_switch_shared_phi_executes_on_lavapipe() {
 
 #[test]
 fn normalized_switch_helper_executes_and_reports_its_own_failure() {
-    let builder = native_module_builder();
+    let isa = sonatina_ir::isa::shader::Shader::new(TargetTriple::new(
+        Architecture::Shader, Vendor::Unknown, OperatingSystem::Unknown,
+    ));
+    let builder = ModuleBuilder::new(ModuleCtx::new(&isa));
     let entry = builder.declare_function(Signature::new(
         "switch_caller", Linkage::Public, &[Type::I32; 4], &[Type::I32],
     )).unwrap();
@@ -5877,6 +5880,17 @@ fn normalized_switch_helper_executes_and_reports_its_own_failure() {
     let backend = SpirvBackend::new().with_grid().with_workgroup_size(8, 1, 1);
     backend.analyze_entry_helpers(&module, entry).unwrap();
     let artifact = backend.compile_module(&module).unwrap();
+    let target = ShaderTargetContract::new(ShaderEnvironment::WebGpu,
+        [ShaderEncoding::Wgsl, ShaderEncoding::Spirv]).unwrap();
+    let request = ShaderCompileRequest::new(&target,
+        ShaderPipeline::LegacyGrid { entry, workgroup_size: [8, 1, 1] });
+    let analysis = NagaBackend::analyze_request_helpers(&module, &request).unwrap();
+    assert!(analysis.rejected.is_empty());
+    assert_eq!(analysis.callable.len(), 1);
+    assert_eq!(analysis.callable[0].function, helper);
+    let requested = NagaBackend::compile_request(&module, &request).unwrap();
+    assert_eq!(requested.wgsl, artifact.wgsl);
+    assert_eq!(requested.words, artifact.words);
     let wgsl = artifact.wgsl.as_deref().unwrap();
     assert_eq!(wgsl.matches("fn switch_callee(").count(), 1);
     assert_eq!(run_grid_u32(wgsl, 8, 1, 8, 1, &[]),
@@ -5894,6 +5908,10 @@ fn normalized_switch_helper_executes_and_reports_its_own_failure() {
     assert!(error.contains("requires an explicit default"), "{error}");
     let error = format!("{:?}", backend.analyze_entry_helpers(&module, entry)
         .err().expect("default-less helper must fail analysis"));
+    assert!(error.contains("switch_callee"), "{error}");
+    assert!(error.contains("requires an explicit default"), "{error}");
+    let error = format!("{:?}", NagaBackend::compile_request(&module, &request)
+        .err().expect("explicit request must reject the same unsupported helper"));
     assert!(error.contains("switch_callee"), "{error}");
     assert!(error.contains("requires an explicit default"), "{error}");
 }
