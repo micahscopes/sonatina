@@ -5703,6 +5703,55 @@ fn scalar_i64_overflow_validates_as_spirv() {
     }
 }
 
+#[test]
+fn normalized_switch_shared_phi_executes_on_lavapipe() {
+    let builder = native_module_builder();
+    let function = builder.declare_function(Signature::new(
+        "switch_grid", Linkage::Public, &[Type::I32; 4], &[Type::I32],
+    )).unwrap();
+    let mut fb = builder.func_builder::<InstInserter>(function);
+    let is = fb.inst_set();
+    let entry = fb.append_block();
+    let special = fb.append_block();
+    let fallback = fb.append_block();
+    let join = fb.append_block();
+    fb.switch_to_block(entry);
+    let selector = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    let two = fb.make_imm_value(2i32);
+    let direct = fb.make_imm_value(40i32);
+    let alternate = fb.make_imm_value(7i32);
+    let default_value = fb.make_imm_value(9i32);
+    fb.insert_inst_no_result(control_flow::BrTable::new(
+        is, selector, Some(fallback), vec![(zero, join), (one, join), (two, special)],
+    ));
+    fb.switch_to_block(special);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, join));
+    fb.switch_to_block(fallback);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, join));
+    fb.switch_to_block(join);
+    let result = fb.insert_inst(control_flow::Phi::new(
+        is, vec![(direct, entry), (alternate, special), (default_value, fallback)],
+    ), Type::I32);
+    fb.insert_return(result);
+    fb.seal_all();
+    fb.finish();
+    let module = builder.build();
+    SpirvBackend::new().with_grid().with_workgroup_size(8, 1, 1)
+        .analyze_entry_helpers(&module, function).expect("helper analysis must normalize switches too");
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(8, 1, 1)
+        .compile_module(&module).expect("normalized switch must lower");
+    let output = run_grid_u32(artifact.wgsl.as_deref().unwrap(), 8, 1, 8, 1, &[]);
+    assert_eq!(output, vec![40, 40, 7, 9, 9, 9, 9, 9]);
+    module.func_store.view(function, |body| {
+        let terminator = body.layout.last_inst_of(entry).unwrap();
+        assert!(<&control_flow::BrTable as sonatina_ir::InstDowncast>::downcast(
+            body.inst_set(), body.dfg.inst(terminator),
+        ).is_some(), "analysis and compilation must not mutate caller-owned IR");
+    });
+}
+
 /// Execute a top-level conditional and its merge phi. Both arms are exercised
 /// across the grid and the phi feeds another instruction after the merge.
 #[test]

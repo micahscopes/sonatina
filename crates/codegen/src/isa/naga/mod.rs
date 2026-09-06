@@ -786,6 +786,9 @@ impl NagaBackend {
         builtin_arguments: &[SpirvBuiltinArgument],
         heap_words: u32,
     ) -> Result<ShaderHelperAnalysis, Vec<SpirvError>> {
+        let normalized = normalize_shader_switches(module, pipeline)
+            .map_err(|error| vec![SpirvError::Translation(error)])?;
+        let module = normalized.as_ref().unwrap_or(module);
         let analyze = || -> Result<ShaderHelperAnalysis, String> {
             if let ShaderPipeline::Raster { vertex, fragment } = pipeline {
                 return authored_raster::analyze_helpers(
@@ -849,6 +852,9 @@ impl NagaBackend {
         target: Option<&ShaderTargetContract>,
         graph_failure: Option<GraphFailureBinding>,
     ) -> Result<ShaderArtifact, Vec<SpirvError>> {
+        let normalized = normalize_shader_switches(module, pipeline)
+            .map_err(|error| vec![SpirvError::Translation(error)])?;
+        let module = normalized.as_ref().unwrap_or(module);
         let capabilities = match target.map(ShaderTargetContract::environment) {
             Some(ShaderEnvironment::WebGpu) => naga::valid::Capabilities::empty(),
             Some(environment) => return Err(vec![SpirvError::UnsupportedTarget(format!(
@@ -6851,6 +6857,42 @@ fn bind_resource_identity_aliases(
         value_map.insert(value, expression);
     }
     Ok(())
+}
+
+/// Analysis and emission must see the same structured-control legalization.
+/// Keep caller-owned IR unchanged and avoid copying switch-free modules.
+#[cfg(feature = "spirv-backend")]
+fn normalize_shader_switches(module: &Module, pipeline: ShaderPipeline) -> Result<Option<Module>, String> {
+    use sonatina_ir::{InstDowncast, inst::control_flow::BrTable};
+    let entries = match pipeline {
+        ShaderPipeline::Raster { vertex, fragment } => vec![vertex, fragment],
+        ShaderPipeline::Compute { entry, .. }
+        | ShaderPipeline::Fullscreen { entry }
+        | ShaderPipeline::LegacyScalar { entry, .. }
+        | ShaderPipeline::LegacyGrid { entry, .. } => vec![entry],
+    };
+    // Interface validation owns missing-entry diagnostics (including raster
+    // stage identity). Do not replace them with a call-graph traversal error.
+    if entries.iter().any(|entry| module.func_store.try_view(*entry, |_| ()).is_none()) {
+        return Ok(None);
+    }
+    let mut functions = Vec::new();
+    for entry in entries {
+        for function in reachable_call_postorder(module, entry)? {
+            if !functions.contains(&function) { functions.push(function); }
+        }
+    }
+    let has_switch = functions.iter().any(|function| module.func_store.view(*function, |body| {
+        body.layout.iter_block().any(|block| body.layout.last_inst_of(block).is_some_and(|inst| {
+            <&BrTable as InstDowncast>::downcast(body.inst_set(), body.dfg.inst(inst)).is_some()
+        }))
+    }));
+    if !has_switch { return Ok(None); }
+    let normalized = module.clone_for_funcs(&functions);
+    for function in functions {
+        normalized.func_store.modify(function, crate::transform::switch::lower_switches)?;
+    }
+    Ok(Some(normalized))
 }
 
 /// Return the direct-call closure rooted at `entry`, with every callee before
