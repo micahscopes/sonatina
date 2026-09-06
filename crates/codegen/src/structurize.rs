@@ -1110,7 +1110,28 @@ impl Structurer<'_> {
                     }
                 }
             }
-            [merge] => Ok(Some(*merge)),
+            [merge] => {
+                // Whole-function post-dominance can see past a backedge to
+                // the eventual loop exit. Prefer a join within this iteration
+                // when all continuing paths reach it; terminal paths need not.
+                if let Some(lp) = cur_loop
+                    && self.is_canonical_loop_exit(lp, *merge)
+                {
+                    if let Some(local) = self.nearest_nonterminal_merge(nz, z, cur_loop) {
+                        return Ok(Some(local));
+                    }
+                    if let Some(stop) = enclosing_stop
+                        && self.is_local_merge_candidate(stop, cur_loop)
+                        && (self.reaches_before_loop_header(nz, stop, cur_loop)
+                            || self.reaches_before_loop_header(z, stop, cur_loop))
+                        && self.all_nonterminal_paths_reach(nz, stop, cur_loop)
+                        && self.all_nonterminal_paths_reach(z, stop, cur_loop)
+                    {
+                        return Ok(Some(stop));
+                    }
+                }
+                Ok(Some(*merge))
+            }
             _ => Err(format!(
                 "spirv structurize: {} immediate postdominator candidates for block {header:?} \
                  (irreducible/unsupported control-flow shape)",

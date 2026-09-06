@@ -5752,6 +5752,55 @@ fn normalized_switch_shared_phi_executes_on_lavapipe() {
     });
 }
 
+/// Repeated switch cases share a continuation inside a loop, while default
+/// exits it. The eventual return must not displace the iteration-local merge
+/// or consume that merge inside a nested selection.
+#[test]
+fn normalized_switch_loop_exit_executes_on_lavapipe() {
+    let builder = native_module_builder();
+    let function = builder.declare_function(Signature::new(
+        "switch_loop", Linkage::Public, &[Type::I32; 4], &[Type::I32],
+    )).unwrap();
+    let mut fb = builder.func_builder::<InstInserter>(function);
+    let is = fb.inst_set();
+    let entry = fb.append_block();
+    let header = fb.append_block();
+    let dispatch = fb.append_block();
+    let latch = fb.append_block();
+    let exit = fb.append_block();
+    fb.switch_to_block(entry);
+    let bound = fb.args()[0];
+    let zero = fb.make_imm_value(0i32);
+    let one = fb.make_imm_value(1i32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(header);
+    let iteration = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let condition = fb.insert_inst(cmp::Lt::new(is, iteration, bound), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new(is, condition, dispatch, exit));
+    fb.switch_to_block(dispatch);
+    fb.insert_inst_no_result(control_flow::BrTable::new(
+        is, iteration, Some(exit), vec![(zero, latch), (one, latch)],
+    ));
+    fb.switch_to_block(latch);
+    let next = fb.insert_inst(arith::Add::new(is, iteration, one), Type::I32);
+    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.switch_to_block(exit);
+    fb.insert_return(iteration);
+    fb.seal_all();
+    fb.finish();
+    let module = builder.build();
+    module.func_store.modify(function, |body| {
+        let phi = body.dfg.value_inst(iteration).unwrap();
+        body.dfg.replace_inst(phi, Box::new(control_flow::Phi::new(
+            is, vec![(zero, entry), (next, latch)],
+        )));
+    });
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(8, 1, 1)
+        .compile_module(&module).expect("switch default must retain the canonical loop exit");
+    assert_eq!(run_grid_u32(artifact.wgsl.as_deref().unwrap(), 8, 1, 8, 1, &[]),
+        vec![0, 1, 2, 2, 2, 2, 2, 2]);
+}
+
 /// Execute a top-level conditional and its merge phi. Both arms are exercised
 /// across the grid and the phi feeds another instruction after the merge.
 #[test]
