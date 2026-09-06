@@ -1833,6 +1833,43 @@ fn spirv_constructs_aggregate_ssa_without_allocations() {
 }
 
 #[test]
+fn spirv_composed_projection_preserves_old_ssa_snapshot() {
+    let parsed = sonatina_parser::parse_module(r#"
+target = "shader-unknown-unknown"
+type @Pair = {i32, i32};
+func public %entry(v0.i32, v1.i32) -> i32 {
+    block0:
+        v2.i32 = call %project_pair 41.i32;
+        return v2;
+}
+func private %project_pair(v0.i32) -> i32 {
+    block0:
+        v1.@Pair = insert_value undef.@Pair 0.i32 v0;
+        v2.@Pair = insert_value v1 1.i32 7.i32;
+        v3.i32 = add v0 1.i32;
+        v4.@Pair = insert_value v2 0.i32 v3;
+        v5.i32 = extract_value v2 0.i32;
+        v6.i32 = extract_value v4 0.i32;
+        v7.i32 = extract_value v4 1.i32;
+        v8.i32 = add v5 v6;
+        v9.i32 = add v8 v7;
+        return v9;
+}
+"#).unwrap();
+    let artifact = SpirvBackend::new().compile_module(&parsed.module).unwrap();
+    assert!(!artifact.words.is_empty());
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    let module = naga::front::wgsl::parse_str(wgsl).unwrap();
+    let (_, helper) = module.functions.iter().find(|(_, function)| {
+        function.name.as_deref().is_some_and(|name| name.contains("project_pair"))
+    }).expect("projection helper remains outlined");
+    assert!(!helper.expressions.iter().any(|(_, expression)| matches!(expression,
+        naga::Expression::Compose { .. } | naga::Expression::AccessIndex { .. })),
+        "resolved SSA components must not be reconstructed/projected: {wgsl}");
+    assert_eq!(run_grid_u32(wgsl, 1, 1, 1, 1, &[]), vec![90]);
+}
+
+#[test]
 fn spirv_zero_aggregate_construction_stays_compact() {
     let isa = Native::new(TargetTriple::new(
         Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native,
