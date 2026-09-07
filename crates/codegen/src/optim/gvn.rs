@@ -1212,19 +1212,19 @@ impl GvnSolver {
                     .saturating_ssub(func.dfg.value_imm(rhs)?),
                 BinaryInstKind::Sdiv => {
                     let (lhs, rhs) = word_binary_imms(func, lhs, rhs, result_ty)?;
-                    fold_result_imm((!rhs.is_zero()).then_some(lhs.sdiv(rhs))?, result_ty)?
+                    fold_result_imm((!rhs.is_zero()).then(|| lhs.sdiv(rhs))?, result_ty)?
                 }
                 BinaryInstKind::Udiv => {
                     let (lhs, rhs) = word_binary_imms(func, lhs, rhs, result_ty)?;
-                    fold_result_imm((!rhs.is_zero()).then_some(lhs.udiv(rhs))?, result_ty)?
+                    fold_result_imm((!rhs.is_zero()).then(|| lhs.udiv(rhs))?, result_ty)?
                 }
                 BinaryInstKind::Umod => {
                     let (lhs, rhs) = word_binary_imms(func, lhs, rhs, result_ty)?;
-                    fold_result_imm((!rhs.is_zero()).then_some(lhs.urem(rhs))?, result_ty)?
+                    fold_result_imm((!rhs.is_zero()).then(|| lhs.urem(rhs))?, result_ty)?
                 }
                 BinaryInstKind::Smod => {
                     let (lhs, rhs) = word_binary_imms(func, lhs, rhs, result_ty)?;
-                    fold_result_imm((!rhs.is_zero()).then_some(lhs.srem(rhs))?, result_ty)?
+                    fold_result_imm((!rhs.is_zero()).then(|| lhs.srem(rhs))?, result_ty)?
                 }
                 BinaryInstKind::Lt => {
                     let (lhs, rhs) = word_binary_imms(func, lhs, rhs, result_ty)?;
@@ -4052,6 +4052,40 @@ func private %entry(v0.i32, v9.i1) -> i32 {
                 "stale query keyed by the old leader should have been invalidated"
             );
         });
+    }
+
+    #[test]
+    fn constant_folding_division_zero_is_not_evaluated() {
+        // Value-phi discovery can ask about constants from an infeasible
+        // predecessor. Decline the fold; do not execute a trapping operation.
+        for op in ["sdiv", "udiv", "smod", "umod"] {
+            for divisor in [0, 2] {
+                let source = format!(
+                    "target = \"evm-ethereum-london\"\n\
+                     func private %entry() -> i32 {{\n\
+                     block0:\n v0.i32 = {op} 8.i32 {divisor}.i32;\n return v0;\n }}"
+                );
+                let module = parse_module(&source).expect("parse should succeed").module;
+                module.func_store.modify(module.funcs()[0], |func| {
+                    let inst = func
+                        .layout
+                        .iter_inst(func.layout.entry_block().unwrap())
+                        .next()
+                        .unwrap();
+                    let key = inst_to_gvn_key(func, inst);
+                    let folded = GvnSolver::new().perform_constant_folding(func, &key, 0);
+                    if divisor == 0 {
+                        assert!(folded.is_none(), "{op} by zero must not be folded");
+                    } else {
+                        let expected = if op.ends_with("mod") { 0 } else { 4 };
+                        assert_eq!(
+                            func.dfg.value_imm(folded.unwrap()),
+                            Some(Immediate::I32(expected))
+                        );
+                    }
+                });
+            }
+        }
     }
 
     #[test]
