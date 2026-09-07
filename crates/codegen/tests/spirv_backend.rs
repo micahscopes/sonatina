@@ -6766,6 +6766,43 @@ func public %fragment(v0.f32) -> i32 {
     assert!(!wgsl.contains("fe_heap"), "pure values must not reintroduce a private arena");
 }
 
+/// A typed scene policy carrying real booleans reaches the raster pair as
+/// actor state. Storage has no one-bit leaf, so the record carries a u32 and
+/// the shader decodes it, matching the compute entry-parameter carrier. The
+/// record keeps every declared field even when one stage never reads it.
+#[test]
+fn authored_raster_carries_boolean_actor_state_in_host_shareable_words() {
+    let parsed = sonatina_parser::parse_module(r#"
+target = "shader-unknown-unknown"
+func public %vertex(v0.i32, v1.f32, v2.i1) -> (f32, f32, f32, f32, f32) {
+    block0:
+        return (v1, 0x00000000.f32, 0x00000000.f32, 0x3f800000.f32, v1);
+}
+func public %fragment(v0.f32, v1.f32, v2.i1) -> i32 {
+    block0:
+        br v2 block1 block2;
+    block1:
+        return 17.i32;
+    block2:
+        return 3.i32;
+}
+"#).expect("raster boolean-state fixture parses");
+    let artifact = SpirvBackend::new().with_authored_raster("vertex", "fragment")
+        .compile_module(&parsed.module).expect("raster admits boolean actor state");
+    let member = artifact.layout.bindings.iter().flat_map(|binding| &binding.members)
+        .find(|member| member.arg_index == 2).expect("boolean state member is retained");
+    assert_eq!((member.width, member.scalar), (4, SpirvScalarKind::U32));
+    let float_member = artifact.layout.bindings.iter().flat_map(|binding| &binding.members)
+        .find(|member| member.arg_index == 1).expect("float state member is retained");
+    assert_eq!((float_member.width, float_member.scalar), (4, SpirvScalarKind::F32));
+    assert_ne!(member.offset, float_member.offset, "state leaves occupy distinct words");
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    let module = naga::front::wgsl::parse_str(wgsl).expect("boolean raster state parses");
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&module).expect("boolean raster state validates");
+    assert_eq!(module.entry_points.len(), 2);
+}
+
 #[test]
 fn authored_raster_preserves_shared_scalar_multi_result_helpers() {
     let isa = sonatina_ir::isa::shader::Shader::new(

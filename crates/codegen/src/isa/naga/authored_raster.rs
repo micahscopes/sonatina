@@ -306,10 +306,10 @@ fn prepare_raster_entries(
         .collect::<Vec<_>>();
     if declared_scalar_state
         .iter()
-        .any(|(_, ty)| !matches!(ty, Type::I32 | Type::F32))
+        .any(|(_, ty)| !matches!(ty, Type::I1 | Type::I32 | Type::F32))
     {
         return Err(
-            "spirv raster: non-resource actor state admits only i32/u32 and f32 leaves"
+            "spirv raster: non-resource actor state admits only i1, i32/u32 and f32 leaves"
             .to_string(),
         );
     }
@@ -909,6 +909,10 @@ fn append_state_binding(
         let (naga_ty, scalar) = match ty {
             Type::I32 => (u32_type, SpirvScalarKind::I32),
             Type::F32 => (f32_type, SpirvScalarKind::F32),
+            // Host-shareable storage has no one-bit leaf. Booleans travel in
+            // the same u32 carrier the compute entry parameters already use,
+            // so the record keeps its uniform four-byte member layout.
+            Type::I1 => (u32_type, SpirvScalarKind::U32),
             _ => unreachable!("state admission checked by translate"),
         };
         let offset = index as u32 * 4;
@@ -999,7 +1003,7 @@ fn load_state(
     let state = naga_func.expressions.append(
         naga::Expression::GlobalVariable(state_var), naga::Span::UNDEFINED,
     );
-    for (member, (state_index, _)) in state_fields.iter().enumerate() {
+    for (member, (state_index, ty)) in state_fields.iter().enumerate() {
         let arg = function.arg_values[first_arg + *state_index];
         let pointer = naga_func.expressions.append(
             naga::Expression::AccessIndex { base: state, index: member as u32 },
@@ -1012,7 +1016,24 @@ fn load_state(
             naga::Statement::Emit(naga::Range::new_from_bounds(pointer, loaded)),
             naga::Span::UNDEFINED,
         );
-        values.insert(arg, loaded);
+        // Booleans stay logical inside the shader. Decode the u32 carrier with
+        // the same nonzero rule the compute storage arguments use.
+        let value = if *ty == Type::I1 {
+            let zero = naga_func.expressions.append(
+                naga::Expression::Literal(naga::Literal::U32(0)), naga::Span::UNDEFINED,
+            );
+            let decoded = naga_func.expressions.append(naga::Expression::Binary {
+                op: naga::BinaryOperator::NotEqual, left: loaded, right: zero,
+            }, naga::Span::UNDEFINED);
+            naga_func.body.push(
+                naga::Statement::Emit(naga::Range::new_from_bounds(decoded, decoded)),
+                naga::Span::UNDEFINED,
+            );
+            decoded
+        } else {
+            loaded
+        };
+        values.insert(arg, value);
     }
 }
 
