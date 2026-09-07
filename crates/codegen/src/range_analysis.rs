@@ -38,6 +38,7 @@ pub struct RangeAnalysis {
     reachable: SecondaryMap<BlockId, bool>,
     initialized: SecondaryMap<BlockId, bool>,
     guarded_subs: FxHashSet<InstId>,
+    call_results: RangeEnv,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +67,17 @@ impl RangeAnalysis {
         dom: &DomTree,
         lpt: &LoopTree,
     ) {
+        self.compute_proved(func, cfg, dom, lpt, &RangeEnv::default());
+    }
+
+    pub(crate) fn compute_with_call_results(&mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree, call_results: &RangeEnv) {
+        let mut dom = DomTree::default();
+        dom.compute(cfg);
+        self.compute_proved(func, cfg, &dom, lpt, call_results);
+    }
+
+    fn compute_proved(&mut self, func: &Function, cfg: &ControlFlowGraph, dom: &DomTree, lpt: &LoopTree, call_results: &RangeEnv) {
+        self.call_results = call_results.clone();
         self.entry_envs.clear();
         self.exit_envs.clear();
         self.reachable.clear();
@@ -129,7 +141,7 @@ impl RangeAnalysis {
             self.reachable[block] = true;
             self.initialized[block] = true;
 
-            let new_exit = simulate_block_from_entry(func, block, &new_entry, &self.guarded_subs);
+            let new_exit = simulate_block_from_entry(func, block, &new_entry, &self.guarded_subs, &self.call_results);
             let exit_changed = new_exit != self.exit_envs[block];
             if exit_changed {
                 self.exit_envs[block] = new_exit;
@@ -167,7 +179,7 @@ impl RangeAnalysis {
                     continue;
                 }
                 self.exit_envs[block] =
-                    simulate_block_from_entry(func, block, &new_entry, &self.guarded_subs);
+                    simulate_block_from_entry(func, block, &new_entry, &self.guarded_subs, &self.call_results);
                 self.entry_envs[block] = new_entry;
                 changed = true;
             }
@@ -197,6 +209,7 @@ impl RangeAnalysis {
 
     pub(crate) fn transfer_inst(&self, func: &Function, env: &mut RangeEnv, inst: InstId) {
         transfer_inst(func, env, inst, &self.guarded_subs);
+        apply_call_results(func, env, inst, &self.call_results);
     }
 }
 
@@ -468,6 +481,7 @@ fn simulate_block_from_entry(
     block: BlockId,
     entry: &RangeEnv,
     guarded_subs: &FxHashSet<InstId>,
+    call_results: &RangeEnv,
 ) -> RangeEnv {
     let mut env = entry.clone();
     for inst in func.layout.iter_inst(block) {
@@ -475,6 +489,7 @@ fn simulate_block_from_entry(
             continue;
         }
         transfer_inst(func, &mut env, inst, guarded_subs);
+        apply_call_results(func, &mut env, inst, call_results);
     }
     env
 }
@@ -2960,5 +2975,13 @@ mod tests {
         let mut analysis = RangeAnalysis::default();
         analysis.compute(func, &cfg, &domtree, &lpt);
         analysis
+    }
+}
+
+fn apply_call_results(func: &Function, env: &mut RangeEnv, inst: InstId, call_results: &RangeEnv) {
+    if func.dfg.call_info(inst).is_some() {
+        for &value in func.dfg.inst_results(inst) {
+            if let Some(&fact) = call_results.get(&value) { set_env_fact(func, env, value, fact); }
+        }
     }
 }

@@ -31,6 +31,16 @@ impl RangeBranchSimplify {
         dom: &DomTree,
         lpt: &LoopTree,
     ) -> bool {
+        self.run_proved(func, cfg, dom, lpt, &RangeEnv::default())
+    }
+
+    pub(crate) fn run_with_call_results(&mut self, func: &mut Function, cfg: &ControlFlowGraph, lpt: &LoopTree, call_results: &RangeEnv) -> bool {
+        let mut dom = DomTree::default();
+        dom.compute(cfg);
+        self.run_proved(func, cfg, &dom, lpt, call_results)
+    }
+
+    fn run_proved(&mut self, func: &mut Function, cfg: &ControlFlowGraph, _dom: &DomTree, lpt: &LoopTree, call_results: &RangeEnv) -> bool {
         if !has_conditional_branch(func) {
             return false;
         }
@@ -38,7 +48,7 @@ impl RangeBranchSimplify {
         self.plans.clear();
 
         let mut analysis = RangeAnalysis::default();
-        analysis.compute(func, cfg, dom, lpt);
+        analysis.compute_with_call_results(func, cfg, lpt, call_results);
 
         let blocks: Vec<_> = func.layout.iter_block().collect();
         for block in blocks {
