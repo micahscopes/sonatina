@@ -64,25 +64,33 @@ impl RangeAnalysis {
         &mut self,
         func: &Function,
         cfg: &ControlFlowGraph,
-        dom: &DomTree,
+        _dom: &DomTree,
         lpt: &LoopTree,
     ) {
-        self.compute_proved(func, cfg, dom, lpt, &RangeEnv::default());
+        self.compute_with_inputs(func, cfg, lpt, &RangeEnv::default(), &RangeEnv::default());
     }
 
-    pub(crate) fn compute_with_call_results(&mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree, call_results: &RangeEnv) {
+    /// Call-result bounds proved from defined callees, never assumptions about
+    /// arbitrary inputs. Apply at the defining call, not at function entry.
+    pub(crate) fn compute_with_call_results(
+        &mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree,
+        call_results: &RangeEnv,
+    ) {
+        self.compute_with_inputs(func, cfg, lpt, call_results, &RangeEnv::default());
+    }
+
+    pub(crate) fn compute_with_inputs(
+        &mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree,
+        call_results: &RangeEnv, arguments: &RangeEnv,
+    ) {
         let mut dom = DomTree::default();
         dom.compute(cfg);
-        self.compute_proved(func, cfg, &dom, lpt, call_results);
-    }
-
-    fn compute_proved(&mut self, func: &Function, cfg: &ControlFlowGraph, dom: &DomTree, lpt: &LoopTree, call_results: &RangeEnv) {
         self.call_results = call_results.clone();
         self.entry_envs.clear();
         self.exit_envs.clear();
         self.reachable.clear();
         self.initialized.clear();
-        self.guarded_subs = guarded_subtractions(func, cfg, dom);
+        self.guarded_subs = guarded_subtractions(func, cfg, &dom);
 
         let Some(entry) = cfg.entry() else {
             return;
@@ -129,6 +137,11 @@ impl RangeAnalysis {
             if is_loop_header(lpt, block) && revisit_count[block] > LOOP_WIDEN_CAP {
                 new_entry = widen_env(func, &self.entry_envs[block], &new_entry);
                 widened = true;
+            }
+            // Arguments are immutable invocation facts, including across loop
+            // widening. Do not seed call results or arbitrary local values here.
+            for (&arg, &fact) in arguments {
+                new_entry.entry(arg).or_insert(fact);
             }
 
             let entry_changed = !old_initialized || new_entry != self.entry_envs[block];
