@@ -30,6 +30,78 @@ fn native_module_builder() -> ModuleBuilder {
     ModuleBuilder::new(ctx)
 }
 
+#[test]
+fn boolean_broadcast_parameters_use_u32_storage_and_logical_values() {
+    let isa = Native::new(TargetTriple::new(Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native));
+    let is = isa.inst_set();
+    let mb = ModuleBuilder::new(ModuleCtx::new(&isa));
+    let entry = mb.declare_function(Signature::new_single(
+        "boolean_parameter", Linkage::Public, &[Type::I32, Type::I32, Type::I1], Type::I32,
+    )).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(entry);
+    let start = fb.append_block();
+    let yes = fb.append_block();
+    let no = fb.append_block();
+    fb.switch_to_block(start);
+    fb.insert_inst_no_result(control_flow::Br::new(is, fb.args()[2], yes, no));
+    for (block, n) in [(yes, 17i32), (no, 3i32)] {
+        fb.switch_to_block(block);
+        let value = fb.make_imm_value(Immediate::from(n));
+        fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
+    }
+    fb.seal_all();
+    fb.finish();
+    let module = mb.build();
+    for backend in [SpirvBackend::new(), SpirvBackend::new().with_grid(), SpirvBackend::new().with_render()] {
+        let artifact = backend.with_workgroup_size(1,1,1).compile_module(&module).unwrap();
+        let member = artifact.layout.bindings.iter().flat_map(|b| &b.members).find(|m| m.arg_index == 2).unwrap();
+        assert_eq!(member.width, 4);
+        assert_eq!(member.scalar, SpirvScalarKind::U32);
+        let wgsl = artifact.wgsl.as_deref().unwrap();
+        let parsed = naga::front::wgsl::parse_str(wgsl).unwrap();
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&parsed).unwrap();
+    }
+    let artifact = SpirvBackend::new().with_grid().with_workgroup_size(1,1,1).compile_module(&module).unwrap();
+    for (input, expected) in [(0u32,3), (1,17), (255,17)] {
+        assert_eq!(run_grid_u32(artifact.wgsl.as_deref().unwrap(), 1,1,1,1, &input.to_le_bytes()), vec![expected]);
+    }
+}
+
+#[test]
+fn boolean_compute_parameter_controls_external_storage_write() {
+    let isa = Native::new(TargetTriple::new(Architecture::X86_64, Vendor::Unknown, OperatingSystem::Native));
+    let is = isa.inst_set();
+    let mb = ModuleBuilder::new(ModuleCtx::new(&isa));
+    let array = mb.declare_array_type(Type::I32, 1);
+    let resource = mb.objref_type(array);
+    let scalar = mb.objref_type(Type::I32);
+    let entry = mb.declare_function(Signature::new_unit("boolean_compute", Linkage::Public, &[resource, Type::I1])).unwrap();
+    let mut fb = mb.func_builder::<InstInserter>(entry);
+    let start = fb.append_block();
+    let yes = fb.append_block();
+    let no = fb.append_block();
+    fb.switch_to_block(start);
+    fb.insert_inst_no_result(control_flow::Br::new(is, fb.args()[1], yes, no));
+    for (block, n) in [(yes, 17i32), (no, 3i32)] {
+        fb.switch_to_block(block);
+        let zero = fb.make_imm_value(0i32);
+        let slot = fb.insert_inst(data::ObjIndex::new(is, fb.args()[0], zero), scalar);
+        let value = fb.make_imm_value(n);
+        fb.insert_inst_no_result(data::ObjStore::new(is, slot, value));
+        fb.insert_inst_no_result(control_flow::Return::new_unit(is));
+    }
+    fb.seal_all();
+    fb.finish();
+    let artifact = SpirvBackend::new().with_compute().with_external_resource(SpirvExternalResource {
+        arg_index:0, group:0, binding:0, name:"output".into(), access:Access::ReadWrite,
+        element:SpirvResourceElement::Scalar(SpirvScalarKind::U32), stride:4, length:1,
+    }).compile_module(&mb.build()).unwrap();
+    let member = artifact.layout.bindings.iter().flat_map(|b| &b.members).find(|m| m.arg_index == 1).unwrap();
+    assert_eq!((member.width, member.scalar), (4, SpirvScalarKind::U32));
+    let parsed = naga::front::wgsl::parse_str(artifact.wgsl.as_deref().unwrap()).unwrap();
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&parsed).unwrap();
+}
+
 /// Fe's canonical atlas cursor combines a typed storage snapshot, a loop exit
 /// aggregate phi, and conditional fields in the next snapshot. Keep the real
 /// failing lowering input until it can be minimized without losing the defect.
@@ -9276,7 +9348,7 @@ func public %float_to_unsigned() -> i64 {
 }
 
 #[test]
-fn storage_buffer_boolean_broadcast_fails_closed() {
+fn unused_boolean_broadcast_retains_host_shareable_layout() {
     let source = r#"
 target = "wasm32-unknown-native"
 func public %boolean(v0.i32, v1.i32, v2.i1) -> i32 {
@@ -9284,8 +9356,11 @@ func public %boolean(v0.i32, v1.i32, v2.i1) -> i32 {
         return v0;
 }
 "#;
-    let error = spirv_error(source, SpirvBackend::new().with_grid());
-    assert!(error.contains("boolean") && error.contains("storage-buffer"), "{error}");
+    let module = sonatina_parser::parse_module(source).unwrap().module;
+    let artifact = SpirvBackend::new().with_grid().compile_module(&module).unwrap();
+    let member = artifact.layout.bindings.iter().flat_map(|b| &b.members)
+        .find(|m| m.arg_index == 2).unwrap();
+    assert_eq!((member.width, member.scalar), (4, SpirvScalarKind::U32));
 }
 
 #[test]
