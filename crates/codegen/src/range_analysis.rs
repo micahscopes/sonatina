@@ -54,6 +54,13 @@ impl RangeAnalysis {
         &mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree,
         call_results: &RangeEnv,
     ) {
+        self.compute_with_inputs(func, cfg, lpt, call_results, &RangeEnv::default());
+    }
+
+    pub(crate) fn compute_with_inputs(
+        &mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree,
+        call_results: &RangeEnv, arguments: &RangeEnv,
+    ) {
         self.entry_envs.clear();
         self.exit_envs.clear();
         self.reachable.clear();
@@ -102,6 +109,11 @@ impl RangeAnalysis {
             }
             if is_loop_header(lpt, block) && revisit_count[block] > LOOP_WIDEN_CAP {
                 new_entry = widen_env(func, &self.entry_envs[block], &new_entry);
+            }
+            // Arguments are immutable invocation facts, including across loop
+            // widening. Do not seed call results or arbitrary local values here.
+            for (&arg, &fact) in arguments {
+                new_entry.entry(arg).or_insert(fact);
             }
 
             let entry_changed = !old_initialized || new_entry != self.entry_envs[block];
