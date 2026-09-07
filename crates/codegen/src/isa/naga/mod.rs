@@ -9596,12 +9596,6 @@ fn analyze_naga_entry_interface(
         if matches!(word, WordKind::U32) && arg_ty == sonatina_ir::Type::I64 {
             return Err(format!("spirv u32: kernel arg {i} is i64, which requires SHADER_INT64"));
         }
-        let is_storage_arg = !(grid || render) || i >= 2;
-        if is_storage_arg && arg_ty == sonatina_ir::Type::I1 {
-            return Err(format!(
-                "spirv: kernel arg {i} is i1; boolean storage-buffer arguments are unsupported"
-            ));
-        }
     }
     if (grid || render) && sig.args().get(0..2) != Some(&[sonatina_ir::Type::I32, sonatina_ir::Type::I32]) {
         return Err("spirv grid/render: coordinate args 0 and 1 must both be i32".to_string());
@@ -9734,6 +9728,27 @@ fn validate_naga_entry_mode(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "spirv-backend")]
+fn decode_storage_argument(
+    function: &mut naga::Function,
+    loaded: naga::Handle<naga::Expression>,
+    ty: sonatina_ir::Type,
+) -> naga::Handle<naga::Expression> {
+    if ty != sonatina_ir::Type::I1 {
+        return loaded;
+    }
+    // Host-shareable storage uses a u32 carrier. Keep booleans logical inside
+    // the shader, with the same nonzero decoding used by typed memory loads.
+    let zero = function.expressions.append(
+        naga::Expression::Literal(naga::Literal::U32(0)), naga::Span::UNDEFINED,
+    );
+    let value = function.expressions.append(naga::Expression::Binary {
+        op: naga::BinaryOperator::NotEqual, left: loaded, right: zero,
+    }, naga::Span::UNDEFINED);
+    function.body.push(naga::Statement::Emit(naga::Range::new_from_bounds(value, value)), naga::Span::UNDEFINED);
+    value
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -9916,6 +9931,7 @@ fn translate_to_naga(
         let mut parameter_align = 1;
         for (arg_index, ty) in &parameter_args {
             let (naga_ty, width, scalar) = match ty {
+                sonatina_ir::Type::I1 => (word_type, 4, SpirvScalarKind::U32),
                 sonatina_ir::Type::I32 => (word_type, 4, SpirvScalarKind::I32),
                 sonatina_ir::Type::F32 => (f32_type, 4, SpirvScalarKind::F32),
                 _ => {
@@ -10221,7 +10237,8 @@ fn translate_to_naga(
                         naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
                         naga::Span::UNDEFINED,
                     );
-                    value_map.insert(function.arg_values[*arg_index], loaded);
+                    let decoded = decode_storage_argument(&mut func, loaded, sig.args()[*arg_index]);
+                    value_map.insert(function.arg_values[*arg_index], decoded);
                 }
             }
             let phase = std::time::Instant::now();
@@ -10433,6 +10450,7 @@ fn translate_to_naga(
             let (naga_ty, width, scalar) = match ty {
                 sonatina_ir::Type::I32 => (word_type, 4, SpirvScalarKind::I32),
                 sonatina_ir::Type::F32 => (f32_type, 4, SpirvScalarKind::F32),
+                sonatina_ir::Type::I1 => (word_type, 4, SpirvScalarKind::U32),
                 _ => return Err(format!("spirv render: broadcast arg {arg_index} has unsupported storage type {ty:?}")),
             };
             input_members.push(naga::StructMember { name: Some(format!("p{arg_index}")), ty: naga_ty, binding: None, offset: input_span });
@@ -10673,7 +10691,8 @@ fn translate_to_naga(
                         naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
                         naga::Span::UNDEFINED,
                     );
-                    value_map.insert(function.arg_values[*arg_index], loaded);
+                    let decoded = decode_storage_argument(&mut fs, loaded, sig.args()[*arg_index]);
+                    value_map.insert(function.arg_values[*arg_index], decoded);
                 }
 
                 // The mode-blind body: SAME structurizer + region emission Grid and
@@ -10842,6 +10861,7 @@ fn translate_to_naga(
             sonatina_ir::Type::I32 => (word_type, 4, SpirvScalarKind::I32),
             sonatina_ir::Type::I64 if word == WordKind::I64 => (word_type, 8, SpirvScalarKind::I64),
             sonatina_ir::Type::F32 => (f32_type, 4, SpirvScalarKind::F32),
+            sonatina_ir::Type::I1 => (word_type, 4, SpirvScalarKind::U32),
             _ => return Err(format!("spirv: input arg {i} has unsupported storage type {ty:?}")),
         };
         input_span = (input_span + width - 1) & !(width - 1);
@@ -11184,7 +11204,8 @@ fn translate_to_naga(
                         naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
                         naga::Span::UNDEFINED,
                     );
-                    value_map.insert(arg_val, loaded);
+                    let decoded = decode_storage_argument(&mut func, loaded, sig.args()[idx]);
+                    value_map.insert(arg_val, decoded);
                 }
             } else {
                 for (idx, &arg_val) in function.arg_values.iter().enumerate() {
@@ -11209,7 +11230,8 @@ fn translate_to_naga(
                         naga::Statement::Emit(naga::Range::new_from_bounds(loaded, loaded)),
                         naga::Span::UNDEFINED,
                     );
-                    value_map.insert(arg_val, loaded);
+                    let decoded = decode_storage_argument(&mut func, loaded, sig.args()[idx]);
+                    value_map.insert(arg_val, decoded);
                 }
             }
 
