@@ -45,6 +45,15 @@ pub struct SignedInterval {
 
 impl RangeAnalysis {
     pub fn compute(&mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree) {
+        self.compute_with_call_results(func, cfg, lpt, &RangeEnv::default());
+    }
+
+    /// Call-result bounds proved from defined callees, never assumptions about
+    /// arbitrary inputs. Apply at the defining call, not at function entry.
+    pub(crate) fn compute_with_call_results(
+        &mut self, func: &Function, cfg: &ControlFlowGraph, lpt: &LoopTree,
+        call_results: &RangeEnv,
+    ) {
         self.entry_envs.clear();
         self.exit_envs.clear();
         self.reachable.clear();
@@ -105,7 +114,7 @@ impl RangeAnalysis {
             self.reachable[block] = true;
             self.initialized[block] = true;
 
-            let new_exit = simulate_block_from_entry(func, block, &new_entry);
+            let new_exit = simulate_block_with_call_results(func, block, &new_entry, call_results);
             let exit_changed = new_exit != self.exit_envs[block];
             if exit_changed {
                 self.exit_envs[block] = new_exit;
@@ -263,19 +272,30 @@ pub(crate) fn exact_immediate(
     None
 }
 
-pub(crate) fn simulate_block_from_entry(
-    func: &Function,
-    block: BlockId,
-    entry: &RangeEnv,
+fn simulate_block_with_call_results(
+    func: &Function, block: BlockId, entry: &RangeEnv, call_results: &RangeEnv,
 ) -> RangeEnv {
     let mut env = entry.clone();
     for inst in func.layout.iter_inst(block) {
         if func.dfg.is_phi(inst) {
             continue;
         }
-        transfer_inst(func, &mut env, inst);
+        transfer_inst_with_call_results(func, &mut env, inst, call_results);
     }
     env
+}
+
+pub(crate) fn transfer_inst_with_call_results(
+    func: &Function, env: &mut RangeEnv, inst: InstId, call_results: &RangeEnv,
+) {
+    transfer_inst(func, env, inst);
+    if func.dfg.call_info(inst).is_some() {
+        for &value in func.dfg.inst_results(inst) {
+            if let Some(&fact) = call_results.get(&value) {
+                set_env_fact(func, env, value, fact);
+            }
+        }
+    }
 }
 
 pub(crate) fn transfer_inst(func: &Function, env: &mut RangeEnv, inst: InstId) {
@@ -1656,7 +1676,7 @@ fn widen_env(func: &Function, old: &RangeEnv, new: &RangeEnv) -> RangeEnv {
     widened
 }
 
-fn join_facts(lhs: RangeFact, rhs: RangeFact, _ty: Type) -> RangeFact {
+pub(crate) fn join_facts(lhs: RangeFact, rhs: RangeFact, _ty: Type) -> RangeFact {
     RangeFact {
         unsigned: lhs.unsigned.join(rhs.unsigned),
         signed: lhs.signed.join(rhs.signed),
