@@ -6766,6 +6766,39 @@ func public %fragment(v0.f32) -> i32 {
     assert!(!wgsl.contains("fe_heap"), "pure values must not reintroduce a private arena");
 }
 
+#[test]
+fn authored_raster_admits_typed_local_memory_but_rejects_forged_roots() {
+    let source = r#"
+target = "shader-unknown-unknown"
+func public %vertex(v0.i32) -> (f32, f32, f32, f32, f32) {
+    block0:
+        v1.*[f32; 4] = alloca [f32; 4];
+        v2.i32 = and v0 3.i32;
+        v3.*f32 = gep v1 0.i32 v2;
+        mstore v3 0x3f800000.f32 f32;
+        v4.f32 = mload v3 f32;
+        return (0x00000000.f32, 0x00000000.f32, 0x00000000.f32, v4, v4);
+}
+func public %fragment(v0.f32) -> i32 {
+    block0:
+        v1.i32 = bitcast v0 i32;
+        return v1;
+}
+"#;
+    let parsed = sonatina_parser::parse_module(source).unwrap();
+    let artifact = SpirvBackend::new().with_authored_raster("vertex", "fragment")
+        .compile_module(&parsed.module).expect("typed-local raster storage is validated and admitted");
+    let wgsl = artifact.wgsl.as_deref().unwrap();
+    assert!(!wgsl.contains("fe_heap"));
+    let module = naga::front::wgsl::parse_str(wgsl).unwrap();
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&module).unwrap();
+    let forged = source.replace("alloca [f32; 4]", "int_to_ptr v0 *[f32; 4]");
+    let parsed = sonatina_parser::parse_module(&forged).unwrap();
+    assert!(SpirvBackend::new().with_authored_raster("vertex", "fragment")
+        .compile_module(&parsed.module).is_err(), "typed pointer syntax alone must not grant private storage provenance");
+}
+
 /// A typed scene policy carrying real booleans reaches the raster pair as
 /// actor state. Storage has no one-bit leaf, so the record carries a u32 and
 /// the shader decodes it, matching the compute entry-parameter carrier. The
