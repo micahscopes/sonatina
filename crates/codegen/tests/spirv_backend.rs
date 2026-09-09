@@ -6873,6 +6873,10 @@ block0:
 "#).unwrap();
     let artifact = SpirvBackend::new().with_authored_raster("vertex", "fragment")
         .compile_module(&parsed.module).expect("early break and exhaustion share fallback");
+    // Validation alone accepts a zero-initialized return on exhaustion. Both
+    // success and fallback must actually publish the raster result.
+    assert!(artifact.wgsl.as_deref().unwrap().matches("loop_result =").count() >= 2,
+        "both exit paths must initialize the transported result");
     let module = naga::front::wgsl::parse_str(artifact.wgsl.as_deref().unwrap()).unwrap();
     naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
         .validate(&module).unwrap();

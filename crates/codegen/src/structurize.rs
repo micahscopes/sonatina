@@ -296,15 +296,21 @@ pub(crate) fn forwarded_loop_exit(
     function: &Function,
     header: BlockId,
     exit: BlockId,
-    in_loop: impl Fn(BlockId) -> bool,
 ) -> Option<BlockId> {
     let is = function.inst_set();
     let join = function.layout.iter_inst(exit).find_map(|iid| {
         <&Jump as InstDowncast>::downcast(is, function.dfg.inst(iid)).map(|j| *j.dest())
     })?;
-    if in_loop(join) { return None; }
     let mut cfg = ControlFlowGraph::default();
     cfg.compute(function);
+    // Structured bodies also contain one-way return corridors. They are not
+    // loop members: use the CFG definition in every consumer of this contract.
+    let mut domtree = DomTree::new();
+    domtree.compute(&cfg);
+    let mut loops = LoopTree::new();
+    loops.compute(&cfg, &domtree);
+    let lp = loops.loop_of_block(header)?;
+    if loops.loop_header(lp) != header || loops.is_in_loop(join, lp) { return None; }
     if !cfg.preds_of(exit).any(|pred| *pred == header) {
         return None;
     }
@@ -313,8 +319,6 @@ pub(crate) fn forwarded_loop_exit(
     // in its loop body, while LoopTree correctly excludes it. Use dominance
     // here so both consumers recognize the same join instead of executing
     // the fallback a second time after a successful break.
-    let mut domtree = DomTree::new();
-    domtree.compute(&cfg);
     cfg.preds_of(join).any(|pred| {
         *pred != header && *pred != exit && domtree.dominates(header, *pred)
             // A subsequent loop's latch is not an early exit of this loop.
@@ -697,8 +701,7 @@ impl Structurer<'_> {
                     if let Some(exit) = self.loop_direct_exit(b, lp) {
                         if self.returns(exit) {
                             consumed.insert(exit);
-                        } else if let Some(join) = forwarded_loop_exit(self.function, b, exit,
-                            |block| self.in_loop(block, lp))
+                        } else if let Some(join) = forwarded_loop_exit(self.function, b, exit)
                         {
                             // The emitter owns this block on the header's
                             // exhaustion edge, just as it owns a returning exit.
@@ -965,8 +968,7 @@ impl Structurer<'_> {
         match self.term(header) {
             Term::Br(nz, z) => {
                 let direct_exit = if self.in_loop(nz, lp) { z } else { nz };
-                let exit = forwarded_loop_exit(self.function, header, direct_exit,
-                    |block| self.in_loop(block, lp)).unwrap_or(direct_exit);
+                let exit = forwarded_loop_exit(self.function, header, direct_exit).unwrap_or(direct_exit);
                 if self.returns(exit) {
                     Ok(None)
                 } else {
