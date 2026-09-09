@@ -6799,6 +6799,44 @@ func public %fragment(v0.f32) -> i32 {
         .compile_module(&parsed.module).is_err(), "typed pointer syntax alone must not grant private storage provenance");
 }
 
+#[test]
+fn authored_raster_carries_all_return_leaves_out_of_a_search_loop() {
+    let parsed = sonatina_parser::parse_module(r#"
+target = "shader-unknown-unknown"
+func public %vertex(v0.i32) -> (f32, f32, f32, f32, f32) {
+block0:
+    jump block1;
+block1:
+    v1.i32 = phi (0.i32 block0) (v4 block3);
+    v2.i1 = lt v1 4.i32;
+    br v2 block2 block5;
+block2:
+    v3.i1 = eq v1 v0;
+    br v3 block4 block3;
+block3:
+    v4.i32 = add v1 1.i32;
+    jump block1;
+block4:
+    jump block6;
+block5:
+    jump block6;
+block6:
+    v5.f32 = phi (0x3f800000.f32 block4) (0x00000000.f32 block5);
+    return (v5, 0x00000000.f32, 0x00000000.f32, 0x3f800000.f32, v5);
+}
+func public %fragment(v0.f32) -> i32 {
+block0:
+    v1.i32 = bitcast v0 i32;
+    return v1;
+}
+"#).unwrap();
+    let artifact = SpirvBackend::new().with_authored_raster("vertex", "fragment")
+        .compile_module(&parsed.module).expect("loop exits preserve the full raster result");
+    let module = naga::front::wgsl::parse_str(artifact.wgsl.as_deref().unwrap()).unwrap();
+    naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
+        .validate(&module).unwrap();
+}
+
 /// A typed scene policy carrying real booleans reaches the raster pair as
 /// actor state. Storage has no one-bit leaf, so the record carries a u32 and
 /// the shader decodes it, matching the compute entry-parameter carrier. The
