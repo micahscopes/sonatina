@@ -5491,8 +5491,7 @@ fn structured_loop_exit(
     } else {
         *branch.nz_dest()
     };
-    Ok(crate::structurize::forwarded_loop_exit(function, header, direct_exit,
-        |block| loop_blocks.contains(&block)).unwrap_or(direct_exit))
+    Ok(crate::structurize::forwarded_loop_exit(function, header, direct_exit).unwrap_or(direct_exit))
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -6095,8 +6094,7 @@ fn emit_recursive_loop_region(
         return Err(format!("spirv: loop {header:?} must have exactly one in-loop successor"));
     }
     let direct_exit = if nz_in { *branch.z_dest() } else { *branch.nz_dest() };
-    let exit = crate::structurize::forwarded_loop_exit(function, header, direct_exit,
-        |block| loop_blocks.contains(&block)).unwrap_or(direct_exit);
+    let exit = crate::structurize::forwarded_loop_exit(function, header, direct_exit).unwrap_or(direct_exit);
     ensure_phi_locals(
         function, inst_set, word, exit, word_type, f32_type, bool_type, func, value_map,
         phi_locals, naga_functions,
