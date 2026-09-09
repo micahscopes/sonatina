@@ -286,11 +286,12 @@ pub fn structurize_function(function: &Function) -> Result<StructuredCfg, String
     })
 }
 
-/// An exhaustion-only block can construct a fallback before joining an early
+/// An exhaustion block can construct a fallback before joining an early
 /// loop exit. Realize that block on the header's exit edge, not unconditionally
 /// after the loop. Other incoming edges may bypass the loop entirely (for
 /// example invalid-input handling). Each such edge still owns its fallback
-/// evaluation and phi transfer. No other edge from inside this loop is admitted.
+/// evaluation and phi transfer. An explicit break may enter the same fallback:
+/// its corridor is emitted inside that arm, with that edge's own phi transfer.
 pub(crate) fn forwarded_loop_exit(
     function: &Function,
     header: BlockId,
@@ -304,9 +305,7 @@ pub(crate) fn forwarded_loop_exit(
     if in_loop(join) { return None; }
     let mut cfg = ControlFlowGraph::default();
     cfg.compute(function);
-    if !cfg.preds_of(exit).any(|pred| *pred == header)
-        || cfg.preds_of(exit).any(|pred| *pred != header && in_loop(*pred))
-    {
+    if !cfg.preds_of(exit).any(|pred| *pred == header) {
         return None;
     }
     // A successful exit's final constructor need not belong to the loop SCC:
