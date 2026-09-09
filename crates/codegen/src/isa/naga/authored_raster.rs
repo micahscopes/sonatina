@@ -10,10 +10,10 @@ use super::{
     Access, LayoutMode, Role, SpirvBinding, SpirvBindingMember, SpirvBuiltinArgument,
     SpirvBuiltinInput, SpirvBuiltinSource, SpirvExternalResource, SpirvLayout, SpirvRasterPipeline,
     SpirvScalarKind, SpirvShaderStage, WordKind, NagaFunctionInfo,
-    NagaFunctionMap, NagaMemoryAbi, NagaMemoryAbiTypes,
+    NagaFunctionMap, NagaMemoryAbi, NagaMemoryAbiTypes, NagaResultAbi, NagaResultSource,
     NagaResourceCapabilities, append_external_resources,
     emit_naga_regions, lower_naga_helper, reachable_call_postorder,
-    resolve_naga_value, spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
+    spirv_instruction_is_lowered, unsupported_signed_op_under_u32,
 };
 
 // Physical shader entry names are compiler-owned ABI, not user-authored
@@ -537,9 +537,18 @@ pub(super) fn translate_entries(
             "spirv raster: vertex root has no derived helper call-site map".to_string()
         })?,
     );
+    let vertex_returns = module.ctx.get_sig(vertex_ref).unwrap().ret_tys().to_vec();
+    let vertex_result_abi = NagaResultAbi {
+        logical: (0..vertex_returns.len()).map(|i| NagaResultSource::Physical(i as u32)).collect(),
+        physical_arity: vertex_returns.len(),
+        physical_type: super::helper_naga_result_type(
+            module, "raster_source_result", &vertex_returns, WordKind::U32,
+            u32_type, f32_type, bool_type, &naga_functions, &mut naga_mod.types,
+        )?,
+    };
     let vertex = lower_vertex(
         module, vertex_ref, &vertex_plan, pipeline, state_var, &scalar_state, &external_roots,
-        builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type, &naga_functions,
+        builtin_arguments, u32_type, f32_type, bool_type, vec4f, output_type, &naga_functions, &vertex_result_abi,
     )?;
     naga_functions.replace_call_sites(
         root_call_sites.remove(&fragment_ref).ok_or_else(|| {
@@ -1153,23 +1162,6 @@ fn normalize_stage_to_single_exit(function: &Function) -> Result<Option<Function
     Ok(Some(normalized))
 }
 
-fn resolve_source_return_values(
-    function: &sonatina_ir::Function,
-    arguments: &[sonatina_ir::ValueId],
-    values: &mut HashMap<sonatina_ir::ValueId, naga::Handle<naga::Expression>>,
-    phis: &HashMap<sonatina_ir::ValueId, naga::Handle<naga::LocalVariable>>,
-    naga_func: &mut naga::Function,
-) -> Result<Vec<naga::Handle<naga::Expression>>, String> {
-    arguments
-        .iter()
-        .copied()
-        .map(|value| {
-            resolve_naga_value(value, function, WordKind::U32, values, phis, naga_func)
-                .ok_or_else(|| format!("spirv raster: returned value {value:?} is unresolved"))
-        })
-        .collect()
-}
-
 #[allow(clippy::too_many_arguments)]
 fn lower_vertex(
     module: &Module,
@@ -1186,6 +1178,7 @@ fn lower_vertex(
     vec4f: naga::Handle<naga::Type>,
     output_type: naga::Handle<naga::Type>,
     naga_functions: &NagaFunctionMap,
+    result_abi: &NagaResultAbi,
 ) -> Result<naga::Function, String> {
     let arguments = builtin_arguments
         .iter()
@@ -1248,17 +1241,22 @@ fn lower_vertex(
             function, function.inst_set(), WordKind::U32, &plan.structured.regions,
             u32_type, f32_type, bool_type, &mut output, &mut values, &mut phis,
             &mut result,
-            None,
+            Some(result_abi),
             naga_functions,
             None,
         )?;
-        let leaves = resolve_source_return_values(
-            function,
-            &plan.return_arguments,
-            &mut values,
-            &phis,
-            &mut output,
-        )?;
+        // Returns inside a loop/branch live in the structured emitter's return
+        // transport, not necessarily in its outer SSA expression map. Preserve
+        // all logical leaves through that same ABI before packaging builtins.
+        let result = result.ok_or_else(|| "spirv raster: vertex produced no structured result".to_string())?;
+        let mut leaves = Vec::with_capacity(result_abi.physical_arity);
+        for index in 0..result_abi.physical_arity {
+            let leaf = output.expressions.append(naga::Expression::AccessIndex {
+                base: result, index: index as u32,
+            }, naga::Span::UNDEFINED);
+            output.body.push(naga::Statement::Emit(naga::Range::new_from_bounds(leaf, leaf)), naga::Span::UNDEFINED);
+            leaves.push(leaf);
+        }
         let position = output.expressions.append(
             naga::Expression::Compose { ty: vec4f, components: leaves[..4].to_vec() },
             naga::Span::UNDEFINED,
@@ -1345,13 +1343,7 @@ fn lower_fragment(
             naga_functions,
             None,
         )?;
-        let packed = resolve_source_return_values(
-            function,
-            &plan.return_arguments,
-            &mut values,
-            &phis,
-            &mut output,
-        )?[0];
+        let packed = result.ok_or_else(|| "spirv raster: fragment produced no structured result".to_string())?;
         let color = output.expressions.append(
             naga::Expression::Math {
                 fun: naga::MathFunction::Unpack4x8unorm,
