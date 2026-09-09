@@ -394,7 +394,9 @@ fn prepare_raster_entries(
     // Fe retains only the scalar, memory-free portion of the helper graph.
     // Object indexing/projection/load remains in the paired stage roots and
     // resolves through their shared external globals. Allocation, pointers,
-    // private memory and traps still have no stage-paired helper channel.
+    // raw arena memory and traps still have no stage-paired helper channel.
+    // Typed function-local loads/stores are validated by the shared typed-local
+    // collector below, including provenance, escape and storage-budget checks.
     for (stage, func_ref) in [("vertex", vertex_ref), ("fragment", fragment_ref)] {
         module.func_store.try_view(func_ref, |function| -> Result<(), String> {
             let inst_set = function.inst_set();
@@ -410,8 +412,10 @@ fn prepare_raster_entries(
                     let has_untransported_effect =
                         <&sonatina_ir::inst::data::ObjAlloc as InstDowncast>::downcast(inst_set, data).is_some()
                         || <&sonatina_ir::inst::data::MemAllocDynamic as InstDowncast>::downcast(inst_set, data).is_some()
-                        || <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(inst_set, data).is_some()
-                        || <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(inst_set, data).is_some()
+                        || <&sonatina_ir::inst::data::Mload as InstDowncast>::downcast(inst_set, data)
+                            .is_some_and(|load| !function.dfg.value_ty(*load.addr()).is_pointer(function.ctx()))
+                        || <&sonatina_ir::inst::data::Mstore as InstDowncast>::downcast(inst_set, data)
+                            .is_some_and(|store| !function.dfg.value_ty(*store.addr()).is_pointer(function.ctx()))
                         || <&sonatina_ir::inst::control_flow::Unreachable as InstDowncast>::downcast(inst_set, data).is_some();
                     if has_untransported_effect {
                         return Err(format!(
