@@ -5458,12 +5458,20 @@ fn forward_structured_return(
 }
 
 #[cfg(feature = "spirv-backend")]
-fn structured_loop_exit(
+struct StructuredLoopExit {
+    condition: sonatina_ir::ValueId,
+    continue_on_nonzero: bool,
+    direct: sonatina_ir::BlockId,
+    canonical: sonatina_ir::BlockId,
+}
+
+#[cfg(feature = "spirv-backend")]
+fn describe_structured_loop_exit(
     function: &sonatina_ir::Function,
     inst_set: &dyn sonatina_ir::InstSetBase,
     header: sonatina_ir::BlockId,
     body_regions: &[crate::structurize::Region],
-) -> Result<sonatina_ir::BlockId, String> {
+) -> Result<StructuredLoopExit, String> {
     use sonatina_ir::InstDowncast;
 
     let mut loop_blocks = std::collections::HashSet::new();
@@ -5491,7 +5499,23 @@ fn structured_loop_exit(
     } else {
         *branch.nz_dest()
     };
-    Ok(crate::structurize::forwarded_loop_exit(function, header, direct_exit).unwrap_or(direct_exit))
+    Ok(StructuredLoopExit {
+        condition: *branch.cond(),
+        continue_on_nonzero: nz_in,
+        direct: direct_exit,
+        canonical: crate::structurize::forwarded_loop_exit(function, header, direct_exit)
+            .unwrap_or(direct_exit),
+    })
+}
+
+#[cfg(feature = "spirv-backend")]
+fn structured_loop_exit(
+    function: &sonatina_ir::Function,
+    inst_set: &dyn sonatina_ir::InstSetBase,
+    header: sonatina_ir::BlockId,
+    body_regions: &[crate::structurize::Region],
+) -> Result<sonatina_ir::BlockId, String> {
+    Ok(describe_structured_loop_exit(function, inst_set, header, body_regions)?.canonical)
 }
 
 #[cfg(feature = "spirv-backend")]
@@ -6083,18 +6107,12 @@ fn emit_recursive_loop_region(
     if let Some(msg) = mem_error.take() {
         return Err(msg);
     }
-    let branch = function.layout.iter_inst(header).find_map(|iid|
-        <&sonatina_ir::inst::control_flow::Br as InstDowncast>::downcast(inst_set, function.dfg.inst(iid))
-    ).ok_or_else(|| format!("spirv: loop header {header:?} has no branch"))?;
-    let condition = resolve_naga_value(*branch.cond(), function, word, value_map, phi_locals, func)
+    let loop_exit = describe_structured_loop_exit(function, inst_set, header, body_regions)?;
+    let condition = resolve_naga_value(loop_exit.condition, function, word, value_map, phi_locals, func)
         .ok_or_else(|| format!("spirv: unresolved loop condition in {header:?}"))?;
-    let nz_in = loop_blocks.contains(branch.nz_dest());
-    let z_in = loop_blocks.contains(branch.z_dest());
-    if nz_in == z_in {
-        return Err(format!("spirv: loop {header:?} must have exactly one in-loop successor"));
-    }
-    let direct_exit = if nz_in { *branch.z_dest() } else { *branch.nz_dest() };
-    let exit = crate::structurize::forwarded_loop_exit(function, header, direct_exit).unwrap_or(direct_exit);
+    let nz_in = loop_exit.continue_on_nonzero;
+    let direct_exit = loop_exit.direct;
+    let exit = loop_exit.canonical;
     ensure_phi_locals(
         function, inst_set, word, exit, word_type, f32_type, bool_type, func, value_map,
         phi_locals, naga_functions,
