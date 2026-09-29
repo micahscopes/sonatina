@@ -6,6 +6,7 @@ use crate::{
     optim::{
         constref_specialize::specialize_private_constrefs,
         dead_arg::{DeadArgElimConfig, run_dead_arg_elim},
+        return_range::run_return_range_branch_simplify,
         pipeline::{FuncPassOverrides, Pass, run_function_pass_round},
         uniform_const_arg::run_uniform_const_arg_binding,
     },
@@ -232,6 +233,8 @@ impl EvmPipelineContext<'_> {
         );
         run_uniform_const_arg_binding(self.work.module(), &self.funcs);
         run_dead_arg_elim(self.work.module(), DeadArgElimConfig::default());
+        // Trial wiring of mb2's opt-in interprocedural return-range pass.
+        run_return_range_branch_simplify(self.work.module(), 4);
         self.func_behavior_dirty = true;
         self.run_pass_round(
             "default",
