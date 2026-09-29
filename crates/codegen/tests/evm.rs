@@ -411,7 +411,14 @@ fn test_evm(fixture: Fixture<&str>) {
     let emit_evm_trace = cfg.evm_trace.unwrap_or(false);
     let emit_observability = cfg.emit_observability.unwrap_or(false);
     let emit_mem_plan_detail = cfg.mem_plan_detail.unwrap_or(false);
-    let opt_pipeline = cfg.opt.unwrap_or(EvmOptPipeline::O0);
+    // Trial-only measurement hook: SONA_TRIAL_OPT=0|1|s|2 overrides the fixture's opt level.
+    let opt_pipeline = match std::env::var("SONA_TRIAL_OPT").as_deref() {
+        Ok("0") => EvmOptPipeline::O0,
+        Ok("1") => EvmOptPipeline::O1,
+        Ok("s") => EvmOptPipeline::Os,
+        Ok("2") => EvmOptPipeline::O2,
+        _ => cfg.opt.unwrap_or(EvmOptPipeline::O0),
+    };
 
     let cases = evm_directives::parse_evm_cases(&parsed.debug.module_comments)
         .unwrap_or_else(|e| panic!("{}: {e}", fixture.path()));
