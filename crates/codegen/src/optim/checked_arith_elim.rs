@@ -348,7 +348,7 @@ mod tests {
         ] {
             let destinations = if true_edge { "block1 block2" } else { "block2 block1" };
             let text = optimized(&format!(r#"
-target = "shader-unknown-unknown"
+target = "evm-ethereum-osaka"
 func public %test(v0.i32, v1.i32) -> i1 {{
  block0:
   v2.i1 = {comparison} {operands};
@@ -368,7 +368,7 @@ func public %test(v0.i32, v1.i32) -> i1 {{
     #[test]
     fn guarded_subtraction_does_not_cross_an_unguarded_merge() {
         let text = optimized(r#"
-target = "shader-unknown-unknown"
+target = "evm-ethereum-osaka"
 func public %test(v0.i32, v1.i32) -> i1 {
  block0:
   v2.i1 = lt v1 v0;
@@ -388,7 +388,7 @@ func public %test(v0.i32, v1.i32) -> i1 {
     #[test]
     fn guarded_subtraction_does_not_follow_changed_loop_operands() {
         let text = optimized(r#"
-target = "shader-unknown-unknown"
+target = "evm-ethereum-osaka"
 func public %test(v0.i32, v1.i32) -> i1 {
  block0:
   v2.i1 = lt v1 v0;
@@ -412,7 +412,7 @@ func public %test(v0.i32, v1.i32) -> i1 {
     #[test]
     fn guarded_subtraction_rejects_undef_dependent_relations() {
         let text = optimized(r#"
-target = "shader-unknown-unknown"
+target = "evm-ethereum-osaka"
 func public %test(v0.i32) -> i1 {
  block0:
   v1.i32 = add undef.i32 v0;

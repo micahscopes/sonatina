@@ -305,7 +305,7 @@ func public %test(v0.i64) -> (i32, i16) {
     fn checked_results_and_traps_execute_before_and_after() {
         use crate::Backend;
         let source = r#"
-target = "wasm32-unknown-native"
+target = "evm-ethereum-osaka"
 func public %checked(v0.i32, v1.i32) -> i32 {
  block0:
   (v2.i32, v3.i1) = uaddo v0 v1;

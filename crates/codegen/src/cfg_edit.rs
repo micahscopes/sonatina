@@ -1311,7 +1311,7 @@ mod tests {
                 };
                 let source = format!(
                     r#"
-target = "wasm32-unknown-native"
+target = "evm-ethereum-osaka"
 func public %test(v0.i1, v1.i1) -> i32 {{
  block0:
   br v0 {outer};
