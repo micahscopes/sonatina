@@ -201,7 +201,7 @@ fn rewrite_returns(function: &mut Function, plan: &FuncPlan) {
                 .collect::<SmallVec<[ValueId; 2]>>();
             function.dfg.replace_inst_preserving_results(
                 inst,
-                Box::new(control_flow::Return::new(
+                Box::new(control_flow::Return::new_unchecked(
                     function.inst_set(),
                     control_flow::ReturnArgs::from(retained),
                 )),
