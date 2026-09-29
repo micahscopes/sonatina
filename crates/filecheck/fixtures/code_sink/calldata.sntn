@@ -15,11 +15,14 @@ func public %sink_in_block() -> i256 {
         return v2;
 }
 
+# The two revert guards fold into one branch on `or`; the load still sinks
+# below it.
 # sameln: func public %sink_through_guards(v0.i1, v1.i1) -> i256 {
 # check: block0:
-# nextln: br v0 block1 block3;
-# check: block1:
-# nextln: br v1 block2 block3;
+# nextln: v5.i1 = is_zero v0;
+# nextln: v6.i1 = is_zero v1;
+# nextln: v7.i1 = or v5 v6;
+# nextln: br v7 block3 block2;
 # check: block2:
 # nextln: v2.i256 = evm_calldata_load 64.i256;
 # nextln: return v2;
