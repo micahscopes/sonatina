@@ -640,6 +640,7 @@ fn test_evm(fixture: Fixture<&str>) {
         .iter()
         .find(|(name, _)| name.0.as_str() == "init")
         .map(|(_, s)| s.bytes.clone());
+    let trial_init_len = init.as_ref().map_or(0, |init| init.len());
     let runtime = artifact
         .sections
         .iter()
@@ -674,6 +675,13 @@ fn test_evm(fixture: Fixture<&str>) {
         writeln!(&mut out, "  <no evm.case directives>").unwrap();
     }
 
+    let mut trial_metrics = format!(
+        "{}\tbytes\truntime\t{}\n{}\tbytes\tinit\t{}\n",
+        fixture.path(),
+        runtime.len(),
+        fixture.path(),
+        trial_init_len,
+    );
     for (idx, case) in cases.iter().enumerate() {
         let (res, trace) =
             harness.call_with_optional_trace(&case.calldata, emit_evm_trace && idx == 0);
@@ -694,6 +702,20 @@ fn test_evm(fixture: Fixture<&str>) {
             runtime_gas,
         )
         .unwrap();
+        trial_metrics.push_str(&format!(
+            "{}\tgas\t{}\t{}\n",
+            fixture.path(),
+            case.name,
+            runtime_gas
+        ));
+    }
+    if let Ok(path) = std::env::var("SONA_TRIAL_METRICS") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_all(trial_metrics.as_bytes()).unwrap();
     }
 
     if emit_stackify_trace || emit_vcode || emit_bytecode_hex {
