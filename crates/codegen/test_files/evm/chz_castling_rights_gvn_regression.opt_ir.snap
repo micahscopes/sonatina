@@ -151,9 +151,9 @@ func private %main_root() {
         br v297 block77 block95;
 
     block77:
-        v393.i256 = phi (0.i256 block75) (512.i256 block95);
+        v403.i256 = phi (0.i256 block75) (512.i256 block95);
         v315.i256 = and v294 -130561.i256;
-        v319.i256 = or v315 v393;
+        v319.i256 = or v315 v403;
         v320.i256 = and v319 -8589803521.i256;
         v323.i256 = or v320 262144.i256;
         v326.i256 = and v323 -2.i256;
