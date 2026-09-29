@@ -371,10 +371,11 @@ fn checked_binary_value_fact(
         BinaryInstKind::Uaddo | BinaryInstKind::Saddo => plain_add_fact(lhs, rhs, ty),
         BinaryInstKind::Usubo | BinaryInstKind::Ssubo => plain_sub_fact(lhs, rhs, ty),
         BinaryInstKind::Umulo | BinaryInstKind::Smulo => plain_mul_fact(lhs, rhs, ty),
-        BinaryInstKind::EvmUdivo
-        | BinaryInstKind::EvmUmodo
-        | BinaryInstKind::EvmSdivo
-        | BinaryInstKind::EvmSmodo => RangeFact::full_for(ty),
+        // Proved safe means the divisor is nonzero.
+        BinaryInstKind::EvmUmodo => plain_umod_fact(lhs, rhs, ty),
+        BinaryInstKind::EvmUdivo | BinaryInstKind::EvmSdivo | BinaryInstKind::EvmSmodo => {
+            RangeFact::full_for(ty)
+        }
         _ => unreachable!(),
     })
 }
@@ -1220,6 +1221,8 @@ fn transfer_binary_inst(func: &Function, env: &mut RangeEnv, inst: InstId, kind:
         BinaryInstKind::Add => transfer_plain_binary(func, env, inst, plain_add_fact),
         BinaryInstKind::Sub => transfer_plain_binary(func, env, inst, plain_sub_fact),
         BinaryInstKind::Mul => transfer_plain_binary(func, env, inst, plain_mul_fact),
+        BinaryInstKind::Umod => transfer_plain_binary(func, env, inst, plain_umod_fact),
+        BinaryInstKind::EvmUmod => transfer_plain_binary(func, env, inst, evm_umod_fact),
         BinaryInstKind::Uaddo
         | BinaryInstKind::Usubo
         | BinaryInstKind::Umulo
@@ -1379,6 +1382,41 @@ fn trunc_fact(src: RangeFact, dst_ty: Type) -> RangeFact {
         };
     }
 
+    fact
+}
+
+fn plain_umod_fact(lhs: RangeFact, rhs: RangeFact, ty: Type) -> RangeFact {
+    // Do not infer a useful result from a potentially undefined division.
+    if rhs.unsigned.lo.is_zero() {
+        return RangeFact::full_for(ty);
+    }
+    remainder_below(lhs, rhs, ty)
+}
+
+/// EVM `mod` defines `x mod 0 = 0`, so a zero divisor only adds the value 0,
+/// which the ordinary remainder bound already contains.
+fn evm_umod_fact(lhs: RangeFact, rhs: RangeFact, ty: Type) -> RangeFact {
+    if rhs.unsigned.hi.is_zero() {
+        return RangeFact::singleton(Immediate::zero(ty));
+    }
+    remainder_below(lhs, rhs, ty)
+}
+
+/// `lhs mod rhs <= min(lhs.hi, rhs.hi - 1)` for any nonzero `rhs`.
+/// Callers handle a divisor that may be zero; `rhs.unsigned.hi` must be nonzero.
+fn remainder_below(lhs: RangeFact, rhs: RangeFact, ty: Type) -> RangeFact {
+    let mut fact = RangeFact::full_for(ty);
+    let hi = lhs.unsigned.hi.min(rhs.unsigned.hi - U256::one());
+    fact.unsigned = UnsignedInterval {
+        lo: U256::zero(),
+        hi,
+    };
+    if hi <= (unsigned_max(ty) >> 1) {
+        fact.signed = SignedInterval {
+            lo: I256::zero(),
+            hi: I256::from(hi),
+        };
+    }
     fact
 }
 
@@ -1812,6 +1850,63 @@ mod tests {
     use crate::domtree::DomTree;
 
     use super::*;
+
+    #[test]
+    fn unsigned_remainder_bounds_cover_every_byte_input() {
+        let full = RangeFact::full_for(Type::I8);
+        for divisor in 1u16..=255 {
+            let rhs = RangeFact::singleton(Immediate::from(divisor as u8));
+            let result = plain_umod_fact(full, rhs, Type::I8);
+            assert_eq!(result.unsigned.hi, U256::from(divisor - 1));
+            for dividend in 0u16..=255 {
+                let remainder = dividend % divisor;
+                assert!(U256::from(remainder) <= result.unsigned.hi);
+                let signed = I256::from(remainder as u8 as i8);
+                assert!(signed >= result.signed.lo && signed <= result.signed.hi);
+            }
+        }
+        assert_eq!(plain_umod_fact(full, full, Type::I8), full);
+        assert_eq!(
+            plain_umod_fact(full, RangeFact::singleton(Immediate::from(0u8)), Type::I8),
+            full
+        );
+        let lhs = RangeFact::singleton(Immediate::from(2u8));
+        let rhs = RangeFact::singleton(Immediate::from(128u8));
+        assert_eq!(
+            plain_umod_fact(lhs, rhs, Type::I8).unsigned.hi,
+            U256::from(2u8)
+        );
+    }
+
+    #[test]
+    fn evm_remainder_bounds_cover_every_byte_input_including_zero_divisor() {
+        let full = RangeFact::full_for(Type::I8);
+        for divisor in 0u16..=255 {
+            let rhs = RangeFact::singleton(Immediate::from(divisor as u8));
+            let result = evm_umod_fact(full, rhs, Type::I8);
+            for dividend in 0u16..=255 {
+                // EVM `mod` returns 0 for a zero divisor.
+                let remainder = if divisor == 0 { 0 } else { dividend % divisor };
+                assert!(U256::from(remainder) <= result.unsigned.hi);
+                let signed = I256::from(remainder as u8 as i8);
+                assert!(signed >= result.signed.lo && signed <= result.signed.hi);
+            }
+        }
+        let zero = RangeFact::singleton(Immediate::from(0u8));
+        assert_eq!(evm_umod_fact(full, zero, Type::I8), zero);
+        let maybe_zero = RangeFact {
+            unsigned: UnsignedInterval {
+                lo: U256::zero(),
+                hi: U256::from(32u8),
+            },
+            ..full
+        };
+        assert_eq!(
+            evm_umod_fact(full, maybe_zero, Type::I8).unsigned.hi,
+            U256::from(31u8)
+        );
+        assert_eq!(plain_umod_fact(full, maybe_zero, Type::I8), full);
+    }
 
     #[test]
     fn interval_helpers_handle_join_intersect_singleton_and_extrema() {
