@@ -1033,7 +1033,7 @@ mod tests {
         let mut dfg = DataFlowGraph::new(ModuleCtx::new(&isa));
         let lhs = dfg.make_imm_value(Immediate::I32(1));
         let rhs = dfg.make_imm_value(Immediate::I32(2));
-        let inst = dfg.make_inst(Uaddo::new(dfg.inst_set(), lhs, rhs));
+        let inst = dfg.make_inst(Uaddo::new_unchecked(dfg.inst_set(), lhs, rhs));
         let sum = dfg.make_value(Value::Inst {
             inst,
             result_idx: 0,
