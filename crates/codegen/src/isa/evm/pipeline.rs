@@ -6,6 +6,8 @@ use crate::{
     optim::{
         constref_specialize::specialize_private_constrefs,
         dead_arg::{DeadArgElimConfig, run_dead_arg_elim},
+        dead_ret::{DeadRetElimConfig, run_dead_ret_elim},
+        forwarded_ret::{ForwardedRetElimConfig, run_forwarded_ret_elim},
         return_range::run_return_range_branch_simplify,
         pipeline::{FuncPassOverrides, Pass, run_function_pass_round},
         uniform_const_arg::run_uniform_const_arg_binding,
@@ -232,6 +234,10 @@ impl EvmPipelineContext<'_> {
             ],
         );
         run_uniform_const_arg_binding(self.work.module(), &self.funcs);
+        run_dead_arg_elim(self.work.module(), DeadArgElimConfig::default());
+        // Trial wiring of mb2's opt-in return-lane passes (shader driver order).
+        run_forwarded_ret_elim(self.work.module(), ForwardedRetElimConfig::default());
+        run_dead_ret_elim(self.work.module(), DeadRetElimConfig::default());
         run_dead_arg_elim(self.work.module(), DeadArgElimConfig::default());
         // Trial wiring of mb2's opt-in interprocedural return-range pass.
         run_return_range_branch_simplify(self.work.module(), 4);
