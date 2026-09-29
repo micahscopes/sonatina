@@ -1135,14 +1135,27 @@ fn malloc_ptr_to_int_fact(func: &Function, value: ValueId) -> Option<RangeFact> 
     if size > U256::from(u32::MAX) {
         return None;
     }
-    let full = RangeFact::full_for(Type::I256);
+    // Policy axiom: an EVM heap pointer stays below 2^64. Memory expansion gas
+    // is quadratic, so no transaction can pay to grow memory anywhere near
+    // that. This is stronger than the structural bound `2^256 - 1 - size`
+    // and lets offsets such as `ptr + 32 * n` drop their overflow checks.
+    // Only the i256 pointer-to-integer cast gets the fact, so it cannot be
+    // misread through a narrower signed type.
+    let hi = heap_pointer_bound().min(unsigned_max(Type::I256) - size);
     Some(RangeFact {
         unsigned: UnsignedInterval {
             lo: U256::zero(),
-            hi: unsigned_max(Type::I256) - size,
+            hi,
         },
-        signed: full.signed,
+        signed: SignedInterval {
+            lo: I256::zero(),
+            hi: I256::from(hi),
+        },
     })
+}
+
+fn heap_pointer_bound() -> U256 {
+    U256::one() << 64
 }
 
 fn transfer_snego_inst(func: &Function, env: &mut RangeEnv, inst: InstId) {

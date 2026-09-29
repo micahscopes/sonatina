@@ -178,8 +178,11 @@ func public %entry() -> i256 {
     assert_fast_verified(&module);
 }
 
+// Trial policy: heap pointers are assumed to stay below 2^64, so an offset past
+// the allocation size no longer keeps its overflow check. Upstream's structural
+// bound (pointer <= 2^256 - 1 - size) kept it.
 #[test]
-fn checked_arith_elim_keeps_malloc_offset_past_alloc_size() {
+fn checked_arith_elim_drops_malloc_offset_under_heap_bound() {
     let (mut module, func_ref) = parse_test_module(
         r#"
 target = "evm-ethereum-osaka"
@@ -189,6 +192,32 @@ func public %entry() -> i256 {
         v0.*i8 = evm_malloc 64.i256;
         v1.i256 = ptr_to_int v0 i256;
         (v2.i256, v3.i1) = uaddo v1 96.i256;
+        br v3 block1 block2;
+
+    block1:
+        return 99.i256;
+
+    block2:
+        return v2;
+}
+"#,
+    );
+    Pipeline::size().run(&mut module);
+    assert_func_not_contains(&module, func_ref, "uaddo");
+    assert_fast_verified(&module);
+}
+
+#[test]
+fn checked_arith_elim_keeps_malloc_offset_beyond_heap_bound() {
+    let (mut module, func_ref) = parse_test_module(
+        r#"
+target = "evm-ethereum-osaka"
+
+func public %entry() -> i256 {
+    block0:
+        v0.*i8 = evm_malloc 64.i256;
+        v1.i256 = ptr_to_int v0 i256;
+        (v2.i256, v3.i1) = uaddo v1 -1.i256;
         br v3 block1 block2;
 
     block1:

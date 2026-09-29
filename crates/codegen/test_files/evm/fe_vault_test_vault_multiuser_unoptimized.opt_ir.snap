@@ -27,30 +27,30 @@ func private %__Vault_init() {
 
 func private %__Vault_runtime() {
     block0:
-        v124.i256 = evm_calldata_size;
-        v126.i1 = lt v124 4.i256;
-        br v126 block66 block67;
+        v128.i256 = evm_calldata_size;
+        v130.i1 = lt v128 4.i256;
+        br v130 block66 block67;
 
     block66:
         evm_revert 0.i256 0.i256;
 
     block67:
-        v127.i256 = evm_calldata_load 0.i256;
-        v129.i256 = shr 224.i256 v127;
-        v130.i32 = trunc v129 i32;
-        v131.objref<@__fe_obj_SolDecoder_3> = obj.alloc @__fe_obj_SolDecoder_3;
-        v132.objref<@__fe_obj_Cursor_2> = obj.proj v131 0.i256;
-        v133.objref<i256> = obj.proj v132 0.i256;
-        obj.store v133 0.i256;
-        v134.objref<i256> = obj.proj v132 1.i256;
-        obj.store v134 4.i256;
-        br_table v130 block1 (1.i32 block2) (2.i32 block3) (3.i32 block4) (4.i32 block5) (5.i32 block6) (6.i32 block7);
+        v131.i256 = evm_calldata_load 0.i256;
+        v133.i256 = shr 224.i256 v131;
+        v134.i32 = trunc v133 i32;
+        v135.objref<@__fe_obj_SolDecoder_3> = obj.alloc @__fe_obj_SolDecoder_3;
+        v136.objref<@__fe_obj_Cursor_2> = obj.proj v135 0.i256;
+        v137.objref<i256> = obj.proj v136 0.i256;
+        obj.store v137 0.i256;
+        v138.objref<i256> = obj.proj v136 1.i256;
+        obj.store v138 4.i256;
+        br_table v134 block1 (1.i32 block2) (2.i32 block3) (3.i32 block4) (4.i32 block5) (5.i32 block6) (6.i32 block7);
 
     block1:
         evm_revert 0.i256 0.i256;
 
     block2:
-        v11.i256 = call %soldecoder_i__ha12a03fcb5ba844b_abidecoder_h638151350e80a086_read_word__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563 v131;
+        v11.i256 = call %soldecoder_i__ha12a03fcb5ba844b_abidecoder_h638151350e80a086_read_word__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563 v135;
         v111.i1 = is_zero v11;
         br v111 block8 block11;
 
@@ -88,14 +88,8 @@ func private %__Vault_runtime() {
         v82.*i8 = evm_malloc 0.i256;
         v83.i256 = ptr_to_int v82 i256;
         mstore v83 v39 i256;
-        (v85.i256, v86.i1) = uaddo v83 32.i256;
-        br v86 block41 block42;
-
-    block41:
-        evm_revert 0.i256 0.i256;
-
-    block42:
-        mstore v85 0.i256 i256;
+        v116.i256 = add v83 32.i256;
+        mstore v116 0.i256 i256;
         v89.i256 = evm_keccak256 v83 64.i256;
         v41.i256 = evm_sload v89;
         (v42.i256, v43.i1) = uaddo v41 v30;
@@ -105,25 +99,19 @@ func private %__Vault_runtime() {
         v90.*i8 = evm_malloc 0.i256;
         v91.i256 = ptr_to_int v90 i256;
         mstore v91 v39 i256;
-        (v92.i256, v93.i1) = uaddo v91 32.i256;
-        br v93 block46 block47;
-
-    block46:
-        evm_revert 0.i256 0.i256;
-
-    block47:
-        mstore v92 0.i256 i256;
+        v118.i256 = add v91 32.i256;
+        mstore v118 0.i256 i256;
         v96.i256 = evm_keccak256 v91 64.i256;
         evm_sstore v96 v42;
         jump block8;
 
     block8:
-        v45.i256 = phi (0.i256 block2) (v30 block47);
+        v45.i256 = phi (0.i256 block2) (v30 block45);
         call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v45;
         unreachable;
 
     block3:
-        v15.i256 = call %soldecoder_i__ha12a03fcb5ba844b_abidecoder_h638151350e80a086_read_word__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563 v131;
+        v15.i256 = call %soldecoder_i__ha12a03fcb5ba844b_abidecoder_h638151350e80a086_read_word__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563 v135;
         v113.i1 = is_zero v15;
         br v113 block21 block24;
 
@@ -137,14 +125,8 @@ func private %__Vault_runtime() {
         v97.*i8 = evm_malloc 0.i256;
         v98.i256 = ptr_to_int v97 i256;
         mstore v98 v50 i256;
-        (v99.i256, v100.i1) = uaddo v98 32.i256;
-        br v100 block51 block52;
-
-    block51:
-        evm_revert 0.i256 0.i256;
-
-    block52:
-        mstore v99 0.i256 i256;
+        v120.i256 = add v98 32.i256;
+        mstore v120 0.i256 i256;
         v103.i256 = evm_keccak256 v98 64.i256;
         v52.i256 = evm_sload v103;
         v53.i1 = gt v15 v52;
@@ -164,35 +146,29 @@ func private %__Vault_runtime() {
 
     block32:
         evm_sstore 1.i256 v63;
-        v119.i256 = evm_udiv v55 v48;
-        (v67.i256, v68.i1) = usubo v54 v119;
+        v122.i256 = evm_udiv v55 v48;
+        (v67.i256, v68.i1) = usubo v54 v122;
         br v68 block29 block33;
 
     block33:
         evm_sstore 0.i256 v67;
+        v123.i256 = sub v52 v15;
         v104.*i8 = evm_malloc 0.i256;
         v105.i256 = ptr_to_int v104 i256;
         mstore v105 v50 i256;
-        (v106.i256, v107.i1) = uaddo v105 32.i256;
-        br v107 block56 block57;
-
-    block56:
-        evm_revert 0.i256 0.i256;
-
-    block57:
-        mstore v106 0.i256 i256;
+        v124.i256 = add v105 32.i256;
+        mstore v124 0.i256 i256;
         v110.i256 = evm_keccak256 v105 64.i256;
-        v120.i256 = sub v52 v15;
-        evm_sstore v110 v120;
+        evm_sstore v110 v123;
         jump block21;
 
     block21:
-        v72.i256 = phi (0.i256 block3) (0.i256 block24) (0.i256 block52) (v119 block57);
+        v72.i256 = phi (0.i256 block3) (0.i256 block24) (0.i256 block26) (v122 block33);
         call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v72;
         unreachable;
 
     block4:
-        v19.i256 = call %soldecoder_i__ha12a03fcb5ba844b_abidecoder_h638151350e80a086_read_word__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563 v131;
+        v19.i256 = call %soldecoder_i__ha12a03fcb5ba844b_abidecoder_h638151350e80a086_read_word__CallData_hf71d505b6ff5dc81__e6d5f05c3478f563 v135;
         v73.i256 = evm_sload 0.i256;
         (v74.i256, v75.i1) = uaddo v73 v19;
         br v75 block37 block38;
@@ -216,19 +192,13 @@ func private %__Vault_runtime() {
 
     block7:
         v79.i256 = evm_caller;
-        v136.*i8 = evm_malloc 0.i256;
-        v137.i256 = ptr_to_int v136 i256;
-        mstore v137 v79 i256;
-        (v138.i256, v139.i1) = uaddo v137 32.i256;
-        br v139 block70 block71;
-
-    block70:
-        evm_revert 0.i256 0.i256;
-
-    block71:
-        mstore v138 0.i256 i256;
-        v140.i256 = evm_keccak256 v137 64.i256;
-        v81.i256 = evm_sload v140;
+        v140.*i8 = evm_malloc 0.i256;
+        v141.i256 = ptr_to_int v140 i256;
+        mstore v141 v79 i256;
+        v142.i256 = add v141 32.i256;
+        mstore v142 0.i256 i256;
+        v143.i256 = evm_keccak256 v141 64.i256;
+        v81.i256 = evm_sload v143;
         call %return_value__Evm_hef0af3106e109414_Sol_hfd482bb803ad8c5f_u256__c4b26908c66ef75f v81;
         unreachable;
 }
