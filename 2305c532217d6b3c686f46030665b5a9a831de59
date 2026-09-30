@@ -1,0 +1,92 @@
+# Seaport code size: handoff notes
+
+These notes hang on commit `2305c532` (branch `trial/port-optim-main` in `micahscopes/sonatina`). They cover
+the investigation into why the Fe port of Seaport 1.6 (`cburgdorf/SeaportFe`) compiles to 65,222 runtime
+bytes when EIP-170 allows 24,576.
+
+## Reading the notes
+
+Fetch them, then read them in this order:
+
+```
+git fetch https://github.com/micahscopes/sonatina.git 'refs/notes/seaport-code-size/*:refs/notes/seaport-code-size/*'
+git notes --ref=seaport-code-size/readme           show 2305c532   # this file
+git notes --ref=seaport-code-size/code-size        show 2305c532   # summary ledger: start here
+git notes --ref=seaport-code-size/sonatina-measure show 2305c532   # every Sonatina variant and flag, with gas
+git notes --ref=seaport-code-size/byte-census      show 2305c532   # every byte attributed via the Fe trace
+git notes --ref=seaport-code-size/facet-analysis   show 2305c532   # excess against solc, memory ops by origin
+git notes --ref=seaport-code-size/retrospective    show 2305c532   # how the tools performed, and ideas for built-in size tooling
+```
+
+Paths under `/workspace/...` in the notes refer to the machine where the work ran. They are not
+available to you. Every number was measured unless a row is marked as an estimate.
+
+## The findings in brief
+
+- **The port's own logic is not the problem.** The 84 functions that pair by name with seaport-core are
+  16,694 bytes in Fe and 16,023 bytes in solc's plain build.
+- **The gap is in the code around it:** ABI decoding, values passed through memory, spills and backend
+  glue. That is 48,528 bytes in Fe against 9,111 in solc.
+- **Optimizer changes and flags move Seaport by 3% at most.**
+  - #344 has no effect on Seaport.
+  - The best build measured is 63,266 bytes.
+- **Measured causes of the excess over solc** (40,088 bytes in all; they explain 59% of it):
+
+  | Cause | Bytes |
+  |---|---:|
+  | ABI encoding and decoding | 8,211 |
+  | Spill stores and reloads | 6,750 |
+  | Repeated code | 4,002 |
+  | Free-pointer clamp at each heap allocation | 2,091 |
+  | Identical functions left unmerged | 1,330 |
+  | Checked arithmetic | 1,135 |
+
+## The branches
+
+All are in `micahscopes/sonatina`. None of them is a PR, and none is meant to merge as it stands.
+
+- **`trial/port-optim-main`:** four optimizer ideas from an experimental Sonatina fork, rebuilt on
+  `ee325c3b`, one commit each with tests. Their effect on Seaport at `-O 1`:
+  - `d11511bb`, unsigned subtraction proved from dominating guards: -436 bytes. This is the main win.
+  - `2305c532`, unused and forwarded private return lanes removed: -69 bytes.
+  - `76bfc832`, remainder bounds including `evm_umod`: 0 bytes.
+  - `5bae5f7f`, branch folding: **+17 bytes on Seaport.** Leave it out unless it is reworked.
+
+  Sonatina's own tests pass on this branch, and the Seaport Foundry suite passes 482 of 482.
+- **`trial/port-optim-main-heap64`:** adds one commit, `eb1540fc`, which assumes EVM heap pointers stay
+  below 2^64.
+  - It is a policy question, not a proposal.
+  - It flips `checked_arith_elim_keeps_malloc_offset_past_alloc_size`, because that test encodes the
+    opposite policy.
+  - It has no effect on Seaport.
+- **`trial/port-optim`:** the first trial, on `22d7aa15`. It includes two measurement-only harness commits
+  (`SONA_TRIAL_METRICS`, `SONA_TRIAL_OPT`) and commits prefixed `trial:`. Keep it for reference only.
+
+## Suggested next steps, highest value first
+
+1. **Measure Seaport on current Sonatina main and on #317.** Main now includes #353 and #349, and #317 lowers
+   switches to comparison trees. Reproduce the baseline first: Fe `342048ea5` with the port's compiler
+   patch, `fe build -O 1`, runtime 65,222 bytes.
+2. **Free-pointer clamp (2,091 bytes, 123 copies).**
+   - Emitted in the EVM lowering of `evm_malloc`, `isa/evm/machine/lower.rs` around `emit_heap_base`.
+   - Options: carry the floor proof forward, or share one clamp routine.
+3. **Merge identical functions at the IR level (1,330 bytes).** The `dyn_array_payload_end` family has
+   byte-identical IR functions that are never merged.
+4. **Provenance for backend-inserted bytes.** 14,386 bytes have no link from bytecode back into Sonatina:
+   spills, the clamp, call transport and shared tails. Tagging each with a reason would turn the estimated
+   rows into measured ones.
+5. **Spills and call transport through memory** (about 6.8 KB and 4.2 KB). These are the largest
+   backend-side levers.
+6. **On the Fe side, for reference:**
+   - `decode_from_bounded` is compiled once per type: 7 instances, 5,553 bytes, all from core `abi.fe:382`.
+   - Aggregate copies come to about 3.4 KB.
+   - The port passes `env` by value in five dispatcher arms, about 640 bytes.
+
+## Not included yet
+
+- **The riff-catalog analysis branch** (`census/fe-trace-bytes`, 13 commits) that produced the census and
+  facet numbers. It is still on another machine and will be pushed separately.
+- **Fe's trace work used here is already on Fe master:** `fe dev trace emit` and
+  `fe dev debug emit --attribution-details`. Tracing Seaport needed a workaround, because `fe dev trace
+  emit` compiles each source file as one module. The other contracts in the file were blanked in a copy of
+  the port.
