@@ -1,0 +1,206 @@
+# Seaport in Fe: how much each Sonatina version saves (2026-09-29)
+
+Question how much code size, and gas where feasible, do newer Sonatina versions save on the Fe port of Seaport (`cburgdorf/SeaportFe`)? The Fe `Seaport` runtime is about 65 KB; the EIP-170 deploy limit is 24,576 bytes.
+
+Everything here is local measurement. Nothing was pushed, no PR or issue was opened, nobody was contacted.
+
+## TL;DR
+
+- **Nothing gets Seaport near 24 KB.** The smallest Seaport runtime measured is **63,266 bytes** (main plus the ported optimizer ideas, at `-O s`), 1,956 bytes (3.0%) below the pinned build. It is still **38,690 bytes over** the limit. Seaport would need about 2.6 times less code. At a fixed optimization level, the Sonatina changes measured here move Seaport by 0% to 1%; adding the switch to `-O s` brings the total to 3%.
+- **The GVN phi fix (#344) changes nothing on Seaport.** The pinned Sonatina plus only that commit produces byte-identical bytecode for all 8 contracts. Current main is 17 bytes smaller.
+- **The ported optimizer ideas save 505 bytes at `-O 1`** (0.77%) and about 170 to 630 gas per call. Seaport's Foundry suite still passes 482 of 482 with them. Almost all of it (-436) comes from one idea, removing the overflow check of `a - b` after a branch proved `a >= b`. Branch folding makes Seaport 17 bytes larger.
+- **Switching Seaport from `-O 1` to `-O s` or `-O 2` saves more than any Sonatina change:** 1,327 bytes (`-O s`) or 1,471 bytes (`-O 2`) on the pinned compiler. `-O s` also passes 482 of 482 and uses less gas than `-O 1` on every call measured.
+- **The heap-pointer bound (a policy question for the Sonatina maintainers) has zero effect on Seaport** at `-O 1` and `-O s`.
+- **The mb2 fork could not be built against this Fe** without real work (102 compile errors, 29 of them missing trace and observability APIs), so it is not in the table.
+- Where the bytes go: the dispatcher (the runtime entry function plus three large message-arm functions) is about 16% of Seaport, and ABI decoding helpers another 16%. The biggest single function is the runtime entry at 6,550 bytes (10%).
+
+## 1. Size table
+
+"Runtime" is the deployed code (what EIP-170 limits). "Init" is the deploy transaction's code, which here is the runtime plus a small constructor wrapper. Gap is runtime minus 24,576.
+
+### All versions at `-O 1` (the level `scripts/bootstrap.py` uses)
+
+Runtime bytes, change from A in parentheses:
+
+| Contract | A. pinned | B. pinned + #344 | C. main | D. main + ideas | D2. D + heap bound |
+| --- | --- | --- | --- | --- | --- |
+| **Seaport** | **65,222** | 65,222 (+0) | 65,205 (-17) | **64,717 (-505)** | 64,717 (-505) |
+| Consideration | 65,228 | 65,228 (+0) | 65,211 (-17) | 64,723 (-505) | 64,723 (-505) |
+| ConduitController | 7,514 | 7,514 (+0) | 7,514 (+0) | 7,519 (+5) | 7,519 (+5) |
+| Conduit | 3,911 | 3,911 (+0) | 3,911 (+0) | 3,909 (-2) | 3,909 (-2) |
+| TransferHelper | 4,218 | 4,218 (+0) | 4,210 (-8) | 4,188 (-30) | 4,188 (-30) |
+| PausableZone | 7,819 | 7,819 (+0) | 7,819 (+0) | 7,702 (-117) | 7,702 (-117) |
+| PausableZoneController | 14,722 | 14,722 (+0) | 14,722 (+0) | 14,579 (-143) | 14,579 (-143) |
+| SeaportRouter | 10,447 | 10,447 (+0) | 10,447 (+0) | 10,334 (-113) | 10,334 (-113) |
+
+Distance to the limit, runtime: Seaport +40,646 (A), +40,646 (B), +40,629 (C), +40,141 (D and D2). Consideration is 6 bytes more than Seaport in every column (its name is part of the EIP-712 domain). All periphery contracts are already under the limit in every column (the largest, PausableZoneController, is 9,854 bytes under in A).
+
+Init bytes (A, B, C, D, D2): Seaport 66,275 / 66,275 / 66,258 / 65,753 / 65,753; Consideration 66,281 / 66,281 / 66,264 / 65,759 / 65,759; ConduitController 11,770 / 11,770 / 11,770 / 11,773 / 11,773; Conduit 4,030 / 4,030 / 4,030 / 4,028 / 4,028; TransferHelper 4,599 / 4,599 / 4,591 / 4,562 / 4,562; PausableZone 7,981 / 7,981 / 7,981 / 7,864 / 7,864; PausableZoneController 22,926 / 22,926 / 22,926 / 22,666 / 22,666; SeaportRouter 11,075 / 11,075 / 11,075 / 10,949 / 10,949.
+
+A reproduces `COMPILER_FIXES.md` byte for byte (its "current" column: Seaport 65,222, Consideration 65,228, ConduitController 7,514, Conduit 3,911, TransferHelper 4,218, PausableZone 7,819, PausableZoneController 14,722, SeaportRouter 10,447). B was checked to be a different compiler binary built from the picked Sonatina (its cargo log compiles `sona-pick344`), and its 16 `.bin` files still compare equal to A's with `cmp`.
+
+### Which of D's ideas does the work (`-O 1`, cumulative)
+
+I built D one commit at a time on top of C (each column adds one commit to the previous column), so each step is the change that commit makes given the ones before it. Runtime bytes:
+
+| Contract | C. main | + branch folding | + guarded subtraction | + remainder bound | + return lanes (= D) |
+| --- | --- | --- | --- | --- | --- |
+| Seaport | 65,205 | 65,222 (+17) | 64,786 (-436) | 64,786 (0) | 64,717 (-69) |
+| ConduitController | 7,514 | 7,526 (+12) | 7,519 (-7) | 7,519 (0) | 7,519 (0) |
+| Conduit | 3,911 | 3,916 (+5) | 3,909 (-7) | 3,909 (0) | 3,909 (0) |
+| TransferHelper | 4,210 | 4,207 (-3) | 4,199 (-8) | 4,199 (0) | 4,188 (-11) |
+| PausableZone | 7,819 | 7,819 (0) | 7,715 (-104) | 7,715 (0) | 7,702 (-13) |
+| PausableZoneController | 14,722 | 14,722 (0) | 14,618 (-104) | 14,618 (0) | 14,579 (-39) |
+| SeaportRouter | 10,447 | 10,439 (-8) | 10,345 (-94) | 10,345 (0) | 10,334 (-11) |
+
+So on Fe contracts **the guarded subtraction check removal carries almost all of D** (-436 of Seaport's -505), the return-lane passes add -69, the remainder bound does nothing even with the `evm_umod` extension, and **branch folding makes three of the seven contracts slightly larger** (Seaport +17, ConduitController +12, Conduit +5). On Sonatina's own corpus branch folding was a small win (chz castling, -13 bytes), so it is worth a closer look before it goes into a PR.
+
+### Optimization levels: pinned (A) and best version (D) at `-O 1`, `-O s`, `-O 2`
+
+Runtime bytes, change from A at `-O 1`:
+
+| Contract | A `-O 1` | A `-O s` | A `-O 2` | D `-O 1` | D `-O s` | D `-O 2` | D2 `-O s` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **Seaport** | 65,222 | 63,895 (-1,327) | 63,751 (-1,471) | 64,717 (-505) | **63,266 (-1,956)** | 63,282 (-1,940) | 63,266 (-1,956) |
+| Consideration | 65,228 | 63,901 (-1,327) | 63,757 (-1,471) | 64,723 (-505) | 63,272 (-1,956) | 63,288 (-1,940) | 63,272 (-1,956) |
+| ConduitController | 7,514 | 7,159 (-355) | 7,249 (-265) | 7,519 (+5) | 7,162 (-352) | 7,252 (-262) | 7,162 (-352) |
+| Conduit | 3,911 | 3,697 (-214) | 3,784 (-127) | 3,909 (-2) | 3,695 (-216) | 3,782 (-129) | 3,695 (-216) |
+| TransferHelper | 4,218 | 4,157 (-61) | 4,160 (-58) | 4,188 (-30) | 4,135 (-83) | 4,138 (-80) | 4,135 (-83) |
+| PausableZone | 7,819 | 7,724 (-95) | 7,293 (-526) | 7,702 (-117) | 7,554 (-265) | 7,173 (-646) | 7,554 (-265) |
+| PausableZoneController | 14,722 | 14,433 (-289) | 13,680 (-1,042) | 14,579 (-143) | 14,245 (-477) | 13,533 (-1,189) | 14,245 (-477) |
+| SeaportRouter | 10,447 | 10,101 (-346) | 9,836 (-611) | 10,334 (-113) | 9,939 (-508) | 9,735 (-712) | 9,939 (-508) |
+
+Seaport distance to the limit: +39,319 (A `-O s`), +39,175 (A `-O 2`), +38,690 (D `-O s`), +38,706 (D `-O 2`). Seaport init: 64,947 (A `-O s`), 64,803 (A `-O 2`), 64,301 (D `-O s`), 64,317 (D `-O 2`).
+
+On Seaport, D's ideas add about the same saving at every level: -505 at `-O 1`, -629 at `-O s` (63,895 to 63,266), -469 at `-O 2` (63,751 to 63,282).
+
+**Every level compiles.** Wall time of the whole `fe build` of the port: 418 s at `-O 1` and 617 s at `-O 2`, both measured with no other build of mine running, so `-O 2` costs about 1.5 times as long. That is well under the 3x threshold, so compile time does not obviously explain the choice of `-O 1`. Other runs overlapped with each other and with other agents' builds (`-O s` 850 s and 1,377 s, `-O 2` 1,446 s and 1,953 s), so those numbers are upper bounds, not comparisons. A second pinned `-O 2` build produced byte-identical output to the first.
+
+**What differs between the levels.** Fe passes its level straight through (`to_sonatina_opt_level`, `crates/codegen/src/sonatina/mod.rs:223`). In Sonatina `3357f3a2`, `-O 1` and `-O 2` run the same IR optimization pipeline, `Pipeline::speed()`, which includes GVN, LICM, SCCP and CheckedArithElim (`crates/codegen/src/compile.rs:72,74`; the pass list is `PRIMARY_FUNC_PASSES`, `optim/pipeline.rs:277`). They differ only in the backend: `-O 1` uses a greedy stack-scheduling search and gas-oriented constants, `-O 2` an exact search and balanced constants (`compile.rs:266-275`). `-O s` runs `Pipeline::size()`, the same passes with a larger inlining budget (`size_inliner_config`, `optim/pipeline.rs:335`), plus the size-oriented late cleanup, the exact search, and size-oriented constants (`compile.rs:73,258,267,273`). So GVN does run at `-O 1`; #344 changed nothing because Seaport's code does not hit the phi pattern it fixes, not because `-O 1` skips GVN. (I measured B only at `-O 1`.)
+
+## 2. Where Seaport's bytes go
+
+Method: a measurement-only Fe patch of about 50 added lines (section 7) reads the per-instruction PC map that Sonatina already produces for its observability output (`PcMapEntry`, with `func_name`, `pc_start`, `pc_end`; `crates/codegen/src/object/artifact.rs:203` in Sonatina) and sums bytes per function. The per-function sums add up exactly to the section's code bytes (64,771 for A, plus 451 bytes of data = 65,222). Turning it on does not change the bytecode: the dumped Seaport runtime compares equal to the normal build for A, C and D `-O s`.
+
+A function name with a `__g...` suffix is one generic instance; `__Seaport_recv_0_N` is one arm of the message dispatcher (the code that decodes one incoming call and runs its handler). `contract_runtime_root_Seaport` is the runtime entry point that reads the selector and jumps to the right arm.
+
+### Top functions, A (pinned, `-O 1`, 210 functions, 64,771 code bytes)
+
+| Bytes | Share | Function |
+| --- | --- | --- |
+| 6,550 | 10.1% | contract_runtime_root_Seaport |
+| 4,320 | 6.7% | fulfill_basic_order |
+| 2,564 | 4.0% | verify_signature |
+| 2,007 | 3.1% | validate_orders_and_prepare_to_fulfill |
+| 1,966 | 3.0% | match_advanced_orders |
+| 1,485 | 2.3% | __Seaport_recv_0_9 |
+| 1,411 | 2.2% | decode_from_bounded__gcd8f |
+| 1,286 | 2.0% | __Seaport_recv_0_3 |
+| 1,231 | 1.9% | validate_and_fulfill_advanced_order |
+| 1,229 | 1.9% | validate_generate_order_returndata |
+| 1,214 | 1.9% | advanced_orders |
+| 1,177 | 1.8% | decode_from_bounded__gb098 |
+| 1,171 | 1.8% | finish_single_order |
+| 1,126 | 1.7% | orders_as_advanced |
+| 1,084 | 1.7% | perform_final_checks_and_execute_orders |
+| 1,077 | 1.7% | install_generated_order |
+
+Grouping generic instances and dispatcher arms together changes the picture a little: the 7 `decode_from_bounded` instances total 5,553 bytes (8.6%), the 3 dispatcher arms 3,780 (5.8%), 11 `abi_field_end_with_input_len` instances 1,594 (2.5%), 9 `dyn_array_payload_end_with_input_len` instances 1,428 (2.2%), and 16 `revert_error` instances 1,002 (1.5%).
+
+A rough rollup by name pattern (regexes in `/workspace/scratch/seaport/categories.py`, so treat it as approximate): dispatch (entry plus arms) 10,330 bytes (15.9%); ABI decoding helpers (`decode*`, `abi_*`, `dyn_array*`, `*input_len`, `read_*`, `calldata*`) 10,660 (16.5%); ABI encoding, return data and events 3,058 (4.7%); hashing and signatures 4,105 (6.3%); revert and error helpers 1,288 (2.0%); everything else, the order logic itself, 35,330 (54.5%).
+
+### Top functions, best version (D at `-O s`, 213 functions, 62,815 code bytes)
+
+| Bytes | Share | Function (change from A) |
+| --- | --- | --- |
+| 5,961 | 9.5% | contract_runtime_root_Seaport (-589) |
+| 4,280 | 6.8% | fulfill_basic_order (-40) |
+| 2,510 | 4.0% | verify_signature (-54) |
+| 1,990 | 3.2% | validate_orders_and_prepare_to_fulfill (-17) |
+| 1,286 | 2.0% | __Seaport_recv_0_9 (-199) |
+| 1,283 | 2.0% | __Seaport_recv_0_3 (-3) |
+| 1,280 | 2.0% | decode_from_bounded__gcd8f (-131) |
+| 1,226 | 2.0% | validate_generate_order_returndata (-3) |
+| 1,219 | 1.9% | validate_and_fulfill_advanced_order (-12) |
+| 1,214 | 1.9% | advanced_orders (+0) |
+| 1,161 | 1.8% | finish_single_order (-10) |
+| 1,110 | 1.8% | orders_as_advanced (-16) |
+| 1,070 | 1.7% | install_generated_order (-7) |
+| 1,070 | 1.7% | perform_final_checks_and_execute_orders (-14) |
+| 1,060 | 1.7% | decode_from_bounded__gb098 (-117) |
+| 1,051 | 1.7% | apply_fulfillment (not a separate function in A) |
+
+`apply_fulfillment` is not a separate function in A at all, and `match_advanced_orders` drops from 1,966 bytes in A to 1,003 here. My reading (not checked in the IR) is that at `-O 1` the inliner folded `apply_fulfillment` into `match_advanced_orders`, and at `-O s` the size-oriented inliner settings keep it out of line; the function count also goes from 210 to 213. Grouped: `decode_from_bounded` 4,979 (7.9%), dispatcher arms 3,570 (5.7%). Rollup: dispatch 9,531 (15.2%), ABI decoding 9,999 (15.9%), everything else 34,932 (55.6%).
+
+What this says: there is no single bloated helper to fix. The largest wins would have to come from the shape of the code Fe emits (the dispatcher and ABI decoding together are about a third of Seaport), and the rest is spread over about 200 functions of order logic. The README's own note points the same way: seaport-core works on calldata pointers directly where the Fe port decodes into an in-memory model.
+
+Raw per-function data: `/workspace/scratch/seaport/out/sizes-pinned-O1/`, `sizes-main/` (C, `-O 1`), `sizes-portopt-Os/`; each has `Seaport.runtime.tsv` and `Seaport.init.tsv`.
+
+## 3. Gas
+
+Seaport's Foundry suite runs without yarn: `scripts/upstream_suite.py` only needs `forge` and the reference artifacts, which `forge build` makes. I cloned the pinned Seaport reference (`7f966fe7`) with submodules and built its `reference` and `optimized` profiles with solc 0.8.24 (the Solidity `Consideration` runtime comes out at 23,969 bytes, as the README says). On this NixOS sandbox the solc 0.8.24 release binary needs a small loader wrapper (`/workspace/scratch/seaport/solc/solc-0.8.24`, sha256 of the binary matches the soliditylang release list).
+
+Gas of the same calls in `test_fuzzCoverage_x` (from `forge test --mt test_fuzzCoverage_x -vvvv`, parsed by `/workspace/scratch/seaport/gas.py`). A's numbers reproduce the README gas table exactly.
+
+| Call | A `-O 1` | D `-O 1` | A `-O s` | D `-O s` |
+| --- | --- | --- | --- | --- |
+| `getCounter` (cold) | 6,295 | 6,122 (-173) | 6,058 (-237) | 6,052 (-243) |
+| `getCounter` (warm) | 4,295 | 4,122 (-173) | 4,058 (-237) | 4,052 (-243) |
+| `getOrderStatus` (cold) | 6,203 | 6,030 (-173) | 5,980 (-223) | 5,974 (-229) |
+| `getOrderStatus` (warm) | 4,214 | 4,041 (-173) | 3,971 (-243) | 3,965 (-249) |
+| `getOrderHash` (1 consideration item) | 14,576 | 14,037 (-539) | 13,867 (-709) | 13,631 (-945) |
+| `fulfillAdvancedOrder`, reverting mutation | 29,331 | 28,701 (-630) | 28,863 (-468) | 28,418 (-913) |
+| `fulfillAdvancedOrder`, native consideration | 46,551 | 45,944 (-607) | 45,983 (-568) | 45,583 (-968) |
+| whole test | 14,069,658 | 14,060,012 | 13,972,393 | 13,968,528 |
+
+The flat -173 on every call under D `-O 1` suggests (inference, not traced) that the saving sits in the shared entry and dispatch path. The Solidity reference for comparison (README): `getCounter` 2,677, `getOrderStatus` 2,465, `getOrderHash` 1,736, `fulfillAdvancedOrder` 21,653. The best version closes about 4% of the Fe-to-Solidity gap on `fulfillAdvancedOrder` (968 of 24,898 gas).
+
+## 4. Behavior check
+
+Seaport's Foundry suite (482 tests, including the fuzz engine) passed **482 of 482** for every build I ran it on: A `-O 1`, D `-O 1`, A `-O s`, D `-O s` (logs `/workspace/scratch/seaport/logs/suite-{pinned,portopt,pinned-Os,portopt-Os}.log`). Not run: B and C (B is byte-identical to A; C differs by 17 bytes on Seaport), the `-O 2` builds, D2, and the Hardhat suite (needs Node with yarn). The `--both` mode was not run.
+
+Sonatina's own tests on the D branch head `2305c532` (release build): `cargo test --workspace --all-targets --no-fail-fast` 1,699 passed, 0 failed, with snapshot updates off; `cargo run -p sonatina-filecheck` 317 of 317; doctests pass; `cargo clippy --workspace --all-features --all-targets -- -D clippy::all` clean; `cargo fmt --all -- --check` clean. Baseline main `ee325c3b`: 1,684 passed and filecheck 312 of 312, so the branch adds 15 unit tests and 5 filecheck cases and breaks nothing.
+
+## 5. The versions
+
+The Fe side is identical in every version: Fe `342048ea5` plus `compiler/seaport-integration.patch` (sha256 `22fc0820...313f6`, matches `reference_manifest.json`), in the worktree `/workspace/scratch/seaport/fe`. The manifest's recorded head `71173789d` is the port's local branch and is not in `/workspace/fe`, so the patch hash is the check. Each version is a `[patch."https://github.com/fe-lang/sonatina"]` path override of all six Sonatina crates. No Fe-side API adaptation was needed for B, C, D or D2.
+
+- **A. pinned:** `3357f3a2`.
+- **B. pinned + #344:** `3357f3a2` plus `cb491f4b` cherry-picked cleanly (local commit `48993840`, not kept on a branch; recreate with one cherry-pick).
+- **C. main:** `ee325c3b` (`upstream-https/main`, includes #344 as `cb491f4b`).
+- **D. main + ideas:** branch `trial/port-optim-main`, head `2305c532`, four commits on `ee325c3b`, one idea each, each with its unit tests, filecheck cases and snapshot refreshes:
+  1. `5bae5f7f` branch folding: a block that holds only a conditional branch and shares a target with its predecessor's branch is merged into one branch on the combined condition (`fold_conditional_bridge`, `crates/codegen/src/cfg_edit.rs:522`, called from CfgCleanup). The `code_sink::calldata::sink_through_guards` expectation now expects one `or` guard instead of two; the load still sinks below it. chz castling fixture: 556 to 543 bytes.
+  2. `d11511bb` guarded subtraction: CheckedArithElim drops the overflow check of `a - b` when a dominating branch already proved `a >= b` from a comparison of the same two values (`dominating_guards` and `guard_proves_unsigned_ge`, `crates/codegen/src/optim/checked_arith_elim.rs:167,196`). Only the undef-taint helper moved over (`undef_dependent_values`, same file line 144); the mb2 scalar CSE pass it lived in is not ported. `CheckedArithElim::run` now takes the dominator tree. Vault multiuser fixture: 3,143 to 3,137 bytes.
+  3. `76bfc832` remainder bound, extended to EVM mod: range analysis learns `x mod c <= min(x.hi, c.hi - 1)` for `umod` (`plain_umod_fact`, `crates/codegen/src/range_analysis.rs:1388`), for `evm_umod` including a divisor that may be zero, since EVM defines `x mod 0 = 0` (`evm_umod_fact`, line 1398), and for a checked `evm_umodo` once its divisor is proved nonzero (line 375). New exhaustive 8-bit unit test and two `evm_umod` filecheck cases. No snapshot changed.
+  4. `2305c532` return-lane passes: dead and forwarded private return values are removed (`optim/dead_ret.rs`, `optim/forwarded_ret.rs`), wired into the EVM aggregate cleanup right after dead-argument elimination, with dead-argument elimination run again when a lane was removed (`crates/codegen/src/isa/evm/pipeline.rs:241-242`). The late dead-arg helper test now uses a helper that does not just echo an argument. 8 fixtures get smaller (for example vault multiuser 3,137 to 3,130 bytes); none grow.
+  Dropped from the old `trial/port-optim`: the two measurement hooks, interprocedural return ranges and the off-pin range axioms (both measured zero in the assessment). The measured D compiler was built from `740c6a0f`, whose code equals `2305c532` except that clippy's collapsed `if` in `dominating_guards` was written as nested `if`s; the later commits only add tests and snapshots.
+- **D2. D + heap-pointer bound:** branch `trial/port-optim-main-heap64`, head `eb1540fc` (one commit on `2305c532`). **Policy question for the Sonatina maintainers**, not a proposal as is. A constant-size `evm_malloc` pointer is assumed to be at most 2^64 instead of upstream's structural bound 2^256 - 1 - size (`malloc_ptr_to_int_fact`, `range_analysis.rs:1119` in `3357f3a2`; `heap_pointer_bound`, line 1157 on the branch), on the argument that quadratic memory gas makes a bigger heap unreachable. It flips upstream's `checked_arith_elim_keeps_malloc_offset_past_alloc_size` test (`crates/codegen/tests/opt_pipeline.rs:182`), which encodes the structural policy, and adds one that an offset beyond 2^64 keeps its check. It saves 29 bytes and 6,085 gas on the vault multiuser fixture and **nothing on Seaport** at `-O 1` or `-O s`. The measured D2 compiler was built from `ec2e622d` (same code as `eb1540fc` apart from the clippy rewrite and the test changes).
+- **E. mb2 fork `f0ae3f55` (skipped).** `cargo check -p fe` against it gives 102 errors: 73 are the instruction-constructor difference (the fork's constructors take `&dyn InstSetBase` where upstream's take `&dyn HasInst<...>`, so Fe's `?` on the instruction-set lookup no longer type-checks, mostly in `lower_runtime.rs`), and 29 are APIs the fork does not have: `PcAttribution`, several `PcMapEntry` and `UnmappedReasonCoverage` fields, `with_symbol_table`, `stamp_all_post_opt_provenance`, `set_inst_frontend_origin`, and the `trace_*` methods on `Module` used by `trace.rs` and `observability.rs`. The first group is mechanical but large; the second needs Fe's trace and observability code stubbed out, which is a semantic change. That is past the 15-minute rename budget, so E is not measured. (Log: `/workspace/scratch/seaport/logs/check-mb2.log`.)
+
+## 6. Commands
+
+- Build one version: `/workspace/scratch/seaport/build-variant.sh <name>` rewrites the patch section of the Fe worktree's `Cargo.toml` to `/workspace/scratch/seaport/sona-<name>`, takes a shared build slot, runs `cargo build --release -p fe --config "build.target-dir='/workspace/build/seaport-fe'"` with `CARGO_BUILD_JOBS=4`, copies the binary to `out/fe-<name>`, and runs `fe build . -O 1 --out-dir out/build-<name>` in the SeaportFe clone. Other levels: `fe-build-level.sh <name> <level>`.
+- Sizes: `sizes.py` (runtime and init bytes from the `.bin` hex files).
+- Per-function sizes: `FE_SIZE_DUMP=<dir> fe build . -O <level> --contract Seaport`, then `breakdown.py` and `categories.py`.
+- Foundry suite: `run-suite.sh <build-name> [forge args]` points `SeaportFe/build/fe` at `out/build-<name>` and runs `scripts/upstream_suite.py` with `FOUNDRY_SOLC` set to the 0.8.24 wrapper and `FOUNDRY_OFFLINE=true`. Gas: `run-suite.sh <name> --mt test_fuzzCoverage_x -vvvv`, then `gas.py`.
+- Per-idea attribution: `attr.sh` checks out each D commit in a scratch Sonatina worktree and runs `build-variant.sh attr`.
+- Sonatina tests: `sona-test.sh <label>` in a separate worktree, target dir `/workspace/build/seaport-sona`.
+
+All scripts and logs are in `/workspace/scratch/seaport/` (`logs/`, `out/`).
+
+## 7. Fe-side changes
+
+No API adaptation was needed. The only Fe change beyond the Seaport patch is the measurement-only size dump, gated on the `FE_SIZE_DUMP` environment variable (`/workspace/scratch/seaport/fe-size-dump.diff`, in `compile_runtime_objects_with_postopt_trace` and a new `dump_function_sizes`, `crates/codegen/src/sonatina/mod.rs`). When the variable is unset it compiles exactly as before; when set it turns on Sonatina's observability output, writes the per-function totals, and then strips that metadata again. A and B were built before this change existed; C, D and D2 with it (unset during the measured builds). The A breakdown used a separate rebuild of the pinned compiler with the dump (`out/fe-pinned-dump`), whose Seaport output compares equal to A.
+
+## 8. What I could not do
+
+- E (mb2 fork): not built, see section 5.
+- Hardhat suite: needs Node with yarn.
+- Behavior of B, C, D2 and the `-O 2` builds on Seaport's suite: not run (see section 4 for why B and C are low risk).
+- Clean compile-time comparisons for `-O s`: my `-O s` builds overlapped with other builds.
+
+## 9. State left behind
+
+- Kept: Sonatina branches `trial/port-optim-main` (`2305c532`) and `trial/port-optim-main-heap64` (`eb1540fc`) in `/workspace/sonatina`; the old `trial/port-optim` is untouched. B's picked commit `48993840` is not on a branch.
+- Removed: all eight Sonatina worktrees and the Fe worktree under `/workspace/scratch/seaport/`.
+- Build dirs: `/workspace/build/seaport-fe` 9.7 GB, `/workspace/build/seaport-sona` 6.5 GB (both under 10 GB, kept for reruns). `/workspace/scratch/seaport` is 1.3 GB (SeaportFe clone with the Seaport reference, outputs, logs).
