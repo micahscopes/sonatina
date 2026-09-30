@@ -1,0 +1,253 @@
+# Seaport byte ledger
+
+The Fe port of Seaport 1.6 (`cburgdorf/SeaportFe`) compiles to **65,222** runtime bytes. The EIP-170 limit is
+24,576, so it is **40,646 bytes over**. We traced every byte back through Fe and Sonatina to see where the size comes
+from and which changes could move it.
+
+Setup: Fe `342048ea5` with the port's compiler integration patch, Sonatina `3357f3a2`, `fe build -O 1` (the port's
+setting). The build reproduces the port's published sizes byte for byte, and its Foundry suite passes 482 of 482.
+
+## Summary
+
+- **Optimizer changes move Seaport by 3% at most.** #344 changes nothing on it. `-O 1` and `-O 2` share the IR
+  pipeline, so Seaport apparently has none of the phi ladders it targets. The smallest build we measured is Sonatina
+  main plus two ported passes at `-O s`: 63,266 bytes.
+- **Per operation, Fe's code looks like solc's.**
+  - Stack shuffles (DUP, SWAP, POP) are 20.1% of Fe's bytes, against 19.9% and 22.4% for the two solc builds.
+  - PUSH bytes are 53 to 57% in all three.
+  - On the periphery contracts, Fe is 0.92 to 1.23 times the size of the plain Solidity reference build. SeaportRouter,
+    which has no reference build, is 1.55 times the deployed one.
+  - Seaport alone is 2.6 times.
+- **Memory traffic is the outlier:** 6,773 memory opcodes against about 1,150 in solc, nearly six times as many.
+  - About 60% come from the backend: spills, call transport, stack objects and other inserted code.
+  - 37% come from Fe's lowering: aggregate copies, loads and stores, and allocation.
+- **Sharing repeated code would save about 8 to 10 KB** after call costs, measured under three comparison rules.
+  Useful, but a quarter of what is needed.
+- **The largest single items** are backend spill traffic (6,750 bytes), seven `decode_from_bounded` instances (5,553
+  bytes) and 123 free-pointer clamps (2,091 bytes).
+- **The port's own code is not the problem.**
+  - The 84 functions that pair by name with seaport-core come to 16,694 bytes in Fe against 16,023 in solc's plain
+    build.
+  - Nearly the whole gap is outside those pairs: library ABI code, dispatch, generated glue and code with no source
+    link, 48,528 bytes against 9,111.
+- **Against plain Solidity, named causes explain 59% of the excess** by measurement, and an estimate brings that to
+  about 92%. See the excess ledger below.
+  - Removing all six measured causes would still leave about 41.7 KB.
+  - Most of the remainder is how calls and structs are passed through memory, plus backend glue.
+
+## Where the bytes come from
+
+| Origin | Bytes | Share |
+|---|---:|---:|
+| The port's own source | 27,035 | 41.5% |
+| Fe core and std (10,783 of it ABI encoding and decoding) | 14,439 | 22.1% |
+| Generated code tied to a source (ABI plumbing, dispatch) | 8,216 | 12.6% |
+| No source link, mostly constant pushes | 15,081 | 23.1% |
+| Data after the code | 451 | 0.7% |
+
+73% of the bytes sit in functions that several recv arms reach. No single arm owns more than 1,838 bytes.
+
+## Compared with Solidity
+
+| Contract | solc, deployed | solc, reference | Fe | Fe vs reference |
+|---|---:|---:|---:|---:|
+| Seaport / Consideration | 23,963 | 25,134 | 65,222 | 2.6x |
+| PausableZoneController | 12,730 | 14,941 | 14,722 | 0.99x |
+| SeaportRouter | 6,759 | none | 10,447 | 1.55x vs deployed |
+| PausableZone | 6,162 | 7,219 | 7,819 | 1.08x |
+| ConduitController | 7,298 | 8,177 | 7,514 | 0.92x |
+| TransferHelper | 3,712 | 4,202 | 4,218 | 1.00x |
+| Conduit | 2,850 | 3,191 | 3,911 | 1.23x |
+
+The plain reference Consideration is itself over the limit. Only the hand-optimized build fits, 612 bytes under, using
+assembly and reading orders straight from calldata.
+
+## Excess against plain Solidity
+
+Fe's Seaport minus solc's plain reference `Consideration` is 40,088 bytes. The same classifier runs on both sides.
+Every byte of each runtime sits in exactly one bucket, so the differences add up exactly. An independent rebuild of the
+ledgers matches.
+
+**Measured:**
+
+| Cause | Fe | solc | Excess |
+|---|---:|---:|---:|
+| ABI decoding and encoding | 13,107 | 4,896 | 8,211 |
+| Spill stores and reloads (Sonatina, Fe only) | 6,750 | 0 | 6,750 |
+| Repeated code beyond its first copy (16 bytes or more) | 7,767 | 3,765 | 4,002 |
+| Free-pointer clamp at each heap allocation (Fe only) | 2,091 | 0 | 2,091 |
+| Identical functions left unmerged (Fe only) | 1,330 | 0 | 1,330 |
+| Checked arithmetic | 1,431 | 296 | 1,135 |
+| **Named causes (58.7%)** | | | **23,519** |
+| Leftover, grouped only by what the instructions do (41.3%) | | | 16,569 |
+
+solc repeats code too, so the repeated-code row counts only Fe's extra. Sharing all of Fe's repeats would save more (8
+to 10 KB, above), but part of that would also be possible in solc's build.
+
+The leftover is mostly memory address constants (5,557), control flow (3,655), stack shuffles (2,956) and memory
+opcodes (2,377).
+
+**Estimated, not measured:** splitting the leftover in proportion to what Fe emitted those bytes for:
+
+| Mechanism | Bytes, about |
+|---|---:|
+| Call arguments and returns passed through memory | 4,200 |
+| Backend code with no IR origin | 3,500 |
+| Aggregate copies | 3,400 |
+| Stack objects | 1,200 |
+| No mechanism label at all | 3,000 (7.6%) |
+
+**Grouped by who could fix it:**
+- **Sonatina:** about 19 KB. Spills, the clamp and the unmerged identical functions are measured, 10.2 KB. Call
+  transport, backend code with no IR origin, and stack objects are estimated, 8.9 KB.
+- **Fe lowering and library:** about 12.7 KB, from ABI decoding and encoding, aggregate copies and checked arithmetic.
+- **Either side:** 4.0 KB of repeated code, by outlining in Sonatina or by sharing in Fe.
+
+**Two more results:**
+- Ignoring types on Sonatina IR finds nothing beyond exact matches. The `decode_from_bounded` instances differ in
+  structure (one field walk per layout), so a single generic decoder would need runtime layout descriptors.
+- Fe and solc share no basic block of 16 bytes or more under any comparison rule. The two compilers' code does not
+  line up block for block.
+
+## How to fix it
+
+Levers ranked by size. "Est." marks an estimated size; the others are measured.
+
+| Lever | About | Who | Status |
+|---|---:|---|---|
+| Read ABI fields from calldata when needed, instead of decoding whole structs into memory. The per-layout copies differ in their field walks, so one generic decoder would need runtime layout descriptors. | 8.2 KB | Fe std and lowering | design question |
+| Fewer spills from stackify | 6.8 KB | Sonatina | #339 shares spill words; all of main at `ee325c3b` moved Seaport by 17 bytes |
+| Pass call arguments and returns on the stack rather than through memory | 4.2 KB, est. | Sonatina | none yet |
+| Avoid aggregate copies (pass references, move values) | 3.4 KB, est. | Fe | none yet |
+| Backend code with no IR origin | 3.5 KB, est. | Sonatina | needs provenance first to say what it is |
+| The free-pointer clamp: carry the floor proof forward, or share one clamped-allocation routine | 2.1 KB | Sonatina | none yet; small |
+| Merge identical functions at the IR level | 1.3 KB | Sonatina | none yet |
+| Guarded subtraction proof and return-value removal | 0.5 KB | Sonatina | ready on a local branch |
+| In the port: build `env` once or pass a reference (0.8 KB); build at `-O s` (1.3 KB) | 2.1 KB | the port | easy |
+
+**Can it get under 24,576?** It needs 40,646 bytes off. Even if every row above were fully removable, which they are not,
+the total is about 33 KB. Getting under the limit probably needs the calldata-view change plus several of the Sonatina
+fixes, and may still fall short. That matches how seaport-core fits only with hand-written calldata-pointer assembly.
+Splitting the contract would be the fallback, but that changes the port's design.
+
+**Related PRs.** Already included in what we measured:
+- #1618, which shares runtime instances across call sites and took Seaport from 154 KB to 65 KB;
+- #339 and #340;
+- #344, which does nothing on Seaport.
+
+Merged since and not yet measured: #353 (lazy dynamic frames) and #349 (phi-of-constants folding). Open and not yet
+measured: #317 (EVM switches as cost-based comparison trees), which could affect the dispatcher: control flow is 3.7
+KB of the excess.
+
+## Where the memory operations come from
+
+Each memory opcode, followed back along the trace's origin edges to the stage that introduced it:
+
+| Source | Stage | Memory ops |
+|---|---|---:|
+| Spill stores and reloads | Sonatina stackify | 1,736 |
+| Aggregate copies (`copy_into`, `mcopy`, zeroing) | Fe MIR lowering | 1,311 |
+| Call arguments and returns passed through memory | Sonatina lowering of calls | 1,126 |
+| Stack object access (`obj.*`) | Sonatina | 960 |
+| Explicit `mload` and `mstore` | Fe | 805 |
+| Allocation (`evm_malloc` 280, free-pointer clamp 123) | Fe asks, Sonatina emits | 403 |
+| Other backend code with no IR origin | Sonatina | 397 |
+| Other | | 35 |
+| **Total** | | **6,773** |
+
+Solidity has 1,137 memory opcodes in the deployed build and 1,187 in the reference Consideration.
+
+## For Sonatina
+
+**Spill traffic is 10.4% of the code:** 1,736 memory ops, and 6,750 bytes with their address pushes.
+- These are spill stores and reloads from stackify. We identified them from Sonatina's own memory plan: 447 one-word
+  spill objects and 491 allocas laid out in `0xa0..0x5f80`.
+- Whether some of it is avoidable is an open question. #339 shares spill words between disjoint lifetimes, but it
+  is not in the pinned version, and main as a whole saves Seaport only 17 bytes.
+- We can break the spill bytes down per function if that helps.
+
+**The free-pointer clamp in `evm_malloc` lowering:** 123 copies of 17 bytes, 2,091 bytes in all.
+- `emit_heap_base` (`isa/evm/machine/lower.rs:761`, called at `:587`) emits `max(free_ptr, 0x5f80)` unless
+  `known_free_ptr_floor` already proves the floor.
+- Most sites come from Fe core's allocation helpers: `MemBuffer::alloc` (53 sites), `alloc<T>` (41) and
+  `with_capacity` (10).
+- Options to consider:
+  - Carry the floor proof further. After one clamped allocation on a path, the pointer should already be at or above
+    the floor.
+  - Share one clamped-allocation routine.
+
+**Backend code has no provenance in the trace:** 15,081 bytes have no source link.
+- The clamp bytes carry no link from bytecode position to backend instruction (1,968 bytes `missing_provenance`, 123
+  `synthetic`).
+- No trace fact describes spills either. Finding them took a probe that dumps Sonatina's memory plan.
+- Trace facts for spill slots and backend-inserted sequences would make this kind of accounting routine.
+
+**Two smaller items:**
+- On main `22d7aa15`, the EVM fixture `callee_heap_escape_free_ptr` panics at forced `-O s` with "alloca escapes"
+  (`static_arena_alloc.rs:323`). It is an O0 fixture, so it may never be meant for `-O s`.
+- A policy question: may range analysis assume heap pointers stay below 2^64, since gas makes such memory unreachable?
+  It does nothing for Seaport, and it saves 29 bytes and 6,085 gas on the vault fixture.
+
+## For Fe
+
+**ABI decoding is compiled once per type:** 7 instances, 5,553 bytes (8.5% of Seaport).
+- Every instance traces to one line, core `abi.fe:382` (`T::decode_from_bounded(input, tail_at, input_len)`),
+  specialized and inlined per type.
+- Three are over calldata: `Order` (1,177 bytes), `AdvancedOrder` (1,411) and `OrderComponents` (951). Four more are
+  over memory slices.
+- `dyn_array_payload_end_with_input_len` has 10 instances.
+- seaport-core reads fields from calldata where it needs them. A calldata-view style of decoding, or one decoder
+  shared across layouts, is the largest single lever we found.
+
+**Aggregate copies and allocation:** 1,311 copy ops and 403 allocation ops.
+- MIR lowering copies aggregates with `copy_into`, `mcopy` and zeroing.
+- The core pointer helpers allocate often enough to account for most of the clamps above.
+
+**`fe dev trace emit` compiles per file, not per object.**
+- The port's per-object compile reached `fe build` but not the trace path, so tracing Seaport would share inlining with
+  `Consideration`.
+- We traced a copy of the port with the other contracts blanked, and checked that its bytecode hash equals the real
+  build's.
+
+## For the port
+
+**`env` is passed by value in five arms:** 161 bytes, 5 times.
+- Five entry points build an `Env` value and pass it on by value (`seaport.fe:189`, 226, 250, 269 and 287).
+- Each one allocates, clamps and copies a constant `Env` image into memory, the same 161 bytes every time.
+- Building it once or passing a reference could save about 640 bytes.
+
+## Sonatina variants we measured
+
+Runtime bytes of Seaport. Blank cells were not measured.
+
+| Sonatina | `-O 1` | `-O s` | `-O 2` |
+|---|---:|---:|---:|
+| Pinned `3357f3a2` | 65,222 | 63,895 | 63,751 |
+| Pinned plus #344 | 65,222 | | |
+| Main `ee325c3b` | 65,205 | | |
+| Main plus four passes from an experimental Sonatina fork | 64,717 | 63,266 | 63,282 |
+
+- **Which fork passes help:**
+  - The proof that `a - b` cannot underflow after a guarding branch saves 436 bytes.
+  - Removing unused and forwarded return values saves 69.
+  - The `evm_umod` remainder bound saves nothing.
+  - Branch-only corridor folding makes Seaport 17 bytes larger, so it stays out.
+- **Gas improves on every measured call:** by 173 to 607 gas at `-O 1`. At `-O s`, `fulfillAdvancedOrder` goes from
+  46,551 to 45,583. The port's Foundry suite passes 482 of 482, and Sonatina's own tests pass on the branch.
+- **The two useful passes** are on a local branch over current main, one commit each with tests. We can open them as a
+  draft PR if you want them.
+
+## How this was measured
+
+- **Byte attribution is Fe's own:** `fe dev trace emit` plus `fe dev debug emit --attribution-details`. The traced
+  runtime's code hash equals the real `Seaport.runtime.bin`.
+- **The analysis runs in riff-catalog,** on a local branch. It does the joins along origin edges (HIR, MIR, Sonatina IR
+  before and after optimization, EVM backend, bytecode) and the repeated-code census. Independent scripts re-derive the
+  census and the joins, and agree exactly.
+- **Repeated code is counted without overlaps,** under three rules: exact, memory offsets ignored, and all constants
+  ignored. Savings are upper bounds before call costs, then a rough estimate after them.
+- **Limits:** nothing here shows that a merge is safe, or what code generation does after one. The estimated rows are apportioned, not measured.
+
+**Not done yet:** comparing Fe's MIR and pre-optimization IR with solc's Yul function by function. That would show where
+Fe asks for more work and where Sonatina emits more code for the same work. Also not done: re-tracing the unmodified
+port (we traced the blanked copy), and gas.
