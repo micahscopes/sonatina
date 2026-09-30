@@ -82,10 +82,17 @@ All are in `micahscopes/sonatina`. None of them is a PR, and none is meant to me
    - Aggregate copies come to about 3.4 KB.
    - The port passes `env` by value in five dispatcher arms, about 640 bytes.
 
-## Not included yet
+## Related work
 
-- **The riff-catalog analysis branch** (`census/fe-trace-bytes`, 13 commits) that produced the census and
-  facet numbers. It is still on another machine and will be pushed separately.
+- **The riff-catalog analysis branch** that produced the census and facet numbers is now
+  `census/fe-trace-bytes` in `micahscopes/riff-catalog` (13 commits on `main`, head `f2f1a5e`). It adds:
+  - the EVM repeated-run census on core facet addresses;
+  - `evm-dataflow/1` and the `erase constants.memory_offset` view directive;
+  - the stage view over Fe's origin graph;
+  - solc source-map attribution;
+  - the `evm-byte-causes` excess ledger.
+
+  `f2f1a5e` documents the commands. The replay scripts named in the facet-analysis note were not pushed.
 - **Fe's trace work used here is already on Fe master:** `fe dev trace emit` and
   `fe dev debug emit --attribution-details`. Tracing Seaport needed a workaround, because `fe dev trace
   emit` compiles each source file as one module. The other contracts in the file were blanked in a copy of
