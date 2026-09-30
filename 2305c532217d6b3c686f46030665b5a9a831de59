@@ -1,0 +1,276 @@
+# Seaport byte census (Fe port, `-O 1`), 2026-09-30
+
+## TL;DR
+
+- **Every one of the 65,222 runtime bytes is accounted for**, from the compiler's own trace, checked against the real artifact. The trace's code hash is the blake3 of the whole real `Seaport.runtime.bin`, and every PUSH value matches. 64,771 bytes are instructions. The last 451 bytes are constant data placed after the code.
+- **Repeated code is real but too small to close the gap.** Seaport is 40,646 bytes over the 24,576 limit. All exact repeats of at least 32 bytes cover 16,119 bytes, and the copies beyond the first come to 10,336 bytes. That is an upper bound, before any call cost. Allowing copies to differ in up to two constants raises it to 13,596. A rough estimate after call costs is 7,900 to 9,700 bytes (table in section 4). Exact whole-function copies are only a small part of this, as the earlier survey found.
+- **Most bytes are shared logic, not per-arm code.** 73% of the bytes (47,697) sit in functions that several recv arms reach. The largest is `fulfill_basic_order` at 4,320 bytes. Code that belongs to one arm alone is 7,434 bytes: the arms' inlined dispatcher regions plus the three arms that stayed functions. With the helpers only one arm calls, it is 10,312 bytes, and no single arm owns more than 1,838.
+- **The largest repeated shapes** are:
+  - library ABI decoding compiled once per type: `decode_from_bounded` 2 x 737 bytes, `dyn_array_payload_end_with_input_len` 5 x 193;
+  - the same 161-byte request prologue inlined into five dispatcher arms;
+  - a 17-byte "clamp the free-memory pointer" check that appears 123 times (2,091 bytes);
+  - the error-encoding prologue of `encode_calldata`, 27 copies that differ only in constants.
+- **Where the bytes go by origin:**
+
+| origin | bytes | share |
+|---|---:|---:|
+| port's own source | 27,035 | 41.5% |
+| Fe core and std libraries | 14,439 | 22.1% |
+| generated code Fe ties to a source (ABI plumbing, dispatch) | 8,216 | 12.6% |
+| no source link at all, mostly stack and constant pushes | 15,081 | 23.1% |
+| data | 451 | 0.7% |
+
+  ABI decoding and encoding make up 10,783 of the library bytes.
+- **New riffcat features** in `census/fe-trace-bytes` (5 commits, not pushed):
+  - an EVM repeated-run census in `riff-catalog-evm`;
+  - a byte ledger over Fe trace facts in `riff-catalog-ingest-trace`;
+  - `riffcat-bloat fe-trace-bytes`, with `evm_runs` census manifests that replay.
+- **No Fe or Sonatina change was needed.** The trace path compiles each source file as one module, so I traced a copy of the port with the other contracts blanked out. Its bytes are identical to the real build.
+
+## 1. How the numbers were produced
+
+**The trace.** `fe dev trace emit` (Fe `342048ea5` with the port's patch, the `fe-pinned` binary from the survey) compiles every source file that has contracts, one Sonatina module per file (`emit_observable_ingot_trace_facts`, `crates/codegen/src/trace.rs:66`, compiling the whole package at `:139`). `seaport.fe` also holds `Consideration`, so a traced Seaport would share inlining decisions with it. the port's per-object compile (`isolate_runtime_package_object`, `compiler/seaport-integration.patch:190`) fixes this for `fe build` but, as `COMPILER_FIXES.md:250` says, not for `fe trace`.
+
+- **Workaround: a blanked copy.** Every contract block except `Seaport`, `Conduit` and `PausableZone` is overwritten with spaces, so byte offsets and line numbers do not move (`blank_contracts.py`). Conduit and PausableZone stay because free functions name them.
+- **Result.** The trace took 29 minutes: 1,248,302 facts, 813 MB. `fe dev trace validate` passes.
+- **Check against the real artifact.** The traced Seaport runtime is a byte-for-byte prefix of the real 65,222-byte `Seaport.runtime.bin`, and the trace's `code_hash` equals the blake3 of the whole real file. So the trace describes exactly this artifact. The unmodified port was not traced to completion, so I have not measured how far its runtime would differ.
+- **The 451 trailing bytes** are data after the last instruction: 448 zero bytes and three `0x01`. No trace fact describes them, and no PUSH in the code points into them. They stay a row of their own and are never attributed.
+- **`shape_node_hash`** does not exist as a trace fact at this Fe commit, so there were no compiler structural hashes to reuse.
+
+**Attribution** is Fe's own. `fe dev debug emit --format ethdebug --attribution-details` gives, per instruction, a classification, a single primary source when there is one, and every origin reachable from it (`DebugFactIndex::debug_instruction`, `crates/debug-export/src/model.rs:458`). riffcat reads that file rather than walking the origin graph again (`ByteLedger::read`, `riff-catalog-ingest-trace/src/bytes.rs:402`). It checks the ledger against the artifact before counting anything (`verify_artifact`, `bytes.rs:564`).
+
+**Emitted function** means the function in the final code layout. A helper inlined into the dispatcher counts under the dispatcher. It comes from the trace edge from each bytecode position to the backend instruction that emitted it (`lineage_block`, `bytes.rs:435`).
+
+- **Linked and unlinked bytes.** The trace links 50,385 bytes (77%) this way. The rest carry no link, like the stack shuffles the backend inserts. They are counted in the function whose first-to-last span holds them.
+- **Function entries.** Each function's entry (its first JUMPDEST plus argument set-up) is unlinked. It is counted in the function when it starts with a JUMPDEST that only that function reaches (`emitted_function_manifest`, `riff-catalog-bloat/src/fe_trace.rs:264`). That covers 2,558 bytes.
+- **Independent check.** The other agent's size dump comes from the compiler's own function-to-bytes map, on a build 17 bytes off (`/workspace/scratch/seaport/out/sizes-main/Seaport.runtime.tsv`). Against it, 192 of 196 functions come out byte-identical. 166 bytes stay "between functions": the shared tails at the end (122 bytes) and one 44-byte entry whose inner JUMPDEST is reached from elsewhere.
+
+## 2. What Fe's attribution covers
+
+| classification (Fe's wording) | bytes | instructions |
+|---|---:|---:|
+| one exact source (`source_mapped`) | 41,474 | 27,254 |
+| generated code with a source it was made for (`synthetic`, `SyntheticFor`) | 8,216 | 5,219 |
+| no source: `missing_provenance` | 12,592 | 8,265 |
+| no source: `synthetic` gap | 1,417 | 1,374 |
+| no source: `NoSourceAttributionEvidence` | 695 | 457 |
+| no source: `no_machine_inst` | 335 | 227 |
+| no source: `label_or_fixup_only` | 42 | 14 |
+| data after the code | 451 | 0 |
+
+No instruction is "ambiguous" (several candidate sources).
+
+- **The unmapped bytes are mostly data movement.** By opcode, `missing_provenance` bytes are 55% PUSH, 10% POP, 9% DUP and 8% ADD. The 1,417 `synthetic` gap bytes are 92% JUMPDEST.
+- **The generated-code bytes point at their sources.** Of the 8,216 generated bytes, 5,292 point at port source (recv arms, mostly) and 2,924 at library code (`core::abi::decode_from_bounded` 518, `checked_frame_end` 424).
+
+## 3. Where the bytes go
+
+Every table here adds up to 65,222 (`check_totals`, `fe_trace.rs:1087`, refuses to report otherwise).
+
+**By emitted function, top 12.**
+
+| bytes | share | function |
+|---:|---:|---|
+| 6,550 | 10.0% | `contract_runtime_root_Seaport` |
+| 4,320 | 6.6% | `fulfill_basic_order` |
+| 2,564 | 3.9% | `verify_signature` |
+| 2,007 | 3.1% | `validate_orders_and_prepare_to_fulfill` |
+| 1,966 | 3.0% | `match_advanced_orders` |
+| 1,485 | 2.3% | `__Seaport_recv_0_9` |
+| 1,411 | 2.2% | `decode_from_bounded__gcd8f` |
+| 1,286 | 2.0% | `__Seaport_recv_0_3` |
+| 1,231 | 1.9% | `validate_and_fulfill_advanced_order` |
+| 1,229 | 1.9% | `validate_generate_order_returndata` |
+| 1,214 | 1.9% | `advanced_orders` |
+| 1,177 | 1.8% | `decode_from_bounded__gb098` |
+| 38,782 | 59.5% | 186 more rows (other functions, 166 bytes between functions, 451 data bytes) |
+
+By primary source file, the port's own `src/*.fe` is 27,035 bytes. The Fe libraries are 14,439:
+
+- ABI decoding and encoding: 10,783 (`core/abi.fe` 7,263, `std/abi/sol.fe` 1,648, `std/evm/calldata.fe` 1,392, `std/abi/dyn_array.fe` 480);
+- `std/evm/effects.fe` (calls, logs, returns): 1,949;
+- `core/ptr.fe` (memory): 1,244;
+- other: 463.
+
+Functions whose names start with `decode`, `abi_` or `dyn_array` hold 10,660 bytes by position. These are mostly type-specialized copies (the `__gXXXX` suffixes).
+
+**Recv arms.**
+
+- **An arm that stayed a function** (`__Seaport_recv_0_3`, `_8`, `_9`) owns that function.
+- **An inlined arm** owns the dispatcher blocks that only it can reach. First, each block is labeled with the arms found among its instructions' Fe origins. The arm's region is then everything below the nearest block through which every path to its own blocks passes, in the dispatcher's control flow (`recv_arms`, `fe_trace.rs:771`). All 19 arms got a region, and none of them would have taken a block of another arm.
+- **Helpers.** The second column adds the functions only that arm reaches. Calls are inferred from pushes of a function's first byte, walked with the existing `reachable_union` (`arm_reach`, `fe_trace.rs:900`). The call graph is marked incomplete, because computed jumps are not seen.
+
+**By recv arm.**
+
+| arm | bytes in the arm itself | plus functions only this arm reaches |
+|---|---:|---:|
+| arm 8 `Cancel` | 1,143 | 1,838 |
+| arm 2 `FulfillOrder` | 452 | 1,629 |
+| arm 9 `Validate` | 1,616 | 1,616 |
+| arm 3 `FulfillAdvancedOrder` | 1,318 | 1,318 |
+| arm 11 `GetOrderHash` | 267 | 1,218 |
+| arm 4 `FulfillAvailableOrders` | 449 | 449 |
+| arm 5 `FulfillAvailableAdvancedOrders` | 438 | 438 |
+| arm 6 `MatchOrders` | 380 | 380 |
+| arm 7 `MatchAdvancedOrders` | 363 | 363 |
+| arm 14 `Information` | 219 | 219 |
+| arm 10 `IncrementCounter` | 157 | 212 |
+| arm 17 `ActivateTstore` | 182 | 182 |
+| arm 18 `_ uses (env, ctx: Ctx, ops: RawOps)` | 152 | 152 |
+| arm 12 `GetOrderStatus` | 97 | 97 |
+| arm 16 `Name` | 61 | 61 |
+| arm 15 `GetContractOffererNonce` | 52 | 52 |
+| arm 13 `GetCounter` | 51 | 51 |
+| arm 0 `FulfillBasicOrder` | 19 | 19 |
+| arm 1 `FulfillBasicOrderEfficient` | 18 | 18 |
+| (functions reached from several recv arms) | | 47,697 |
+| (functions reached only from shared dispatch code) | | 3,232 |
+| (no single recv arm: dispatch, shared code or not assigned) | | 3,062 |
+| (functions not reached through inferred calls) | | 468 |
+| (data after the code: no instruction in the trace) | | 451 |
+| (sum of arm rows, first column) | 7,434 | 10,312 |
+
+**Largest functions reached from several arms.**
+
+| bytes | arms reaching it | function |
+|---:|---:|---|
+| 4,320 | 2 | `fulfill_basic_order` |
+| 2,564 | 9 | `verify_signature` |
+| 2,007 | 4 | `validate_orders_and_prepare_to_fulfill` |
+| 1,966 | 2 | `match_advanced_orders` |
+| 1,231 | 2 | `validate_and_fulfill_advanced_order` |
+| 1,229 | 6 | `validate_generate_order_returndata` |
+| 1,214 | 2 | `advanced_orders` |
+| 1,171 | 2 | `finish_single_order` |
+
+`FulfillBasicOrder` and `FulfillBasicOrderEfficient` both call `fulfill_basic_order`. That is why the two arms own 19 and 18 bytes, and the 4,320-byte function counts as shared by 2 arms. The largest function no arm owns alone is `verify_signature` (2,564 bytes, 9 arms).
+
+## 4. Repeated regions
+
+**What counts as a repeat.** A repeated region is a run of consecutive instructions, inside one function, that appears more than once. Two copies match when:
+
+- their opcodes and PUSH values are equal;
+- each jump inside the run lands at the same distance from the run's start, so a copy placed elsewhere still matches;
+- jumps leaving the run are treated as parameters ("outside labels"). The table says how many there are and how many differ between copies.
+
+The EVM passes values on its stack through explicit DUP, SWAP and POP instructions. So equal runs also wire their values the same way, given the same stack at entry (policy `evm-run/relative-internal-labels/external-label-ports/1`, `RUN_POLICY`, `riff-catalog-evm/src/runs.rs:55`; key built in `occurrence_key`, `runs.rs:393`).
+
+- **How candidates are found and chosen.** Candidates come from a suffix array over the instruction stream (`census_runs`, `runs.rs:441`). Selection is greedy by total bytes. Each chosen class claims its bytes, and every other class is re-scored on what is left, so no byte is counted twice and the "covered" column adds up.
+- **Where this is recorded.** The census writes these as `evm_run` regions in the existing region census (`add_evm_runs`, `riff-catalog-bloat/src/census.rs:306`). So `riffcat-bloat census` and `census-replay` reproduce them from the saved manifest.
+- **Column meanings.**
+  - "Extra" is the bytes beyond the first copy.
+  - "Same source" counts the instructions whose Fe primary source is identical in every copy. A high count means the same Fe code was emitted more than once. A low count means different Fe code compiled to identical bytes.
+
+**Top 15, exact key, at least 32 bytes per copy.**
+
+| # | copies | bytes per copy | covered | extra (upper bound) | outside labels (differ) | same source | emitted in | main source body | arms |
+|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| 1 | 2 | 737 | 1,474 | 737 | 7 (1) | 365/501 | `decode_from_bounded__gb098`, `decode_from_bounded__gcd8f` | 2 x std::evm::calldata::len (impl ByteInput for CallData) (calldata.fe:37) | in a function 1 arm reaches; not tied to an arm |
+| 2 | 5 | 193 | 965 | 772 | 3 (2) | 91/150 | `dyn_array_payload_end_with_input_len__g8f47`, `dyn_array_payload_end_with_input_len__g93c8`, `dyn_array_payload_end_with_input_len__gee36` ... | 5 x core::abi::dyn_array_payload_end_with_input_len (abi.fe:2373) | 4 x not tied to an arm; in a function 1 arm reaches |
+| 3 | 5 | 161 | 805 | 644 | 0 (0) | 0/120 | `contract_runtime_root_Seaport` x5 | seaport::seaport::fulfill_available_advanced (seaport.fe:249); seaport::seaport::match_orders (seaport.fe:268); seaport::seaport::fulfill_order (seaport.fe:188) ... | arm 5 `FulfillAvailableAdvancedOrders`; arm 6 `MatchOrders`; arm 2 `FulfillOrder`; arm 4 `FulfillAvailableOrders` ... |
+| 4 | 14 | 37 | 518 | 481 | 0 (0) | 7/25 | `verify_order_status` x2, `revert_error__geb2e`, `revert_error__g0252` ... | 14 x core::ptr::MemBuffer::alloc (ptr.fe:236) | 3 x in a function 8 arms reach; 3 x in a function 9 arms reach; 2 x not tied to an arm; 2 x in a function 6 arms reach ... |
+| 5 | 8 | 56 | 448 | 392 | 1 (0) | 0/28 | `fulfill_basic_order` x8 | 6 x seaport::basic::validate_and_fulfill_basic_order (basic.fe:120); 2 x seaport::basic::transfer_erc20_and_finalize (basic.fe:598) | 8 x in a function 2 arms reach |
+| 6 | 2 | 204 | 408 | 204 | 4 (0) | 85/155 | `abi_field_end_with_input_len__g8dfd`, `abi_field_end_with_input_len__ga7dc` | 2 x core::abi::abi_record_field_end (abi.fe:486) | 2 x in a function 1 arm reaches |
+| 7 | 12 | 32 | 384 | 352 | 0 (0) | 5/21 | `verify_signature` x2, `contract_runtime_root_Seaport`, `revert_error__gdab3` ... | 12 x core::ptr::MemBuffer::alloc (ptr.fe:236) | 5 x not tied to an arm; 2 x in a function 6 arms reach; 2 x in a function 9 arms reach; dispatcher, shared part ... |
+| 8 | 2 | 177 | 354 | 177 | 7 (1) | 0/115 | `aggregate_consideration_items`, `aggregate_offer_items` | seaport::applier::aggregate_consideration_items (applier.fe:111); seaport::applier::aggregate_offer_items (applier.fe:57) | 2 x in a function 4 arms reach |
+| 9 | 11 | 32 | 352 | 320 | 1 (0) | 17/23 | `contract_runtime_root_Seaport` x11 | 11 x core::abi::checked_frame_end (abi.fe:257) | 9 x dispatcher, shared part; arm 9 `Validate`; arm 8 `Cancel` |
+| 10 | 4 | 79 | 316 | 237 | 2 (1) | 26/63 | `dyn_array_payload_end_scan_with_input_len__ga7dc`, `dyn_array_payload_end_scan_with_input_len__gee36`, `dyn_array_payload_end_scan_with_input_len__gf56c` ... | 4 x core::abi::dyn_array_payload_end_scan_with_input_len (abi.fe:2355) | 3 x not tied to an arm; in a function 1 arm reaches |
+| 11 | 9 | 33 | 297 | 264 | 0 (0) | 5/22 | `apply_criteria_resolvers` x2, `verify_signature` x2, `update_criteria_item` ... | 9 x core::ptr::MemBuffer::alloc (ptr.fe:236) | 5 x in a function 6 arms reach; 2 x in a function 9 arms reach; in a function 7 arms reach; in a function 2 arms reach |
+| 12 | 9 | 32 | 288 | 256 | 0 (0) | 0/26 | `(unlinked)` x7, `execution_array`, `run_execution` | 7 x no single source; seaport::combiner::execution_array (combiner.fe:700); seaport::combiner::run_execution (combiner.fe:521) | 7 x not tied to an arm; 2 x in a function 4 arms reach |
+| 13 | 2 | 142 | 284 | 142 | 2 (0) | 7/113 | `advanced_orders`, `orders_as_advanced` | seaport::model::advanced_orders (model.fe:248); seaport::model::orders_as_advanced (model.fe:297) | 2 x in a function 2 arms reach |
+| 14 | 8 | 35 | 280 | 245 | 3 (1) | 25/25 | `contract_runtime_root_Seaport` x8 | 8 x core::abi::decode_from_prechecked_head (impl Decode for DynArray) (abi.fe:2457) | 8 x dispatcher, shared part |
+| 15 | 8 | 35 | 280 | 245 | 1 (0) | 2/23 | `alloc__gaf1c`, `alloc__ge513`, `alloc__g028b` ... | 6 x seaport::arr::Arr::alloc (arr.fe:19); seaport::executor::transfer_buffer (executor.fe:59); seaport::model::single_order (model.fe:362) | 3 x in a function 6 arms reach; 2 x in a function 9 arms reach; 2 x in a function 4 arms reach; in a function 2 arms reach |
+
+What the top rows are, in plain words:
+
+- **Rows 1, 2, 6 and 10: one library function compiled once per type.** These are library ABI helpers (`decode_from_bounded`, `dyn_array_payload_end_with_input_len`, `abi_record_field_end`, `dyn_array_payload_end_scan_with_input_len`). Specialization made one copy per type, and the copies came out byte-identical apart from outside jump targets. The survey's whole-function check had already found some of these (`dyn_array_payload_end_with_input_len`, `abi_field_end_with_input_len`).
+- **Row 3: a common request prologue.** The same 161 bytes open five dispatcher arms (FulfillOrder, FulfillAvailableOrders, FulfillAvailableAdvancedOrders, MatchOrders, MatchAdvancedOrders). The five come from five different Fe functions (0/120 same source), so it is shared code shape rather than one Fe function emitted five times.
+- **Rows 4, 7, 11 and 15: inline allocation.** These contain `PUSH1 0x40 MLOAD PUSH2 0x5f7f DUP2 GT ... PUSH2 0x5f80 JUMPDEST`, which reads the free-memory pointer and raises it to at least `0x5f80`. Counted directly as a byte pattern over the code, that 17-byte check appears 123 times (2,091 bytes). The IR has 332 `evm_malloc` instructions (`seaport.sona`). That the backend emits the check wherever it cannot prove the pointer is already above its floor (sonatina `isa/evm/machine/free_ptr_floor.rs:78`, `compute_program_free_ptr_floor_before_malloc`) is my inference from the code, not verified.
+- **Rows 9 and 14: dispatcher decoding.** These are ABI decoding steps inlined into the dispatcher: 11 copies of a `checked_frame_end` bounds check, and 8 of a `decode_from_prechecked_head` step.
+
+**Top 10 when copies may differ in up to two constants, at least 32 bytes per copy.**
+
+| # | copies | bytes per copy | covered | extra (upper bound) | outside labels (differ) | constants (differ) | same source | emitted in | main source body | arms |
+|---:|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| 1 | 2 | 737 | 1,474 | 737 | 7 (1) | 19 (0) | 365/501 | `decode_from_bounded__gb098`, `decode_from_bounded__gcd8f` | 2 x std::evm::calldata::len (impl ByteInput for CallData) (calldata.fe:37) | in a function 1 arm reaches; not tied to an arm |
+| 2 | 27 | 54 | 1,458 | 1,404 | 0 (0) | 7 (2) | 21/36 | `verify_signature` x4, `contract_runtime_root_Seaport` x2, `apply_criteria_resolvers` x2 ... | 27 x std::evm::effects::encode_calldata (effects.fe:1164) | 7 x in a function 6 arms reach; 5 x not tied to an arm; 4 x in a function 9 arms reach; 3 x in a function 2 arms reach ... |
+| 3 | 5 | 193 | 965 | 772 | 3 (2) | 4 (0) | 91/150 | `dyn_array_payload_end_with_input_len__g8f47`, `dyn_array_payload_end_with_input_len__g93c8`, `dyn_array_payload_end_with_input_len__gee36` ... | 5 x core::abi::dyn_array_payload_end_with_input_len (abi.fe:2373) | 4 x not tied to an arm; in a function 1 arm reaches |
+| 4 | 23 | 38 | 874 | 836 | 1 (0) | 1 (1) | 0/4 | `(unlinked)` x22, `verify_signature` | 23 x no single source | 22 x not tied to an arm; in a function 9 arms reach |
+| 5 | 14 | 61 | 854 | 793 | 0 (0) | 8 (2) | 23/41 | `verify_order_status` x2, `revert_error__geb2e`, `revert_error__g0252` ... | 14 x std::evm::effects::encode_calldata (effects.fe:1164) | 3 x in a function 8 arms reach; 3 x in a function 9 arms reach; 2 x not tied to an arm; 2 x in a function 6 arms reach ... |
+| 6 | 5 | 164 | 820 | 656 | 0 (0) | 10 (1) | 0/121 | `contract_runtime_root_Seaport` x5 | seaport::seaport::fulfill_available_advanced (seaport.fe:249); seaport::seaport::match_orders (seaport.fe:268); seaport::seaport::fulfill_order (seaport.fe:188) ... | arm 5 `FulfillAvailableAdvancedOrders`; arm 6 `MatchOrders`; arm 2 `FulfillOrder`; arm 4 `FulfillAvailableOrders` ... |
+| 7 | 2 | 204 | 408 | 204 | 4 (0) | 2 (0) | 85/155 | `abi_field_end_with_input_len__g8dfd`, `abi_field_end_with_input_len__ga7dc` | 2 x core::abi::abi_record_field_end (abi.fe:486) | 2 x in a function 1 arm reaches |
+| 8 | 6 | 67 | 402 | 335 | 1 (0) | 15 (1) | 0/33 | `fulfill_basic_order` x6 | 4 x seaport::basic::validate_and_fulfill_basic_order (basic.fe:120); 2 x seaport::basic::transfer_erc20_and_finalize (basic.fe:598) | 6 x in a function 2 arms reach |
+| 9 | 11 | 32 | 352 | 320 | 1 (0) | 2 (0) | 17/23 | `contract_runtime_root_Seaport` x11 | 11 x core::abi::checked_frame_end (abi.fe:257) | 9 x dispatcher, shared part; arm 9 `Validate`; arm 8 `Cancel` |
+| 10 | 9 | 37 | 333 | 296 | 0 (0) | 2 (2) | 0/3 | `fulfill_basic_order` x4, `hash_items` x2, `domain_separator` x2 ... | 4 x seaport::basic::prepare_basic_fulfillment_from_calldata (basic.fe:237); 2 x seaport::hashing::hash_items (hashing.fe:73); 2 x seaport::hashing::derive_domain_separator (hashing.fe:35) ... | 4 x in a function 2 arms reach; 3 x in a function 9 arms reach; 2 x in a function 10 arms reach |
+
+This variant treats PUSH values like outside labels, but only keeps classes whose copies differ in at most two of them (policy `.../constant-ports/1`, cap `max_varying_constants`).
+
+- **Row 2: error encoding.** It adds what looks like the error-encoding prologue of `encode_calldata`, 27 copies of 54 bytes that differ in two constants, one of them the 4-byte value pushed just before `PUSH1 0xe0 SHL` (an error selector, by its shape).
+- **Row 4: error words.** 23 copies of "push a 32-byte word, jump to a shared tail", which differ only in the word.
+
+**Sensitivity and a rough net estimate.** The last column is an estimate, not a measurement. It charges each copy 8 bytes for a call (PUSH2 return address, PUSH2 target, JUMP, JUMPDEST), plus 3 bytes per differing parameter, drops classes that would go negative, and ignores stack shuffling around the call.
+
+**By minimum run size.**
+
+| minimum bytes per copy | key | classes | covered | extra (upper bound) | rough net after call cost |
+|---:|---|---:|---:|---:|---:|
+| 16 | exact | 231 | 24,383 | 16,853 | 8,652 |
+| 16 | constants may differ (at most 2) | 242 | 29,103 | 21,609 | 8,556 |
+| 32 | exact | 89 | 16,119 | 10,336 | 7,860 |
+| 32 | constants may differ (at most 2) | 103 | 20,102 | 13,596 | 9,662 |
+| 64 | exact | 31 | 8,785 | 5,100 | 4,384 |
+| 64 | constants may differ (at most 2) | 36 | 10,750 | 6,713 | 5,544 |
+| 128 | exact | 6 | 4,290 | 2,676 | 2,490 |
+| 128 | constants may differ (at most 2) | 7 | 4,475 | 2,773 | 2,526 |
+
+At 16 bytes many classes are short idioms, such as the allocation check on its own. At 64 and 128 bytes the classes are longer stretches, like the ABI helpers in rows 1 and 2 of the exact-key table.
+
+## 5. What this census does not show
+
+- **That sharing any region is safe.** A match says the bytes line up under the key above. It does not prove the copies behave the same with the stack and memory they are entered with, and it is not an equivalence proof. The key also treats a PUSH whose value happens to equal a JUMPDEST position as a jump label; that can only split a class or show up as a parameter.
+- **What code generation does after sharing.** Sharing a region changes stack scheduling and inlining around it. The estimate column assumes a fixed call cost and no other change.
+- **Gas.** Nothing here measures gas, and sharing code usually costs gas.
+- **Why Seaport is 2.7 times the size of solc's build.** The same contract built by solc (via-IR) is 23,963 bytes. The extra copies found here are 25% of the 40,646-byte overshoot at the 32-byte exact setting, and 53% at the loosest setting counted (16 bytes, constants may differ), both before call costs. It does not compare code density per operation with solc; that is the next census to run.
+- **Which Fe stage made a byte.** Bytes the trace does not link to a function (14,386, 22.1%) are counted by position, not attributed. The per-arm split relies on Fe's origins reaching the arm bodies, and on calls inferred from label pushes.
+- **Selection is greedy, not optimal.** A different selection could cover somewhat more bytes; the totals are what this selection found.
+
+## 6. Checks that the matches are real
+
+`verify_runs.py` is an independent Python implementation. It has its own decoder, label rule and normalization, and shares no code with riffcat. For every class of all 8 census runs (both keys, 16 to 128 bytes), it re-normalized every occurrence from the raw bytes. It also checked that occurrences stay inside one function, that no two selected occurrences overlap, and that riffcat's classification totals equal a direct sum over Fe's attribution file.
+
+- **Result: 0 problems.** For example, at 32 bytes: 89 classes and 275 occurrences for the exact key, and 103 classes and 345 occurrences with constants allowed to differ. The logs are `verify-min*.txt` and `verify-cp-min*.txt`.
+- **Negative control.** Running the exact-key check on the census that allows constants to differ reports 51 mismatches, as it should (`verify-negative-control.txt`).
+
+## 7. Reproduce
+
+```sh
+cd /workspace/scratch/seaport-census
+TMPDIR=/workspace/tmp ./fe-pinned dev trace emit SeaportFe-seaport-only -O 1 --out trace-O1.jsonl
+./fe-pinned dev trace validate --from trace-O1.jsonl
+./fe-pinned dev debug emit --format ethdebug --from trace-O1.jsonl --out ethdebug-O1.json \
+  --attribution-details attribution-O1.json
+RIFFCAT=/workspace/build/riffcat-census/release/riffcat-bloat
+$RIFFCAT fe-trace-bytes --trace trace-O1.jsonl --attribution attribution-O1.json --contract Seaport \
+  --artifact /workspace/scratch/seaport-riffcat/build-O1/Seaport.runtime.bin \
+  --min-run-bytes 32 --census-dir census-O1-min32 --json-out report-O1-min32.json
+# add --constants-as-ports --max-varying-constants 2 for the second key
+$RIFFCAT census census-O1-min32/runtime.bin --regions census-O1-min32/regions.json   # replays the run census
+python3 verify_runs.py census-O1-min32/runtime.bin census-O1-min32/regions.json report-O1-min32.json attribution-O1.json Seaport 100000
+```
+
+Everything lives in `/workspace/scratch/seaport-census/`:
+
+- traces: `trace-O1.jsonl`, `attribution-O1.json`;
+- reports: `report-O1-*.json`, `fe-trace-bytes-O1-*.txt`;
+- manifests: `census-O1-*/regions.json`;
+- tables for this note: `tables.py`, `analyze.py`.
+
+## 8. Commits
+
+Branch `census/fe-trace-bytes` in `/workspace/riff-catalog-worktrees/census-fe-trace-bytes`, based on `main` `cb0a909`. Not pushed. After the third commit the full workspace passed `cargo test --release --workspace` (269 tests, 0 failed, demo app excluded); the last two were tested on the crates they change.
+
+- `0464c25` Add a repeated-run census for EVM bytecode (`riff-catalog-evm/src/runs.rs`).
+- `c40fc39` Read Fe trace instruction facts into a byte ledger (`riff-catalog-ingest-trace/src/bytes.rs`; the origin reader also accepts trace schema 2, which only added a fact kind it skips).
+- `341b67f` Census Fe EVM contracts from the compiler trace (`evm_runs` manifests, `riffcat-bloat fe-trace-bytes`, docs in `riff-catalog-bloat/docs/artifact-census.md`).
+- `b5d80bb` Cap differing constants and skip one-instruction runs.
+- `1fab95e` Count an arm's own function by position, like the other tables.
