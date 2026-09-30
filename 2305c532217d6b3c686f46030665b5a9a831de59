@@ -1,0 +1,349 @@
+# Seaport facet analysis (Fe port, `-O 1`), 2026-09-30
+
+Follow-up to `SEAPORT_BYTE_CENSUS_2026-09-30.md`. Same trace and artifact: the Fe Seaport runtime is 65,222 bytes, and the limit is 24,576. Every number below comes from a riffcat command that can be replayed from the saved files in `/workspace/scratch/seaport-facets/`. Python was used only to check riffcat independently.
+
+## TL;DR
+
+**Where the bloat is: an excess ledger.** Every byte of Fe's runtime and of solc's goes into exactly one bucket. Named causes are tried first, in a fixed order. Bytes no cause claims fall into a bucket by opcode role. The per-bucket differences add up exactly to the size gap, and the tool refuses to print otherwise.
+
+The baseline is solc's plain (non-via-IR) build of seaport-core's `Consideration`, 25,134 bytes. The gap is 40,088 bytes. Note that this solc build is itself over the limit.
+
+| # | cause (measured, same classifier on both sides) | Fe | solc | excess | share |
+|---:|---|---:|---:|---:|---:|
+| 1 | ABI decoding and encoding | 13,107 | 4,896 | 8,211 | 20.5% |
+| 2 | spill stores and reloads that Sonatina's stack scheduler inserts (Fe only) | 6,750 | 0 | 6,750 | 16.8% |
+| 3 | repeated code beyond its first copy (exact runs of 16+ bytes) | 7,767 | 3,765 | 4,002 | 10.0% |
+| 4 | the free-pointer clamp Sonatina emits at each heap allocation (Fe only) | 2,091 | 0 | 2,091 | 5.2% |
+| 5 | identical functions left unmerged (same Sonatina IR, exact facet) | 1,330 | 0 | 1,330 | 3.3% |
+| 6 | checked arithmetic (overflow checks) | 1,431 | 296 | 1,135 | 2.8% |
+| | **named causes** | | | **23,519** | **58.7%** |
+| 7 | leftover: memory address constants | 6,822 | 1,265 | 5,557 | 13.9% |
+| 8 | leftover: control flow (JUMP, JUMPI, JUMPDEST, label pushes) | 7,588 | 3,933 | 3,655 | 9.1% |
+| 9 | leftover: stack shuffles (DUP, SWAP, POP) | 6,708 | 3,752 | 2,956 | 7.4% |
+| 10 | leftover: memory opcodes | 3,229 | 852 | 2,377 | 5.9% |
+| 11 | leftover: arithmetic, other constants, data, effects | 8,399 | 6,375 | 2,024 | 5.0% |
+| | **leftover, by role only** | | | **16,569** | **41.3%** |
+
+- **Measured with the same rules on both sides, named causes explain 59% of the gap, not 80%.** The other 41% is classified only by what the instructions do.
+- **The leftover can be traced to Fe-side mechanisms, as an estimate.** The stage view says which Fe or Sonatina construct each Fe byte was emitted for. Splitting each leftover bucket's excess in proportion to those mechanisms gives:
+  - internal call and return transport: about 4,200;
+  - backend code with no IR origin: about 3,500;
+  - aggregate copies (MIR `copy_into`): about 3,400;
+  - Sonatina stack objects: about 1,200;
+  - explicit loads and stores in the IR: about 500;
+  - allocation: about 400.
+
+  About 3,000 bytes (7.6%) carry no mechanism label and stay unexplained. This split is apportioned, not measured (section 1).
+- **Paired function by function, the port's own code is not the problem.** For the 84 name-paired functions, Fe's bytes by source function total 16,694, against 16,023 for solc reference and 12,519 for solc optimized. Nearly all of the gap is outside the pairs: 48,528 Fe bytes against 9,111 reference bytes. Those bytes are library ABI code, dispatch, code with no source, and generated code (section 5).
+
+One measured number per lever:
+
+| lever | measured | what it means |
+|---|---:|---|
+| stack scheduling (DUP/SWAP/POP) | 13,123 bytes, 20.3% of code | a normal share: solc reference 22.4%, optimized 19.9%. It grows with code volume and is not a separate problem. |
+| hidden repeats (same computation, different scheduling) | 603 extra bytes (whole blocks of 8+ bytes) | scheduling hides very little repetition |
+| exact repeats, 32+ bytes | 10,336 beyond first copies (rough net 7,860) | unchanged from the census, now as core facet addresses |
+| repeats with memory offsets forgotten | 14,760 (net 8,324) | the same code for different struct layouts adds 4,424 |
+| repeats with all constants forgotten | 20,059 (net 10,363) | upper bound; replaces the old "at most 2 constants" cap |
+| type specialization (Sonatina IR, types blind) | 0 beyond exact; 1,347 bytes of identical unmerged functions | `decode_from_bounded`'s 7 instances (5,553 bytes) differ in structure, not only in types |
+| spills | 6,750 bytes (1,736 memory ops plus their address pushes) | 10.4% of the code; solc emits none |
+| per-function gap against solc | port's own functions 1.04x reference | the excess sits in library, generated and no-source code |
+
+**What this implies for 24,576.** Fe must lose 40,646 bytes.
+- The mechanisms solc does not have at all come to 10,171 bytes: spills, the clamp and unmerged duplicates.
+- ABI code is 8,211 bytes more than solc's.
+- Even if Fe's excess in all six named causes disappeared outright, the result would be about 41,700 bytes, still over the limit.
+- The rest of the gap is in how calls and aggregates move through memory (transport, copies, stack objects) and in backend glue. That is code-generation shape, not duplication. Deduplication alone cannot reach the limit.
+
+## 1. The excess ledger
+
+**Commands.**
+- `riffcat-bloat evm-byte-causes` builds a ledger.
+- `evm-byte-causes-compare` subtracts two ledgers (`riff-catalog-bloat/src/byte_causes.rs`).
+- Replay with `/workspace/scratch/seaport-facets/excess/run.sh`. Output is in `excess/fe-vs-reference.txt` and `excess/fe-vs-optimized.txt`.
+
+**How a byte is classified.**
+- **Named causes, in this order.** The first one that holds an instruction wins.
+  1. Spill traffic. These are pc tags from Sonatina's own memory plan (section 2.1).
+  2. The clamp. A byte pattern.
+  3. Unmerged duplicate functions. From the Sonatina facet census (`sonatina-functions`, exact facet; see the lever table).
+  4. ABI code.
+     - Fe side: source bodies whose name contains `$abi$`, `$calldata$`, `dyn_array`, `decode`, `encode` or `Abi`. For generated code, its `SyntheticFor` source counts.
+     - solc side: functions named `*Decoder.*`, `*Encoder.*`, `._decode*`, `._encode*`, and generated Yul `abi_*`.
+  5. Checked arithmetic.
+     - Fe: code that lowers from Sonatina `uaddo`, `usubo` or `umulo`.
+     - solc: generated Yul `checked_*` and `panic_error_*`.
+  6. Repeats. Every occurrence beyond the first of each exact run class of 16+ bytes.
+- **Everything else goes by opcode role.** A PUSH counts as a memory address constant when every use of its value in its block is an MLOAD, MSTORE, MSTORE8, CALLDATALOAD or CALLDATACOPY address, directly or through ADDs.
+
+**Against solc via-IR optimized** (23,963 bytes, gap 41,259), the same view gives:
+
+| cause | excess |
+|---|---:|
+| ABI | 11,516 |
+| spills | 6,750 |
+| memory address constants | 5,524 |
+| repeats | 4,493 |
+| stack shuffles | 2,717 |
+| control flow | 2,231 |
+| memory opcodes | 2,221 |
+| clamp | 2,091 |
+| checked arithmetic | 1,431 |
+| duplicates | 1,330 |
+| rest | 955 |
+
+solc's optimized ABI code is small (1,591 bytes) because seaport-core decodes calldata with hand-written assembly.
+
+**The estimate.** `evm-byte-causes-compare` prints a second table when the Fe ledger carries detail labels.
+- **Where the labels come from.** Each Fe instruction is labeled with the mechanism it was emitted for, from the stage view (section 2). Each leftover bucket's excess is then split in proportion to the Fe bytes per label in that bucket.
+- **The Fe-side cross-tabulation.** It is measured and printed in `excess/fe.txt`:
+  - Fe's 6,822 memory address constant bytes: aggregate copies 2,486, call transport 1,485, backend code with no IR origin 1,263, stack objects 690.
+  - Fe's 7,588 control-flow bytes: 3,062 are call transport.
+- **Why only an estimate.** solc's equivalent work has no such labels, so the split of the difference is apportioned, not measured.
+
+**What the ledger does not show.**
+- **Priority order changes attribution.** For example, ABI comes before repeats, so a repeated ABI helper counts as ABI.
+- **Role buckets are not causes.** A byte's role says what it does, not why the compiler emitted it.
+- **Different targets.** solc targets cancun and uses PUSH0; Fe targets osaka.
+- **What a bucket's excess promises.** It is not what a fix would save. Removing a spill changes scheduling around it.
+
+**Check.**
+- `verify_causes.py` rebuilds all three ledgers (Fe, reference, optimized). It uses its own decoder, label rule and role rules, and its own dataflow lifter for memory-address constants. It builds the cause sets from the same inputs. All buckets agree exactly (`excess/verify.txt`).
+- It found one riffcat and verifier difference, where the verifier was wrong: it had skipped PUSH0 as a memory-address constant.
+
+## 2. Traced into Fe
+
+A new stage view (`riff-catalog-ingest-trace/src/stages.rs`) indexes the trace's origin graph by stage: HIR, MIR, Sonatina pre-opt, post-opt, prepared, vcode, bytecode. It reuses the origin-edge and fact readers.
+
+`riffcat-bloat fe-trace-stages` (`riff-catalog-bloat/src/fe_stages.rs`) follows named sets of emitted bytes back to HIR. Replay with `stages/run.sh`; output is in `stages/fe-stages.txt` and `.json`.
+
+- **Chains are content-addressed.** The chain from each HIR construct to its bytes is a riff graph (`chain_graph`), digested at the Structure facet of level `fe-stage-chain/1`. Constructs that expanded the same way through every stage group together.
+- **Check.** `verify_stages.py` rejoins the trace independently. For the memory-operation set, per-stage node counts, provenance ends and origin buckets all agree exactly.
+
+**Whole contract.** The code traces back to:
+
+| stage | count |
+|---|---:|
+| HIR expressions | 2,201 |
+| MIR statements | 3,696 |
+| pre-opt instructions (counted forward from those MIR statements; post-opt links to MIR directly) | 11,312 |
+| post-opt instructions | 8,446 |
+| prepared instructions | 10,555 |
+| vcode instructions | 32,930 |
+| bytecode instructions | 42,810 |
+
+Two things stand out:
+- Sonatina's optimizer shrinks pre-opt to post-opt by 25%.
+- The EVM backend then emits 3.9 vcode instructions per post-opt instruction.
+
+### 2.1 Memory operations
+
+Fe has 6,773 memory opcodes. The coordinator's opcode count (`/workspace/scratch/seaport-opmix/opmix.py`) gives 1,187 for solc reference and 1,137 for solc optimized. Here is what introduced Fe's, from the stage view's `memory_ops` selection:
+
+| mechanism | memory ops |
+|---|---:|
+| spill store or reload that Sonatina's stackify inserted | 1,736 |
+| aggregate copy (MIR `copy_into`, `mcopy`) | 1,311 |
+| call and return transport (lowers only from post-opt `call` or `return`) | 1,126 |
+| Sonatina stack object access (`obj.*`) | 960 |
+| explicit `mload`/`mstore` in the IR | 805 |
+| allocation (`evm_malloc` 280, clamp 123) | 403 |
+| other backend code with no IR origin | 397 |
+| other | 35 |
+
+By library the split is ABI 1,196, port 4,131, core ptr 297 and unknown 1,149. The two splits cut the same ops differently and overlap.
+
+**The spill tags come from Sonatina itself.** A probe (`memplan/probe/`) runs Sonatina 3357f3a's `snapshot_mem_plan_detail` on `seaport.sona` with Fe's -O1 backend settings. It reproduces Fe's 65,222 bytes except 16 jump-target bytes in three reordered shared tails.
+- It tags 1,736 spill memory ops, and every one was checked against the real bytes.
+- Static layout: 447 one-word spill objects and 491 allocas between 0xa0 and 0x5f80. The free-pointer floor is 0x5f80.
+
+### 2.2 The 17-byte clamp, 123 copies (2,091 bytes)
+
+- **Where it is emitted.** Sonatina's EVM lowering of `evm_malloc`, placement `Heap`: `emit_heap_base` and `emit_word_max_const_u32`, `isa/evm/machine/lower.rs:765-790` at 3357f3a. It is skipped only when `free_ptr_floor` proves the pointer is already at least 0x5f80.
+- **It carries no provenance of its own.** Its gap reasons are missing_provenance 1,968 and synthetic 123.
+- **What triggers each copy.** Tied to the next instruction that lowers from `evm_malloc` (115 of 123), the copies come from these Fe sources (in `ingots/core/src/ptr.fe` at 342048ea5):
+  - `MemBuffer::alloc` (ptr.fe:236), 53;
+  - `alloc<T>` (ptr.fe:419), 41;
+  - `MemBuffer::with_capacity` (ptr.fe:244), 10;
+  - 11 direct sites: the five env arms, `manage.fe`, `status.fe`.
+
+### 2.3 ABI helpers compiled once per type
+
+- **`decode_from_bounded`: 7 instances, 5,553 bytes.**
+  - Over `CallData`: Order 1,177, AdvancedOrder 1,411, OrderComponents 951.
+  - Over `MemSlice<u8>`: Order 640, AdvancedOrder 893, CriteriaResolver 305, Fulfillment 176.
+  - Every call site traces to core `abi.fe:382`, `return T::decode_from_bounded(input, tail_at, input_len)`.
+- **`dyn_array_payload_end_with_input_len`: 10 instances,** one per element type and input kind, 40 to 233 bytes each.
+
+### 2.4 The 161-byte prologue in five dispatcher arms
+
+It is `env` passed by value in the five arms at `seaport.fe:189/226/250/269/287`. Each copy is an `evm_malloc`, the clamp, and an `evm_code_copy` of the constant `Env` image.
+
+The five chains share one content address. That makes them one construct expanded five times (5 x 96 traced bytes), not five different pieces of code.
+
+### 2.5 The 15,081 bytes with no source
+
+- **14,386 bytes have no link from the bytecode to a vcode instruction at all.** Sonatina's pc map marks them unmapped:
+  - missing_provenance 12,592;
+  - synthetic 1,417;
+  - no_machine_inst 335;
+  - label_or_fixup_only 42.
+- **695 bytes reach post-opt but no MIR.**
+
+So the loss is almost entirely on the Sonatina side, in backend-synthesized code. That code includes the clamps (2,091) and 1,615 bytes of spill traffic. Fixing it needs Sonatina attribution changes. None was made.
+
+### 2.6 Expansion by stage
+
+Per Fe body, the stage view counts HIR, MIR, pre-opt, post-opt and vcode nodes and bytes (`expansion_by_body`). Post-opt instructions per pre-opt instruction mark inlining:
+
+| body | post-opt per pre-opt |
+|---|---:|
+| `checked_tail` | 62 |
+| `checked_frame_end` | 47.5 |
+| calldata `len` | 25.6 |
+| `read_word` | 12 |
+| `dyn_array_payload_end_with_input_len` | 1.0 (outlined, one per type) |
+
+The constructs that are the primary source of the most bytes are all library ABI code:
+- abi.fe:382, 1,076 bytes;
+- sol.fe:354, 926;
+- calldata.fe:42, 571;
+- effects.fe:1164, 490.
+
+I did not compare Fe MIR or pre-opt sizes against solc Yul function by function (not done).
+
+## 3. Core facets for the run census
+
+Run classes are now core facet addresses (`run_graph`, level `evm-run/1`, `riff-catalog-evm/src/runs.rs`):
+- exact = Structure plus Constants;
+- constants blind = Structure only.
+
+The equality pattern among constants stays in Structure (`constant_port`), so a class still needs one parameter per distinct value. The suffix array only proposes candidates, and the core address decides them. A test checks that the two partitions agree on every window.
+
+- **The old numbers reproduce class for class:**
+  - exact, 32+: 89 classes, 16,119 bytes, 10,336 beyond the first copy;
+  - old cap of 2 constants: 103 classes, 20,102 bytes, 13,596 beyond the first copy.
+- **The cap is removed.** At 16 bytes the uncapped constants-blind net fell below the cap's (7,886 against 8,556), because greedy selection picks many-parameter classes. So the cap was a workaround. The memory-offset facet (next section) is the principled version of what it guarded against.
+
+| min bytes | exact (classes / covered / extra / net) | memory offsets blind | constants blind |
+|---:|---|---|---|
+| 16 | 231 / 24,383 / 16,853 / 8,652 | 261 / 31,128 / 23,175 / 7,524 | 270 / 36,055 / 27,607 / 7,886 |
+| 32 | 89 / 16,119 / 10,336 / 7,860 | 115 / 21,841 / 14,760 / 8,324 | 142 / 28,745 / 20,059 / 10,363 |
+| 64 | 31 / 8,785 / 5,100 / 4,384 | 42 / 12,078 / 7,448 / 5,479 | 61 / 16,946 / 10,216 / 6,362 |
+| 128 | 6 / 4,290 / 2,676 / 2,490 | 11 / 6,547 / 4,264 / 3,687 | 12 / 7,508 / 4,749 / 4,009 |
+
+"Net" is the census's rough estimate (8 bytes per copy for a call, 3 per differing parameter), not a measurement. It comes from `census` output (`evm_run_summary`, `compare/run-census-summary.txt`).
+
+**Check.** `verify_runs_facets.py` re-normalizes every occurrence of all 12 censuses from raw bytes under each key. It found 0 problems. Negative controls (checking a looser census under a stricter key) fail as expected, with 49 and 75 mismatches (`runs/verify.txt`).
+
+## 4. `evm-dataflow/1` and memory offsets
+
+**The lowering** (`riff-catalog-evm/src/dataflow.rs`) splits code into basic blocks and lifts each by symbolic stack execution:
+- DUP, SWAP and POP become operand wiring, not nodes;
+- pure operations and constants are hash-consed;
+- effects keep their order;
+- entry and exit stack items are numbered ports.
+
+A constant whose every use is a memory or calldata address, directly or through ADDs, carries the Constants field class `memory_offset`.
+
+**The facets that erase one field class are `riffcat-view/1` plans.** The view language gained an `erase dimension.field` directive (`riff-catalog-view/src/lib.rs`). It is recorded in the plan id, so these facets carry their own policy level. No sixth dimension was needed.
+- The trade-off: a field class is expressible, but a view's digests are not comparable with the base level's digests.
+- A dimension would allow that comparison, at the cost of a schema change.
+
+**Scheduling.**
+- DUP/SWAP/POP are 13,123 of 64,771 code bytes: DUP 5,665, SWAP 5,241, POP 2,217.
+- Only 3,156 of them are among the 15,081 no-source bytes.
+- The largest: dispatcher 1,007 of 6,550 bytes; `fulfill_basic_order` 580 of 4,320; `match_advanced_orders` 415 of 1,966.
+- solc: reference 5,606 of 25,081, optimized 4,768 of 23,951 (`df/*-report.txt`).
+
+**Hidden repeats.** Whole blocks of 8+ bytes, bytes beyond the first copy, with the part the flat exact facet does not already group in parentheses:
+
+| facet | beyond first copy (not grouped by flat exact) |
+|---|---:|
+| dataflow | 9,628 (603) |
+| dataflow, stack port order forgotten | 11,251 (2,226) |
+| dataflow, memory offsets forgotten | 11,958 (2,933) |
+| dataflow, both | 14,000 (4,975) |
+| dataflow, constants blind | 17,526 (8,501) |
+
+Blocks are small (mean 19.5 bytes), so block-level numbers undercount multi-block regions; the run census covers those.
+
+**A core-digest issue, fixed.** Core's Merkle fold identifies a child by its content. So two distinct nodes with equal content hashed alike, and a consumer of one looked like a consumer of the other.
+- The independent lifter caught two constants-blind classes (54 bytes) that riffcat merged wrongly.
+- Fix, in the lowering: every node gets a distinct Structure identity (constant ports, effect indexes).
+- Afterwards all three block facets partition identically to the Python lifter on Fe and on both solc builds (`df/*verify*`). No core change was needed.
+
+**Across compilers** (`evm-dataflow-compare`). Fe and solc share no basic block of 16 or more bytes at any facet, even dataflow with memory offsets and port order forgotten. At 8 bytes only short idioms match: 31 to 38 addresses, about 1 to 1.8 KB on each side. These are heuristic leads, not equivalences.
+
+## 5. Across compilers, function by function
+
+**solc function ranges.** They come from the source maps joined to the ASTs (`riff-catalog-solc/src/sourcemap.rs`, `riffcat-bloat solc-functions`). Generated Yul helpers are named from `generatedSources`.
+- A subagent recompiled with solc 0.8.24 `--standard-json` and the forge settings, since the build-info held no ASTs. The runtime bytes are identical to the forge artifacts.
+- riffcat's per-function totals equal the subagent's independent table for all 164 / 181 / 108 functions.
+
+**Pairing.**
+- `solc/pairing.json` pairs by name using the README module table: 66 high, 13 medium and 5 low confidence pairs have a Fe source body.
+- `compare-functions` compares Fe bytes by primary source body with solc bytes by innermost source function. On both sides inlined code counts toward the function it came from.
+- Output: `compare/functions.txt`.
+
+| | Fe | solc reference | solc optimized |
+|---|---:|---:|---:|
+| 84 paired functions | 16,694 | 16,023 | 12,519 |
+| everything else (unpaired, dispatch, no source, generated, data) | 48,528 | 9,111 | 11,444 |
+
+Largest pairs (Fe / reference / optimized):
+
+| function | Fe | reference | optimized |
+|---|---:|---:|---:|
+| `prepare_basic_fulfillment_from_calldata` | 903 | 760 | 755 |
+| `validate_and_fulfill_basic_order` | 698 | 421 | 290 |
+| `model::advanced_orders` (low confidence; no direct Solidity counterpart) | 673 | 61 | 32 |
+| `validate_orders_and_prepare_to_fulfill` | 366 | 968 | 628 |
+
+Several Fe functions are smaller than solc's.
+
+**Categories.** The trace's `category` field (step 5) is `move` for PUSH, DUP and SWAP, so `move` is Fe's largest category in every pair. It says little. Per-function category tables are in `stages/fe-stages.txt` ("bytes by trace category per emitted function").
+
+## 6. What was added to riffcat
+
+Branch `census/fe-trace-bytes`, not pushed.
+
+| commit | what |
+|---|---|
+| `b2c55cd` | run classes as core facet addresses |
+| `2b17c2a` | `evm-dataflow/1`, the view `erase` directive, the memory-offset run key (the cap removed) |
+| `100d114` | distinct node identities in the dataflow graphs (the digest fix); dataflow block report |
+| `ac04c75` | stage view and `fe-trace-stages` |
+| `825625c` | solc source-map attribution, `solc-functions`, `compare-functions` |
+| `3e23a73` | `sonatina-functions` facets, cross-artifact block matches, stage-view categories, census run summary |
+| `497fb29` | the excess ledger (`evm-byte-causes`, `-compare`), mechanism pc sets, generated Yul names, residual rows |
+| `f2f1a5e` | docs |
+
+Each piece has tests. After the last commit the full workspace test (`cargo test --release --workspace --exclude riffcat-demo-app`) passed: 293 tests, 0 failed, 4 ignored (`logs/full.log`).
+
+**Fe and Sonatina.**
+- No Fe or Sonatina source was changed.
+- A Fe worktree, `/workspace/fe-worktrees/trace-seaport` (branch `trace/seaport-integration`), carries the port's patch as its first commit (`15cc098c7`), for reading the patched library sources.
+- The memory-plan probe patched a private copy of Sonatina under `memplan/`.
+
+## 7. Not done
+
+- **The Fe-side trace changes.** No change to Fe's trace was needed for these numbers:
+  - per-object trace compile, instead of the blanked copy;
+  - closing the Sonatina pc-map gaps;
+  - inliner facts.
+- **Fe MIR and pre-opt size against solc Yul per function.**
+- **Moving `analyze.py` and `tables.py` of the first census into riffcat.** Their numbers were already riffcat report fields; they only format them.
+- **The unmodified port was not re-traced.**
+- **Gas was not measured.**
+
+## Reproduce
+
+```sh
+cd /workspace/scratch/seaport-facets
+stages/run.sh          # stage view, memory origins, mechanisms (needs memplan/pc_tags.json)
+excess/run.sh          # excess ledgers and comparisons
+python3 verify_causes.py fe; python3 verify_causes.py reference; python3 verify_causes.py optimized
+python3 verify_stages.py
+python3 verify_dataflow.py runs/runtime.bin 64771 df/fe-blocks.json
+```
