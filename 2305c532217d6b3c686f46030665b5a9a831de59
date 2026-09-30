@@ -1,0 +1,279 @@
+# riffcat on the Seaport code-size problem: a retrospective
+
+Date: 2026-09-30. Covers the work of 2026-09-29 and early 2026-09-30 on the Fe port of Seaport 1.6
+(`cburgdorf/SeaportFe`). It was reconstructed from the session transcript and the four write-ups in
+`sync/old-workspace/reviews/codex-mb3-2026-09-22/`:
+
+- `SEAPORT_SONATINA_MEASURE_2026-09-29.md`
+- `SEAPORT_BYTE_CENSUS_2026-09-30.md`
+- `SEAPORT_FACET_ANALYSIS_2026-09-30.md`
+- `SEAPORT_CODE_SIZE_2026-09-30.md` (the summary ledger)
+
+## TL;DR
+
+- **The question:** why is Fe's Seaport 65,222 bytes when EIP-170 allows 24,576? It is 40,646 bytes over.
+- **The answer we reached:**
+  - **The port's own code is fine.** The 84 functions that pair by name with seaport-core are 16,694 bytes
+    in Fe and 16,023 bytes in solc's plain build.
+  - **The gap is the code around it:** ABI decoding, values passed through memory, spills and backend glue.
+    That is 48,528 bytes in Fe against 9,111 in solc.
+  - **By who could fix it:** about 19 KB is Sonatina, about 12.7 KB is Fe lowering and the Fe library, and
+    4 KB is repeated code either side could remove.
+- **How much riffcat helped, honestly:**
+  - **Its distinctive engine** (content addressing under facets) mostly produced **negative results**. Those
+    were useful because they ruled out whole hypotheses quickly: deduplication, stack scheduling and type
+    specialization.
+  - **The most important positive findings** came from riffcat doing **bookkeeping over Fe's own trace**:
+    self-checking byte ledgers, the stage view and solc source-map pairing.
+  - **Most of that riffcat code was written during the analysis:** 13 commits, about 9,450 lines.
+- **What worked:**
+  - ledgers that refuse to print unless every byte is accounted for;
+  - an independent Python checker for every table;
+  - trusting a trace only after its code hash matched the real artifact;
+  - rebuilding the ad hoc census onto riffcat's core facets, which exposed a hidden workaround.
+- **What went wrong:**
+  - **Overstated riffcat's role, twice.** The user had to ask twice before we said plainly what riffcat did.
+  - **Estimates were far too high:** "2 to 3 days" for work that took about 90 minutes each time.
+  - **Missed existing instrumentation.** The user had to point out the mb2 recorder and the merged Fe EVM
+    trace work.
+  - **The story changed four times** before measurement settled it.
+  - **The riffcat branch was never pushed,** and today it exists only on slab.
+- **For a production tool in Fe:** the pieces that mattered should live in the compiler, as always-on,
+  cheap, self-checking size attribution. The analysis engine (facets, cross-compiler comparison) stays in
+  riffcat as a library Fe links. Section 6 has the plan.
+
+## 1. The problem, and why riffcat came up
+
+- **The report on the Fe chat:** Seaport's main contract was still 65 KB after #1618. A pending Sonatina fix
+  for phi bloat (#344) had just cut the Uniswap V3 pool from 20,692 to 14,298 bytes.
+- **The first step was plain measurement:** build the port against several Sonatina versions and flags.
+  - **The pinned build reproduced the port's published numbers byte for byte,** and the Foundry suite passed
+    482 of 482.
+  - **#344 changed nothing,** and nothing measured came close to the limit. The best build (Sonatina main,
+    the ported mb2 ideas and `-O s`) was 63,266 bytes, 3% smaller.
+- **That result is what brought in riffcat.** Once optimizer tuning was clearly the wrong size of lever, the
+  user said "this seems like a job for riff-catalog". The port's notes blamed repeated code, and finding
+  repeated shapes is what riffcat is for.
+
+## 2. Timeline
+
+Times are UTC on 2026-09-29 unless marked.
+
+| When | Step | Tool that did the work | Outcome |
+|---|---|---|---|
+| 2026-09-02 | solc pilots over the solc-bench corpus | riffcat solc adapter | seaport-core crashed solc's experimental backend ("Spilling requires a memoryguard boundary"). No bytecode, no data. The first attempt yielded nothing for Seaport. |
+| 18:24 to 22:20 | Sonatina variant builds (5 variants, 3 flag levels, Foundry suite) | plain builds, a 50-line size-dump hook, Python | optimizers move Seaport by 3% at most; #344 has no effect |
+| 19:37 to 20:00 | **Attempt 1: survey** | riffcat Sonatina adapter plus structure census, via an uncommitted 150-line driver; Python n-gram probe | whole-function copies are only 2% (about 1.3 KB). riffcat compares only whole functions and blocks, so it could not see repeats inside functions, which is where the n-gram probe pointed. |
+| 20:16 to 20:23 | Plan revised twice after the user's prompts | | the mb2 recorder (built for shaders) and Fe's merged `fe dev trace emit` both already existed; the plan moved onto the trace |
+| 20:22 to 21:56 | **Attempt 2: byte census** (5 commits) | Fe trace plus attribution export; new riffcat EVM run census and byte ledger | every byte is attributed; 73% of bytes are shared code; sharing repeats saves about 8 to 10 KB, a quarter of the gap |
+| 22:02 | "and you're telling me riffcat helped with this?" | | honest answer: less than the framing said. The run census had its own fingerprint, so riffcat was "the home for that code, not the engine behind it." |
+| 22:05 to 23:43 | **Attempt 3: facets, stage view and excess ledger** (8 commits) | riffcat core facets and digests, new `evm-dataflow/1` level, `erase constants.memory_offset` view directive, stage view over Fe's origin graph, solc source-map attribution, `evm-byte-causes` | exact census reproduced class for class; stack scheduling and type specialization ruled out; memory ops split by origin; the clamp, `decode_from_bounded` and `env` traced to code lines; excess ledger 59% measured, about 92% with an estimate |
+| 22:29 to 22:32 | The user asked to trace intuitions "through into fe" and to use riffcat "as much as possible" | | rule set: every number from a replayable riffcat command; Python only checks |
+| 23:17 | "hmmm, and we used riffcat to find this?" | | code locations were verified by reading the code before they were published |
+| 09-30 03:06 | "to what degree and specifically how was riff-cat useful?" | | an itemized answer, the basis of section 3 below |
+| 09-30 06:40 | Summary doc renamed by topic | | `SEAPORT_CODE_SIZE_2026-09-30.md` |
+
+## 3. What riffcat actually contributed
+
+### 3.1 Where riffcat's own engine did the work
+
+A **facet** is riffcat's rule for which details a comparison ignores, such as constants, types or memory
+offsets. **Content addressing** means code with the same shape under a facet gets the same hash, so copies
+group together automatically.
+
+| Finding | Mechanism |
+|---|---|
+| Sharing repeated code saves only about 8 to 10 KB after call costs | the run census under three facets (exact, memory offsets ignored, all constants ignored), keyed by core facet digests |
+| Code that differs only in struct layout adds 4,424 bytes of repeats | the new memory-offset field class, erased by a view directive (no new dimension) |
+| Different stack scheduling hides almost no repeats (603 bytes) | `evm-dataflow/1`: each block is lifted into a dataflow graph so DUP, SWAP and POP disappear |
+| Ignoring types finds nothing beyond exact matches; 1,330 bytes are identical functions left unmerged | Sonatina IR function facets |
+| `decode_from_bounded`'s 7 instances differ in structure, so one generic decoder would need runtime layout descriptors | the same facets, which showed that no facet merges them |
+| The 161-byte prologue in five dispatcher arms is one construct: `env` passed by value | traced chains are content addressed, so the five group into one class |
+| Fe and solc share no basic block of 16 bytes or more | cross-compiler matching (a null result) |
+
+**Pattern:** the engine answered "is X the cause?" questions quickly and decisively, and mostly the answer
+was no. That is valuable, because each no removed a line of work, such as an outlining pass or a type-erasure
+design. It did not point at the causes that turned out to matter.
+
+### 3.2 Where riffcat was bookkeeping
+
+These joins could have been scripts. In riffcat they became replayable commands with conservation checks
+that refuse to report when totals don't match the artifact.
+
+- **The byte-origin ledger** (`bytes.rs`) joins Fe's per-instruction attribution to every byte.
+- **"The port's own code is at parity with solc"** came from solc source-map attribution plus pairing by
+  name (`sourcemap.rs`, `compare_functions.rs`). This was the most important single finding.
+- **The stage view** (`stages.rs`, `fe_stages.rs`) walks Fe's origin edges from bytes back through Sonatina
+  IR and MIR to source lines. It produced three findings:
+  - the memory-op split;
+  - the clamp's 115 call sites;
+  - every `decode_from_bounded` call site tracing to `abi.fe:382`.
+- **The excess ledger** (`byte_causes.rs`) places every byte of both runtimes in exactly one bucket, so the
+  per-bucket differences add up to exactly the 40,088-byte gap.
+
+### 3.3 What was not riffcat
+
+- **The foundation:** Fe's `fe dev trace emit` and `fe dev debug emit --attribution-details`, which link
+  each EVM instruction to its sources. riffcat depends on this; it cannot produce it.
+- **Spill identification:** a probe that patched Sonatina to dump its memory plan.
+- **The first "20% shuffles, six times the memory ops" comparison:** a 40-line opcode count. riffcat
+  confirmed it later.
+- **All contract sizes and Sonatina variant numbers:** builds and small Python scripts.
+- **Code locations in Fe and Sonatina:** read directly.
+- **The independent checks:** Python, on purpose.
+
+### 3.4 Cost
+
+| | Agent time | riffcat commits |
+|---|---|---|
+| Survey | about 23 minutes (mostly waiting on a 1,090 s build) | 0 (uncommitted driver) |
+| Byte census | about 95 minutes, including a 29-minute trace | 5 |
+| Facets and excess ledger | about 98 minutes | 8 |
+
+- **About 9,450 new lines in all,** with full workspace tests passing (293).
+- **The trace:** 1,248,302 facts, 813 MB, 29 minutes.
+
+## 4. How the story changed
+
+Each correction came from a measurement, which is the good part. Several wrong guesses were stated
+confidently first, which is the part to fix.
+
+| Stage | What we believed | What corrected it |
+|---|---|---|
+| 1 | #344 will help Seaport about as much as it helped Uniswap (about 30%) | the variant build: 0 bytes |
+| 2 | #344 does nothing because `-O 1` skips GVN | `-O 1` and `-O 2` share the IR pipeline; Seaport just lacks the pattern |
+| 3 | The size is per-arm copies of ABI decoding | survey plus census: whole-function copies are 2%, and 73% of bytes are shared code |
+| 4 | The 15 KB with no source link is stack shuffling, a density problem | quick opcode count: Fe's shuffle share (20%) matches solc's. Dataflow facet: only 3,156 of those bytes are shuffles. |
+| 5 | The memory traffic is what Fe's lowering asks for | stage view: about 60% is backend-inserted (spills, call transport, stack objects) |
+| 6 | Final: the port is at parity; Sonatina accounts for about 47% of the excess and Fe about 32% | excess ledger, measured on both sides with the same classifier |
+
+## 5. Lessons
+
+### What worked
+
+1. **Validate the trace against the real artifact before trusting it.** The byte-for-byte runtime match and
+   the whole-file code hash made every later number defensible.
+2. **Conservation checks in the tool.** "The columns add up exactly, and the tool refuses otherwise" caught
+   errors early and made each table easy to trust.
+3. **An independent checker for every table.** It found a real flaw in riffcat's hashing: two different
+   nodes with the same content hashed alike, which wrongly merged two classes (54 bytes). This was fixed in
+   the dataflow lowering.
+4. **Rebuilding ad hoc code onto the core machinery.** The first census's "at most 2 constants may differ"
+   cap looked like a policy, but it was compensating for greedy selection. Moving onto core facets
+   reproduced the old numbers exactly, then exposed the cap. The memory-offset facet replaced it.
+5. **Separating measured from estimated.** The excess ledger missed its 80% target (59% measured). The
+   report said so and labeled the proportional split as an estimate.
+6. **Stop and report after the cheap survey.** The survey found riffcat's blind spot (runs inside functions)
+   before any heavy work started.
+
+### What to do differently
+
+1. **Keep a provenance column for claims.** Twice the summary credited riffcat for findings that came from
+   Fe's trace or a quick script. Tagging each number with the tool that produced it, as you go, makes the
+   honest answer free.
+2. **Inventory existing instrumentation first.** The mb2 recorder and Fe's merged EVM trace were both found
+   only after prompting. A five-minute search of both repos should come before any plan.
+3. **Estimate from the last similar run.** "2 to 3 days" was quoted twice; each phase took about 90
+   minutes.
+4. **State a hypothesis as a hypothesis until it's measured.** Four framings in section 4 were presented as
+   likely before any number backed them.
+5. **Push or mirror analysis branches.** `census/fe-trace-bytes` (13 commits) lives only on slab, and slab
+   does not serve that repo. The replay scripts in `/workspace/scratch/seaport-facets/` are slab-only too.
+   The work is not reproducible from calc today.
+6. **Match the deliverable the user asked for.** The user wanted Markdown, not an HTML page. Docs should be
+   named by topic, not after a person.
+
+### What riffcat's design showed
+
+- **Facets are the right abstraction for "is this the cause?" questions.** The memory-offset class fit
+  inside the existing constants dimension with one view directive.
+- **Cross-compiler content addressing at the bytecode level found nothing.** Fe's and solc's code don't line
+  up block for block. The IR level (Fe's Sonatina IR against solc's Yul) is the more promising place.
+- **riffcat can only be as good as the trace it reads.** Three gaps limited it:
+  - **Missing provenance:** 14,386 bytes have no link from bytecode back into Sonatina at all.
+  - **Uninformative categories:** the trace's `category` field is `move` for every PUSH, DUP and SWAP.
+  - **Per-file compilation:** `fe dev trace emit` compiles each source file as one module. The workaround
+    was to blank every other contract in a copy of the port.
+
+## 6. Turning this into a production debugging tool in the Fe compiler
+
+I read "V compiler" as Fe. What follows assumes that.
+
+### Principles, from what worked
+
+- **The compiler emits facts, and analysis lives in a library.** Fe should not grow a second recorder. The
+  existing trace and attribution model is the single source of truth. riffcat's core is already a small
+  dependency-light library, and Fe can link its schema and digest crates.
+- **Conservation is a hard check, not a debug assertion.** Mapped plus unmapped bytes must equal code bytes
+  in release builds too. Unknown bytes are reported as their own counted row, never dropped.
+- **Zero cost when off, cheap when on.** The default build stays byte-identical. The cheap report should
+  take seconds, not the 29 minutes and 813 MB of the full trace.
+- **Replayable.** Every report can be regenerated from a saved manifest.
+
+### Layers, cheapest and most useful first
+
+1. **`fe build --size-report`, always available.**
+   - Bytes per function, per source line and per library, from the pc map the compiler already has. The
+     50-line size-dump hook from the variant run is most of it.
+   - When a contract exceeds EIP-170 (or a configured budget), the error lists the top contributors instead
+     of only the total.
+   - Output as a table for people and JSON for tools.
+2. **Complete provenance from Sonatina.**
+   - Every byte the backend inserts carries a reason: spill, reload, call transport, stack object, heap
+     clamp, shared tail. Today they carry nothing, or `move`.
+   - A producer-side conformance test in Sonatina runs the real pipeline at O0 and O2. It asserts
+     conservation and that nothing is attributed to the wrong origin.
+   - This one change would have turned the estimated 41% of the excess ledger into measured rows.
+3. **Per-stage growth.**
+   - Record each function's size at each stage: MIR, Sonatina IR before optimization, after optimization,
+     then bytes. Also record which callee the inliner placed where.
+   - The mb2 fork's pass-boundary observer (`ca5210d1`, `69c4a777`, about 150 lines) is a ready starting
+     point.
+   - Answers "where does this code grow, and what can't the optimizer shrink?" without a separate trace
+     run.
+4. **Trace per compiled object, with a stable schema.**
+   - Trace exactly what `fe build` compiles: one object, its own inlining budget.
+   - New fact kinds are skippable by older readers.
+   - A compact streamed format, filterable to one contract.
+5. **`fe explain size <function | file:line>`.**
+   - Walks the origin graph for one item and groups sites that expand identically, as in "passing `env` by
+     value costs 96 bytes at each of 5 sites".
+   - The same data can back an editor code lens showing bytes per line.
+6. **Lints and optimizer hints from the facet census.**
+   - Identical functions left unmerged is an optimizer bug; report it in compiler tests.
+   - Repeats that differ only in memory offsets are outlining candidates.
+   - These run on the compiler's own IR, with riffcat core as the library.
+7. **Size regression gate in CI.**
+   - Build a fixed corpus (Seaport, the Uniswap V3 port, ERC-20, the deposit contract) on every PR.
+   - Diff the cause ledger, not only the totals, so a reviewer sees "spills +300, ABI -1,200".
+8. **Stays in riffcat, outside the compiler:**
+   - comparing against solc or other compilers;
+   - excess ledgers against a reference build;
+   - cross-compiler facet matching.
+   The compiler's job is to export stable facts (ethdebug and the trace) that these tools can read.
+
+### Also worth doing
+
+- **Gas attribution on the same model.** Attribute executed gas to origins the same way bytes are
+  attributed. The test-failure tracing draft (#1622) already builds on this trace work.
+- **Closing the Sonatina provenance gap first.** Every layer above depends on it, and it is the one piece
+  riffcat cannot work around.
+
+### Suggested order
+
+1. Size report plus the EIP-170 contributor error (layer 1).
+2. Sonatina provenance and the conformance test (layer 2).
+3. Per-object trace compile (layer 4), which removes the blanking workaround.
+4. Stage growth (layer 3) and `fe explain size` (layer 5).
+5. CI gate (layer 7) and lints (layer 6).
+
+## 7. Open items
+
+- **Recover `census/fe-trace-bytes`** (commits `0464c25` to `f2f1a5e`) and the replay scripts from slab.
+  Then push the branch somewhere both machines can fetch.
+- **Measure Seaport on current Sonatina main** (#353, #349) and on the open #317.
+- **Prototype the free-pointer clamp fix** in Sonatina (2,091 bytes).
+- **Compare Fe's IR with solc's Yul, function by function.** This separates "Fe asks for more work" from
+  "Sonatina emits more for the same work."
+- **Re-trace the unmodified port** (the trace used a copy with the other contracts blanked), and measure
+  gas.
