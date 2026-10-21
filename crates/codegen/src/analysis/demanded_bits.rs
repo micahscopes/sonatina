@@ -453,7 +453,7 @@ mod tests {
             module::ModuleCtx,
         };
 
-        let isa = Wasm32::new("wasm32-unknown-native".parse().unwrap());
+        let isa = Wasm32::new(sonatina_triple::TargetTriple::parse("wasm32-unknown-native").unwrap());
         let mb = ModuleBuilder::new(ModuleCtx::new(&isa));
         let function = mb
             .declare_function(Signature::new_single(
@@ -463,7 +463,7 @@ mod tests {
                 Type::F32,
             ))
             .unwrap();
-        let mut builder = mb.func_builder(function);
+        let mut builder = mb.func_builder::<sonatina_ir::func_cursor::InstInserter>(function);
         let is = isa.inst_set();
         let block = builder.append_block();
         builder.switch_to_block(block);
