@@ -59,9 +59,21 @@ impl<'a> DemandedBitsQuery<'a> {
         queued: &mut SecondaryMap<ValueId, bool>,
     ) {
         let inst_data = self.func.dfg.inst(inst);
+        // This analysis propagates demand only through integral results. A
+        // pure instruction producing a float, pointer, or aggregate is still
+        // an observation boundary for its integer inputs: for example, every
+        // bit of an i32 -> f32 bitcast contributes to the returned float. Do
+        // not mistake the unmodelled result's lack of demand for dead bits.
+        let has_unmodelled_result = self
+            .func
+            .dfg
+            .inst_results(inst)
+            .iter()
+            .any(|&result| !supports_known_bits(self.func.dfg.value_ty(result)));
         let is_external_use = self.func.dfg.branch_info(inst).is_some()
             || inst_data.kind() == InstClassKind::Opaque
-            || !self.func.dfg.can_drop_if_unused(inst);
+            || !self.func.dfg.can_drop_if_unused(inst)
+            || has_unmodelled_result;
         if !is_external_use {
             return;
         }
@@ -421,6 +433,64 @@ mod tests {
         let query = DemandedBitsQuery::new(&func);
         assert_eq!(query.for_value(extended), low_mask(16));
         assert_eq!(query.for_value(arg), low_mask(8));
+    }
+
+    #[test]
+    fn float_bitcast_demands_integer_bits_and_preserves_masks() {
+        use crate::optim::known_bits_simplify::KnownBitsSimplify;
+        use sonatina_ir::{
+            Immediate, Linkage, Signature,
+            builder::ModuleBuilder,
+            inst::{
+                cast::Bitcast,
+                logic::{And, Or},
+            },
+            isa::wasm32::Wasm32,
+            module::ModuleCtx,
+        };
+
+        let isa = Wasm32::new("wasm32-unknown-native".parse().unwrap());
+        let mb = ModuleBuilder::new(ModuleCtx::new(&isa));
+        let function = mb
+            .declare_function(Signature::new_single(
+                "signed_infinity",
+                Linkage::Public,
+                &[Type::I32],
+                Type::F32,
+            ))
+            .unwrap();
+        let mut builder = mb.func_builder(function);
+        let is = isa.inst_set();
+        let block = builder.append_block();
+        builder.switch_to_block(block);
+        let arg = builder.args()[0];
+        let sign =
+            builder.make_imm_value(Immediate::from_i256(I256::from(0x8000_0000u32), Type::I32));
+        let exponent =
+            builder.make_imm_value(Immediate::from_i256(I256::from(0x7f80_0000u32), Type::I32));
+        let masked = builder.insert_inst(And::new(is, arg, sign), Type::I32);
+        let bits = builder.insert_inst(Or::new(is, exponent, masked), Type::I32);
+        let float = builder.insert_inst(Bitcast::new(is, bits, Type::F32), Type::F32);
+        builder.insert_return(float);
+        builder.seal_all();
+        builder.finish();
+
+        let mut func = only_func(&mb);
+        let query = DemandedBitsQuery::new(&func);
+        assert_eq!(query.for_value(bits), low_mask(32));
+        assert_eq!(query.for_value(masked), low_mask(32));
+        KnownBitsSimplify::new().run(&mut func);
+        let kinds = func
+            .layout
+            .iter_block()
+            .flat_map(|block| {
+                func.layout
+                    .iter_inst(block)
+                    .map(|inst| func.dfg.inst(inst).kind())
+            })
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&InstClassKind::Binary(BinaryInstKind::And)));
+        assert!(kinds.contains(&InstClassKind::Binary(BinaryInstKind::Or)));
     }
 
     fn only_func(mb: &sonatina_ir::builder::ModuleBuilder) -> Function {
