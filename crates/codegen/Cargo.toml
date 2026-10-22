@@ -110,3 +110,7 @@ required-features = ["cranelift", "wasm", "spirv-backend"]
 [[test]]
 name = "mandelbrot_relay_render"
 required-features = ["cranelift", "wasm"]
+
+[[test]]
+name = "shader_source_names"
+required-features = ["spirv-backend"]

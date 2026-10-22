@@ -7824,6 +7824,7 @@ fn intern_naga_typed_local_type(
                     }
                 }
                 sonatina_ir::types::CompoundType::Struct(data) if !data.packed => {
+                    let source_fields = module.ctx.struct_field_names(ty);
                     let mut members = Vec::with_capacity(data.fields.len());
                     let mut offset = 0u32;
                     let mut alignment = 1u32;
@@ -7840,7 +7841,11 @@ fn intern_naga_typed_local_type(
                         )?;
                         offset = align_helper_offset(offset, field.alignment);
                         members.push(naga::StructMember {
-                            name: Some(format!("f{index}")),
+                            name: Some(source_fields.as_ref()
+                                .and_then(|names| names.get(index))
+                                .filter(|name| !name.is_empty())
+                                .cloned()
+                                .unwrap_or_else(|| format!("f{index}"))),
                             ty: field.handle,
                             binding: None,
                             offset,
