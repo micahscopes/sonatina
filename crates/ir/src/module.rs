@@ -263,6 +263,7 @@ pub struct ModuleCtx {
     func_effects: Arc<RwLock<FxHashMap<FuncRef, FuncEffectSummary>>>,
     func_hints: Arc<RwLock<FxHashMap<FuncRef, FuncHints>>>,
     type_store: Arc<RwLock<TypeStore>>,
+    struct_field_names: Arc<RwLock<FxHashMap<Type, Vec<String>>>>,
     gv_store: Arc<RwLock<GlobalVariableStore>>,
 }
 impl AsRef<ModuleCtx> for ModuleCtx {
@@ -279,6 +280,7 @@ impl ModuleCtx {
             type_layout: isa.type_layout(),
             address_spaces: isa.address_spaces(),
             type_store: Arc::new(RwLock::new(TypeStore::default())),
+            struct_field_names: Arc::new(RwLock::new(FxHashMap::default())),
             declared_funcs: Arc::new(DashMap::new()),
             func_effects: Arc::new(RwLock::new(FxHashMap::default())),
             func_hints: Arc::new(RwLock::new(FxHashMap::default())),
@@ -313,6 +315,7 @@ impl ModuleCtx {
             func_effects: Arc::new(RwLock::new(func_effects)),
             func_hints: Arc::new(RwLock::new(func_hints)),
             type_store: Arc::new(RwLock::new(self.type_store.read().clone())),
+            struct_field_names: Arc::new(RwLock::new(self.struct_field_names.read().clone())),
             gv_store: Arc::new(RwLock::new(self.gv_store.read().clone())),
         }
     }
@@ -333,8 +336,30 @@ impl ModuleCtx {
             func_effects: Arc::new(RwLock::new(FxHashMap::default())),
             func_hints: Arc::new(RwLock::new(FxHashMap::default())),
             type_store: Arc::new(RwLock::new(self.type_store.read().clone())),
+            struct_field_names: Arc::new(RwLock::new(self.struct_field_names.read().clone())),
             gv_store: Arc::new(RwLock::new(self.gv_store.read().clone())),
         }
+    }
+
+    /// Optional source labels for presentation only; never part of type identity,
+    /// layout, or textual IR. Missing labels retain backend-generated names.
+    pub fn set_struct_field_names(&self, ty: Type, names: Vec<String>) -> Result<(), String> {
+        let Type::Compound(compound) = ty else {
+            return Err("field labels require a struct type".into());
+        };
+        let expected = self.with_ty_store(|store| match store.resolve_compound(compound) {
+            CompoundType::Struct(data) => Some(data.fields.len()),
+            _ => None,
+        });
+        if expected != Some(names.len()) {
+            return Err("field labels must match the struct's field count".into());
+        }
+        self.struct_field_names.write().insert(ty, names);
+        Ok(())
+    }
+
+    pub fn struct_field_names(&self, ty: Type) -> Option<Vec<String>> {
+        self.struct_field_names.read().get(&ty).cloned()
     }
 
     pub fn size_of(&self, ty: Type) -> Result<usize, TypeLayoutError> {
@@ -573,6 +598,23 @@ mod tests {
             vendor: Vendor::Ethereum,
             operating_system: OperatingSystem::Evm(EvmVersion::Osaka),
         })))
+    }
+
+    #[test]
+    fn struct_field_labels_follow_type_context_without_changing_identity() {
+        let builder = test_builder();
+        let ty = builder.declare_struct_type("Complex", &[Type::F32, Type::F32], false);
+        let names = vec!["re".to_string(), "im".to_string()];
+        assert!(builder.ctx.set_struct_field_names(ty, vec!["re".into()]).is_err());
+        assert!(builder.ctx.set_struct_field_names(Type::I32, vec![]).is_err());
+        builder.ctx.set_struct_field_names(ty, names.clone()).unwrap();
+        assert_eq!(ty, builder.declare_struct_type("Complex", &[Type::F32, Type::F32], false));
+        for context in [builder.ctx.clone(), builder.ctx.deep_clone(), builder.ctx.fork()] {
+            assert_eq!(context.struct_field_names(ty), Some(names.clone()));
+        }
+        let copied = builder.ctx.deep_clone();
+        copied.set_struct_field_names(ty, vec!["x".into(), "y".into()]).unwrap();
+        assert_eq!(builder.ctx.struct_field_names(ty), Some(names));
     }
 
     #[test]

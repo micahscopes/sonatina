@@ -523,6 +523,17 @@ impl ModuleLinker {
                         .update_struct_fields(&s_data.name, &s_data.fields);
                 }
 
+                if let Some(names) = self.modules[&module_ref]
+                    .ctx.struct_field_names(Type::Compound(cmpd_ref))
+                {
+                    // Presentation metadata does not participate in type linking.
+                    // Keep the first available labels for a shared linked type.
+                    let linked_ty = Type::Compound(linked_cmpd_ref);
+                    if self.builder.ctx.struct_field_names(linked_ty).is_none() {
+                        self.builder.ctx.set_struct_field_names(linked_ty, names)
+                            .expect("linked struct has the same field count");
+                    }
+                }
                 return Ok(linked_cmpd_ref);
             }
 
