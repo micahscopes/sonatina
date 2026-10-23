@@ -335,7 +335,7 @@ func public %checked(v0.i32, v1.i32) -> i32 {
                 });
             }
             let artifact = crate::isa::wasm::WasmBackend::new()
-                .compile_module(&module)
+                .compile_module(&module, &crate::BackendOptions::default())
                 .unwrap();
             let executable = wasmtime::Module::new(&engine, &artifact.bytes).unwrap();
             let mut store = wasmtime::Store::new(&engine, ());

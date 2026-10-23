@@ -218,7 +218,7 @@ mod tests {
         fb.insert_inst_no_result(Jump::new(is, join));
         fb.switch_to_block(join);
         let result = fb.insert_inst(
-            Phi::new(is, vec![(direct, entry), (indirect, other)]),
+            Phi::new(is, vec![(direct, entry), (indirect, other)].into()),
             Type::I32,
         );
         fb.insert_inst_no_result(Return::new_single(is, result));

@@ -223,7 +223,7 @@ block0:
     )
     .expect("f32 carrier IR should parse");
     let funcs = parsed.module.funcs();
-    let backend = test_backend();
+    let backend = osaka_backend();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         backend.prepare_section(work_module(&parsed.module, &funcs))

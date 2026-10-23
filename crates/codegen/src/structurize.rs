@@ -543,6 +543,27 @@ impl Structurer<'_> {
             && self.function.layout.iter_inst(block).count() == 1
     }
 
+    /// A phi-free return reached directly from sibling loop headers belongs
+    /// to each loop's returning-exit transport, not to a later if-merge. The
+    /// loops are mutually exclusive: whichever loop exits evaluates the return
+    /// block exactly once. Do not make it a third owner after the selection.
+    fn is_shared_loop_return(&self, block: BlockId) -> bool {
+        if !matches!(self.term(block), Term::Return)
+            || self.function.layout.iter_inst(block).any(|inst_id| {
+                <&Phi as InstDowncast>::downcast(self.is, self.function.dfg.inst(inst_id)).is_some()
+            })
+        {
+            return false;
+        }
+        let predecessors = self.cfg.preds_of(block).copied().collect::<Vec<_>>();
+        predecessors.len() >= 2 && predecessors.iter().all(|predecessor| {
+            self.loop_tree.loop_of_block(*predecessor).is_some_and(|lp| {
+                self.loop_tree.loop_header(lp) == *predecessor
+                    && self.loop_direct_exit(*predecessor, lp) == Some(block)
+            })
+        })
+    }
+
     /// A shared, phi-free block directly before a bare terminal is likewise a
     /// safe tree leaf. Its side effects execute once on whichever mutually
     /// exclusive path reaches that leaf, and it owns no edge-dependent values.
@@ -1146,6 +1167,9 @@ impl Structurer<'_> {
                 }
             }
             [merge] => {
+                if self.is_shared_loop_return(*merge) {
+                    return Ok(None);
+                }
                 // Whole-function post-dominance can see past a backedge to
                 // the eventual loop exit. Prefer a join within this iteration
                 // when all continuing paths reach it; terminal paths need not.
@@ -1180,7 +1204,8 @@ impl Structurer<'_> {
         // also owns a phi or other instructions is a real convergence point.
         // Match lowering commonly produces exactly that shape: live arms join
         // through a result phi and return, while the default arm traps.
-        let owns_join = !self.returns(block) || !self.is_shared_bare_terminal(block);
+        let owns_join = (!self.returns(block) || !self.is_shared_bare_terminal(block))
+            && !self.is_shared_loop_return(block);
         let Some(lp) = cur_loop else {
             return owns_join;
         };
@@ -1415,7 +1440,7 @@ mod tests {
     };
     use sonatina_triple::{Architecture, OperatingSystem, TargetTriple, Vendor};
 
-    fn native_builder() -> (ModuleBuilder, &'static dyn sonatina_ir::InstSetBase) {
+    fn native_builder() -> (ModuleBuilder, &'static sonatina_ir::inst::native::inst_set::NativeInstSet) {
         let isa = Native::new(TargetTriple::new(
             Architecture::X86_64,
             Vendor::Unknown,
@@ -1431,6 +1456,58 @@ mod tests {
             .func_store
             .view(fr, |func| structurize_function(func))
             .unwrap()
+    }
+
+    #[test]
+    fn sibling_guarded_loops_own_their_shared_value_return() {
+        let (mb, is) = native_builder();
+        let sig = Signature::new_single(
+            "sibling_guarded_loop_return", Linkage::Public,
+            &[Type::I1, Type::I1, Type::I32], Type::I32,
+        );
+        let fr = mb.declare_function(sig).unwrap();
+        let mut fb = mb.func_builder::<InstInserter>(fr);
+        let entry = fb.append_block();
+        let left = fb.append_block();
+        let left_guard = fb.append_block();
+        let left_latch = fb.append_block();
+        let right = fb.append_block();
+        let right_guard = fb.append_block();
+        let right_latch = fb.append_block();
+        let shared_return = fb.append_block();
+        let trap = fb.append_block();
+        let args = fb.args().to_vec();
+        let zero = fb.make_imm_value(0i32);
+        let one = fb.make_imm_value(1i32);
+        fb.switch_to_block(entry);
+        fb.insert_inst_no_result(Br::new(is, args[0], left, right));
+        for (header, guard, latch) in [(left, left_guard, left_latch), (right, right_guard, right_latch)] {
+            fb.switch_to_block(header);
+            let counter = fb.insert_inst(Phi::new(is, vec![(zero, entry)].into()), Type::I32);
+            let more = fb.insert_inst(cmp::Lt::new(is, counter, args[2]), Type::I1);
+            fb.insert_inst_no_result(Br::new(is, more, guard, shared_return));
+            fb.switch_to_block(guard);
+            fb.insert_inst_no_result(Br::new(is, args[1], trap, latch));
+            fb.switch_to_block(latch);
+            let next = fb.insert_inst(arith::Add::new(is, counter, one), Type::I32);
+            fb.insert_inst_no_result(Jump::new(is, header));
+            fb.append_phi_arg(counter, next, latch);
+        }
+        fb.switch_to_block(shared_return);
+        let result = fb.insert_inst(arith::Add::new(is, args[2], one), Type::I32);
+        fb.insert_inst_no_result(Return::new_single(is, result));
+        fb.switch_to_block(trap);
+        fb.insert_inst_no_result(Unreachable::new(is));
+        fb.seal_all();
+        fb.finish();
+        let module = mb.build();
+        let structured = structurize(&module, fr);
+        assert!(structured.regions.iter().any(|region| matches!(
+            region, Region::IfThenElse { merge: None, .. }
+        )));
+        assert!(!structured.regions.iter().any(|region| matches!(
+            region, Region::Block(block) if *block == shared_return
+        )), "returning exits must not also become an enclosing merge");
     }
 
     #[test]
@@ -1545,7 +1622,7 @@ mod tests {
         fb.insert_inst_no_result(Jump::new(is, latch));
         fb.switch_to_block(latch);
         let carried = fb.insert_inst(
-            Phi::new(is, vec![(zero, choose_update), (updated, update)]),
+            Phi::new(is, vec![(zero, choose_update), (updated, update)].into()),
             Type::I32,
         );
         let keep_going = fb.insert_inst(cmp::Lt::new(is, zero, carried), Type::I1);
@@ -1620,7 +1697,7 @@ mod tests {
         let y = fb.insert_inst(arith::Sub::new(is, a0, a1), Type::I32);
         fb.insert_inst_no_result(Jump::new(is, m));
         fb.switch_to_block(m);
-        let r = fb.insert_inst(Phi::new(is, vec![(x, t), (y, e)]), Type::I32);
+        let r = fb.insert_inst(Phi::new(is, vec![(x, t), (y, e)].into()), Type::I32);
         fb.insert_inst_no_result(Return::new_single(is, r));
         fb.seal_all();
         fb.finish();
@@ -1740,15 +1817,10 @@ mod tests {
         }
         fb.switch_to_block(merge);
         let result = fb.insert_inst(
-            Phi::new(
-                is,
-                vec![
-                    (zero, arm_zero),
-                    (one, arm_one),
-                    (two, arm_two),
-                    (fallback, arm_three),
-                ],
-            ),
+            Phi::new(is, vec![(zero, arm_zero),
+            (one, arm_one),
+            (two, arm_two),
+            (fallback, arm_three),].into()),
             Type::I32,
         );
         fb.insert_inst_no_result(Return::new_single(is, result));
@@ -1814,15 +1886,10 @@ mod tests {
         fb.insert_inst_no_result(Br::new(is, is_three, merge, trap));
         fb.switch_to_block(merge);
         let result = fb.insert_inst(
-            Phi::new(
-                is,
-                vec![
-                    (zero, entry),
-                    (one, check_one),
-                    (two, check_two),
-                    (fallback, check_three),
-                ],
-            ),
+            Phi::new(is, vec![(zero, entry),
+            (one, check_one),
+            (two, check_two),
+            (fallback, check_three),].into()),
             Type::I32,
         );
         fb.insert_inst_no_result(Return::new_single(is, result));
@@ -1889,7 +1956,7 @@ mod tests {
         fb.insert_inst_no_result(Jump::new(is, merge));
         fb.switch_to_block(merge);
         let result = fb.insert_inst(
-            Phi::new(is, vec![(zero, first_arm), (one, second_arm)]),
+            Phi::new(is, vec![(zero, first_arm), (one, second_arm)].into()),
             Type::I32,
         );
         fb.insert_inst_no_result(Return::new_single(is, result));
@@ -2139,10 +2206,7 @@ mod tests {
         fb.insert_inst_no_result(Jump::new(is, merge));
         fb.switch_to_block(merge);
         let result = fb.insert_inst(
-            Phi::new(
-                is,
-                vec![(body_value, body), (shared_value, shared_forwarder)],
-            ),
+            Phi::new(is, vec![(body_value, body), (shared_value, shared_forwarder)].into()),
             Type::I32,
         );
         fb.insert_inst_no_result(Return::new_single(is, result));
@@ -2221,7 +2285,7 @@ mod tests {
         fb.insert_inst_no_result(Jump::new(is, corridor_merge));
         fb.switch_to_block(corridor_merge);
         let selected_value = fb.insert_inst(
-            Phi::new(is, vec![(left_value, left), (right_value, right)]),
+            Phi::new(is, vec![(left_value, left), (right_value, right)].into()),
             Type::I32,
         );
         let remains_live = fb.insert_inst(cmp::Lt::new(is, selected_value, value), Type::I1);
@@ -2345,7 +2409,7 @@ mod tests {
         let x = fb.insert_inst(arith::Add::new(is, a0, a1), Type::I32);
         fb.insert_inst_no_result(Jump::new(is, m));
         fb.switch_to_block(m);
-        let r = fb.insert_inst(Phi::new(is, vec![(a0, entry), (x, t)]), Type::I32);
+        let r = fb.insert_inst(Phi::new(is, vec![(a0, entry), (x, t)].into()), Type::I32);
         fb.insert_inst_no_result(Return::new_single(is, r));
         fb.seal_all();
         fb.finish();
@@ -2387,7 +2451,7 @@ mod tests {
         let zero = fb.make_imm_value(0i32);
         fb.insert_inst_no_result(Jump::new(is, lh));
         fb.switch_to_block(lh);
-        let i = fb.insert_inst(Phi::new(is, vec![(zero, entry)]), Type::I32);
+        let i = fb.insert_inst(Phi::new(is, vec![(zero, entry)].into()), Type::I32);
         let max = fb.make_imm_value(50i32);
         let c = fb.insert_inst(cmp::Lt::new(is, i, max), Type::I1);
         fb.insert_inst_no_result(Br::new(is, c, lb, exit));
@@ -2906,14 +2970,14 @@ func public %guarded_continue(v0.i1, v1.i1, v2.i1) -> i32 {
         fb.insert_inst_no_result(Jump::new(is, oh));
 
         fb.switch_to_block(oh);
-        let i = fb.insert_inst(Phi::new(is, vec![(zero, entry)]), Type::I32);
-        let s_outer = fb.insert_inst(Phi::new(is, vec![(zero, entry)]), Type::I32);
+        let i = fb.insert_inst(Phi::new(is, vec![(zero, entry)].into()), Type::I32);
+        let s_outer = fb.insert_inst(Phi::new(is, vec![(zero, entry)].into()), Type::I32);
         let oc = fb.insert_inst(cmp::Lt::new(is, i, eight), Type::I1);
         fb.insert_inst_no_result(Br::new(is, oc, ih, oexit));
 
         fb.switch_to_block(ih);
-        let j = fb.insert_inst(Phi::new(is, vec![(zero, oh)]), Type::I32);
-        let s_inner = fb.insert_inst(Phi::new(is, vec![(s_outer, oh)]), Type::I32);
+        let j = fb.insert_inst(Phi::new(is, vec![(zero, oh)].into()), Type::I32);
+        let s_inner = fb.insert_inst(Phi::new(is, vec![(s_outer, oh)].into()), Type::I32);
         let ic = fb.insert_inst(cmp::Lt::new(is, j, eight), Type::I1);
         fb.insert_inst_no_result(Br::new(is, ic, ib, idone));
 
@@ -3095,21 +3159,13 @@ func public %guarded_continue(v0.i1, v1.i1, v2.i1) -> i32 {
         fb.insert_inst_no_result(Jump::new(is, corridor_merge));
         fb.switch_to_block(corridor_merge);
         let selected = fb.insert_inst(
-            Phi::new(
-                is,
-                vec![
-                    (direct_value, corridor_decision),
-                    (arm_value, corridor_value),
-                ],
-            ),
+            Phi::new(is, vec![(direct_value, corridor_decision),
+            (arm_value, corridor_value),].into()),
             Type::I32,
         );
         fb.switch_to_block(canonical_exit);
         let result = fb.insert_inst(
-            Phi::new(
-                is,
-                vec![(header_value, header), (selected, corridor_merge)],
-            ),
+            Phi::new(is, vec![(header_value, header), (selected, corridor_merge)].into()),
             Type::I32,
         );
         fb.insert_inst_no_result(Return::new_single(is, result));
@@ -3263,7 +3319,7 @@ func public %guarded_continue(v0.i1, v1.i1, v2.i1) -> i32 {
         fb.switch_to_block(corridor_entry);
         fb.insert_inst_no_result(Jump::new(is, inner_header));
         fb.switch_to_block(inner_header);
-        let i = fb.insert_inst(Phi::new(is, vec![(zero, corridor_entry)]), Type::I32);
+        let i = fb.insert_inst(Phi::new(is, vec![(zero, corridor_entry)].into()), Type::I32);
         let inner_cond = fb.insert_inst(cmp::Lt::new(is, i, two), Type::I1);
         fb.insert_inst_no_result(Br::new(is, inner_cond, inner_body, corridor_exit));
         fb.switch_to_block(inner_body);
@@ -3276,10 +3332,7 @@ func public %guarded_continue(v0.i1, v1.i1, v2.i1) -> i32 {
         fb.insert_inst_no_result(Jump::new(is, canonical_exit));
         fb.switch_to_block(canonical_exit);
         let result = fb.insert_inst(
-            Phi::new(
-                is,
-                vec![(header_value, outer_header), (selected, corridor_exit)],
-            ),
+            Phi::new(is, vec![(header_value, outer_header), (selected, corridor_exit)].into()),
             Type::I32,
         );
         fb.insert_inst_no_result(Return::new_single(is, result));

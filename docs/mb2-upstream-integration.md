@@ -44,7 +44,7 @@ ports above are mandatory follow-up work, not silently dropped features.
 - Locked library check with `spirv-backend,wasm,cranelift-jit`: PASS (`check-native-3.log`).
 - Readable shader field names: PASS (1/1), emitted WGSL validates and non-debug SPIR-V words are unchanged.
 - Native legacy numerical subset: PASS (23/23), including six f32 edge/oracle tests, integer/i128 overflow, arrays, control-flow order, exact modular runtime declarations and three-backend known answers.
-- Seven legacy allocation/wide-result cases remain outside this subset; modern upstream JIT suite, SP1 build, Fe frontend adaptation and application GPU oracle checks are pending.
+- Seven legacy allocation/wide-result cases remain outside this subset. The upstream native JIT suite passes74/74, SP1-enabled library check passes, and Fe frontend/CLI adaptation builds. Shader application integration remains experimental; no physical Pixel repair is established.
 
 Native object atomics and dynamic arena checkpoints currently fail closed. Native
 allocation follows upstream's host-heap model; the old stack-allocation tests
@@ -65,3 +65,28 @@ An unrecognized unused external name remains an import, consistent with upstream
 
 Receipts: `test-shader-names-1.log`, `test-native-f32-1.log`,
 `test-native-safe-matrix-4.log`. Earlier failing matrices remain preserved.
+
+## Shared returning loop exits
+
+A valid phi-free return reached directly from two natural-loop headers was
+mistaken for an additional enclosing selection merge. Both loops already own
+that block through returning-exit transport. The resulting consumed-block error
+rejected the helper; Fe then inlined it and its callers, producing a561630-byte
+entry function in the array-addition experiment.
+
+The classifier now excludes this precise returning-exit shape from merge
+selection. It does not relax consumed-block checks, noncanonical exits or
+phi-bearing return joins. A small IR regression fails before the repair with
+the same multiply-consumed-return diagnostic and passes afterward. All32
+structurizer tests pass, including the existing fail-closed cases. A separate
+backend regression verifies full IR, retains the helper, and parses/validates
+its emitted WGSL. See `SHARED-LOOP-RETURN-RED-GREEN.json`,
+`test-structurizer-all-1.log` and `test-shared-loop-helper-3.log` in the local
+receipt directory. Application rebuild and GPU equivalence are separate gates.
+
+Compiling these library tests also exposed stale upstream test APIs. The test
+builder now retains its concrete native instruction capability, Phi vectors
+convert to SmallVec, two Wasm test calls pass BackendOptions, and an EVM fixture
+uses its existing osaka_backend constructor. Assertions were not weakened.
+The historical large spirv_backend integration file still needs a separate
+API migration; the new focused regression has its own current-API target.

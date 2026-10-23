@@ -1334,7 +1334,7 @@ func public %test(v0.i1, v1.i1) -> i32 {{
                 {
                     use crate::Backend;
                     let artifact = crate::isa::wasm::WasmBackend::new()
-                        .compile_module(&module)
+                        .compile_module(&module, &crate::BackendOptions::default())
                         .unwrap();
                     let engine = wasmtime::Engine::default();
                     let executable = wasmtime::Module::new(&engine, artifact.bytes).unwrap();
