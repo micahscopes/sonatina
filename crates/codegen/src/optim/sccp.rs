@@ -655,7 +655,7 @@ impl SccpSolver {
                         {
                             func.dfg.replace_inst(
                                 inst,
-                                Box::new(cast::Bitcast::new(func.inst_set(), src, result_ty)),
+                                Box::new(cast::Bitcast::new_unchecked(func.inst_set(), src, result_ty)),
                             );
                             return true;
                         }
@@ -667,7 +667,7 @@ impl SccpSolver {
                             && let Some(is_zero) = func.inst_set().has_is_zero()
                         {
                             func.dfg
-                                .replace_inst(inst, Box::new(cmp::IsZero::new(func.inst_set(), arg)));
+                                .replace_inst(inst, Box::new(cmp::IsZero::new_unchecked(func.inst_set(), arg)));
                             return true;
                         }
                     }

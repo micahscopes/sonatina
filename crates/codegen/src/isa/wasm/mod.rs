@@ -147,7 +147,7 @@ impl Backend for WasmBackend {
     type Artifact = WasmArtifact;
     type Error = WasmError;
 
-    fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
+    fn compile_module(&self, module: &Module, _options: &crate::backend::BackendOptions) -> Result<Self::Artifact, Vec<Self::Error>> {
         self.validate_memory_configuration()?;
         let (wasm_module, func_names) = translate::translate_module(
             module,

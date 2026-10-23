@@ -183,6 +183,7 @@ impl Immediate {
             Self::I64(val) => Self::I64(val.swap_bytes()),
             Self::I128(val) => Self::I128(val.swap_bytes()),
             Self::I256(val) => Self::I256(I256::from_le_bytes(&val.to_u256().to_big_endian())),
+            Self::F32(_) => panic!("floating-point values have no integer byte order"),
             Self::EnumTag { .. } => panic!("enum tags have no byte order"),
         }
     }

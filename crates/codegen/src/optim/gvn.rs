@@ -71,7 +71,7 @@ fn make_gvn_unary_key(
     match kind {
         UnaryInstKind::IsZero => {
             is.has_is_zero()?;
-            Some(cmp::IsZero::new(is, arg).owned_key(&[result_ty]))
+            Some(cmp::IsZero::new_unchecked(is, arg).owned_key(&[result_ty]))
         }
         UnaryInstKind::Neg
         | UnaryInstKind::Not
@@ -92,15 +92,15 @@ fn make_gvn_binary_key(
     match kind {
         BinaryInstKind::Add => {
             is.has_add()?;
-            Some(arith::Add::new(is, lhs, rhs).owned_key(&[result_ty]))
+            Some(arith::Add::new_unchecked(is, lhs, rhs).owned_key(&[result_ty]))
         }
         BinaryInstKind::Sub => {
             is.has_sub()?;
-            Some(arith::Sub::new(is, lhs, rhs).owned_key(&[result_ty]))
+            Some(arith::Sub::new_unchecked(is, lhs, rhs).owned_key(&[result_ty]))
         }
         BinaryInstKind::Shl => {
             is.has_shl()?;
-            Some(arith::Shl::new(is, lhs, rhs).owned_key(&[result_ty]))
+            Some(arith::Shl::new_unchecked(is, lhs, rhs).owned_key(&[result_ty]))
         }
         _ => None,
     }

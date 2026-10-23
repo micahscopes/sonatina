@@ -37,7 +37,7 @@ fn build_br_table(
         table.push((value, block));
     }
 
-    Ok(BrTable::new(fb.inst_set(), scrutinee, default, table))
+    Ok(BrTable::new(has_inst, scrutinee, default, table))
 }
 
 fn build_phi(
@@ -64,7 +64,7 @@ fn build_phi(
     if let Some(arg) = ast_args.next() {
         Err(Box::new(Error::UnexpectedTrailingInstArg(arg.span)))
     } else {
-        Ok(Phi::new(fb.inst_set(), args))
+        Ok(Phi::new(has_inst, args))
     }
 }
 
@@ -92,7 +92,7 @@ fn build_call(
     if let Some(arg) = ast_args.next() {
         Err(Box::new(Error::UnexpectedTrailingInstArg(arg.span)))
     } else {
-        Ok(Call::new(fb.inst_set(), callee, args))
+        Ok(Call::new(has_inst, callee, args))
     }
 }
 
@@ -100,7 +100,7 @@ fn build_call_indirect(
     ctx: &mut BuildCtx,
     fb: &mut FunctionBuilder<ir::func_cursor::InstInserter>,
     args: &[ast::InstArg],
-    _has_inst: &dyn HasInst<CallIndirect>,
+    has_inst: &dyn HasInst<CallIndirect>,
 ) -> Result<CallIndirect, Box<Error>> {
     let mut ast_args = args.iter().peekable();
     let callee = super::process_arg!(ctx, fb, ast_args, ValueId);
@@ -110,7 +110,7 @@ fn build_call_indirect(
         call_args.push(ctx.value(fb, arg.try_into()?));
     }
     Ok(CallIndirect::new(
-        fb.inst_set(),
+        has_inst,
         callee,
         signature,
         call_args,
@@ -155,6 +155,6 @@ fn build_return(
     if let Some(arg) = ast_args.next() {
         Err(Box::new(Error::UnexpectedTrailingInstArg(arg.span)))
     } else {
-        Ok(Return::new(fb.inst_set(), args.into()))
+        Ok(Return::new(has_inst, args.into()))
     }
 }

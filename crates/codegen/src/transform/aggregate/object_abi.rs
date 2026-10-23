@@ -712,7 +712,7 @@ impl ObjectReturnOutParam {
         let new_call = cursor.insert_inst_data_from(
             function,
             inst,
-            control_flow::Call::new(
+            control_flow::Call::new_unchecked(
                 function.inst_set(),
                 *call.callee(),
                 new_args,

@@ -177,7 +177,9 @@ impl Backend for CraneliftJitBackend {
             CraneliftObjectBackend::flag_builder(options, false).map_err(|error| vec![error])?,
         );
         let isa = build_native_isa(flags).map_err(|error| vec![error])?;
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        builder.symbol("__u256_addmod", u256_runtime::__u256_addmod as *const u8);
+        builder.symbol("__u256_mulmod", u256_runtime::__u256_mulmod as *const u8);
         let mut jit = JITModule::new(builder);
         let functions = translate::translate_module(&module, &mut jit)
             .map_err(|error| vec![CraneliftError::Translation(error)])?;

@@ -952,7 +952,7 @@ impl ObjectAggregateAbi {
 
         function.dfg.replace_inst(
             inst,
-            Box::new(control_flow::Return::new(
+            Box::new(control_flow::Return::new_unchecked(
                 function.inst_set(),
                 direct_returns.into(),
             )),
@@ -1273,7 +1273,7 @@ impl ObjectAggregateAbi {
         let new_call = pre_call.insert_inst_data_from(
             function,
             inst,
-            control_flow::Call::new(
+            control_flow::Call::new_unchecked(
                 function.inst_set(),
                 *call.callee(),
                 new_args,

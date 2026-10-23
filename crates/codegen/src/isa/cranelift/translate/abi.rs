@@ -101,6 +101,7 @@ pub(super) fn sonatina_type_to_clif(ty: Type, pointer_type: clif::Type) -> Optio
         Type::I1 | Type::I8 => Some(clif::types::I8),
         Type::I16 => Some(clif::types::I16),
         Type::I32 => Some(clif::types::I32),
+        Type::F32 => Some(clif::types::F32),
         Type::I64 => Some(clif::types::I64),
         Type::I128 => Some(clif::types::I128),
         // I256 and compound values are represented by native pointers to
@@ -123,6 +124,7 @@ pub(super) fn sonatina_scalar_type_to_clif_or_err(ty: Type) -> Result<clif::Type
         Type::I1 | Type::I8 => Ok(clif::types::I8),
         Type::I16 => Ok(clif::types::I16),
         Type::I32 => Ok(clif::types::I32),
+        Type::F32 => Ok(clif::types::F32),
         Type::I64 => Ok(clif::types::I64),
         Type::I128 => Ok(clif::types::I128),
         _ => Err(format!("unsupported scalar type for cranelift: {ty:?}")),

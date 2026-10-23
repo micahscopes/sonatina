@@ -1154,7 +1154,7 @@ fn normalize_stage_to_single_exit(function: &Function) -> Result<Option<Function
         normalized.dfg.attach_result(phi_inst, phi_value);
         exit_values.push(phi_value);
     }
-    let ret = Return::new(normalized.inst_set(), exit_values.into());
+    let ret = Return::new_unchecked(normalized.inst_set(), exit_values.into());
     let ret_inst = normalized.dfg.make_inst(ret);
     normalized.layout.append_inst(ret_inst, exit);
     normalized.rebuild_users();

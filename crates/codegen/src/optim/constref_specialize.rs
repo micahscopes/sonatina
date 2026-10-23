@@ -288,7 +288,7 @@ fn prepend_const_ref(
     global: sonatina_ir::GlobalVariableRef,
     ty: Type,
 ) -> PrependedValue {
-    let inst = func.dfg.make_inst(data::ConstRef::new(
+    let inst = func.dfg.make_inst(data::ConstRef::new_unchecked(
         func.inst_set(),
         global.into(),
     ));
@@ -322,7 +322,7 @@ fn prepend_const_proj(
     let index = func
         .dfg
         .make_imm_value(Immediate::I64(i64::try_from(idx).expect("index overflow")));
-    let inst = func.dfg.make_inst(data::ConstProj::new(
+    let inst = func.dfg.make_inst(data::ConstProj::new_unchecked(
         func.inst_set(),
         smallvec![base.value, index],
     ));
@@ -350,7 +350,7 @@ fn prepend_const_index(
     let index = func
         .dfg
         .make_imm_value(Immediate::I64(i64::try_from(idx).expect("index overflow")));
-    let inst = func.dfg.make_inst(data::ConstIndex::new(
+    let inst = func.dfg.make_inst(data::ConstIndex::new_unchecked(
         func.inst_set(),
         base.value,
         index,
@@ -373,7 +373,7 @@ fn rewrite_call_callee(function: &mut Function, inst: sonatina_ir::InstId, clone
     let args: SmallVec<[_; 8]> = call.args().iter().copied().collect();
     function.dfg.replace_inst_preserving_results(
         inst,
-        Box::new(control_flow::Call::new(
+        Box::new(control_flow::Call::new_unchecked(
             function.inst_set(),
             clone,
             args,

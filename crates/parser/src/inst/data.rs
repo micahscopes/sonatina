@@ -52,7 +52,7 @@ fn build_sym_addr(
     has_inst: &dyn HasInst<SymAddr>,
 ) -> Result<SymAddr, Box<Error>> {
     let sym = build_symbol_ref(ctx, fb, args)?;
-    Ok(SymAddr::new(fb.inst_set(), sym))
+    Ok(SymAddr::new(has_inst, sym))
 }
 
 fn build_const_ref(
@@ -62,7 +62,7 @@ fn build_const_ref(
     has_inst: &dyn HasInst<ConstRef>,
 ) -> Result<ConstRef, Box<Error>> {
     let global = build_global_ref(ctx, fb, args)?;
-    Ok(ConstRef::new(fb.inst_set(), global.into()))
+    Ok(ConstRef::new(has_inst, global.into()))
 }
 
 fn build_sym_size(
@@ -72,7 +72,7 @@ fn build_sym_size(
     has_inst: &dyn HasInst<SymSize>,
 ) -> Result<SymSize, Box<Error>> {
     let sym = build_symbol_ref(ctx, fb, args)?;
-    Ok(SymSize::new(fb.inst_set(), sym))
+    Ok(SymSize::new(has_inst, sym))
 }
 
 fn build_global_ref(
@@ -189,7 +189,7 @@ fn build_const_proj(
     if let Some(arg) = ast_args.next() {
         Err(Box::new(Error::UnexpectedTrailingInstArg(arg.span)))
     } else {
-        Ok(ConstProj::new(fb.inst_set(), values))
+        Ok(ConstProj::new(has_inst, values))
     }
 }
 
@@ -208,7 +208,7 @@ fn build_gep(
     if let Some(arg) = ast_args.next() {
         Err(Box::new(Error::UnexpectedTrailingInstArg(arg.span)))
     } else {
-        Ok(Gep::new(fb.inst_set(), values))
+        Ok(Gep::new(has_inst, values))
     }
 }
 
@@ -227,7 +227,7 @@ fn build_obj_proj(
     if let Some(arg) = ast_args.next() {
         Err(Box::new(Error::UnexpectedTrailingInstArg(arg.span)))
     } else {
-        Ok(ObjProj::new(fb.inst_set(), values))
+        Ok(ObjProj::new(has_inst, values))
     }
 }
 
@@ -241,7 +241,7 @@ fn build_enum_make(
     let variant_name: &ast::VariantName = (&args[1]).try_into()?;
     let variant = ctx.enum_variant(&fb.module_builder, enum_ty, variant_name, args[1].span);
     let values = build_enum_payload_values(ctx, fb, &args[2..])?;
-    Ok(EnumMake::new(fb.inst_set(), enum_ty, variant, values))
+    Ok(EnumMake::new(has_inst, enum_ty, variant, values))
 }
 
 fn build_enum_is_variant(
@@ -254,7 +254,7 @@ fn build_enum_is_variant(
     let variant_name: &ast::VariantName = (&args[1]).try_into()?;
     let enum_ty = fb.func.dfg.value_ty(value);
     let variant = ctx.enum_variant(&fb.module_builder, enum_ty, variant_name, args[1].span);
-    Ok(EnumIsVariant::new(fb.inst_set(), value, variant))
+    Ok(EnumIsVariant::new(has_inst, value, variant))
 }
 
 fn build_enum_assert_variant(
@@ -267,7 +267,7 @@ fn build_enum_assert_variant(
     let variant_name: &ast::VariantName = (&args[1]).try_into()?;
     let enum_ty = fb.func.dfg.value_ty(value);
     let variant = ctx.enum_variant(&fb.module_builder, enum_ty, variant_name, args[1].span);
-    Ok(EnumAssertVariant::new(fb.inst_set(), value, variant))
+    Ok(EnumAssertVariant::new(has_inst, value, variant))
 }
 
 fn build_enum_extract(
@@ -281,7 +281,7 @@ fn build_enum_extract(
     let field = ctx.value(fb, (&args[2]).try_into()?);
     let enum_ty = fb.func.dfg.value_ty(value);
     let variant = ctx.enum_variant(&fb.module_builder, enum_ty, variant_name, args[1].span);
-    Ok(EnumExtract::new(fb.inst_set(), value, variant, field))
+    Ok(EnumExtract::new(has_inst, value, variant, field))
 }
 
 fn build_enum_assert_variant_ref(
@@ -303,7 +303,7 @@ fn build_enum_assert_variant_ref(
         })
         .unwrap_or(ir::Type::Unit);
     let variant = ctx.enum_variant(&fb.module_builder, enum_ty, variant_name, args[1].span);
-    Ok(EnumAssertVariantRef::new(fb.inst_set(), object, variant))
+    Ok(EnumAssertVariantRef::new(has_inst, object, variant))
 }
 
 fn build_enum_set_tag(
@@ -325,7 +325,7 @@ fn build_enum_set_tag(
         })
         .unwrap_or(ir::Type::Unit);
     let variant = ctx.enum_variant(&fb.module_builder, enum_ty, variant_name, args[1].span);
-    Ok(EnumSetTag::new(fb.inst_set(), object, variant))
+    Ok(EnumSetTag::new(has_inst, object, variant))
 }
 
 fn build_enum_write_variant(
@@ -348,7 +348,7 @@ fn build_enum_write_variant(
         .unwrap_or(ir::Type::Unit);
     let variant = ctx.enum_variant(&fb.module_builder, enum_ty, variant_name, args[1].span);
     let values = build_enum_payload_values(ctx, fb, &args[2..])?;
-    Ok(EnumWriteVariant::new(fb.inst_set(), object, variant, values))
+    Ok(EnumWriteVariant::new(has_inst, object, variant, values))
 }
 
 fn build_enum_proj(
@@ -371,7 +371,7 @@ fn build_enum_proj(
         })
         .unwrap_or(ir::Type::Unit);
     let variant = ctx.enum_variant(&fb.module_builder, enum_ty, variant_name, args[1].span);
-    Ok(EnumProj::new(fb.inst_set(), object, variant, field))
+    Ok(EnumProj::new(has_inst, object, variant, field))
 }
 
 fn build_enum_payload_values(

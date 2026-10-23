@@ -94,6 +94,13 @@ fn serialize_initializer(
                     imm.ty()
                 ));
             }
+            if let Immediate::F32(bits) = imm {
+                if bytes.len() != 4 {
+                    return Err("f32 initializer requires four bytes".into());
+                }
+                bytes.copy_from_slice(&bits.to_le_bytes());
+                return Ok(());
+            }
             let words = imm.zext(Type::I256).as_i256().to_u256().to_little_endian();
             bytes.copy_from_slice(&words[..bytes.len()]);
         }

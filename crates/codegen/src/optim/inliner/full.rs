@@ -54,6 +54,7 @@ pub(super) fn try_inline_callsite_full(
     callee_ref: FuncRef,
     callee: (SummaryKey, &Function),
     validated_callees: &mut FxHashSet<SummaryKey>,
+    record_full_clone_ids: bool,
 ) -> Result<FullInlineResult, FullInlineFail> {
     let (callee_key, callee) = callee;
     if !caller.layout.is_inst_inserted(call_inst) {
@@ -197,7 +198,7 @@ pub(super) fn try_inline_callsite_full(
                 .func_mut()
                 .import_inst_attribution_from(callee, old_inst, new_inst);
             inserted_insts += 1;
-            if _config.record_full_clone_ids {
+            if record_full_clone_ids {
                 cloned_insts.push(new_inst);
             }
 
@@ -242,7 +243,7 @@ pub(super) fn try_inline_callsite_full(
                 .import_inst_attribution_from(callee, term_id, new_jump);
             let new_inst = new_jump;
             inserted_insts += 1;
-            if _config.record_full_clone_ids {
+            if record_full_clone_ids {
                 cloned_insts.push(new_inst);
             }
 
@@ -265,7 +266,7 @@ pub(super) fn try_inline_callsite_full(
                 .import_inst_attribution_from(callee, term_id, new_term);
             let new_inst = new_term;
             inserted_insts += 1;
-            if _config.record_full_clone_ids {
+            if record_full_clone_ids {
                 cloned_insts.push(new_inst);
             }
         }
@@ -342,7 +343,7 @@ pub(super) fn try_inline_callsite_full(
                     func.dfg.attach_result(phi_inst, phi_value);
                     func.dfg.change_to_alias(call_result, phi_value);
                     inserted_insts += 1;
-                    if _config.record_full_clone_ids {
+                    if record_full_clone_ids {
                         cloned_insts.push(phi_inst);
                     }
                 }

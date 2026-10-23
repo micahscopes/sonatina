@@ -1201,6 +1201,7 @@ pub(super) fn resolve_value(
     let value = function.dfg.value(value_id);
     match value {
         Value::Immediate { imm, ty } => match imm {
+            Immediate::F32(bits) => Ok(builder.ins().f32const(clif::immediates::Ieee32::with_bits(*bits))),
             Immediate::I128(value) => Ok(scalar_constant(clif::types::I128, *value, builder)),
             Immediate::I256(value) => Ok(emit_i256_immediate(value, builder)),
             _ => {
@@ -1228,7 +1229,11 @@ pub(super) fn resolve_value(
                 let pointer_ty =
                     sonatina_scalar_type_to_clif_or_err(ctx.type_layout.pointer_repl())?;
                 let clif_ty = sonatina_type_to_clif_or_err(*ty, pointer_ty)?;
-                Ok(scalar_constant(clif_ty, 0, builder))
+                if *ty == Type::F32 {
+                    Ok(builder.ins().f32const(clif::immediates::Ieee32::with_bits(0)))
+                } else {
+                    Ok(scalar_constant(clif_ty, 0, builder))
+                }
             }
         }
         Value::Global { gv, .. } => Err(format!(

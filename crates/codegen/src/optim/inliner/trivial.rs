@@ -502,7 +502,7 @@ pub(super) fn apply_plan(
                 return None;
             }
 
-            let new_call = control_flow::Call::new(caller.inst_set(), new_callee, args);
+            let new_call = control_flow::Call::new_unchecked(caller.inst_set(), new_callee, args);
             caller.dfg.replace_inst(call_inst_id, Box::new(new_call));
             stats.calls_rewritten += 1;
             true

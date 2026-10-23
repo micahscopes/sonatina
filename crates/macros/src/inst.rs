@@ -393,7 +393,7 @@ impl InstStruct {
         let has_inst_method = ty_name_to_method_name(&self.struct_name);
         quote! {
             #[allow(clippy::too_many_arguments)]
-            pub fn new(hi: &dyn crate::HasInst<Self>, #(#ctor_args),*) -> Self {
+            pub fn new(_inst_capability: &dyn crate::HasInst<Self>, #(#ctor_args),*) -> Self {
                 Self {
                     #(#field_names),*
                 }

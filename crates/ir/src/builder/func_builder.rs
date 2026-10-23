@@ -286,71 +286,71 @@ where
     }
 
     pub fn insert_uaddo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(Uaddo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(Uaddo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_saddo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(Saddo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(Saddo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_uaddsat(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.insert_saturating_binary(Uaddsat::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_saturating_binary(Uaddsat::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_saddsat(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.insert_saturating_binary(Saddsat::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_saturating_binary(Saddsat::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_usubo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(Usubo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(Usubo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_usubsat(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.insert_saturating_binary(Usubsat::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_saturating_binary(Usubsat::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_ssubo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(Ssubo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(Ssubo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_ssubsat(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.insert_saturating_binary(Ssubsat::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_saturating_binary(Ssubsat::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_umulo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(Umulo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(Umulo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_umulsat(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.insert_saturating_binary(Umulsat::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_saturating_binary(Umulsat::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_smulo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(Smulo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(Smulo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_smulsat(&mut self, lhs: ValueId, rhs: ValueId) -> ValueId {
-        self.insert_saturating_binary(Smulsat::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_saturating_binary(Smulsat::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_snego(&mut self, arg: ValueId) -> [ValueId; 2] {
-        self.insert_checked_unary(Snego::new(self.inst_set(), arg), arg)
+        self.insert_checked_unary(Snego::new_unchecked(self.inst_set(), arg), arg)
     }
 
     pub fn insert_evm_udivo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(EvmUdivo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(EvmUdivo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_evm_sdivo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(EvmSdivo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(EvmSdivo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_evm_umodo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(EvmUmodo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(EvmUmodo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_evm_smodo(&mut self, lhs: ValueId, rhs: ValueId) -> [ValueId; 2] {
-        self.insert_checked_binary(EvmSmodo::new(self.inst_set(), lhs, rhs), lhs, rhs)
+        self.insert_checked_binary(EvmSmodo::new_unchecked(self.inst_set(), lhs, rhs), lhs, rhs)
     }
 
     pub fn insert_call_results(
@@ -361,7 +361,7 @@ where
         let ret_tys = self
             .module_builder
             .sig(callee, |sig| sig.ret_tys().to_vec());
-        let call = control_flow::Call::new(self.inst_set(), callee, args);
+        let call = control_flow::Call::new_unchecked(self.inst_set(), callee, args);
         self.insert_inst_results(call, &ret_tys)
     }
 
@@ -379,7 +379,7 @@ where
     }
 
     pub fn insert_return_values(&mut self, values: &[ValueId]) {
-        self.insert_inst_no_result(control_flow::Return::new(
+        self.insert_inst_no_result(control_flow::Return::new_unchecked(
             self.inst_set(),
             SmallVec::from_slice(values).into(),
         ));

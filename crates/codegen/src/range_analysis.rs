@@ -1981,7 +1981,7 @@ fn widen_env(func: &Function, old: &RangeEnv, new: &RangeEnv) -> RangeEnv {
     widened
 }
 
-fn join_facts(lhs: RangeFact, rhs: RangeFact, _ty: Type) -> RangeFact {
+pub(crate) fn join_facts(lhs: RangeFact, rhs: RangeFact, _ty: Type) -> RangeFact {
     RangeFact {
         unsigned: lhs.unsigned.join(rhs.unsigned),
         signed: lhs.signed.join(rhs.signed),

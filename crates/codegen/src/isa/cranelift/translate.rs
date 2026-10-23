@@ -237,6 +237,162 @@ fn translate_function(
             let inst_data = function.dfg.inst(inst_id);
 
             match native_inst_set().resolve_inst(inst_data) {
+                NativeInstKind::Fneg(inst) => {
+                    let arg = resolve_value(function, *inst.arg(), &value_map, &mut builder)?;
+                    let result = builder.ins().fneg(arg);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fsqrt(inst) => {
+                    let arg = resolve_value(function, *inst.arg(), &value_map, &mut builder)?;
+                    let result = builder.ins().sqrt(arg);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fabs(inst) => {
+                    let arg = resolve_value(function, *inst.arg(), &value_map, &mut builder)?;
+                    let result = builder.ins().fabs(arg);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Ffloor(inst) => {
+                    let arg = resolve_value(function, *inst.arg(), &value_map, &mut builder)?;
+                    let result = builder.ins().floor(arg);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fceil(inst) => {
+                    let arg = resolve_value(function, *inst.arg(), &value_map, &mut builder)?;
+                    let result = builder.ins().ceil(arg);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Ftrunc(inst) => {
+                    let arg = resolve_value(function, *inst.arg(), &value_map, &mut builder)?;
+                    let result = builder.ins().trunc(arg);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fround(inst) => {
+                    let arg = resolve_value(function, *inst.arg(), &value_map, &mut builder)?;
+                    let result = builder.ins().nearest(arg);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fadd(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fadd(lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fsub(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fsub(lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fmul(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fmul(lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fdiv(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fdiv(lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fmin(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fmin(lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fmax(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fmax(lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::FminRelaxed(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fmin(lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::FmaxRelaxed(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fmax(lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Feq(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fcmp(clif::condcodes::FloatCC::Equal, lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Flt(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fcmp(clif::condcodes::FloatCC::LessThan, lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::Fle(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let result = builder.ins().fcmp(clif::condcodes::FloatCC::LessThanOrEqual, lhs, rhs);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::EvmAddMod(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let modulus = resolve_value(function, *inst.modulus(), &value_map, &mut builder)?;
+                    let result = emit_modular_runtime(module, "__u256_addmod", [lhs, rhs, modulus], clif_module, &mut builder)?;
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::EvmMulMod(inst) => {
+                    let lhs = resolve_value(function, *inst.lhs(), &value_map, &mut builder)?;
+                    let rhs = resolve_value(function, *inst.rhs(), &value_map, &mut builder)?;
+                    let modulus = resolve_value(function, *inst.modulus(), &value_map, &mut builder)?;
+                    let result = emit_modular_runtime(module, "__u256_mulmod", [lhs, rhs, modulus], clif_module, &mut builder)?;
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::I32ToF32(inst) => {
+                    let value = resolve_value(function, *inst.from(), &value_map, &mut builder)?;
+                    let result = builder.ins().fcvt_from_sint(clif::types::F32, value);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::U32ToF32(inst) => {
+                    let value = resolve_value(function, *inst.from(), &value_map, &mut builder)?;
+                    let result = builder.ins().fcvt_from_uint(clif::types::F32, value);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::F32ToI32(inst) => {
+                    let value = resolve_value(function, *inst.from(), &value_map, &mut builder)?;
+                    let result = builder.ins().fcvt_to_sint_sat(clif::types::I32, value);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::F32ToU32(inst) => {
+                    let value = resolve_value(function, *inst.from(), &value_map, &mut builder)?;
+                    let result = builder.ins().fcvt_to_uint_sat(clif::types::I32, value);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
+                NativeInstKind::ObjAtomicAdd(_) | NativeInstKind::ObjAtomicUMin(_)
+                | NativeInstKind::ObjAtomicLoad(_) | NativeInstKind::ObjAtomicStore(_) => {
+                    return Err("native object atomic semantics are not implemented".into());
+                }
+                NativeInstKind::MemCheckpoint(_) | NativeInstKind::MemRewind(_) => {
+                    return Err("native dynamic arena checkpoint semantics are not implemented".into());
+                }
+                NativeInstKind::Memcopy(copy) => {
+                    let dest = resolve_pointer_sized_value(function, *copy.dest(), &value_map, pointer_type, &mut builder)?;
+                    let src = resolve_pointer_sized_value(function, *copy.src(), &value_map, pointer_type, &mut builder)?;
+                    let len = resolve_pointer_sized_value(function, *copy.len(), &value_map, pointer_type, &mut builder)?;
+                    builder.call_memmove(target_config, dest, src, len);
+                }
+                NativeInstKind::Fclamp(inst) => {
+                    let arg = resolve_value(function, *inst.arg(), &value_map, &mut builder)?;
+                    let lo = resolve_value(function, *inst.lo(), &value_map, &mut builder)?;
+                    let hi = resolve_value(function, *inst.hi(), &value_map, &mut builder)?;
+                    let lower = builder.ins().fmax(arg, lo);
+                    let result = builder.ins().fmin(lower, hi);
+                    insert_clif_results(function, inst_id, [result], &mut value_map);
+                }
                 NativeInstKind::Add(add) => {
                     let result_val = if function.dfg.value_ty(*add.lhs()) == Type::I256 {
                         emit_i256_add(function, *add.lhs(), *add.rhs(), &value_map, &mut builder)?
@@ -1978,4 +2134,31 @@ fn collect_phi_args_for_block(
         }
     }
     Ok(args)
+}
+
+/// Typed modular arithmetic uses a fixed limb ABI, never name-based call interception.
+fn emit_modular_runtime(
+    module: &Module,
+    symbol: &str,
+    operands: [clif::Value; 3],
+    clif_module: &mut impl ClifModule,
+    builder: &mut FunctionBuilder,
+) -> Result<clif::Value, String> {
+    if module.ctx.triple == TargetTriple::SP1 {
+        return Err("host modular runtime is unavailable on SP1".into());
+    }
+    if module.funcs().iter().any(|&func| module.ctx.func_sig(func, |sig| {
+        sig.name() == symbol && !sig.linkage().is_external()
+    })) {
+        return Err(format!("authored function conflicts with native runtime symbol {symbol}"));
+    }
+    let pointer_type = clif_module.target_config().pointer_type();
+    let mut signature = clif_module.make_signature();
+    signature.params = vec![clif::AbiParam::new(pointer_type); 4];
+    let function = clif_module.declare_function(symbol, Linkage::Import, &signature)
+        .map_err(|error| format!("cannot declare modular runtime: {error}"))?;
+    let function = clif_module.declare_func_in_func(function, builder.func);
+    let result = create_i256_slot(builder);
+    builder.ins().call(function, &[operands[0], operands[1], operands[2], result]);
+    Ok(result)
 }

@@ -90,7 +90,7 @@ pub fn lower_switches(function: &mut Function) -> Result<usize, String> {
         }
         let mut current = source;
         for (index, (value, destination)) in cases.iter().enumerate() {
-            let comparison = function.dfg.make_inst(Eq::new(is, selector, *value));
+            let comparison = function.dfg.make_inst(Eq::new_unchecked(is, selector, *value));
             let condition = function.dfg.make_value(Value::Inst {
                 inst: comparison,
                 result_idx: 0,
@@ -109,7 +109,7 @@ pub fn lower_switches(function: &mut Function) -> Result<usize, String> {
                 function.layout.append_block(next);
                 next
             };
-            let branch = Br::new(is, condition, edge_for(*destination), otherwise);
+            let branch = Br::new_unchecked(is, condition, edge_for(*destination), otherwise);
             if current == source {
                 function.dfg.replace_inst(terminator, Box::new(branch));
             } else {

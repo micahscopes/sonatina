@@ -416,7 +416,7 @@ fn rewrite_calls(function: &mut Function, plans: &FxHashMap<FuncRef, FuncPlan>) 
                 .collect();
             function.dfg.replace_inst_preserving_results(
                 inst,
-                Box::new(control_flow::Call::new(
+                Box::new(control_flow::Call::new_unchecked(
                     function.inst_set(),
                     *call.callee(),
                     new_args,

@@ -241,7 +241,7 @@ impl AggregateExpandAbi {
 
                 func.dfg.replace_inst(
                     inst,
-                    Box::new(control_flow::Return::new(
+                    Box::new(control_flow::Return::new_unchecked(
                         func.inst_set(),
                         new_args.into(),
                     )),
@@ -291,7 +291,7 @@ impl AggregateExpandAbi {
         let new_call = cursor.insert_inst_data_from(
             func,
             inst,
-            control_flow::Call::new(
+            control_flow::Call::new_unchecked(
                 func.inst_set(),
                 *call.callee(),
                 new_args,

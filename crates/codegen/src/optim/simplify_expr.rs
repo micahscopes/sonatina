@@ -491,6 +491,7 @@ fn fold_unary_with_facts(
     let arg = defined_imm(facts, key.unary_arg()?)?;
     let result_ty = *key.result_tys().first()?;
     let result = match kind {
+        UnaryInstKind::Fneg | UnaryInstKind::Fsqrt | UnaryInstKind::Fabs | UnaryInstKind::Ffloor | UnaryInstKind::Fceil | UnaryInstKind::Ftrunc | UnaryInstKind::Fround => return None,
         UnaryInstKind::Neg => SimplifiedInst::one(SimplifiedResult::Const(-arg)),
         UnaryInstKind::Snego => {
             let (value, overflow) = arg.overflowing_sneg();
@@ -521,6 +522,7 @@ fn fold_binary_with_facts(
     let (lhs, rhs) = key.binary_args()?;
     let result_ty = *key.result_tys().first()?;
     let result = match kind {
+        BinaryInstKind::Fadd | BinaryInstKind::Fsub | BinaryInstKind::Fmul | BinaryInstKind::Fdiv | BinaryInstKind::Fmin | BinaryInstKind::Fmax | BinaryInstKind::FminRelaxed | BinaryInstKind::FmaxRelaxed | BinaryInstKind::Feq | BinaryInstKind::Flt | BinaryInstKind::Fle => return None,
         BinaryInstKind::Add => {
             let (lhs, rhs) = word_binary_imms(func, facts, lhs, rhs, result_ty)?;
             fold_result_imm(lhs + rhs, result_ty)?

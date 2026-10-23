@@ -58,7 +58,7 @@ macro_rules! impl_inst_build {
                 $(
                     let $arg_name = crate::inst::process_arg!(ctx, fb, &mut arg_iter, $arg_kind);
                 )*
-                Ok(<$ty>::new(fb.inst_set(), $( $arg_name ),*))
+                Ok(<$ty>::new(_has_inst, $( $arg_name ),*))
             }
         );
     };

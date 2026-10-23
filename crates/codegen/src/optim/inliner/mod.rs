@@ -501,6 +501,7 @@ impl Inliner {
                             site.callee,
                             (cost::SummaryKey::Snapshot(site.callee), callee),
                             &mut validated_callees,
+                            self.config.record_full_clone_ids,
                         )
                     } else {
                         module.func_store.view(site.callee, |callee| {
@@ -511,6 +512,7 @@ impl Inliner {
                                 site.callee,
                                 (cost::SummaryKey::Live(site.callee), callee),
                                 &mut validated_callees,
+                                self.config.record_full_clone_ids,
                             )
                         })
                     };

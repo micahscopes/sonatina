@@ -1,4 +1,4 @@
-use sonatina_codegen::{Backend, isa::spirv::SpirvBackend};
+use sonatina_codegen::{Backend, BackendOptions, isa::spirv::SpirvBackend};
 use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
@@ -25,18 +25,18 @@ fn typed_struct_source_labels_only_change_shader_debug_names() {
     let mut fb = mb.func_builder::<InstInserter>(entry);
     let block = fb.append_block();
     fb.switch_to_block(block);
-    let local = fb.insert_inst(data::Alloca::new(is, pair), pair_ptr);
-    let first = fb.insert_inst(cast::Bitcast::new(is, local, word_ptr), word_ptr);
+    let local = fb.insert_inst(data::Alloca::new_unchecked(is, pair), pair_ptr);
+    let first = fb.insert_inst(cast::Bitcast::new_unchecked(is, local, word_ptr), word_ptr);
     let value = fb.make_imm_value(37i32);
-    fb.insert_inst_no_result(data::Mstore::new(is, first, value, Type::I32));
-    let loaded = fb.insert_inst(data::Mload::new(is, first, Type::I32), Type::I32);
+    fb.insert_inst_no_result(data::Mstore::new_unchecked(is, first, value, Type::I32));
+    let loaded = fb.insert_inst(data::Mload::new_unchecked(is, first, Type::I32), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
     fb.seal_all();
     fb.finish();
     let module = mb.build();
-    let anonymous = SpirvBackend::new().compile_module(&module).unwrap();
+    let anonymous = SpirvBackend::new().compile_module(&module, &BackendOptions::default()).unwrap();
     module.ctx.set_struct_field_names(pair, vec!["re".into(), "im".into()]).unwrap();
-    let named = SpirvBackend::new().compile_module(&module).unwrap();
+    let named = SpirvBackend::new().compile_module(&module, &BackendOptions::default()).unwrap();
     let wgsl = named.wgsl.as_deref().unwrap();
     assert!(wgsl.contains("re:"), "{wgsl}");
     assert!(wgsl.contains("im:"), "{wgsl}");

@@ -639,14 +639,14 @@ impl Backend for NagaBackend {
     type Error = SpirvError;
 
     #[cfg(not(feature = "spirv-backend"))]
-    fn compile_module(&self, _module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
+    fn compile_module(&self, _module: &Module, _options: &crate::backend::BackendOptions) -> Result<Self::Artifact, Vec<Self::Error>> {
         Err(vec![SpirvError::Translation(
             "SPIR-V backend requires the spirv-backend feature".to_string(),
         )])
     }
 
     #[cfg(feature = "spirv-backend")]
-    fn compile_module(&self, module: &Module) -> Result<Self::Artifact, Vec<Self::Error>> {
+    fn compile_module(&self, module: &Module, _options: &crate::backend::BackendOptions) -> Result<Self::Artifact, Vec<Self::Error>> {
         self.compile_module_for_entry(module, None, None)
     }
 }
