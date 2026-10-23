@@ -1,5 +1,5 @@
 use sonatina_codegen::{Backend, Compile, OptLevel};
-use sonatina_codegen::isa::cranelift::CraneliftBackend;
+use sonatina_codegen::isa::cranelift::CraneliftJitBackend;
 use sonatina_ir::{
     Linkage, Signature, Type,
     builder::ModuleBuilder,
@@ -47,18 +47,18 @@ fn cranelift_definition_order_follows_cfg_not_block_layout() {
         let second = fb.append_block();
         let (definition, use_block) = if reversed { (second, first) } else { (first, second) };
         fb.switch_to_block(entry);
-        fb.insert_inst_no_result(control_flow::Jump::new(is, definition));
+        fb.insert_inst_no_result(control_flow::Jump::new_unchecked(is, definition));
         fb.switch_to_block(definition);
         let two = fb.make_imm_value(2i32);
-        let value = fb.insert_inst(arith::Add::new(is, fb.args()[0], two), Type::I32);
-        fb.insert_inst_no_result(control_flow::Jump::new(is, use_block));
+        let value = fb.insert_inst(arith::Add::new_unchecked(is, fb.args()[0], two), Type::I32);
+        fb.insert_inst_no_result(control_flow::Jump::new_unchecked(is, use_block));
         fb.switch_to_block(use_block);
         fb.insert_inst_no_result(control_flow::Return::new_single(is, value));
         fb.seal_all();
         fb.finish();
-        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        let artifact = CraneliftJitBackend::new().compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default()).unwrap();
         type Probe = unsafe extern "C" fn(i32) -> i32;
-        let probe: Probe = unsafe { std::mem::transmute(artifact.get_func_ptr::<Probe>("layout").unwrap()) };
+        let probe: Probe = unsafe { std::mem::transmute(artifact.function_address("layout").unwrap()) };
         for value in [0i32, 40, -7, i32::MAX] {
             assert_eq!(unsafe { probe(value) }, value.wrapping_add(2), "reversed={reversed}");
         }
@@ -80,23 +80,23 @@ fn cranelift_loop_phi_transport_is_independent_of_block_layout() {
         let [header, body, exit] = order.map(|index| blocks[index]);
         fb.switch_to_block(entry);
         let zero = fb.make_imm_value(0i32);
-        fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+        fb.insert_inst_no_result(control_flow::Jump::new_unchecked(is, header));
         fb.switch_to_block(header);
-        let index = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
-        let cond = fb.insert_inst(cmp::Slt::new(is, index, fb.args()[0]), Type::I1);
-        fb.insert_inst_no_result(control_flow::Br::new(is, cond, body, exit));
+        let index = fb.insert_inst(control_flow::Phi::new_unchecked(is, vec![(zero, entry)].into()), Type::I32);
+        let cond = fb.insert_inst(cmp::Slt::new_unchecked(is, index, fb.args()[0]), Type::I1);
+        fb.insert_inst_no_result(control_flow::Br::new_unchecked(is, cond, body, exit));
         fb.switch_to_block(body);
         let one = fb.make_imm_value(1i32);
-        let next = fb.insert_inst(arith::Add::new(is, index, one), Type::I32);
+        let next = fb.insert_inst(arith::Add::new_unchecked(is, index, one), Type::I32);
         fb.append_phi_arg(index, next, body);
-        fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+        fb.insert_inst_no_result(control_flow::Jump::new_unchecked(is, header));
         fb.switch_to_block(exit);
         fb.insert_inst_no_result(control_flow::Return::new_single(is, index));
         fb.seal_all();
         fb.finish();
-        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        let artifact = CraneliftJitBackend::new().compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default()).unwrap();
         type Probe = unsafe extern "C" fn(i32) -> i32;
-        let probe: Probe = unsafe { std::mem::transmute(artifact.get_func_ptr::<Probe>("layout_loop").unwrap()) };
+        let probe: Probe = unsafe { std::mem::transmute(artifact.function_address("layout_loop").unwrap()) };
         for count in [-1, 0, 1, 7, 100] {
             assert_eq!(unsafe { probe(count) }, count.max(0), "order={order:?}");
         }
@@ -122,28 +122,28 @@ fn cranelift_integer_overflow_matches_wide_oracle() {
                 fb.switch_to_block(entry);
                 let mut args = [fb.args()[0], fb.args()[1]];
                 if ty != Type::I64 {
-                    for arg in &mut args { *arg = fb.insert_inst(cast::Trunc::new(is, *arg, ty), ty); }
+                    for arg in &mut args { *arg = fb.insert_inst(cast::Trunc::new_unchecked(is, *arg, ty), ty); }
                 }
                 let [lhs, rhs] = args;
                 let result_types = [ty, Type::I1];
                 let results = match name {
-                    "uadd" => fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &result_types),
-                    "usub" => fb.insert_inst_results(arith::Usubo::new(is, lhs, rhs), &result_types),
-                    "umul" => fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &result_types),
-                    "sadd" => fb.insert_inst_results(arith::Saddo::new(is, lhs, rhs), &result_types),
-                    "ssub" => fb.insert_inst_results(arith::Ssubo::new(is, lhs, rhs), &result_types),
-                    "smul" => fb.insert_inst_results(arith::Smulo::new(is, lhs, rhs), &result_types),
+                    "uadd" => fb.insert_inst_results(arith::Uaddo::new_unchecked(is, lhs, rhs), &result_types),
+                    "usub" => fb.insert_inst_results(arith::Usubo::new_unchecked(is, lhs, rhs), &result_types),
+                    "umul" => fb.insert_inst_results(arith::Umulo::new_unchecked(is, lhs, rhs), &result_types),
+                    "sadd" => fb.insert_inst_results(arith::Saddo::new_unchecked(is, lhs, rhs), &result_types),
+                    "ssub" => fb.insert_inst_results(arith::Ssubo::new_unchecked(is, lhs, rhs), &result_types),
+                    "smul" => fb.insert_inst_results(arith::Smulo::new_unchecked(is, lhs, rhs), &result_types),
                     _ => unreachable!(),
                 };
                 let value = if result_types[lane] == Type::I64 { results[lane] } else {
-                    fb.insert_inst(cast::Zext::new(is, results[lane], Type::I64), Type::I64)
+                    fb.insert_inst(cast::Zext::new_unchecked(is, results[lane], Type::I64), Type::I64)
                 };
                 fb.insert_return(value);
                 fb.seal_all();
                 fb.finish();
             }
         }
-        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        let artifact = CraneliftJitBackend::new().compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default()).unwrap();
         let mask = u64::MAX >> (64 - bits);
         let sign = mask / 2 + 1;
         let mut cases = vec![(0, 0), (0, mask), (mask, 0), (mask, 1), (1, mask),
@@ -159,8 +159,8 @@ fn cranelift_integer_overflow_matches_wide_oracle() {
         }
         for name in operations {
             type Probe = unsafe extern "C" fn(u64, u64) -> u64;
-            let value: Probe = unsafe { std::mem::transmute(artifact.get_func_ptr::<Probe>(&format!("{name}_0")).unwrap()) };
-            let overflow: Probe = unsafe { std::mem::transmute(artifact.get_func_ptr::<Probe>(&format!("{name}_1")).unwrap()) };
+            let value: Probe = unsafe { std::mem::transmute(artifact.function_address(&format!("{name}_0")).unwrap()) };
+            let overflow: Probe = unsafe { std::mem::transmute(artifact.function_address(&format!("{name}_1")).unwrap()) };
             for &(lhs, rhs) in &cases {
                 let (lhs, rhs) = (lhs & mask, rhs & mask);
                 let expected = if name.starts_with('s') {
@@ -196,36 +196,36 @@ fn cranelift_i128_overflow_preserves_both_words_and_flag() {
             let shift = fb.make_imm_value(sonatina_ir::Immediate::I128(64));
             let mut operands = Vec::new();
             for pair in 0..2 {
-                let lo = fb.insert_inst(cast::Zext::new(is, fb.args()[pair * 2], Type::I128), Type::I128);
-                let hi = fb.insert_inst(cast::Zext::new(is, fb.args()[pair * 2 + 1], Type::I128), Type::I128);
-                let hi = fb.insert_inst(arith::Shl::new(is, shift, hi), Type::I128);
-                operands.push(fb.insert_inst(logic::Or::new(is, lo, hi), Type::I128));
+                let lo = fb.insert_inst(cast::Zext::new_unchecked(is, fb.args()[pair * 2], Type::I128), Type::I128);
+                let hi = fb.insert_inst(cast::Zext::new_unchecked(is, fb.args()[pair * 2 + 1], Type::I128), Type::I128);
+                let hi = fb.insert_inst(arith::Shl::new_unchecked(is, shift, hi), Type::I128);
+                operands.push(fb.insert_inst(logic::Or::new_unchecked(is, lo, hi), Type::I128));
             }
             let (lhs, rhs) = (operands[0], operands[1]);
             let types = [Type::I128, Type::I1];
             let results = match name {
-                "uadd" => fb.insert_inst_results(arith::Uaddo::new(is, lhs, rhs), &types),
-                "usub" => fb.insert_inst_results(arith::Usubo::new(is, lhs, rhs), &types),
-                "umul" => fb.insert_inst_results(arith::Umulo::new(is, lhs, rhs), &types),
-                "sadd" => fb.insert_inst_results(arith::Saddo::new(is, lhs, rhs), &types),
-                "ssub" => fb.insert_inst_results(arith::Ssubo::new(is, lhs, rhs), &types),
-                "smul" => fb.insert_inst_results(arith::Smulo::new(is, lhs, rhs), &types),
+                "uadd" => fb.insert_inst_results(arith::Uaddo::new_unchecked(is, lhs, rhs), &types),
+                "usub" => fb.insert_inst_results(arith::Usubo::new_unchecked(is, lhs, rhs), &types),
+                "umul" => fb.insert_inst_results(arith::Umulo::new_unchecked(is, lhs, rhs), &types),
+                "sadd" => fb.insert_inst_results(arith::Saddo::new_unchecked(is, lhs, rhs), &types),
+                "ssub" => fb.insert_inst_results(arith::Ssubo::new_unchecked(is, lhs, rhs), &types),
+                "smul" => fb.insert_inst_results(arith::Smulo::new_unchecked(is, lhs, rhs), &types),
                 _ => unreachable!(),
             };
             let value = match lane {
-                0 => fb.insert_inst(cast::Trunc::new(is, results[0], Type::I64), Type::I64),
+                0 => fb.insert_inst(cast::Trunc::new_unchecked(is, results[0], Type::I64), Type::I64),
                 1 => {
-                    let hi = fb.insert_inst(arith::Shr::new(is, shift, results[0]), Type::I128);
-                    fb.insert_inst(cast::Trunc::new(is, hi, Type::I64), Type::I64)
+                    let hi = fb.insert_inst(arith::Shr::new_unchecked(is, shift, results[0]), Type::I128);
+                    fb.insert_inst(cast::Trunc::new_unchecked(is, hi, Type::I64), Type::I64)
                 }
-                _ => fb.insert_inst(cast::Zext::new(is, results[1], Type::I64), Type::I64),
+                _ => fb.insert_inst(cast::Zext::new_unchecked(is, results[1], Type::I64), Type::I64),
             };
             fb.insert_return(value);
             fb.seal_all();
             fb.finish();
         }
     }
-    let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+    let artifact = CraneliftJitBackend::new().compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default()).unwrap();
     let mut values = vec![0u128, 1, 2, u64::MAX as u128, u128::MAX, 1u128 << 127, (1u128 << 127) - 1];
     let mut random = 0x1234_5678_9abc_def0u64;
     for _ in 0..64 {
@@ -237,7 +237,7 @@ fn cranelift_i128_overflow_preserves_both_words_and_flag() {
     for name in operations {
         type Probe = unsafe extern "C" fn(u64, u64, u64, u64) -> u64;
         let probes: Vec<Probe> = (0..3).map(|lane| unsafe {
-            std::mem::transmute(artifact.get_func_ptr::<Probe>(&format!("{name}_{lane}")).unwrap())
+            std::mem::transmute(artifact.function_address(&format!("{name}_{lane}")).unwrap())
         }).collect();
         for &lhs in &values {
             for &rhs in &values {
@@ -277,16 +277,16 @@ fn cranelift_i128_constants_preserve_both_words() {
             fb.switch_to_block(entry);
             let value = fb.make_imm_value(sonatina_ir::Immediate::I128(bits as i128));
             let shift = fb.make_imm_value(sonatina_ir::Immediate::I128(lane * 64));
-            let value = fb.insert_inst(arith::Shr::new(is, shift, value), Type::I128);
-            let word = fb.insert_inst(cast::Trunc::new(is, value, Type::I64), Type::I64);
+            let value = fb.insert_inst(arith::Shr::new_unchecked(is, shift, value), Type::I128);
+            let word = fb.insert_inst(cast::Trunc::new_unchecked(is, value, Type::I64), Type::I64);
             fb.insert_return(word);
             fb.seal_all();
             fb.finish();
         }
-        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        let artifact = CraneliftJitBackend::new().compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default()).unwrap();
         for lane in 0..2 {
             let probe: unsafe extern "C" fn() -> u64 = unsafe {
-                std::mem::transmute(artifact.get_func_ptr::<unsafe extern "C" fn() -> u64>(&format!("word_{lane}")).unwrap())
+                std::mem::transmute(artifact.function_address(&format!("word_{lane}")).unwrap())
             };
             assert_eq!(unsafe { probe() }, (bits >> (lane * 64)) as u64);
         }
@@ -328,7 +328,7 @@ fn authored_modular_names_remain_native_functions() {
             let mut fb = mb.func_builder::<InstInserter>(helper);
             let block = fb.append_block();
             fb.switch_to_block(block);
-            let value = fb.insert_inst(arith::Add::new(is, fb.args()[0], fb.args()[1]), Type::I64);
+            let value = fb.insert_inst(arith::Add::new_unchecked(is, fb.args()[0], fb.args()[1]), Type::I64);
             fb.insert_return(value);
             fb.seal_all();
             fb.finish();
@@ -338,19 +338,19 @@ fn authored_modular_names_remain_native_functions() {
             let block = fb.append_block();
             fb.switch_to_block(block);
             let value = fb.insert_inst(
-                control_flow::Call::new(is, helper, fb.args().iter().copied().collect()),
+                control_flow::Call::new_unchecked(is, helper, fb.args().iter().copied().collect()),
                 Type::I64,
             );
             fb.insert_return(value);
             fb.seal_all();
             fb.finish();
         }
-        let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+        let artifact = CraneliftJitBackend::new().compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default()).unwrap();
         for exported in [name, "invoke_authored"] {
             let function: unsafe extern "C" fn(i64, i64) -> i64 = unsafe {
                 std::mem::transmute(
                     artifact
-                        .get_func_ptr::<unsafe extern "C" fn(i64, i64) -> i64>(exported)
+                        .function_address(exported)
                         .unwrap(),
                 )
             };
@@ -376,7 +376,7 @@ fn native_modular_declarations_require_exact_names_and_signatures() {
             let declaration = mb
                 .declare_function(Signature::new_single(
                     name,
-                    Linkage::Private,
+                    Linkage::External,
                     &[Type::I256; 3],
                     Type::I256,
                 ))
@@ -398,18 +398,18 @@ fn native_modular_declarations_require_exact_names_and_signatures() {
                 )))
             });
             let value = fb.insert_inst(
-                control_flow::Call::new(is, declaration, args.into_iter().collect()),
+                control_flow::Call::new_unchecked(is, declaration, args.into_iter().collect()),
                 Type::I256,
             );
-            let low = fb.insert_inst(cast::Trunc::new(is, value, Type::I64), Type::I64);
+            let low = fb.insert_inst(cast::Trunc::new_unchecked(is, value, Type::I64), Type::I64);
             fb.insert_return(low);
             fb.seal_all();
             fb.finish();
-            let artifact = CraneliftBackend::new().compile_module(&mb.build()).unwrap();
+            let artifact = CraneliftJitBackend::new().compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default()).unwrap();
             let probe: unsafe extern "C" fn() -> u64 = unsafe {
                 std::mem::transmute(
                     artifact
-                        .get_func_ptr::<unsafe extern "C" fn() -> u64>("modular_probe")
+                        .function_address("modular_probe")
                         .unwrap(),
                 )
             };
@@ -426,17 +426,12 @@ fn native_modular_declarations_require_exact_names_and_signatures() {
                 "{name}, modulus {modulus}"
             );
             assert!(
-                unsafe { artifact.get_func_ptr::<()>(name) }.is_none(),
+                artifact.function_address(name).is_none(),
                 "runtime declarations must not appear as undefined JIT exports"
             );
         }
     }
     for (name, args, expected) in [
-        (
-            "authored_addmod_helper",
-            vec![Type::I256; 3],
-            "unsupported native runtime declaration",
-        ),
         (
             "addmod",
             vec![Type::I64; 3],
@@ -451,18 +446,26 @@ fn native_modular_declarations_require_exact_names_and_signatures() {
         let mb = native_module_builder();
         mb.declare_function(Signature::new_single(
             name,
-            Linkage::Private,
+            Linkage::External,
             &args,
             Type::I256,
         ))
         .unwrap();
-        let error = CraneliftBackend::new()
-            .compile_module(&mb.build())
+        let error = CraneliftJitBackend::new().compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default())
             .err()
             .expect("invalid declaration must fail closed");
         let error = format!("{error:?}");
         assert!(error.contains(name) && error.contains(expected), "{error}");
     }
+    let mb = native_module_builder();
+    mb.declare_function(Signature::new_single(
+        "authored_addmod_helper", Linkage::External, &[Type::I256; 3], Type::I256,
+    )).unwrap();
+    let artifact = CraneliftJitBackend::new()
+        .compile_module(&mb.build(), &sonatina_codegen::BackendOptions::default())
+        .expect("an unused external import is not a modular runtime alias");
+    assert!(artifact.function_address("authored_addmod_helper").is_none());
+
 }
 
 #[test]
@@ -483,17 +486,17 @@ fn cranelift_add_two_i64s() {
 
     let a = fb.args()[0];
     let b = fb.args()[1];
-    let sum = fb.insert_inst(arith::Add::new(is, a, b), Type::I64);
+    let sum = fb.insert_inst(arith::Add::new_unchecked(is, a, b), Type::I64);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("compilation failed");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("compilation failed");
 
     let add_fn: fn(i64, i64) -> i64 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn(i64, i64) -> i64>("add_i64").unwrap();
+        let ptr = artifact.function_address("add_i64").unwrap();
         std::mem::transmute(ptr)
     };
 
@@ -520,19 +523,19 @@ fn cranelift_arithmetic_chain() {
 
     let a = fb.args()[0];
     let b = fb.args()[1];
-    let sum = fb.insert_inst(arith::Add::new(is, a, b), Type::I32);
-    let diff = fb.insert_inst(arith::Sub::new(is, a, b), Type::I32);
-    let product = fb.insert_inst(arith::Mul::new(is, sum, diff), Type::I32);
+    let sum = fb.insert_inst(arith::Add::new_unchecked(is, a, b), Type::I32);
+    let diff = fb.insert_inst(arith::Sub::new_unchecked(is, a, b), Type::I32);
+    let product = fb.insert_inst(arith::Mul::new_unchecked(is, sum, diff), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, product));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("compilation failed");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("compilation failed");
 
     let f: fn(i32, i32) -> i32 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn(i32, i32) -> i32>("arith").unwrap();
+        let ptr = artifact.function_address("arith").unwrap();
         std::mem::transmute(ptr)
     };
 
@@ -563,12 +566,12 @@ fn cranelift_through_generic_compile_pipeline() {
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
+    let backend = CraneliftJitBackend::new();
     let compile = Compile::new(module, backend).with_opt_level(OptLevel::O0);
-    let artifact = compile.compile().expect("Compile<CraneliftBackend> failed");
+    let artifact = compile.compile().expect("Compile<CraneliftJitBackend> failed");
 
     let f: fn(i64) -> i64 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn(i64) -> i64>("identity").unwrap();
+        let ptr = artifact.function_address("identity").unwrap();
         std::mem::transmute(ptr)
     };
 
@@ -600,7 +603,7 @@ fn cranelift_array_index() {
     let idx = fb.args()[0];
 
     // obj.alloc [i64; 3]
-    let arr = fb.insert_inst(data::ObjAlloc::new(is, arr_ty), arr_objref_ty);
+    let arr = fb.insert_inst(data::ObjAlloc::new_unchecked(is, arr_ty), arr_objref_ty);
 
     // Store elements: arr[0]=10, arr[1]=20, arr[2]=30
     let imm0 = fb.make_imm_value(0i64);
@@ -611,29 +614,29 @@ fn cranelift_array_index() {
     let val20 = fb.make_imm_value(20i64);
     let val30 = fb.make_imm_value(30i64);
 
-    let p0 = fb.insert_inst(data::ObjIndex::new(is, arr, imm0), elem_objref_ty);
-    fb.insert_inst_no_result(data::ObjStore::new(is, p0, val10));
+    let p0 = fb.insert_inst(data::ObjIndex::new_unchecked(is, arr, imm0), elem_objref_ty);
+    fb.insert_inst_no_result(data::ObjStore::new_unchecked(is, p0, val10));
 
-    let p1 = fb.insert_inst(data::ObjIndex::new(is, arr, imm1), elem_objref_ty);
-    fb.insert_inst_no_result(data::ObjStore::new(is, p1, val20));
+    let p1 = fb.insert_inst(data::ObjIndex::new_unchecked(is, arr, imm1), elem_objref_ty);
+    fb.insert_inst_no_result(data::ObjStore::new_unchecked(is, p1, val20));
 
-    let p2 = fb.insert_inst(data::ObjIndex::new(is, arr, imm2), elem_objref_ty);
-    fb.insert_inst_no_result(data::ObjStore::new(is, p2, val30));
+    let p2 = fb.insert_inst(data::ObjIndex::new_unchecked(is, arr, imm2), elem_objref_ty);
+    fb.insert_inst_no_result(data::ObjStore::new_unchecked(is, p2, val30));
 
     // Dynamic index: val = arr[idx]
-    let pi = fb.insert_inst(data::ObjIndex::new(is, arr, idx), elem_objref_ty);
-    let val = fb.insert_inst(data::ObjLoad::new(is, pi), Type::I64);
+    let pi = fb.insert_inst(data::ObjIndex::new_unchecked(is, arr, idx), elem_objref_ty);
+    let val = fb.insert_inst(data::ObjLoad::new_unchecked(is, pi), Type::I64);
 
     fb.insert_inst_no_result(control_flow::Return::new_single(is, val));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("compilation failed");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("compilation failed");
 
     let f: fn(i64) -> i64 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn(i64) -> i64>("get_elem").unwrap();
+        let ptr = artifact.function_address("get_elem").unwrap();
         std::mem::transmute(ptr)
     };
 
@@ -663,27 +666,27 @@ fn cranelift_array_sum() {
     let entry = fb.append_block();
     fb.switch_to_block(entry);
 
-    let arr = fb.insert_inst(data::ObjAlloc::new(is, arr_ty), arr_objref_ty);
+    let arr = fb.insert_inst(data::ObjAlloc::new_unchecked(is, arr_ty), arr_objref_ty);
 
     // Store 4 elements
     for (i, val) in [100i64, 200, 300, 400].iter().enumerate() {
         let idx = fb.make_imm_value(i as i64);
         let imm_val = fb.make_imm_value(*val);
-        let p = fb.insert_inst(data::ObjIndex::new(is, arr, idx), elem_objref_ty);
-        fb.insert_inst_no_result(data::ObjStore::new(is, p, imm_val));
+        let p = fb.insert_inst(data::ObjIndex::new_unchecked(is, arr, idx), elem_objref_ty);
+        fb.insert_inst_no_result(data::ObjStore::new_unchecked(is, p, imm_val));
     }
 
     // Load and sum
     let mut acc = {
         let idx = fb.make_imm_value(0i64);
-        let p = fb.insert_inst(data::ObjIndex::new(is, arr, idx), elem_objref_ty);
-        fb.insert_inst(data::ObjLoad::new(is, p), Type::I64)
+        let p = fb.insert_inst(data::ObjIndex::new_unchecked(is, arr, idx), elem_objref_ty);
+        fb.insert_inst(data::ObjLoad::new_unchecked(is, p), Type::I64)
     };
     for i in 1..4 {
         let idx = fb.make_imm_value(i as i64);
-        let p = fb.insert_inst(data::ObjIndex::new(is, arr, idx), elem_objref_ty);
-        let elem = fb.insert_inst(data::ObjLoad::new(is, p), Type::I64);
-        acc = fb.insert_inst(arith::Add::new(is, acc, elem), Type::I64);
+        let p = fb.insert_inst(data::ObjIndex::new_unchecked(is, arr, idx), elem_objref_ty);
+        let elem = fb.insert_inst(data::ObjLoad::new_unchecked(is, p), Type::I64);
+        acc = fb.insert_inst(arith::Add::new_unchecked(is, acc, elem), Type::I64);
     }
 
     fb.insert_inst_no_result(control_flow::Return::new_single(is, acc));
@@ -691,11 +694,11 @@ fn cranelift_array_sum() {
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("compilation failed");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("compilation failed");
 
     let f: fn() -> i64 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn() -> i64>("sum_arr").unwrap();
+        let ptr = artifact.function_address("sum_arr").unwrap();
         std::mem::transmute(ptr)
     };
 
@@ -738,22 +741,22 @@ fn cranelift_const_ref_array() {
     let idx = fb.args()[0];
 
     // const.ref → pointer to global array
-    let arr_ref = fb.insert_inst(data::ConstRef::new(is, gv.into()), constref_type);
+    let arr_ref = fb.insert_inst(data::ConstRef::new_unchecked(is, gv.into()), constref_type);
     // const.index → pointer to element
-    let elem_ref = fb.insert_inst(data::ConstIndex::new(is, arr_ref, idx), elem_constref_type);
+    let elem_ref = fb.insert_inst(data::ConstIndex::new_unchecked(is, arr_ref, idx), elem_constref_type);
     // const.load → load the element value
-    let val = fb.insert_inst(data::ConstLoad::new(is, elem_ref), Type::I64);
+    let val = fb.insert_inst(data::ConstLoad::new_unchecked(is, elem_ref), Type::I64);
 
     fb.insert_inst_no_result(control_flow::Return::new_single(is, val));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("compilation failed");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("compilation failed");
 
     let f: fn(i64) -> i64 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn(i64) -> i64>("get_const").unwrap();
+        let ptr = artifact.function_address("get_const").unwrap();
         std::mem::transmute(ptr)
     };
 
@@ -811,37 +814,37 @@ fn cranelift_poseidon_loop_with_const_array() {
     fb.switch_to_block(entry);
     let init_acc = fb.make_imm_value(1i64);
     let init_i = fb.make_imm_value(0i64);
-    fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
+    fb.insert_inst_no_result(control_flow::Jump::new_unchecked(is, loop_header));
 
     // loop_header: phi(acc, i), check i < 4
     fb.switch_to_block(loop_header);
     let acc_phi = fb.insert_inst(
-        control_flow::Phi::new(is, vec![(init_acc, entry)]),
+        control_flow::Phi::new_unchecked(is, vec![(init_acc, entry)].into()),
         Type::I64,
     );
     let i_phi = fb.insert_inst(
-        control_flow::Phi::new(is, vec![(init_i, entry)]),
+        control_flow::Phi::new_unchecked(is, vec![(init_i, entry)].into()),
         Type::I64,
     );
     let four = fb.make_imm_value(4i64);
-    let cond = fb.insert_inst(cmp::Lt::new(is, i_phi, four), Type::I1);
-    fb.insert_inst_no_result(control_flow::Br::new(is, cond, loop_body, exit));
+    let cond = fb.insert_inst(cmp::Lt::new_unchecked(is, i_phi, four), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new_unchecked(is, cond, loop_body, exit));
 
     // loop_body: c = C[i], sigma(acc + c), i++
     fb.switch_to_block(loop_body);
-    let arr_ref = fb.insert_inst(data::ConstRef::new(is, gv.into()), constref_type);
-    let elem_ref = fb.insert_inst(data::ConstIndex::new(is, arr_ref, i_phi), elem_constref_type);
-    let c = fb.insert_inst(data::ConstLoad::new(is, elem_ref), Type::I64);
-    let sum = fb.insert_inst(arith::Add::new(is, acc_phi, c), Type::I64);
-    let sq = fb.insert_inst(arith::Mul::new(is, sum, sum), Type::I64);
-    let new_acc = fb.insert_inst(arith::Add::new(is, sq, sum), Type::I64);
+    let arr_ref = fb.insert_inst(data::ConstRef::new_unchecked(is, gv.into()), constref_type);
+    let elem_ref = fb.insert_inst(data::ConstIndex::new_unchecked(is, arr_ref, i_phi), elem_constref_type);
+    let c = fb.insert_inst(data::ConstLoad::new_unchecked(is, elem_ref), Type::I64);
+    let sum = fb.insert_inst(arith::Add::new_unchecked(is, acc_phi, c), Type::I64);
+    let sq = fb.insert_inst(arith::Mul::new_unchecked(is, sum, sum), Type::I64);
+    let new_acc = fb.insert_inst(arith::Add::new_unchecked(is, sq, sum), Type::I64);
     let one = fb.make_imm_value(1i64);
-    let new_i = fb.insert_inst(arith::Add::new(is, i_phi, one), Type::I64);
+    let new_i = fb.insert_inst(arith::Add::new_unchecked(is, i_phi, one), Type::I64);
 
     // Update phis and jump back
     fb.append_phi_arg(acc_phi, new_acc, loop_body);
     fb.append_phi_arg(i_phi, new_i, loop_body);
-    fb.insert_inst_no_result(control_flow::Jump::new(is, loop_header));
+    fb.insert_inst_no_result(control_flow::Jump::new_unchecked(is, loop_header));
 
     // exit: return acc
     fb.switch_to_block(exit);
@@ -851,11 +854,11 @@ fn cranelift_poseidon_loop_with_const_array() {
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("compilation failed");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("compilation failed");
 
     let f: fn() -> i64 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn() -> i64>("poseidon_sum").unwrap();
+        let ptr = artifact.function_address("poseidon_sum").unwrap();
         std::mem::transmute(ptr)
     };
 
@@ -888,11 +891,11 @@ fn cross_target_three_backend_known_answer() {
     fb.switch_to_block(entry);
     let a = fb.args()[0];
     let b = fb.args()[1];
-    let sum = fb.insert_inst(arith::Add::new(is, a, b), Type::I64);
-    let diff = fb.insert_inst(arith::Sub::new(is, a, b), Type::I64);
-    let prod = fb.insert_inst(arith::Mul::new(is, sum, diff), Type::I64);
+    let sum = fb.insert_inst(arith::Add::new_unchecked(is, a, b), Type::I64);
+    let diff = fb.insert_inst(arith::Sub::new_unchecked(is, a, b), Type::I64);
+    let prod = fb.insert_inst(arith::Mul::new_unchecked(is, sum, diff), Type::I64);
     let c42 = fb.make_imm_value(42i64);
-    let result = fb.insert_inst(arith::Add::new(is, prod, c42), Type::I64);
+    let result = fb.insert_inst(arith::Add::new_unchecked(is, prod, c42), Type::I64);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -900,16 +903,16 @@ fn cross_target_three_backend_known_answer() {
     let module = mb.build();
 
     // Cranelift execution
-    let cranelift_backend = CraneliftBackend::new();
-    let cranelift_artifact = cranelift_backend.compile_module(&module).expect("cranelift failed");
+    let cranelift_backend = CraneliftJitBackend::new();
+    let cranelift_artifact = cranelift_backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("cranelift failed");
     let cranelift_fn: fn(i64, i64) -> i64 = unsafe {
-        let ptr = cranelift_artifact.get_func_ptr::<fn(i64, i64) -> i64>("compute").unwrap();
+        let ptr = cranelift_artifact.function_address("compute").unwrap();
         std::mem::transmute(ptr)
     };
 
     // WASM execution
     let wasm_backend = WasmBackend::new();
-    let wasm_artifact = wasm_backend.compile_module(&module).expect("wasm failed");
+    let wasm_artifact = wasm_backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("wasm failed");
     wasmparser::validate(&wasm_artifact.bytes).expect("invalid wasm");
     let engine = wasmtime::Engine::default();
     let wasm_module = wasmtime::Module::new(&engine, &wasm_artifact.bytes).expect("load failed");
@@ -919,7 +922,7 @@ fn cross_target_three_backend_known_answer() {
 
     // SPIR-V compilation and validation
     let spirv_backend = SpirvBackend::new();
-    let spirv_artifact = spirv_backend.compile_module(&module).expect("spirv failed");
+    let spirv_artifact = spirv_backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("spirv failed");
     assert_eq!(spirv_artifact.words[0], 0x07230203, "SPIR-V magic number");
 
     let tmp = std::env::temp_dir().join("cross_target_test.spv");
@@ -1018,7 +1021,7 @@ fn build_f32_intrinsics_module() -> sonatina_ir::Module {
     let entry = fb.append_block();
     fb.switch_to_block(entry);
     let x = fb.args()[0];
-    let result = fb.insert_inst(arith::Fabs::new(is, x), Type::F32);
+    let result = fb.insert_inst(arith::Fabs::new_unchecked(is, x), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1035,7 +1038,7 @@ fn build_f32_intrinsics_module() -> sonatina_ir::Module {
     fb.switch_to_block(entry);
     let a = fb.args()[0];
     let b = fb.args()[1];
-    let result = fb.insert_inst(arith::Fmin::new(is, a, b), Type::F32);
+    let result = fb.insert_inst(arith::Fmin::new_unchecked(is, a, b), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1052,7 +1055,7 @@ fn build_f32_intrinsics_module() -> sonatina_ir::Module {
     fb.switch_to_block(entry);
     let a = fb.args()[0];
     let b = fb.args()[1];
-    let result = fb.insert_inst(arith::Fmax::new(is, a, b), Type::F32);
+    let result = fb.insert_inst(arith::Fmax::new_unchecked(is, a, b), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1070,7 +1073,7 @@ fn build_f32_intrinsics_module() -> sonatina_ir::Module {
     let x = fb.args()[0];
     let lo = fb.args()[1];
     let hi = fb.args()[2];
-    let result = fb.insert_inst(arith::Fclamp::new(is, x, lo, hi), Type::F32);
+    let result = fb.insert_inst(arith::Fclamp::new_unchecked(is, x, lo, hi), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1114,19 +1117,18 @@ fn build_f32_comparison_module() -> sonatina_ir::Module {
 
 #[test]
 fn cranelift_f32_comparisons_preserve_ordered_ieee_semantics() {
-    let artifact = CraneliftBackend::new()
-        .compile_module(&build_f32_comparison_module())
+    let artifact = CraneliftJitBackend::new().compile_module(&build_f32_comparison_module(), &sonatina_codegen::BackendOptions::default())
         .expect("cranelift compile");
 
     type Compare = extern "C" fn(f32, f32) -> u8;
     let eq: Compare = unsafe {
-        std::mem::transmute(artifact.get_func_ptr::<Compare>("f32_eq").unwrap())
+        std::mem::transmute(artifact.function_address("f32_eq").unwrap())
     };
     let lt: Compare = unsafe {
-        std::mem::transmute(artifact.get_func_ptr::<Compare>("f32_lt").unwrap())
+        std::mem::transmute(artifact.function_address("f32_lt").unwrap())
     };
     let le: Compare = unsafe {
-        std::mem::transmute(artifact.get_func_ptr::<Compare>("f32_le").unwrap())
+        std::mem::transmute(artifact.function_address("f32_le").unwrap())
     };
 
     for (lhs, rhs) in [
@@ -1164,11 +1166,11 @@ fn build_wide_scalar_return_module() -> sonatina_ir::Module {
     fb.switch_to_block(entry);
     let lhs = fb.args()[0];
     let rhs = fb.args()[1];
-    let add = fb.insert_inst(arith::Fadd::new(is, lhs, rhs), Type::F32);
-    let sub = fb.insert_inst(arith::Fsub::new(is, lhs, rhs), Type::F32);
-    let mul = fb.insert_inst(arith::Fmul::new(is, lhs, rhs), Type::F32);
-    let div = fb.insert_inst(arith::Fdiv::new(is, lhs, rhs), Type::F32);
-    fb.insert_inst_no_result(control_flow::Return::new(
+    let add = fb.insert_inst(arith::Fadd::new_unchecked(is, lhs, rhs), Type::F32);
+    let sub = fb.insert_inst(arith::Fsub::new_unchecked(is, lhs, rhs), Type::F32);
+    let mul = fb.insert_inst(arith::Fmul::new_unchecked(is, lhs, rhs), Type::F32);
+    let div = fb.insert_inst(arith::Fdiv::new_unchecked(is, lhs, rhs), Type::F32);
+    fb.insert_inst_no_result(control_flow::Return::new_unchecked(
         is,
         [add, sub, mul, div]
             .into_iter()
@@ -1190,16 +1192,16 @@ fn build_wide_scalar_return_module() -> sonatina_ir::Module {
     let entry = fb.append_block();
     fb.switch_to_block(entry);
     let results = fb.insert_inst_results(
-        control_flow::Call::new(
+        control_flow::Call::new_unchecked(
             is,
             wide,
             [fb.args()[0], fb.args()[1]].into_iter().collect(),
         ),
         &result_tys,
     );
-    let first = fb.insert_inst(arith::Fadd::new(is, results[0], results[1]), Type::F32);
-    let second = fb.insert_inst(arith::Fadd::new(is, results[2], results[3]), Type::F32);
-    let total = fb.insert_inst(arith::Fadd::new(is, first, second), Type::F32);
+    let first = fb.insert_inst(arith::Fadd::new_unchecked(is, results[0], results[1]), Type::F32);
+    let second = fb.insert_inst(arith::Fadd::new_unchecked(is, results[2], results[3]), Type::F32);
+    let total = fb.insert_inst(arith::Fadd::new_unchecked(is, first, second), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, total));
     fb.seal_all();
     fb.finish();
@@ -1209,13 +1211,12 @@ fn build_wide_scalar_return_module() -> sonatina_ir::Module {
 
 #[test]
 fn cranelift_wide_scalar_returns_use_a_caller_owned_buffer() {
-    let artifact = CraneliftBackend::new()
-        .compile_module(&build_wide_scalar_return_module())
+    let artifact = CraneliftJitBackend::new().compile_module(&build_wide_scalar_return_module(), &sonatina_codegen::BackendOptions::default())
         .expect("cranelift compile");
 
     type Wide = extern "C" fn(*mut u128, f32, f32);
     let wide: Wide = unsafe {
-        std::mem::transmute(artifact.get_func_ptr::<Wide>("wide_f32").unwrap())
+        std::mem::transmute(artifact.function_address("wide_f32").unwrap())
     };
     let mut slots = [0u128; 4];
     wide(slots.as_mut_ptr(), 6.0, 2.0);
@@ -1224,13 +1225,13 @@ fn cranelift_wide_scalar_returns_use_a_caller_owned_buffer() {
 
     type Sum = extern "C" fn(f32, f32) -> f32;
     let sum: Sum = unsafe {
-        std::mem::transmute(artifact.get_func_ptr::<Sum>("sum_wide_f32").unwrap())
+        std::mem::transmute(artifact.function_address("sum_wide_f32").unwrap())
     };
     assert_eq!(sum(6.0, 2.0), 27.0);
 }
 
 #[test]
-fn cranelift_integer_comparison_legalizes_narrow_enum_carriers() {
+fn cranelift_integer_comparison_preserves_explicit_narrowing() {
     let mb = native_module_builder();
     let isa = native_isa();
     let is = isa.inst_set();
@@ -1239,20 +1240,28 @@ fn cranelift_integer_comparison_legalizes_narrow_enum_carriers() {
     let mut fb = mb.func_builder::<InstInserter>(func_ref);
     let entry = fb.append_block();
     fb.switch_to_block(entry);
-    let narrow = fb.insert_inst(cast::Trunc::new(is, fb.args()[0], Type::I8), Type::I8);
+    let narrow = fb.insert_inst(cast::Trunc::new_unchecked(is, fb.args()[0], Type::I8), Type::I8);
     let one = fb.make_imm_value(1i32);
-    let equal = fb.insert_inst(cmp::Eq::new(is, narrow, one), Type::I1);
-    let result = fb.insert_inst(cast::Zext::new(is, equal, Type::I32), Type::I32);
+    // Comparisons require identical IR types. Preserve the truncation's
+    // low byte, then make the intended unsigned widening explicit.
+    let widened = fb.insert_inst(cast::Zext::new_unchecked(is, narrow, Type::I32), Type::I32);
+    let equal = fb.insert_inst(cmp::Eq::new_unchecked(is, widened, one), Type::I1);
+    let result = fb.insert_inst(cast::Zext::new_unchecked(is, equal, Type::I32), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
 
-    let artifact = CraneliftBackend::new()
-        .compile_module(&mb.build())
+    let module = mb.build();
+    let report = sonatina_verifier::verify_module(
+        &module,
+        &sonatina_verifier::VerifierConfig::for_level(sonatina_verifier::VerificationLevel::Full),
+    );
+    assert!(!report.has_errors(), "{report}");
+    let artifact = CraneliftJitBackend::new().compile_module(&module, &sonatina_codegen::BackendOptions::default())
         .expect("cranelift compile");
     type Entry = extern "C" fn(i32) -> i32;
     let entry: Entry = unsafe {
-        std::mem::transmute(artifact.get_func_ptr::<Entry>("is_one").unwrap())
+        std::mem::transmute(artifact.function_address("is_one").unwrap())
     };
     assert_eq!(entry(0), 0);
     assert_eq!(entry(1), 1);
@@ -1265,30 +1274,30 @@ fn cranelift_integer_comparison_legalizes_narrow_enum_carriers() {
 #[test]
 fn cranelift_f32_abs_min_max_clamp_oracle() {
     let module = build_f32_intrinsics_module();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("cranelift compile");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("cranelift compile");
 
     let abs: fn(f32) -> f32 = unsafe {
-        std::mem::transmute(artifact.get_func_ptr::<fn(f32) -> f32>("f32_abs").unwrap())
+        std::mem::transmute(artifact.function_address("f32_abs").unwrap())
     };
     let min: fn(f32, f32) -> f32 = unsafe {
         std::mem::transmute(
             artifact
-                .get_func_ptr::<fn(f32, f32) -> f32>("f32_min")
+                .function_address("f32_min")
                 .unwrap(),
         )
     };
     let max: fn(f32, f32) -> f32 = unsafe {
         std::mem::transmute(
             artifact
-                .get_func_ptr::<fn(f32, f32) -> f32>("f32_max")
+                .function_address("f32_max")
                 .unwrap(),
         )
     };
     let clamp: fn(f32, f32, f32) -> f32 = unsafe {
         std::mem::transmute(
             artifact
-                .get_func_ptr::<fn(f32, f32, f32) -> f32>("f32_clamp")
+                .function_address("f32_clamp")
                 .unwrap(),
         )
     };
@@ -1335,27 +1344,26 @@ fn cross_backend_f32_min_max_nan_zero_inf_differential() {
 
     let module = build_f32_intrinsics_module();
 
-    let cranelift_backend = CraneliftBackend::new();
-    let cranelift_artifact = cranelift_backend
-        .compile_module(&module)
+    let cranelift_backend = CraneliftJitBackend::new();
+    let cranelift_artifact = cranelift_backend.compile_module(&module, &sonatina_codegen::BackendOptions::default())
         .expect("cranelift compile");
     let cranelift_min: fn(f32, f32) -> f32 = unsafe {
         std::mem::transmute(
             cranelift_artifact
-                .get_func_ptr::<fn(f32, f32) -> f32>("f32_min")
+                .function_address("f32_min")
                 .unwrap(),
         )
     };
     let cranelift_max: fn(f32, f32) -> f32 = unsafe {
         std::mem::transmute(
             cranelift_artifact
-                .get_func_ptr::<fn(f32, f32) -> f32>("f32_max")
+                .function_address("f32_max")
                 .unwrap(),
         )
     };
 
     let wasm_backend = WasmBackend::new();
-    let wasm_artifact = wasm_backend.compile_module(&module).expect("wasm compile");
+    let wasm_artifact = wasm_backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("wasm compile");
     wasmparser::validate(&wasm_artifact.bytes).expect("valid wasm");
     let engine = wasmtime::Engine::default();
     let wasm_module = wasmtime::Module::new(&engine, &wasm_artifact.bytes).expect("load wasm");
@@ -1371,7 +1379,7 @@ fn cross_backend_f32_min_max_nan_zero_inf_differential() {
     let cranelift_clamp: fn(f32, f32, f32) -> f32 = unsafe {
         std::mem::transmute(
             cranelift_artifact
-                .get_func_ptr::<fn(f32, f32, f32) -> f32>("f32_clamp")
+                .function_address("f32_clamp")
                 .unwrap(),
         )
     };
@@ -1524,7 +1532,7 @@ fn build_f32_relaxed_intrinsics_module() -> sonatina_ir::Module {
     fb.switch_to_block(entry);
     let a = fb.args()[0];
     let b = fb.args()[1];
-    let result = fb.insert_inst(arith::FminRelaxed::new(is, a, b), Type::F32);
+    let result = fb.insert_inst(arith::FminRelaxed::new_unchecked(is, a, b), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1541,7 +1549,7 @@ fn build_f32_relaxed_intrinsics_module() -> sonatina_ir::Module {
     fb.switch_to_block(entry);
     let a = fb.args()[0];
     let b = fb.args()[1];
-    let result = fb.insert_inst(arith::FmaxRelaxed::new(is, a, b), Type::F32);
+    let result = fb.insert_inst(arith::FmaxRelaxed::new_unchecked(is, a, b), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1569,38 +1577,36 @@ fn cranelift_and_wasm_f32_relaxed_minmax_equals_exact_native() {
     let exact_module = build_f32_intrinsics_module();
     let relaxed_module = build_f32_relaxed_intrinsics_module();
 
-    let cranelift_backend = CraneliftBackend::new();
-    let cranelift_exact = cranelift_backend
-        .compile_module(&exact_module)
+    let cranelift_backend = CraneliftJitBackend::new();
+    let cranelift_exact = cranelift_backend.compile_module(&exact_module, &sonatina_codegen::BackendOptions::default())
         .expect("cranelift exact compile");
-    let cranelift_relaxed = cranelift_backend
-        .compile_module(&relaxed_module)
+    let cranelift_relaxed = cranelift_backend.compile_module(&relaxed_module, &sonatina_codegen::BackendOptions::default())
         .expect("cranelift relaxed compile");
 
     let cl_min: fn(f32, f32) -> f32 = unsafe {
-        std::mem::transmute(cranelift_exact.get_func_ptr::<fn(f32, f32) -> f32>("f32_min").unwrap())
+        std::mem::transmute(cranelift_exact.function_address("f32_min").unwrap())
     };
     let cl_max: fn(f32, f32) -> f32 = unsafe {
-        std::mem::transmute(cranelift_exact.get_func_ptr::<fn(f32, f32) -> f32>("f32_max").unwrap())
+        std::mem::transmute(cranelift_exact.function_address("f32_max").unwrap())
     };
     let cl_min_relaxed: fn(f32, f32) -> f32 = unsafe {
         std::mem::transmute(
             cranelift_relaxed
-                .get_func_ptr::<fn(f32, f32) -> f32>("f32_min_relaxed")
+                .function_address("f32_min_relaxed")
                 .unwrap(),
         )
     };
     let cl_max_relaxed: fn(f32, f32) -> f32 = unsafe {
         std::mem::transmute(
             cranelift_relaxed
-                .get_func_ptr::<fn(f32, f32) -> f32>("f32_max_relaxed")
+                .function_address("f32_max_relaxed")
                 .unwrap(),
         )
     };
 
     let wasm_backend = WasmBackend::new();
-    let wasm_exact_artifact = wasm_backend.compile_module(&exact_module).expect("wasm exact compile");
-    let wasm_relaxed_artifact = wasm_backend.compile_module(&relaxed_module).expect("wasm relaxed compile");
+    let wasm_exact_artifact = wasm_backend.compile_module(&exact_module, &sonatina_codegen::BackendOptions::default()).expect("wasm exact compile");
+    let wasm_relaxed_artifact = wasm_backend.compile_module(&relaxed_module, &sonatina_codegen::BackendOptions::default()).expect("wasm relaxed compile");
     wasmparser::validate(&wasm_exact_artifact.bytes).expect("valid exact wasm");
     wasmparser::validate(&wasm_relaxed_artifact.bytes).expect("valid relaxed wasm");
     let engine = wasmtime::Engine::default();
@@ -1706,7 +1712,7 @@ fn build_f32_rounding_module() -> sonatina_ir::Module {
     let entry = fb.append_block();
     fb.switch_to_block(entry);
     let x = fb.args()[0];
-    let result = fb.insert_inst(arith::Ffloor::new(is, x), Type::F32);
+    let result = fb.insert_inst(arith::Ffloor::new_unchecked(is, x), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1717,7 +1723,7 @@ fn build_f32_rounding_module() -> sonatina_ir::Module {
     let entry = fb.append_block();
     fb.switch_to_block(entry);
     let x = fb.args()[0];
-    let result = fb.insert_inst(arith::Fceil::new(is, x), Type::F32);
+    let result = fb.insert_inst(arith::Fceil::new_unchecked(is, x), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1728,7 +1734,7 @@ fn build_f32_rounding_module() -> sonatina_ir::Module {
     let entry = fb.append_block();
     fb.switch_to_block(entry);
     let x = fb.args()[0];
-    let result = fb.insert_inst(arith::Ftrunc::new(is, x), Type::F32);
+    let result = fb.insert_inst(arith::Ftrunc::new_unchecked(is, x), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1739,7 +1745,7 @@ fn build_f32_rounding_module() -> sonatina_ir::Module {
     let entry = fb.append_block();
     fb.switch_to_block(entry);
     let x = fb.args()[0];
-    let result = fb.insert_inst(arith::Fround::new(is, x), Type::F32);
+    let result = fb.insert_inst(arith::Fround::new_unchecked(is, x), Type::F32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, result));
     fb.seal_all();
     fb.finish();
@@ -1755,30 +1761,30 @@ fn build_f32_rounding_module() -> sonatina_ir::Module {
 #[test]
 fn cranelift_f32_rounding_oracle() {
     let module = build_f32_rounding_module();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("cranelift compile");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("cranelift compile");
 
     let floor: fn(f32) -> f32 = unsafe {
         std::mem::transmute(
             artifact
-                .get_func_ptr::<fn(f32) -> f32>("f32_floor")
+                .function_address("f32_floor")
                 .unwrap(),
         )
     };
     let ceil: fn(f32) -> f32 = unsafe {
-        std::mem::transmute(artifact.get_func_ptr::<fn(f32) -> f32>("f32_ceil").unwrap())
+        std::mem::transmute(artifact.function_address("f32_ceil").unwrap())
     };
     let trunc: fn(f32) -> f32 = unsafe {
         std::mem::transmute(
             artifact
-                .get_func_ptr::<fn(f32) -> f32>("f32_trunc")
+                .function_address("f32_trunc")
                 .unwrap(),
         )
     };
     let round: fn(f32) -> f32 = unsafe {
         std::mem::transmute(
             artifact
-                .get_func_ptr::<fn(f32) -> f32>("f32_round")
+                .function_address("f32_round")
                 .unwrap(),
         )
     };
@@ -1854,12 +1860,11 @@ fn cross_backend_f32_rounding_differential() {
 
     let module = build_f32_rounding_module();
 
-    let cranelift_backend = CraneliftBackend::new();
-    let cranelift_artifact = cranelift_backend
-        .compile_module(&module)
+    let cranelift_backend = CraneliftJitBackend::new();
+    let cranelift_artifact = cranelift_backend.compile_module(&module, &sonatina_codegen::BackendOptions::default())
         .expect("cranelift compile");
     let cranelift_fn = |name: &str| -> fn(f32) -> f32 {
-        unsafe { std::mem::transmute(cranelift_artifact.get_func_ptr::<fn(f32) -> f32>(name).unwrap()) }
+        unsafe { std::mem::transmute(cranelift_artifact.function_address(name).unwrap()) }
     };
     let cl_floor = cranelift_fn("f32_floor");
     let cl_ceil = cranelift_fn("f32_ceil");
@@ -1867,7 +1872,7 @@ fn cross_backend_f32_rounding_differential() {
     let cl_round = cranelift_fn("f32_round");
 
     let wasm_backend = WasmBackend::new();
-    let wasm_artifact = wasm_backend.compile_module(&module).expect("wasm compile");
+    let wasm_artifact = wasm_backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("wasm compile");
     wasmparser::validate(&wasm_artifact.bytes).expect("valid wasm");
     let engine = wasmtime::Engine::default();
     let wasm_module = wasmtime::Module::new(&engine, &wasm_artifact.bytes).expect("load wasm");
@@ -1951,7 +1956,7 @@ fn cross_backend_f32_rounding_differential() {
 // Rung 3 STEP 2 (native leg): `MemAllocDynamic`/`Mload`/`Mstore` -- function-
 // local `[u32; N]` arrays -- lowered to real cranelift stack slots + native
 // loads/stores. Before this rung, `MemAllocDynamic` was unhandled
-// ("unsupported instruction for CraneliftBackend: Opaque"); `Mload`/`Mstore`
+// ("unsupported instruction for CraneliftJitBackend: Opaque"); `Mload`/`Mstore`
 // and `Unreachable` (traps) were ALREADY lowered (pre-existing, used by the
 // object model), so those two need no test coverage here beyond what already
 // exists elsewhere in this file -- these tests specifically exercise the
@@ -1985,25 +1990,25 @@ fn cranelift_mem_alloc_dynamic_array_executes() {
     fb.switch_to_block(entry);
     let k = fb.args()[0];
     let alloc_size = fb.make_imm_value(32i32); // 8 elements * 4 bytes
-    let base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new_unchecked(is, alloc_size), Type::I32);
     let twelve = fb.make_imm_value(12i32);
-    let addr3 = fb.insert_inst(arith::Add::new(is, base, twelve), Type::I32);
+    let addr3 = fb.insert_inst(arith::Add::new_unchecked(is, base, twelve), Type::I32);
     let val3 = fb.make_imm_value(0xABCDi32);
-    fb.insert_inst_no_result(data::Mstore::new(is, addr3, val3, Type::I32));
+    fb.insert_inst_no_result(data::Mstore::new_unchecked(is, addr3, val3, Type::I32));
     let twenty = fb.make_imm_value(20i32);
-    let addr5 = fb.insert_inst(arith::Add::new(is, base, twenty), Type::I32);
+    let addr5 = fb.insert_inst(arith::Add::new_unchecked(is, base, twenty), Type::I32);
     let val5 = fb.make_imm_value(0x1234i32);
-    fb.insert_inst_no_result(data::Mstore::new(is, addr5, val5, Type::I32));
+    fb.insert_inst_no_result(data::Mstore::new_unchecked(is, addr5, val5, Type::I32));
 
     let eight = fb.make_imm_value(8i32);
-    let in_bounds = fb.insert_inst(cmp::Lt::new(is, k, eight), Type::I1);
-    fb.insert_inst_no_result(control_flow::Br::new(is, in_bounds, ok, trap));
+    let in_bounds = fb.insert_inst(cmp::Lt::new_unchecked(is, k, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new_unchecked(is, in_bounds, ok, trap));
 
     fb.switch_to_block(ok);
     let four = fb.make_imm_value(4i32);
-    let off = fb.insert_inst(arith::Mul::new(is, k, four), Type::I32);
-    let addr_k = fb.insert_inst(arith::Add::new(is, base, off), Type::I32);
-    let loaded = fb.insert_inst(data::Mload::new(is, addr_k, Type::I32), Type::I32);
+    let off = fb.insert_inst(arith::Mul::new_unchecked(is, k, four), Type::I32);
+    let addr_k = fb.insert_inst(arith::Add::new_unchecked(is, base, off), Type::I32);
+    let loaded = fb.insert_inst(data::Mload::new_unchecked(is, addr_k, Type::I32), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
 
     fb.switch_to_block(trap);
@@ -2013,13 +2018,12 @@ fn cranelift_mem_alloc_dynamic_array_executes() {
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend
-        .compile_module(&module)
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default())
         .expect("MemAllocDynamic array kernel should compile natively");
 
     let probe: fn(i32) -> i32 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn(i32) -> i32>("probe").unwrap();
+        let ptr = artifact.function_address("probe").unwrap();
         std::mem::transmute(ptr)
     };
 
@@ -2048,25 +2052,25 @@ fn cranelift_mem_alloc_dynamic_two_arrays_do_not_alias() {
     fb.switch_to_block(entry);
 
     let size = fb.make_imm_value(16i32);
-    let a = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
-    let b = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let a = fb.insert_inst(data::MemAllocDynamic::new_unchecked(is, size), Type::I32);
+    let b = fb.insert_inst(data::MemAllocDynamic::new_unchecked(is, size), Type::I32);
     let va = fb.make_imm_value(111i32);
-    fb.insert_inst_no_result(data::Mstore::new(is, a, va, Type::I32));
+    fb.insert_inst_no_result(data::Mstore::new_unchecked(is, a, va, Type::I32));
     let vb = fb.make_imm_value(222i32);
-    fb.insert_inst_no_result(data::Mstore::new(is, b, vb, Type::I32));
-    let la = fb.insert_inst(data::Mload::new(is, a, Type::I32), Type::I32);
-    let lb = fb.insert_inst(data::Mload::new(is, b, Type::I32), Type::I32);
-    let sum = fb.insert_inst(arith::Add::new(is, la, lb), Type::I32);
+    fb.insert_inst_no_result(data::Mstore::new_unchecked(is, b, vb, Type::I32));
+    let la = fb.insert_inst(data::Mload::new_unchecked(is, a, Type::I32), Type::I32);
+    let lb = fb.insert_inst(data::Mload::new_unchecked(is, b, Type::I32), Type::I32);
+    let sum = fb.insert_inst(arith::Add::new_unchecked(is, la, lb), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, sum));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect("two-array kernel should compile");
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect("two-array kernel should compile");
 
     let f: fn() -> i32 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn() -> i32>("two_arrays").unwrap();
+        let ptr = artifact.function_address("two_arrays").unwrap();
         std::mem::transmute(ptr)
     };
     assert_eq!(f(), 333, "storing into b must not clobber a (or vice versa)");
@@ -2099,26 +2103,25 @@ fn cranelift_mem_alloc_dynamic_odd_size_zero_inits_and_executes() {
     // 13 bytes: not a multiple of 8, 4, or even 2 -- greatest_divisible_
     // power_of_two(13) == 1, the tightest possible case.
     let size = fb.make_imm_value(13i32);
-    let base = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new_unchecked(is, size), Type::I32);
     let nine = fb.make_imm_value(9i32);
-    let addr9 = fb.insert_inst(arith::Add::new(is, base, nine), Type::I32);
+    let addr9 = fb.insert_inst(arith::Add::new_unchecked(is, base, nine), Type::I32);
     let val = fb.make_imm_value(7i32);
-    fb.insert_inst_no_result(data::Mstore::new(is, addr9, val, Type::I32));
+    fb.insert_inst_no_result(data::Mstore::new_unchecked(is, addr9, val, Type::I32));
     // Reading back an UNTOUCHED byte-addressed i32 window (base+0) must be
     // zero (explicit zero-init), not garbage.
-    let loaded = fb.insert_inst(data::Mload::new(is, base, Type::I32), Type::I32);
+    let loaded = fb.insert_inst(data::Mload::new_unchecked(is, base, Type::I32), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend
-        .compile_module(&module)
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default())
         .expect("an odd-sized (13-byte) MemAllocDynamic should compile and zero-init cleanly");
 
     let f: fn() -> i32 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn() -> i32>("odd_size").unwrap();
+        let ptr = artifact.function_address("odd_size").unwrap();
         std::mem::transmute(ptr)
     };
     assert_eq!(f(), 0, "an untouched window of an odd-sized allocation must read back zero");
@@ -2153,30 +2156,30 @@ fn cranelift_mem_alloc_dynamic_pointer_round_up_idiom_executes() {
     // lower_alloc_object's own over-allocation), then round the RETURNED
     // pointer up to an 8-byte boundary via (raw + 7) & !7.
     let size = fb.make_imm_value(27i32);
-    let raw = fb.insert_inst(data::MemAllocDynamic::new(is, size), Type::I32);
+    let raw = fb.insert_inst(data::MemAllocDynamic::new_unchecked(is, size), Type::I32);
     let seven = fb.make_imm_value(7i32);
-    let biased = fb.insert_inst(arith::Add::new(is, raw, seven), Type::I32);
+    let biased = fb.insert_inst(arith::Add::new_unchecked(is, raw, seven), Type::I32);
     let neg_align = fb.make_imm_value(-8i32); // !7 as a two's-complement i32 mask
-    let rounded = fb.insert_inst(logic::And::new(is, biased, neg_align), Type::I32);
+    let rounded = fb.insert_inst(logic::And::new_unchecked(is, biased, neg_align), Type::I32);
 
     // Store through the ROUNDED pointer and read it back, proving the
     // rounded address is a real, usable, in-bounds pointer, not just that
     // the And instruction compiles.
     let val = fb.make_imm_value(0x5a5au32 as i32);
-    fb.insert_inst_no_result(data::Mstore::new(is, rounded, val, Type::I32));
-    let loaded = fb.insert_inst(data::Mload::new(is, rounded, Type::I32), Type::I32);
+    fb.insert_inst_no_result(data::Mstore::new_unchecked(is, rounded, val, Type::I32));
+    let loaded = fb.insert_inst(data::Mload::new_unchecked(is, rounded, Type::I32), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, loaded));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend.compile_module(&module).expect(
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).expect(
         "the pointer-round-up idiom (Add then And on a MemAllocDynamic result) must compile",
     );
 
     let f: fn() -> i32 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn() -> i32>("round_up").unwrap();
+        let ptr = artifact.function_address("round_up").unwrap();
         std::mem::transmute(ptr)
     };
     assert_eq!(f(), 0x5a5a, "store/load through the rounded-up pointer must round-trip correctly");
@@ -2203,14 +2206,14 @@ fn cranelift_mem_alloc_non_constant_size_fails_closed() {
     let entry = fb.append_block();
     fb.switch_to_block(entry);
     let n = fb.args()[0];
-    let base = fb.insert_inst(data::MemAllocDynamic::new(is, n), Type::I32);
+    let base = fb.insert_inst(data::MemAllocDynamic::new_unchecked(is, n), Type::I32);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, base));
     fb.seal_all();
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let errors = backend.compile_module(&module).err().expect("invalid allocation must reject the module");
+    let backend = CraneliftJitBackend::new();
+    let errors = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).err().expect("invalid allocation must reject the module");
     let message = format!("{errors:?}");
     assert!(message.contains("dyn_size"), "{message}");
     assert!(message.contains("non-constant size"), "{message}");
@@ -2241,21 +2244,21 @@ fn cranelift_mem_alloc_inside_loop_fails_closed() {
 
     fb.switch_to_block(entry);
     let zero = fb.make_imm_value(0i32);
-    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.insert_inst_no_result(control_flow::Jump::new_unchecked(is, header));
 
     fb.switch_to_block(header);
-    let i = fb.insert_inst(control_flow::Phi::new(is, vec![(zero, entry)]), Type::I32);
+    let i = fb.insert_inst(control_flow::Phi::new_unchecked(is, vec![(zero, entry)].into()), Type::I32);
     let three = fb.make_imm_value(3i32);
-    let cond = fb.insert_inst(cmp::Lt::new(is, i, three), Type::I1);
-    fb.insert_inst_no_result(control_flow::Br::new(is, cond, body, exit));
+    let cond = fb.insert_inst(cmp::Lt::new_unchecked(is, i, three), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new_unchecked(is, cond, body, exit));
 
     fb.switch_to_block(body);
     let alloc_size = fb.make_imm_value(16i32);
-    let _base = fb.insert_inst(data::MemAllocDynamic::new(is, alloc_size), Type::I32);
+    let _base = fb.insert_inst(data::MemAllocDynamic::new_unchecked(is, alloc_size), Type::I32);
     let one = fb.make_imm_value(1i32);
-    let next_i = fb.insert_inst(arith::Add::new(is, i, one), Type::I32);
+    let next_i = fb.insert_inst(arith::Add::new_unchecked(is, i, one), Type::I32);
     fb.append_phi_arg(i, next_i, body);
-    fb.insert_inst_no_result(control_flow::Jump::new(is, header));
+    fb.insert_inst_no_result(control_flow::Jump::new_unchecked(is, header));
 
     fb.switch_to_block(exit);
     fb.insert_inst_no_result(control_flow::Return::new_single(is, i));
@@ -2263,8 +2266,8 @@ fn cranelift_mem_alloc_inside_loop_fails_closed() {
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let errors = backend.compile_module(&module).err().expect("invalid allocation must reject the module");
+    let backend = CraneliftJitBackend::new();
+    let errors = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default()).err().expect("invalid allocation must reject the module");
     let message = format!("{errors:?}");
     assert!(message.contains("loop_alloc"), "{message}");
     assert!(message.contains("inside a loop"), "{message}");
@@ -2308,8 +2311,8 @@ fn cranelift_no_mem_trap_compiles_and_ok_path_executes_correctly() {
     fb.switch_to_block(entry);
     let k = fb.args()[0];
     let eight = fb.make_imm_value(8i32);
-    let cond = fb.insert_inst(cmp::Lt::new(is, k, eight), Type::I1);
-    fb.insert_inst_no_result(control_flow::Br::new(is, cond, ok, trap));
+    let cond = fb.insert_inst(cmp::Lt::new_unchecked(is, k, eight), Type::I1);
+    fb.insert_inst_no_result(control_flow::Br::new_unchecked(is, cond, ok, trap));
 
     fb.switch_to_block(ok);
     let forty_two = fb.make_imm_value(42i32);
@@ -2322,13 +2325,12 @@ fn cranelift_no_mem_trap_compiles_and_ok_path_executes_correctly() {
     fb.finish();
 
     let module = mb.build();
-    let backend = CraneliftBackend::new();
-    let artifact = backend
-        .compile_module(&module)
+    let backend = CraneliftJitBackend::new();
+    let artifact = backend.compile_module(&module, &sonatina_codegen::BackendOptions::default())
         .expect("a no-Mem-ops trapping function must still compile on native");
 
     let f: fn(i32) -> i32 = unsafe {
-        let ptr = artifact.get_func_ptr::<fn(i32) -> i32>("no_mem_trap").unwrap();
+        let ptr = artifact.function_address("no_mem_trap").unwrap();
         std::mem::transmute(ptr)
     };
     assert_eq!(f(0), 42, "the non-trapping (in-bounds) path must compute the correct value");

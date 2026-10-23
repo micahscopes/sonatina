@@ -42,14 +42,26 @@ ports above are mandatory follow-up work, not silently dropped features.
 
 - Locked library check with `spirv-backend,wasm`: PASS (`check-7.log`).
 - Locked library check with `spirv-backend,wasm,cranelift-jit`: PASS (`check-native-3.log`).
-- Readable shader field names: focused regression is running.
-- Native numerical/ABI/allocation regressions, SP1 build, Fe frontend adaptation and application GPU oracle checks: pending.
+- Readable shader field names: PASS (1/1), emitted WGSL validates and non-debug SPIR-V words are unchanged.
+- Native legacy numerical subset: PASS (23/23), including six f32 edge/oracle tests, integer/i128 overflow, arrays, control-flow order, exact modular runtime declarations and three-backend known answers.
+- Seven legacy allocation/wide-result cases remain outside this subset; modern upstream JIT suite, SP1 build, Fe frontend adaptation and application GPU oracle checks are pending.
 
 Native object atomics and dynamic arena checkpoints currently fail closed. Native
 allocation follows upstream's host-heap model; the old stack-allocation tests
 need reconciliation against its initialization and lifetime contract before use.
-Typed modular arithmetic now declares a fixed runtime ABI and rejects authored
-symbol conflicts; runtime execution and object-linking tests remain pending.
+Typed modular instructions and exact typed external modular declarations use an explicit four-pointer runtime adapter. Native execution, wrong-signature rejection and preservation of authored names pass. Unused ordinary external imports retain upstream behavior; object-linking tests remain pending.
 
 Raw build receipts live locally under
 `/lab/argot/scratch/mb2-sonatina-upstream-rebase-20261022/`.
+
+## Native test migration
+
+The older suite now uses `CraneliftJitBackend`, `BackendOptions`, capability-checked
+instruction construction, `PhiArgs`, and artifact-scoped `function_address`.
+The narrow comparison test now explicitly widens its i8 operand and passes full
+IR verification; its original numerical assertions are unchanged. Modular
+runtime declarations use `External` linkage, rather than empty private bodies.
+An unrecognized unused external name remains an import, consistent with upstream.
+
+Receipts: `test-shader-names-1.log`, `test-native-f32-1.log`,
+`test-native-safe-matrix-4.log`. Earlier failing matrices remain preserved.

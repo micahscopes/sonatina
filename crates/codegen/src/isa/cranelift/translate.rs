@@ -33,12 +33,29 @@ pub(super) fn translate_module(
 ) -> Result<HashMap<String, FuncId>, String> {
     let mut defined_func_map: HashMap<String, FuncId> = HashMap::new();
     let mut func_id_map: HashMap<FuncRef, FuncId> = HashMap::new();
+    let mut modular_declarations = HashMap::new();
     let data_ids = define_globals(&module.ctx, clif_module)?;
 
     let funcs = module.funcs();
     let object_effects = compute_object_effect_summaries(module);
 
     for &func_ref in &funcs {
+        let runtime = module.ctx.func_sig(func_ref, |sig| -> Result<Option<&'static str>, String> {
+            if !sig.linkage().is_external() { return Ok(None); }
+            let symbol = match sig.name() {
+                "addmod" | "__addmod" | "__u256_addmod" => "__u256_addmod",
+                "mulmod" | "__mulmod" | "__u256_mulmod" => "__u256_mulmod",
+                _ => return Ok(None),
+            };
+            if sig.args() != [Type::I256; 3] || sig.ret_tys() != [Type::I256] {
+                return Err(format!("native runtime declaration `{}` requires (i256, i256, i256) -> i256", sig.name()));
+            }
+            Ok(Some(symbol))
+        })?;
+        if let Some(symbol) = runtime {
+            modular_declarations.insert(func_ref, symbol);
+            continue;
+        }
         let (name, sig) = module.ctx.func_sig(func_ref, |sig| -> Result<_, String> {
             validate_cranelift_signature(&module.ctx, sig)?;
             let name = sig.name().to_string();
@@ -55,6 +72,7 @@ pub(super) fn translate_module(
     }
 
     for &func_ref in &funcs {
+        if modular_declarations.contains_key(&func_ref) { continue; }
         let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
         let translated = module
             .func_store
@@ -72,6 +90,7 @@ pub(super) fn translate_module(
                     func_ref,
                     &heap_roots,
                     &func_id_map,
+                    &modular_declarations,
                     &data_ids,
                     clif_module,
                 )?;
@@ -109,6 +128,7 @@ fn translate_function(
     func_ref: FuncRef,
     heap_roots: &FxHashSet<ValueId>,
     func_id_map: &HashMap<FuncRef, FuncId>,
+    modular_declarations: &HashMap<FuncRef, &'static str>,
     data_ids: &GlobalDataMap,
     clif_module: &mut impl ClifModule,
 ) -> Result<(), String> {
@@ -1094,6 +1114,15 @@ fn translate_function(
                 }
                 NativeInstKind::Call(call) => {
                     let callee = *call.callee();
+                    if let Some(&symbol) = modular_declarations.get(&callee) {
+                        let operands: Vec<_> = call.args().iter()
+                            .map(|value| resolve_value(function, *value, &value_map, &mut builder))
+                            .collect::<Result<_, _>>()?;
+                        let operands = operands.try_into().map_err(|_| "modular runtime call requires three arguments")?;
+                        let result = emit_modular_runtime(module, symbol, operands, clif_module, &mut builder)?;
+                        insert_clif_results(function, inst_id, [result], &mut value_map);
+                        continue;
+                    }
                     let clif_func_id = func_id_map
                         .get(&callee)
                         .ok_or_else(|| format!("unknown callee {callee:?}"))?;

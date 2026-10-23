@@ -89,7 +89,7 @@ required-features = ["cranelift-jit"]
 
 [[test]]
 name = "cranelift_backend"
-required-features = ["cranelift", "wasm", "spirv-backend"]
+required-features = ["cranelift-jit", "wasm", "spirv-backend"]
 
 [[test]]
 name = "wasm_backend"
