@@ -35,6 +35,7 @@ bit-set = "0.8.0"
 indexmap = { version = "2.12" }
 tracing = "0.1"
 vec-collections = { version = "0.4.3", default-features = false }
+waffle = { version = "0.2", optional = true }
 
 [dev-dependencies]
 hex = "0.4.3"
@@ -45,6 +46,8 @@ revm = { version = "18.0.0", default-features = false, features = ["std"] }
 sonatina-parser = { path = "../parser", version = "0.0.3-alpha" }
 object = { version = "0.39.1", default-features = false, features = ["read", "std"] }
 tempfile = "3.23"
+wasmparser = "0.248.0"
+wasmtime = { version = "44.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [features]
 cranelift = [
@@ -56,6 +59,7 @@ cranelift = [
 ]
 cranelift-jit = ["cranelift", "dep:cranelift-jit"]
 sp1 = ["cranelift", "cranelift-codegen/riscv64"]
+wasm = ["dep:waffle"]
 
 [[test]]
 name = "cranelift_sp1"
@@ -68,3 +72,7 @@ required-features = ["cranelift"]
 [[test]]
 name = "cranelift_jit"
 required-features = ["cranelift-jit"]
+
+[[test]]
+name = "wasm_backend"
+required-features = ["wasm"]
