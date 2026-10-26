@@ -419,3 +419,47 @@ fn a_function_without_parameters_can_count_in_256_bits() {
         assert_eq!(machine.call(&f, &[])[0].unwrap_i32(), 20, "{level:?}");
     }
 }
+
+/// A loop carries a two-field struct and updates one field. The other field
+/// reaches the back edge unchanged, so its scalar phi is its own user. The
+/// optimizer panicked on it at -O1 and above.
+#[test]
+fn a_loop_can_carry_a_struct_and_update_one_field() {
+    let source = "type @P = { i32, i32 };
+func public %f(v0.i32) -> i32 {
+    block0:
+        v1.@P = insert_value undef.@P 0.i32 v0;
+        v2.@P = insert_value v1 1.i32 v0;
+        jump block1;
+    block1:
+        v3.i32 = phi (0.i32 block0) (v7 block2);
+        v4.@P = phi (v2 block0) (v6 block2);
+        v11.i1 = lt v3 v0;
+        br v11 block2 block3;
+    block2:
+        v8.i32 = extract_value v4 0.i32;
+        v9.i32 = add v8 v3;
+        v6.@P = insert_value v4 0.i32 v9;
+        v7.i32 = add v3 1.i32;
+        jump block1;
+    block3:
+        v13.i32 = extract_value v4 0.i32;
+        v14.i32 = extract_value v4 1.i32;
+        v15.i32 = mul v13 1000.i32;
+        v16.i32 = add v15 v14;
+        return v16;
+}
+";
+    for level in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::Os] {
+        let mut machine = Machine::new(&build_at(source, level));
+        let f = machine.func("f");
+        for n in [0, 1, 2, 5, 10] {
+            let sum = n + n * (n - 1) / 2;
+            assert_eq!(
+                machine.call(&f, &[Val::I32(n)])[0].unwrap_i32(),
+                sum * 1000 + n,
+                "{level:?}: f({n})"
+            );
+        }
+    }
+}
