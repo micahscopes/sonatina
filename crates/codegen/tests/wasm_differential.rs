@@ -351,9 +351,7 @@ fn program(rng: &mut Lcg) -> String {
         generator.name(),
         generator.name(),
     );
-    // Most loops keep the struct in an object. In the others it is a phi,
-    // which the shared optimizer panics on at -O1 and above for some shapes
-    // (see the skipped runs below).
+    // Most loops keep the struct in an object. In the others it is a phi.
     let phi_state = generator.rng.below(10) < 3;
     let state_object = if phi_state {
         String::new()
@@ -514,7 +512,6 @@ fn generated_aggregate_programs_agree_with_the_native_backend() {
         (-1, i64::MAX),
         (12345, 987_654_321),
     ];
-    let mut skipped = 0;
     for case in 0..200 {
         let source = program(&mut rng);
         for level in [OptLevel::O0, OptLevel::O2] {
@@ -523,14 +520,7 @@ fn generated_aggregate_programs_agree_with_the_native_backend() {
                 CraneliftJitBackend::new(),
             )
             .with_opt_level(level);
-            // The shared optimizer panics on some programs; they are skipped.
-            let optimized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                compile.optimize();
-            }));
-            if optimized.is_err() {
-                skipped += 1;
-                continue;
-            }
+            compile.optimize();
             let native = compile.compile().unwrap_or_else(|errors| {
                 panic!("native, case {case} {level:?}: {errors:?}\n{source}")
             });
@@ -558,9 +548,4 @@ fn generated_aggregate_programs_agree_with_the_native_backend() {
             }
         }
     }
-    assert!(skipped <= 100, "{skipped} of 400 runs were skipped");
-    println!(
-        "generated programs: 200, runs compared: {}, skipped: {skipped}",
-        400 - skipped
-    );
 }
