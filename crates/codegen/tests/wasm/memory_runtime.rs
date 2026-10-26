@@ -434,6 +434,43 @@ func public %outer(v0.i32) -> i32 {
 }
 
 #[test]
+fn a_trap_after_a_host_call_leaves_the_stack_as_it_was() {
+    // Each call to `run` has a 1 KiB frame and calls the host, which makes the
+    // module note where the caller's stack ends. The division after it traps
+    // when the argument is zero. The stack is 128 KiB less 16 bytes (64 KiB
+    // rounded up to a page boundary after the reserved block), so if every
+    // trap left the note behind, 128 traps would use it up.
+    let source = "declare external %host(i32) -> i32;
+func public %run(v0.i32) -> i32 {
+    block0:
+        v1.*[i8; 1024] = alloca [i8; 1024];
+        v2.*i8 = gep v1 0.i32 0.i32;
+        mstore v2 1.i8 i8;
+        v3.i32 = call %host v0;
+        v4.i32 = udiv 100.i32 v0;
+        v5.i8 = mload v2 i8;
+        v6.i32 = zext v5 i32;
+        v7.i32 = add v4 v6;
+        v8.i32 = add v7 v3;
+        return v8;
+}";
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let bytes = build_with(source, level, WasmBackend::new().with_stack_size(1 << 16));
+        let mut machine = Limited::with_imports(&bytes, usize::MAX, |linker| {
+            linker.func_wrap("env", "host", |x: i32| x + 1000).unwrap();
+        });
+        for round in 0..200 {
+            assert!(
+                machine.call("run", &[Val::I32(0)]).is_err(),
+                "{level:?}: round {round} should trap"
+            );
+        }
+        let got = machine.call("run", &[Val::I32(5)]).unwrap()[0].unwrap_i32();
+        assert_eq!(got, 20 + 1 + 1005, "{level:?}");
+    }
+}
+
+#[test]
 fn global_data_has_its_alignment_contents_and_is_writable() {
     let source = "type @Record = { i8, i64, i16 };
 global private i8 $first = 5;
