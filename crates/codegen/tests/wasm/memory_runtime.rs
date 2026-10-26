@@ -853,3 +853,26 @@ func public %copy(v0.i32, v1.i32, v2.i32) {
         );
     }
 }
+
+#[test]
+fn a_load_is_not_moved_past_a_later_store() {
+    // `v1` is read before the store and used after it, through a chain of
+    // pure operations.
+    let source = "func public %f(v0.i32, v1.i32) -> i32 {
+    block0:
+        v2.*i32 = int_to_ptr v0 *i32;
+        v3.i32 = mload v2 i32;
+        v4.i32 = add v3 1.i32;
+        mstore v2 v1 i32;
+        v5.i32 = add v4 100.i32;
+        v6.i32 = mul v5 3.i32;
+        return v6;
+}";
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let mut machine = Machine::new(&build_with(source, level, WasmBackend::new()));
+        machine.write(64, &7i32.to_le_bytes());
+        let f = machine.func("f");
+        let got = machine.call(&f, &[Val::I32(64), Val::I32(500)])[0].unwrap_i32();
+        assert_eq!(got, (7 + 1 + 100) * 3, "{level:?}");
+    }
+}

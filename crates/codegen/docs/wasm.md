@@ -201,6 +201,14 @@ native backend:
 - `unreachable` traps.
 - An `undef` operand is materialized as zero.
 
+## Order of effects
+
+Reads, writes and calls happen in program order. WAFFLE, which encodes the
+module, can emit a load after a later store when the loaded value passes
+through a pure operation whose result is used after the store. The backend
+gives such a loaded value a second, unused use, which makes WAFFLE keep it in
+a local at the place of the load.
+
 ## Unsupported input
 
 Every instruction of the native instruction set is either translated or

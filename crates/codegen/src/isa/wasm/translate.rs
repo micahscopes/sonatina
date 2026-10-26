@@ -751,6 +751,7 @@ fn build_wrapper(
         &[],
     );
     body.set_terminator(entry, Terminator::Return { values: results });
+    super::schedule::keep_effect_order(&mut body);
     Ok(body)
 }
 
@@ -1065,6 +1066,7 @@ impl<'a> FunctionTranslator<'a> {
         // Sonatina values can depend on memory, so make every cross-block use
         // an explicit block parameter to keep the definition-time snapshot.
         self.body.convert_to_max_ssa(None);
+        super::schedule::keep_effect_order(&mut self.body);
         Ok(self.body)
     }
 

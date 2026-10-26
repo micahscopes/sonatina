@@ -350,3 +350,174 @@ func public %never() -> i32 {
     let never = machine.func("never");
     assert!(machine.try_call(&never, &[]).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Reads, writes and calls stay in program order.
+// ---------------------------------------------------------------------------
+
+/// One step of a generated straight-line program over eight 32-bit cells of
+/// memory at addresses 64, 68, ...
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    Load(usize),
+    Store(usize, usize),
+    Add(usize, usize),
+    Sub(usize, usize),
+    Mul(usize, usize),
+    Xor(usize, usize),
+    /// A call that writes cell 7 with its argument and returns it plus one.
+    Bump(usize),
+}
+
+fn random_steps(rng: &mut crate::Lcg, count: usize) -> Vec<Step> {
+    // Values 0 and 1 are the parameters. Every step refers to earlier values.
+    let mut steps = Vec::new();
+    let mut values = 2;
+    for _ in 0..count {
+        let pick = |rng: &mut crate::Lcg, values: usize| (rng.next() % values as u64) as usize;
+        let cell = (rng.next() % 8) as usize;
+        let step = match rng.next() % 9 {
+            0 | 1 => Step::Load(cell),
+            2 | 3 => Step::Store(cell, pick(rng, values)),
+            4 => Step::Add(pick(rng, values), pick(rng, values)),
+            5 => Step::Sub(pick(rng, values), pick(rng, values)),
+            6 => Step::Mul(pick(rng, values), pick(rng, values)),
+            7 => Step::Xor(pick(rng, values), pick(rng, values)),
+            _ => Step::Bump(pick(rng, values)),
+        };
+        if !matches!(step, Step::Store(..)) {
+            values += 1;
+        }
+        steps.push(step);
+        // Often follow a read with a pure operation on its value.
+        if matches!(step, Step::Load(_) | Step::Bump(_)) && rng.next() % 3 != 0 {
+            let newest = values - 1;
+            let other = (rng.next() % values as u64) as usize;
+            steps.push(match rng.next() % 3 {
+                0 => Step::Add(newest, other),
+                1 => Step::Xor(other, newest),
+                _ => Step::Mul(newest, other),
+            });
+            values += 1;
+        }
+    }
+    steps
+}
+
+/// The IR of a program, and its result for the given memory and parameters.
+fn run_steps(steps: &[Step], memory: &mut [i32; 8], params: [i32; 2]) -> (String, i32) {
+    let mut ir = String::from(
+        "func private %bump(v0.i32) -> i32 {
+    block0:
+        v1.*i32 = int_to_ptr 92.i32 *i32;
+        mstore v1 v0 i32;
+        v2.i32 = add v0 1.i32;
+        return v2;
+}
+func public %f(v0.i32, v1.i32) -> i32 {
+    block0:
+",
+    );
+    let mut values = vec![params[0], params[1]];
+    // Value numbers: the parameters are v0 and v1, a step that produces a value
+    // is v(2 + its rank), and addresses are v1000 + step.
+    for (index, step) in steps.iter().enumerate() {
+        let name = values.len();
+        match *step {
+            Step::Load(cell) => {
+                ir += &format!(
+                    "        v{}.*i32 = int_to_ptr {}.i32 *i32;\n        v{name}.i32 = mload v{} i32;\n",
+                    1000 + index,
+                    64 + 4 * cell,
+                    1000 + index
+                );
+                values.push(memory[cell]);
+            }
+            Step::Store(cell, from) => {
+                ir += &format!(
+                    "        v{}.*i32 = int_to_ptr {}.i32 *i32;\n        mstore v{} v{from} i32;\n",
+                    1000 + index,
+                    64 + 4 * cell,
+                    1000 + index
+                );
+                memory[cell] = values[from];
+            }
+            Step::Add(a, b) => {
+                ir += &format!("        v{name}.i32 = add v{a} v{b};\n");
+                values.push(values[a].wrapping_add(values[b]));
+            }
+            Step::Sub(a, b) => {
+                ir += &format!("        v{name}.i32 = sub v{a} v{b};\n");
+                values.push(values[a].wrapping_sub(values[b]));
+            }
+            Step::Mul(a, b) => {
+                ir += &format!("        v{name}.i32 = mul v{a} v{b};\n");
+                values.push(values[a].wrapping_mul(values[b]));
+            }
+            Step::Xor(a, b) => {
+                ir += &format!("        v{name}.i32 = xor v{a} v{b};\n");
+                values.push(values[a] ^ values[b]);
+            }
+            Step::Bump(from) => {
+                ir += &format!("        v{name}.i32 = call %bump v{from};\n");
+                memory[7] = values[from];
+                values.push(values[from].wrapping_add(1));
+            }
+        }
+    }
+    // Combine the values that no step uses, at the end, so that results of
+    // early reads are held across later writes.
+    let mut used = vec![false; values.len()];
+    for step in steps {
+        match *step {
+            Step::Load(_) => {}
+            Step::Store(_, a) | Step::Bump(a) => used[a] = true,
+            Step::Add(a, b) | Step::Sub(a, b) | Step::Mul(a, b) | Step::Xor(a, b) => {
+                used[a] = true;
+                used[b] = true;
+            }
+        }
+    }
+    let mut accumulator = String::from("0.i32");
+    let mut result = 0i32;
+    for (index, value) in values.iter().enumerate() {
+        if used[index] {
+            continue;
+        }
+        ir += &format!(
+            "        v{}.i32 = mul {accumulator} 31.i32;\n",
+            2000 + index
+        );
+        ir += &format!(
+            "        v{}.i32 = add v{} v{index};\n",
+            3000 + index,
+            2000 + index
+        );
+        accumulator = format!("v{}", 3000 + index);
+        result = result.wrapping_mul(31).wrapping_add(*value);
+    }
+    ir += &format!("        return {accumulator};\n}}\n");
+    (ir, result)
+}
+
+#[test]
+fn generated_programs_keep_reads_writes_and_calls_in_order() {
+    let mut rng = crate::Lcg(0x0dd5_eed5);
+    for case in 0..250 {
+        let steps = random_steps(&mut rng, 8 + (case % 24));
+        let mut memory = [3, 1, 4, 1, 5, 9, 2, 6];
+        let params = [rng.next() as i32, rng.next() as i32];
+        let (source, want) = run_steps(&steps, &mut memory.clone(), params);
+        let mut machine = Machine::new(&compile_valid(&parse(&source)));
+        let start: Vec<u8> = memory.iter().flat_map(|v| v.to_le_bytes()).collect();
+        machine.write(64, &start);
+        let f = machine.func("f");
+        let got = machine.call(&f, &[Val::I32(params[0]), Val::I32(params[1])])[0].unwrap_i32();
+        assert_eq!(got, want, "case {case}: {steps:?}\n{source}");
+        let after = machine.read(64, 32);
+        let mut expected = memory;
+        let _ = run_steps(&steps, &mut expected, params);
+        let want_memory: Vec<u8> = expected.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(after, want_memory, "case {case}: memory after");
+    }
+}
