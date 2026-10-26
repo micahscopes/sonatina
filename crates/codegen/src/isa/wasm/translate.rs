@@ -2,20 +2,38 @@
 //!
 //! WAFFLE takes SSA with block parameters, so Sonatina phi nodes become block
 //! parameters, and recovers structured control flow when the module is
-//! encoded. The integer lowerings live in [`super::arith`].
+//! encoded. The integer lowerings live in [`super::arith`], the 256-bit ones in
+//! [`super::wide`] and the layout of linear memory in [`super::memory`]. The
+//! aggregate and memory instructions are in the `aggregate` submodule.
 //!
 //! Every instruction of the native instruction set is matched explicitly. An
 //! instruction that is not translated returns an error naming it; no
 //! instruction is skipped.
+//!
+//! # Values
+//!
+//! An integer of at most 64 bits is one WebAssembly value. A pointer, an
+//! `objref`, a `constref` and a value of struct or array type are one `i32`:
+//! the address of the value in linear memory (aggregates live in memory, as
+//! on the native target). A 256-bit integer is four `i64` values.
+//!
+//! # Frames
+//!
+//! When a module needs linear-memory storage, every function takes the address
+//! of the first free byte of the stack as a hidden first parameter, places its
+//! frame there, and passes the end of its frame to the functions it calls. No
+//! mutable stack pointer exists, so a trap leaves nothing to repair. An exported
+//! function is a thin wrapper that starts the stack at the `stack_top` global.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use waffle::{
     BlockTarget, ExportKind, Func, FuncDecl, FunctionBody, MemoryArg, Module as WaffleModule,
-    Operator, SignatureData, Terminator, Type as WType, ValueDef,
+    Operator, Signature, SignatureData, Terminator, Type as WType, ValueDef,
 };
 
 use sonatina_ir::{
-    BlockId, ControlFlowGraph, Function, Immediate, Inst, Linkage, Module, Type, Value, ValueId,
+    BlockId, ControlFlowGraph, Function, Immediate, Inst, InstId, Linkage, Module, Type, Value,
+    ValueId,
     inst::{inst_set::InstSetExt, native::inst_set::NativeInstKind},
     isa::native::inst_set as native_inst_set,
     module::{FuncRef, ModuleCtx},
@@ -25,7 +43,20 @@ use sonatina_ir::{
 use super::{
     WasmError,
     arith::{Arith, Cmp, DivRem, Emit, Int, Shift},
+    memory::{
+        self, ALIGN, MemoryPlan, RuntimeGlobals, align_up, build_arena_allocator,
+        declare_runtime_globals,
+    },
+    wide::{self, LIMBS, Limbs},
 };
+use crate::transform::aggregate::{
+    compute_object_effect_summaries, object_abi::native_heap_object_roots,
+};
+
+mod aggregate;
+mod wide_ops;
+
+use wide_ops::{WideHelpers, WideOp};
 
 type V = waffle::Value;
 
@@ -43,197 +74,54 @@ fn invalid(message: String) -> WasmError {
     WasmError::Invalid(message)
 }
 
-/// A function the module can call: its WAFFLE index and its Sonatina signature.
-struct Callee {
-    func: Func,
-    params: Vec<Type>,
-    rets: Vec<Type>,
-    /// Results of an import come from the host and are not known to be
-    /// canonical.
-    is_import: bool,
+/// How a Sonatina type is held by WebAssembly values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Repr {
+    /// An integer of at most 64 bits: one value.
+    Int(Int),
+    /// A 256-bit integer: four `i64` values.
+    Wide,
+    /// A pointer, `objref` or `constref`: an `i32` address.
+    Pointer,
+    /// A struct or array: an `i32` address of the value in memory.
+    Aggregate,
 }
 
-pub(super) fn translate_module(
-    module: &Module,
-    import_module: &str,
-) -> Result<Translated, WasmError> {
-    if let Some(symbol) = module
-        .ctx
-        .with_gv_store(|store| store.all_gv_data().next().map(|data| data.symbol.clone()))
-    {
-        return Err(unsupported(format!(
-            "global variable `{symbol}`: global variables are not translated"
-        )));
-    }
-
-    let mut wmod = WaffleModule::empty();
-    // Linear memory is always present and exported, so scalar loads and stores
-    // and host access share one contract. It starts at one page and may grow.
-    let memory = wmod.memories.push(waffle::MemoryData {
-        initial_pages: 1,
-        maximum_pages: None,
-        segments: vec![],
-    });
-    wmod.exports.push(waffle::Export {
-        name: "memory".to_string(),
-        kind: ExportKind::Memory(memory),
-    });
-
-    let funcs = module.funcs();
-    let mut callees: FxHashMap<FuncRef, Callee> = FxHashMap::default();
-    let mut exports = Vec::new();
-    let mut export_names: FxHashSet<String> = FxHashSet::default();
-    export_names.insert("memory".to_string());
-
-    // WAFFLE requires imported functions to take the lowest function indexes,
-    // so declare every import before any defined function.
-    let mut definitions = Vec::new();
-    for &func_ref in &funcs {
-        let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
-        let linkage = module.ctx.func_linkage(func_ref);
-        let has_body = module
-            .func_store
-            .try_view(func_ref, |function| function.layout.entry_block().is_some())
-            .unwrap_or(false);
-
-        match (linkage, has_body) {
-            (Linkage::External, false) => {
-                let signature = declared_signature(module, func_ref, &name)?;
-                let wsig = wmod.signatures.push(signature.wasm);
-                let func = wmod.funcs.push(FuncDecl::Import(wsig, name.clone()));
-                wmod.imports.push(waffle::Import {
-                    module: import_module.to_string(),
-                    name,
-                    kind: waffle::ImportKind::Func(func),
-                });
-                callees.insert(
-                    func_ref,
-                    Callee {
-                        func,
-                        params: signature.params,
-                        rets: signature.rets,
-                        is_import: true,
-                    },
-                );
-            }
-            (Linkage::External, true) => {
-                return Err(invalid(format!(
-                    "function `{name}` is external but has a body"
-                )));
-            }
-            (Linkage::Public | Linkage::Private, false) => {
-                return Err(invalid(format!(
-                    "function `{name}` is defined in this module but has no body"
-                )));
-            }
-            (Linkage::Public | Linkage::Private, true) => {
-                definitions.push((func_ref, name, linkage))
-            }
-        }
-    }
-
-    // Declare every defined function before translating bodies so calls
-    // resolve regardless of definition order.
-    let mut pending = Vec::new();
-    for (func_ref, name, linkage) in definitions {
-        let signature = declared_signature(module, func_ref, &name)?;
-        let wsig = wmod.signatures.push(signature.wasm);
-        let placeholder = FunctionBody::new(&wmod, wsig);
-        let func = wmod
-            .funcs
-            .push(FuncDecl::Body(wsig, name.clone(), placeholder));
-        let public = linkage == Linkage::Public;
-        if public {
-            if !export_names.insert(name.clone()) {
-                return Err(invalid(format!(
-                    "export name `{name}` is used by more than one function or by the memory"
-                )));
-            }
-            wmod.exports.push(waffle::Export {
-                name: name.clone(),
-                kind: ExportKind::Func(func),
-            });
-            exports.push(name.clone());
-        }
-        callees.insert(
-            func_ref,
-            Callee {
-                func,
-                params: signature.params,
-                rets: signature.rets,
-                is_import: false,
-            },
-        );
-        pending.push((func_ref, func, wsig, name, public));
-    }
-
-    for (func_ref, func, wsig, name, public) in pending {
-        let body = module
-            .func_store
-            .try_view(func_ref, |function| {
-                FunctionTranslator::new(
-                    module, function, func_ref, &name, &wmod, wsig, memory, &callees,
-                )
-                .translate(public)
-            })
-            .ok_or_else(|| invalid(format!("function `{name}` has no body")))??;
-        wmod.funcs[func] = FuncDecl::Body(wsig, name, body);
-    }
-
-    Ok(Translated {
-        module: wmod,
-        exports,
-    })
-}
-
-struct DeclaredSignature {
-    wasm: SignatureData,
-    params: Vec<Type>,
-    rets: Vec<Type>,
-}
-
-fn declared_signature(
-    module: &Module,
-    func_ref: FuncRef,
-    name: &str,
-) -> Result<DeclaredSignature, WasmError> {
-    module.ctx.func_sig(func_ref, |sig| {
-        let carrier = |ty: Type, role: String| {
-            value_carrier(&module.ctx, ty).ok_or_else(|| {
-                unsupported(format!(
-                    "function `{name}`: {role} has type {}, which the wasm32 backend does not support",
-                    type_name(&module.ctx, ty)
-                ))
-            })
-        };
-        let params = sig
-            .args()
-            .iter()
-            .enumerate()
-            .map(|(index, ty)| carrier(*ty, format!("parameter {index}")))
-            .collect::<Result<Vec<_>, _>>()?;
-        let returns = sig
-            .ret_tys()
-            .iter()
-            .enumerate()
-            .map(|(index, ty)| carrier(*ty, format!("result {index}")))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(DeclaredSignature {
-            wasm: SignatureData { params, returns },
-            params: sig.args().to_vec(),
-            rets: sig.ret_tys().to_vec(),
-        })
-    })
-}
-
-/// The WebAssembly value type that carries a Sonatina value, if there is one.
-fn value_carrier(ctx: &ModuleCtx, ty: Type) -> Option<WType> {
+fn repr(ctx: &ModuleCtx, ty: Type) -> Option<Repr> {
     if let Some(int) = Int::from_type(ty) {
-        return Some(int.carrier());
+        return Some(Repr::Int(int));
     }
-    match ty.resolve_compound(ctx) {
-        // wasm32 pointers are 32-bit linear-memory offsets.
-        Some(CompoundType::Ptr(_)) => Some(WType::I32),
+    if ty == Type::I256 {
+        return Some(Repr::Wide);
+    }
+    match ty.resolve_compound(ctx)? {
+        CompoundType::Ptr(_) | CompoundType::ObjRef(_) | CompoundType::ConstRef(_) => {
+            Some(Repr::Pointer)
+        }
+        CompoundType::Array { .. } | CompoundType::Struct(_) => Some(Repr::Aggregate),
+        CompoundType::Enum(_) | CompoundType::Func { .. } => None,
+    }
+}
+
+impl Repr {
+    fn push_carriers(self, out: &mut Vec<WType>) {
+        match self {
+            Self::Int(int) => out.push(int.carrier()),
+            Self::Wide => out.extend([WType::I64; LIMBS]),
+            Self::Pointer | Self::Aggregate => out.push(WType::I32),
+        }
+    }
+}
+
+/// The type of storage that a function returns through its hidden buffer, if
+/// it does: a single struct, array or `constref` result.
+fn indirect_return_storage(ctx: &ModuleCtx, rets: &[Type]) -> Option<Type> {
+    let [ty] = rets else {
+        return None;
+    };
+    match ty.resolve_compound(ctx)? {
+        CompoundType::Array { .. } | CompoundType::Struct(_) => Some(*ty),
+        CompoundType::ConstRef(inner) => Some(inner),
         _ => None,
     }
 }
@@ -263,6 +151,607 @@ fn type_name(ctx: &ModuleCtx, ty: Type) -> String {
     }
 }
 
+/// A function the module can call: its WAFFLE index and its Sonatina signature.
+struct Callee {
+    func: Func,
+    params: Vec<Type>,
+    rets: Vec<Type>,
+    /// Results of an import come from the host and are not known to be
+    /// canonical.
+    is_import: bool,
+    /// The function takes the stack top as a hidden first parameter.
+    stack_param: bool,
+    /// The function returns its single aggregate result through a hidden
+    /// buffer whose address is its next parameter. The type is the storage.
+    sret: Option<Type>,
+}
+
+/// What a scan of the module found that decides the shape of the output.
+struct Scan {
+    runtime: bool,
+    arena: bool,
+    /// Which 256-bit helper functions are used: multiplication, division, left
+    /// and right shifts.
+    helpers: (bool, bool, bool, bool),
+    heap_roots: FxHashMap<FuncRef, FxHashSet<ValueId>>,
+}
+
+fn kind_needs_runtime(kind: &NativeInstKind<'_>) -> bool {
+    matches!(
+        kind,
+        NativeInstKind::Alloca(_)
+            | NativeInstKind::ObjAlloc(_)
+            | NativeInstKind::ConstRef(_)
+            | NativeInstKind::ConstProj(_)
+            | NativeInstKind::ConstIndex(_)
+            | NativeInstKind::ConstLoad(_)
+            | NativeInstKind::ObjProj(_)
+            | NativeInstKind::ObjIndex(_)
+            | NativeInstKind::ObjLoad(_)
+            | NativeInstKind::ObjStore(_)
+            | NativeInstKind::ObjInitConst(_)
+            | NativeInstKind::ObjMaterializeStack(_)
+            | NativeInstKind::ObjMaterializeHeap(_)
+            | NativeInstKind::InsertValue(_)
+            | NativeInstKind::ExtractValue(_)
+            | NativeInstKind::MemAllocDynamic(_)
+    )
+}
+
+/// The 256-bit operation of an instruction that calls a helper, and its first
+/// operand.
+fn wide_op_of(kind: &NativeInstKind<'_>) -> Option<(WideOp, ValueId, ValueId)> {
+    Some(match kind {
+        NativeInstKind::Mul(i) => (WideOp::Mul, *i.lhs(), *i.rhs()),
+        NativeInstKind::Umulo(i) => (WideOp::Umulo, *i.lhs(), *i.rhs()),
+        NativeInstKind::Smulo(i) => (WideOp::Smulo, *i.lhs(), *i.rhs()),
+        NativeInstKind::Udiv(i) => (WideOp::Udiv, *i.lhs(), *i.rhs()),
+        NativeInstKind::Umod(i) => (WideOp::Umod, *i.lhs(), *i.rhs()),
+        NativeInstKind::Sdiv(i) => (WideOp::Sdiv, *i.lhs(), *i.rhs()),
+        NativeInstKind::Smod(i) => (WideOp::Smod, *i.lhs(), *i.rhs()),
+        NativeInstKind::Shl(i) => (WideOp::Shl, *i.value(), *i.bits()),
+        NativeInstKind::Shr(i) => (WideOp::Shr, *i.value(), *i.bits()),
+        NativeInstKind::Sar(i) => (WideOp::Sar, *i.value(), *i.bits()),
+        _ => return None,
+    })
+}
+
+fn scan_module(module: &Module) -> Scan {
+    let effects = compute_object_effect_summaries(module);
+    let mut runtime = module.ctx.with_gv_store(|store| !store.is_empty());
+    let mut arena = false;
+    let mut helpers = (false, false, false, false);
+    let mut heap_roots = FxHashMap::default();
+    let inst_set = native_inst_set();
+    for func_ref in module.funcs() {
+        let is_aggregate = |ty: Type| {
+            matches!(
+                repr(&module.ctx, ty),
+                Some(Repr::Aggregate) | None if ty != Type::Unit && !ty.is_enum_tag()
+            ) || matches!(
+                ty.resolve_compound(&module.ctx),
+                Some(CompoundType::ObjRef(_) | CompoundType::ConstRef(_))
+            )
+        };
+        module.ctx.func_sig(func_ref, |sig| {
+            if sig
+                .args()
+                .iter()
+                .chain(sig.ret_tys())
+                .any(|ty| is_aggregate(*ty))
+            {
+                runtime = true;
+            }
+        });
+        module.func_store.try_view(func_ref, |function| {
+            let roots = native_heap_object_roots(function, &effects);
+            if !roots.is_empty() {
+                arena = true;
+                runtime = true;
+                heap_roots.insert(func_ref, roots);
+            }
+            for block in function.layout.iter_block() {
+                for inst_id in function.layout.iter_inst(block) {
+                    let inst = function.dfg.inst(inst_id);
+                    if !inst_set.contains_inst(inst) {
+                        continue;
+                    }
+                    let kind = inst_set.resolve_inst(inst);
+                    if kind_needs_runtime(&kind) {
+                        runtime = true;
+                    }
+                    if matches!(kind, NativeInstKind::MemAllocDynamic(_)) {
+                        arena = true;
+                    }
+                    if let Some((op, lhs, _)) = wide_op_of(&kind)
+                        && function.dfg.value_ty(lhs) == Type::I256
+                    {
+                        let (mulo, divrem, shl, shr) = op.needs();
+                        helpers.0 |= mulo;
+                        helpers.1 |= divrem;
+                        helpers.2 |= shl;
+                        helpers.3 |= shr;
+                    }
+                }
+            }
+            for (value, _) in function.dfg.values_iter() {
+                if is_aggregate(function.dfg.value_ty(value)) {
+                    runtime = true;
+                }
+            }
+        });
+    }
+    Scan {
+        runtime,
+        arena,
+        helpers,
+        heap_roots,
+    }
+}
+
+pub(super) fn translate_module(
+    module: &Module,
+    import_module: &str,
+    stack_bytes: u32,
+) -> Result<Translated, WasmError> {
+    let scan = scan_module(module);
+    let plan = memory::plan_memory(module, scan.runtime, scan.arena, stack_bytes)?;
+
+    let mut wmod = WaffleModule::empty();
+    // Linear memory is always present and exported, so scalar loads and stores
+    // and host access share one contract. It may grow.
+    let memory = wmod.memories.push(waffle::MemoryData {
+        initial_pages: plan.initial_pages,
+        maximum_pages: None,
+        segments: plan.segments.clone(),
+    });
+    wmod.exports.push(waffle::Export {
+        name: "memory".to_string(),
+        kind: ExportKind::Memory(memory),
+    });
+    let globals = plan
+        .runtime
+        .then(|| declare_runtime_globals(&mut wmod, &plan));
+
+    let funcs = module.funcs();
+    let mut callees: FxHashMap<FuncRef, Callee> = FxHashMap::default();
+    let mut exports = Vec::new();
+    let mut export_names: FxHashSet<String> = FxHashSet::default();
+    export_names.insert("memory".to_string());
+
+    // WAFFLE requires imported functions to take the lowest function indexes,
+    // so declare every import before any defined function.
+    let mut definitions = Vec::new();
+    for &func_ref in &funcs {
+        let name = module.ctx.func_sig(func_ref, |sig| sig.name().to_string());
+        let linkage = module.ctx.func_linkage(func_ref);
+        let has_body = module
+            .func_store
+            .try_view(func_ref, |function| function.layout.entry_block().is_some())
+            .unwrap_or(false);
+
+        match (linkage, has_body) {
+            (Linkage::External, false) => {
+                let signature = declared_signature(module, func_ref, &name, &plan, true)?;
+                let wsig = wmod.signatures.push(signature.wasm);
+                let func = wmod.funcs.push(FuncDecl::Import(wsig, name.clone()));
+                wmod.imports.push(waffle::Import {
+                    module: import_module.to_string(),
+                    name,
+                    kind: waffle::ImportKind::Func(func),
+                });
+                callees.insert(
+                    func_ref,
+                    Callee {
+                        func,
+                        params: signature.params,
+                        rets: signature.rets,
+                        is_import: true,
+                        stack_param: false,
+                        sret: None,
+                    },
+                );
+            }
+            (Linkage::External, true) => {
+                return Err(invalid(format!(
+                    "function `{name}` is external but has a body"
+                )));
+            }
+            (Linkage::Public | Linkage::Private, false) => {
+                return Err(invalid(format!(
+                    "function `{name}` is defined in this module but has no body"
+                )));
+            }
+            (Linkage::Public | Linkage::Private, true) => {
+                definitions.push((func_ref, name, linkage))
+            }
+        }
+    }
+
+    // Declare every defined function before translating bodies so calls
+    // resolve regardless of definition order.
+    let mut pending = Vec::new();
+    let mut wrappers = Vec::new();
+    for (func_ref, name, linkage) in definitions {
+        let public = linkage == Linkage::Public;
+        if public && !export_names.insert(name.clone()) {
+            return Err(invalid(format!(
+                "export name `{name}` is used by more than one function or by the memory"
+            )));
+        }
+        if public {
+            exports.push(name.clone());
+        }
+        // The function that other functions call. With a runtime it takes the
+        // stack top, so an export is a wrapper around it.
+        let inner = declared_signature(module, func_ref, &name, &plan, false)?;
+        if public {
+            check_exportable(module, func_ref, &name)?;
+        }
+        let stack_param = plan.runtime;
+        let sret = inner.sret;
+        let wsig = wmod.signatures.push(inner.wasm);
+        let placeholder = FunctionBody::new(&wmod, wsig);
+        let inner_name = if public && plan.runtime {
+            format!("{name}$body")
+        } else {
+            name.clone()
+        };
+        let func = wmod
+            .funcs
+            .push(FuncDecl::Body(wsig, inner_name.clone(), placeholder));
+        if public && plan.runtime {
+            let exported = declared_signature(module, func_ref, &name, &plan, true)?;
+            let export_sig = wmod.signatures.push(exported.wasm);
+            let placeholder = FunctionBody::new(&wmod, export_sig);
+            let wrapper = wmod
+                .funcs
+                .push(FuncDecl::Body(export_sig, name.clone(), placeholder));
+            wmod.exports.push(waffle::Export {
+                name: name.clone(),
+                kind: ExportKind::Func(wrapper),
+            });
+            wrappers.push((
+                wrapper,
+                export_sig,
+                func,
+                inner.params.clone(),
+                inner.rets.clone(),
+            ));
+        } else if public {
+            wmod.exports.push(waffle::Export {
+                name: name.clone(),
+                kind: ExportKind::Func(func),
+            });
+        }
+        callees.insert(
+            func_ref,
+            Callee {
+                func,
+                params: inner.params,
+                rets: inner.rets,
+                is_import: false,
+                stack_param,
+                sret,
+            },
+        );
+        pending.push((func_ref, func, wsig, inner_name, public && !plan.runtime));
+    }
+
+    let arena_func = if plan.arena {
+        let sig = memory::arena_signature(&mut wmod);
+        let placeholder = FunctionBody::new(&wmod, sig);
+        Some((
+            wmod.funcs
+                .push(FuncDecl::Body(sig, "arena_alloc".to_string(), placeholder)),
+            sig,
+        ))
+    } else {
+        None
+    };
+
+    // The 256-bit helpers that the bodies call.
+    let mut helpers = WideHelpers::default();
+    let mut helper_bodies = Vec::new();
+    let wide_results = |count: usize| vec![WType::I64; count];
+    let mut declare =
+        |wmod: &mut WaffleModule<'static>, name: &str, results: Vec<WType>, kind: HelperKind| {
+            let sig = wide::helper_signature(wmod, 2 * LIMBS, &results);
+            let placeholder = FunctionBody::new(wmod, sig);
+            let func = wmod
+                .funcs
+                .push(FuncDecl::Body(sig, name.to_string(), placeholder));
+            helper_bodies.push((func, sig, name.to_string(), kind));
+            func
+        };
+    let (needs_mulo, needs_divrem, needs_shl, needs_shr) = scan.helpers;
+    if needs_mulo {
+        let mut results = wide_results(LIMBS);
+        results.push(WType::I32);
+        helpers.mulo = Some(declare(&mut wmod, "i256.mulo", results, HelperKind::Mulo));
+    }
+    if needs_divrem {
+        helpers.udivrem = Some(declare(
+            &mut wmod,
+            "i256.udivrem",
+            wide_results(2 * LIMBS),
+            HelperKind::DivRem,
+        ));
+    }
+    if needs_shl {
+        helpers.shl = Some(declare(
+            &mut wmod,
+            "i256.shl",
+            wide_results(LIMBS),
+            HelperKind::Shift { left: true },
+        ));
+    }
+    if needs_shr {
+        helpers.shr = Some(declare(
+            &mut wmod,
+            "i256.shr",
+            wide_results(LIMBS),
+            HelperKind::Shift { left: false },
+        ));
+    }
+
+    let empty_roots = FxHashSet::default();
+    for (func_ref, func, wsig, name, canonicalize_params) in pending {
+        let heap_roots = scan.heap_roots.get(&func_ref).unwrap_or(&empty_roots);
+        let body = module
+            .func_store
+            .try_view(func_ref, |function| {
+                FunctionTranslator::new(
+                    module,
+                    function,
+                    func_ref,
+                    &name,
+                    &wmod,
+                    wsig,
+                    memory,
+                    &callees,
+                    &plan,
+                    globals,
+                    arena_func.map(|(func, _)| func),
+                    helpers,
+                    heap_roots,
+                )
+                .translate(canonicalize_params)
+            })
+            .ok_or_else(|| invalid(format!("function `{name}` has no body")))??;
+        wmod.funcs[func] = FuncDecl::Body(wsig, name, body);
+    }
+
+    for (wrapper, export_sig, inner, params, rets) in wrappers {
+        let globals = globals.expect("a wrapper exists only with a runtime");
+        let body = build_wrapper(&wmod, export_sig, inner, &params, &rets, globals)?;
+        let name = match &wmod.funcs[wrapper] {
+            FuncDecl::Body(_, name, _) => name.clone(),
+            _ => unreachable!("a wrapper is a defined function"),
+        };
+        wmod.funcs[wrapper] = FuncDecl::Body(export_sig, name, body);
+    }
+
+    for (func, sig, name, kind) in helper_bodies {
+        let body = match kind {
+            HelperKind::Mulo => wide::build_mulo(&wmod, sig),
+            HelperKind::DivRem => wide::build_udivrem(&wmod, sig),
+            HelperKind::Shift { left } => wide::build_shift(&wmod, sig, left),
+        };
+        wmod.funcs[func] = FuncDecl::Body(sig, name, body);
+    }
+
+    if let (Some((func, sig)), Some(globals)) = (arena_func, globals) {
+        let arena_top = globals
+            .arena_top
+            .expect("the arena global exists with an arena");
+        let body = build_arena_allocator(&wmod, sig, memory, arena_top);
+        wmod.funcs[func] = FuncDecl::Body(sig, "arena_alloc".to_string(), body);
+    }
+
+    Ok(Translated {
+        module: wmod,
+        exports,
+    })
+}
+
+/// Which 256-bit helper function a declaration is for.
+#[derive(Clone, Copy)]
+enum HelperKind {
+    Mulo,
+    DivRem,
+    Shift { left: bool },
+}
+
+struct DeclaredSignature {
+    wasm: SignatureData,
+    params: Vec<Type>,
+    rets: Vec<Type>,
+    sret: Option<Type>,
+}
+
+/// The WebAssembly signature of a function. With `external` the signature is
+/// the one the host sees: no hidden parameters, and scalars only. Otherwise it
+/// is the signature that the module's own calls use.
+fn declared_signature(
+    module: &Module,
+    func_ref: FuncRef,
+    name: &str,
+    plan: &MemoryPlan,
+    external: bool,
+) -> Result<DeclaredSignature, WasmError> {
+    module.ctx.func_sig(func_ref, |sig| {
+        let sret = indirect_return_storage(&module.ctx, sig.ret_tys());
+        if sig.ret_tys().len() > 1
+            && sig.ret_tys().iter().any(|ty| {
+                matches!(
+                    repr(&module.ctx, *ty),
+                    Some(Repr::Aggregate) | None
+                ) || matches!(ty.resolve_compound(&module.ctx), Some(CompoundType::ConstRef(_)))
+            })
+        {
+            return Err(unsupported(format!(
+                "function `{name}`: results that mix several values with a struct, an array or a \
+                 constant reference are not supported"
+            )));
+        }
+        let carrier = |ty: Type, role: String| {
+            let Some(representation) = repr(&module.ctx, ty) else {
+                return Err(unsupported(format!(
+                    "function `{name}`: {role} has type {}, which the wasm32 backend does not support",
+                    type_name(&module.ctx, ty)
+                )));
+            };
+            if external && matches!(representation, Repr::Wide | Repr::Aggregate)
+                || external && is_reference(&module.ctx, ty)
+            {
+                return Err(unsupported(format!(
+                    "function `{name}`: {role} has type {}, which cannot cross the module \
+                     boundary; only integers of at most 64 bits and pointers can",
+                    type_name(&module.ctx, ty)
+                )));
+            }
+            Ok(representation)
+        };
+        let mut params = Vec::new();
+        let mut returns = Vec::new();
+        let hidden_stack = plan.runtime && !external;
+        if hidden_stack {
+            params.push(WType::I32);
+        }
+        if sret.is_some() && !external {
+            params.push(WType::I32);
+        }
+        for (index, ty) in sig.args().iter().enumerate() {
+            carrier(*ty, format!("parameter {index}"))?.push_carriers(&mut params);
+        }
+        for (index, ty) in sig.ret_tys().iter().enumerate() {
+            let representation = carrier(*ty, format!("result {index}"))?;
+            if sret.is_none() || external {
+                representation.push_carriers(&mut returns);
+            }
+        }
+        Ok(DeclaredSignature {
+            wasm: SignatureData { params, returns },
+            params: sig.args().to_vec(),
+            rets: sig.ret_tys().to_vec(),
+            sret,
+        })
+    })
+}
+
+fn is_reference(ctx: &ModuleCtx, ty: Type) -> bool {
+    matches!(
+        ty.resolve_compound(ctx),
+        Some(CompoundType::ObjRef(_) | CompoundType::ConstRef(_))
+    )
+}
+
+/// An export crosses the module boundary, so its signature must too.
+fn check_exportable(module: &Module, func_ref: FuncRef, name: &str) -> Result<(), WasmError> {
+    // Building the host-facing signature reports the offending type by name.
+    let plan = MemoryPlan::bare();
+    declared_signature(module, func_ref, name, &plan, true).map(|_| ())
+}
+
+/// The calling function of an export: it starts the stack at the `stack_top`
+/// global, calls the function, and puts the global back as it found it.
+fn build_wrapper(
+    wmod: &WaffleModule<'static>,
+    wsig: Signature,
+    inner: Func,
+    params: &[Type],
+    rets: &[Type],
+    globals: RuntimeGlobals,
+) -> Result<FunctionBody, WasmError> {
+    let mut body = FunctionBody::new(wmod, wsig);
+    let entry = body.entry;
+    let incoming: Vec<V> = body.blocks[entry]
+        .params
+        .iter()
+        .map(|param| param.1)
+        .collect();
+    let mut args = Vec::with_capacity(incoming.len() + 1);
+    let top = body.add_op(
+        entry,
+        Operator::GlobalGet {
+            global_index: globals.stack_top,
+        },
+        &[],
+        &[WType::I32],
+    );
+    args.push(top);
+    for (ty, value) in params.iter().zip(incoming) {
+        let value = match Int::from_type(*ty) {
+            // The host may pass any bits above the width of a narrow parameter.
+            Some(int) => Emit {
+                body: &mut body,
+                block: entry,
+            }
+            .canonicalize(int, value),
+            None => value,
+        };
+        args.push(value);
+    }
+    let carriers: Vec<WType> = rets
+        .iter()
+        .map(|ty| match Int::from_type(*ty) {
+            Some(int) => Ok(int.carrier()),
+            None => Ok(WType::I32),
+        })
+        .collect::<Result<_, WasmError>>()?;
+    let results = emit_call(&mut body, entry, inner, &args, &carriers);
+    body.add_op(
+        entry,
+        Operator::GlobalSet {
+            global_index: globals.stack_top,
+        },
+        &[top],
+        &[],
+    );
+    body.set_terminator(entry, Terminator::Return { values: results });
+    Ok(body)
+}
+
+/// Emit a call and return its results in order. WAFFLE stores a multi-value
+/// operator's results in forward order while the stack holds them in reverse, so
+/// the physical order is declared and each result is picked from the end.
+fn emit_call(
+    body: &mut FunctionBody,
+    block: waffle::Block,
+    func: Func,
+    args: &[V],
+    carriers: &[WType],
+) -> Vec<V> {
+    let call = Operator::Call {
+        function_index: func,
+    };
+    if carriers.is_empty() {
+        body.add_op(block, call, args, &[]);
+        return Vec::new();
+    }
+    let physical: Vec<WType> = carriers.iter().rev().copied().collect();
+    let call_value = body.add_op(block, call, args, &physical);
+    let count = carriers.len();
+    carriers
+        .iter()
+        .enumerate()
+        .map(|(index, carrier)| {
+            if count == 1 {
+                call_value
+            } else {
+                let picked = body.add_value(ValueDef::PickOutput(
+                    call_value,
+                    (count - 1 - index) as u32,
+                    *carrier,
+                ));
+                body.append_to_block(block, picked);
+                picked
+            }
+        })
+        .collect()
+}
+
 /// How a scalar moves between linear memory and a value.
 #[derive(Clone, Copy)]
 enum Access {
@@ -290,10 +779,36 @@ struct FunctionTranslator<'a> {
     body: FunctionBody,
     memory: waffle::Memory,
     callees: &'a FxHashMap<FuncRef, Callee>,
+    plan: &'a MemoryPlan,
+    globals: Option<RuntimeGlobals>,
+    arena: Option<Func>,
+    heap_roots: &'a FxHashSet<ValueId>,
+    wide_helpers: WideHelpers,
     return_tys: Vec<Type>,
-    /// Sonatina values defined so far, in canonical WAFFLE form.
+    /// Sonatina values defined so far, in canonical WAFFLE form. Not 256-bit
+    /// values, which are in `wide`.
     values: FxHashMap<ValueId, V>,
+    wide: FxHashMap<ValueId, Limbs>,
     blocks: FxHashMap<BlockId, waffle::Block>,
+    /// The stack top received from the caller, which is the base of the frame.
+    sp: Option<V>,
+    /// The end of the frame, which callees receive as their stack top.
+    top: Option<V>,
+    /// The placeholder constant that holds the frame size once it is known.
+    frame_size: Option<V>,
+    /// The bytes of the frame handed out so far.
+    frame: u32,
+    /// The hidden buffer for an aggregate result.
+    sret: Option<(V, Type)>,
+    trap: Option<waffle::Block>,
+    /// Block parameters that carry the contents of aggregate phis, by result.
+    phi_params: FxHashMap<ValueId, V>,
+    /// Frame offsets of the storage of aggregate phis, by result.
+    phi_slots: FxHashMap<ValueId, u32>,
+    /// Frame offsets of snapshots of the inputs of aggregate phis, by edge.
+    edge_slots: FxHashMap<(BlockId, BlockId, InstId), u32>,
+    /// Frame offsets of the zero-filled storage of aggregate `undef` operands.
+    undef_slots: FxHashMap<ValueId, u32>,
 }
 
 impl<'a> FunctionTranslator<'a> {
@@ -304,9 +819,14 @@ impl<'a> FunctionTranslator<'a> {
         func_ref: FuncRef,
         name: &'a str,
         wmod: &WaffleModule,
-        wsig: waffle::Signature,
+        wsig: Signature,
         memory: waffle::Memory,
         callees: &'a FxHashMap<FuncRef, Callee>,
+        plan: &'a MemoryPlan,
+        globals: Option<RuntimeGlobals>,
+        arena: Option<Func>,
+        wide_helpers: WideHelpers,
+        heap_roots: &'a FxHashSet<ValueId>,
     ) -> Self {
         Self {
             module,
@@ -315,13 +835,29 @@ impl<'a> FunctionTranslator<'a> {
             body: FunctionBody::new(wmod, wsig),
             memory,
             callees,
+            plan,
+            globals,
+            arena,
+            heap_roots,
+            wide_helpers,
             return_tys: callees[&func_ref].rets.clone(),
             values: FxHashMap::default(),
+            wide: FxHashMap::default(),
             blocks: FxHashMap::default(),
+            sp: None,
+            top: None,
+            frame_size: None,
+            frame: 0,
+            sret: None,
+            trap: None,
+            phi_params: FxHashMap::default(),
+            phi_slots: FxHashMap::default(),
+            edge_slots: FxHashMap::default(),
+            undef_slots: FxHashMap::default(),
         }
     }
 
-    fn translate(mut self, public: bool) -> Result<FunctionBody, WasmError> {
+    fn translate(mut self, canonicalize_params: bool) -> Result<FunctionBody, WasmError> {
         let function = self.function;
         let entry = function
             .layout
@@ -336,8 +872,9 @@ impl<'a> FunctionTranslator<'a> {
 
         // A Sonatina entry block may be a loop header, but WebAssembly cannot
         // branch to the start of a function body. Enter such a block through
-        // a separate prologue.
-        let needs_prologue = cfg.preds_of(entry).next().is_some();
+        // a separate prologue. The frame check also lives there.
+        let runtime = self.plan.runtime;
+        let needs_prologue = runtime || cfg.preds_of(entry).next().is_some();
         for &block in &order {
             let wb = if block == entry && !needs_prologue {
                 self.body.entry
@@ -347,28 +884,72 @@ impl<'a> FunctionTranslator<'a> {
             self.blocks.insert(block, wb);
         }
 
-        let params = self.body.blocks[self.body.entry].params.clone();
-        for (index, &arg) in function.arg_values.iter().enumerate() {
-            let mut value = params[index].1;
-            if public && let Some(int) = Int::from_type(function.dfg.value_ty(arg)) {
-                // The host may pass any bits above the width of a narrow
-                // parameter.
-                let block = self.body.entry;
-                value = self.emit(block).canonicalize(int, value);
+        let params: Vec<V> = self.body.blocks[self.body.entry]
+            .params
+            .iter()
+            .map(|param| param.1)
+            .collect();
+        let mut next = 0;
+        let prologue = self.body.entry;
+        if runtime {
+            let sp = params[next];
+            next += 1;
+            self.sp = Some(sp);
+            let size = self.emit(prologue).c32(0);
+            self.frame_size = Some(size);
+            let top = self
+                .emit(prologue)
+                .op(Operator::I32Add, &[sp, size], WType::I32);
+            self.top = Some(top);
+        }
+        let callee_sret = self
+            .callees
+            .values()
+            .next()
+            .map(|_| ())
+            .and(indirect_return_storage(&self.module.ctx, &self.return_tys));
+        if let Some(storage) = callee_sret {
+            self.sret = Some((params[next], storage));
+            next += 1;
+        }
+        for &arg in &function.arg_values {
+            let ty = function.dfg.value_ty(arg);
+            let representation = repr(&self.module.ctx, ty).ok_or_else(|| {
+                unsupported(format!(
+                    "function `{}`: parameter of type {}, which the wasm32 backend does not support",
+                    self.name,
+                    type_name(&self.module.ctx, ty)
+                ))
+            })?;
+            match representation {
+                Repr::Wide => {
+                    let limbs: Limbs = [
+                        params[next],
+                        params[next + 1],
+                        params[next + 2],
+                        params[next + 3],
+                    ];
+                    next += LIMBS;
+                    self.wide.insert(arg, limbs);
+                }
+                Repr::Int(int) => {
+                    let mut value = params[next];
+                    next += 1;
+                    if canonicalize_params {
+                        // The host may pass any bits above the width of a narrow
+                        // parameter.
+                        value = self.emit(prologue).canonicalize(int, value);
+                    }
+                    self.values.insert(arg, value);
+                }
+                Repr::Pointer | Repr::Aggregate => {
+                    self.values.insert(arg, params[next]);
+                    next += 1;
+                }
             }
-            self.values.insert(arg, value);
         }
         if needs_prologue {
-            let target = self.blocks[&entry];
-            self.body.set_terminator(
-                self.body.entry,
-                Terminator::Br {
-                    target: BlockTarget {
-                        block: target,
-                        args: vec![],
-                    },
-                },
-            );
+            // The terminator of the prologue is set once the frame is known.
         }
 
         for &block in &order {
@@ -387,20 +968,56 @@ impl<'a> FunctionTranslator<'a> {
                     invalid(format!("function `{}`: a phi has no result", self.name))
                 })?;
                 let ty = function.dfg.value_ty(result);
-                let carrier = value_carrier(&self.module.ctx, ty).ok_or_else(|| {
+                let representation = repr(&self.module.ctx, ty).ok_or_else(|| {
                     unsupported(format!(
                         "function `{}`: `phi` of type {}, which the wasm32 backend does not support",
                         self.name,
                         type_name(&self.module.ctx, ty)
                     ))
                 })?;
-                let param = self.body.add_blockparam(self.blocks[&block], carrier);
-                self.values.insert(result, param);
+                let wb = self.blocks[&block];
+                match representation {
+                    Repr::Wide => {
+                        let mut limbs = [params[0]; LIMBS];
+                        for limb in &mut limbs {
+                            *limb = self.body.add_blockparam(wb, WType::I64);
+                        }
+                        self.wide.insert(result, limbs);
+                    }
+                    Repr::Int(int) => {
+                        let param = self.body.add_blockparam(wb, int.carrier());
+                        self.values.insert(result, param);
+                    }
+                    Repr::Pointer => {
+                        let param = self.body.add_blockparam(wb, WType::I32);
+                        self.values.insert(result, param);
+                    }
+                    Repr::Aggregate => {
+                        // The block parameter is the address of the incoming
+                        // contents. The block copies them into storage of its own
+                        // before anything else runs.
+                        let param = self.body.add_blockparam(wb, WType::I32);
+                        self.phi_params.insert(result, param);
+                        let (size, align) = self.layout_of(ty)?;
+                        let slot = self.slot(size, align)?;
+                        self.phi_slots.insert(result, slot);
+                    }
+                }
             }
         }
 
+        let first = self.blocks[&entry];
         for &block in &order {
             self.translate_block(block)?;
+        }
+
+        if needs_prologue {
+            let target = BlockTarget {
+                block: first,
+                args: vec![],
+            };
+            let terminator = self.finish_frame(target)?;
+            self.body.set_terminator(prologue, terminator);
         }
 
         // WAFFLE may recompute a pure value at each use in another block.
@@ -408,6 +1025,44 @@ impl<'a> FunctionTranslator<'a> {
         // an explicit block parameter to keep the definition-time snapshot.
         self.body.convert_to_max_ssa(None);
         Ok(self.body)
+    }
+
+    /// Fix the frame size in the prologue and return its terminator: a branch to
+    /// `target`, preceded by a check that the stack has room for the frame.
+    fn finish_frame(&mut self, target: BlockTarget) -> Result<Terminator, WasmError> {
+        let (Some(size_value), Some(sp)) = (self.frame_size, self.sp) else {
+            return Ok(Terminator::Br { target });
+        };
+        let size = align_up(self.frame, ALIGN).ok_or_else(|| {
+            unsupported(format!("function `{}`: the frame is too large", self.name))
+        })?;
+        let ValueDef::Operator(_, args, tys) = self.body.values[size_value].clone() else {
+            return Err(invalid("the frame size is not a constant".to_string()));
+        };
+        self.body.values[size_value] =
+            ValueDef::Operator(Operator::I32Const { value: size }, args, tys);
+        if size == 0 {
+            return Ok(Terminator::Br { target });
+        }
+        let prologue = self.body.entry;
+        let stack_limit = self.plan.stack_limit;
+        let limit = self.emit(prologue).c32(stack_limit);
+        let room = self
+            .emit(prologue)
+            .op(Operator::I32Sub, &[limit, sp], WType::I32);
+        let need = self.emit(prologue).c32(size);
+        let short = self
+            .emit(prologue)
+            .op(Operator::I32LtU, &[room, need], WType::I32);
+        let trap = self.trap_block();
+        Ok(Terminator::CondBr {
+            cond: short,
+            if_true: BlockTarget {
+                block: trap,
+                args: vec![],
+            },
+            if_false: target,
+        })
     }
 
     fn emit(&mut self, block: waffle::Block) -> Emit<'_> {
@@ -440,6 +1095,14 @@ impl<'a> FunctionTranslator<'a> {
     /// instruction that needs it.
     fn int_ty(&self, op: &str, ty: Type) -> Result<Int, WasmError> {
         Int::from_type(ty).ok_or_else(|| {
+            if ty == Type::I256 {
+                return unsupported(format!(
+                    "function `{}`: `{op}` on i256 is not supported by the wasm32 backend \
+                     (256-bit integers support arithmetic, shifts, bitwise operations, \
+                     comparisons and conversions, but not `bswap` or the saturating forms)",
+                    self.name
+                ));
+            }
             unsupported(format!(
                 "function `{}`: `{op}` on {}, which the wasm32 backend does not support \
                  (integers of 1, 8, 16, 32 and 64 bits are supported)",
@@ -454,6 +1117,10 @@ impl<'a> FunctionTranslator<'a> {
             ty.resolve_compound(&self.module.ctx),
             Some(CompoundType::Ptr(_))
         )
+    }
+
+    fn is_wide(&self, id: ValueId) -> bool {
+        self.function.dfg.value_ty(id) == Type::I256
     }
 
     fn operand(&mut self, wb: waffle::Block, id: ValueId) -> Result<V, WasmError> {
@@ -476,19 +1143,43 @@ impl<'a> FunctionTranslator<'a> {
             Value::Undef { ty } => {
                 // An undefined value is materialized as zero, as the native
                 // backend does.
-                if let Some(int) = Int::from_type(*ty) {
-                    Ok(self.emit(wb).zero(int))
-                } else if self.is_pointer(*ty) {
-                    Ok(self.emit(wb).c32(0))
-                } else {
-                    Err(self.unsupported_type("an undefined value", *ty))
+                match repr(&self.module.ctx, *ty) {
+                    Some(Repr::Int(int)) => Ok(self.emit(wb).zero(int)),
+                    Some(Repr::Pointer) => Ok(self.emit(wb).c32(0)),
+                    Some(Repr::Aggregate) => self.undef_aggregate(wb, id, *ty),
+                    _ => Err(self.unsupported_type("an undefined value", *ty)),
                 }
             }
-            Value::Global { .. } => Err(unsupported(format!(
-                "function `{}`: global variable operands are not supported",
-                self.name
-            ))),
+            Value::Global { gv, .. } => {
+                let address = self.plan.globals.get(gv).ok_or_else(|| {
+                    invalid(format!(
+                        "function `{}`: global variable operand has no storage",
+                        self.name
+                    ))
+                })?;
+                Ok(self.emit(wb).c32(*address))
+            }
             Value::Arg { .. } | Value::Inst { .. } => Err(invalid(format!(
+                "function `{}`: value v{} is used before it is defined",
+                self.name, id.0
+            ))),
+        }
+    }
+
+    /// The limbs of a 256-bit operand.
+    fn wide_operand(&mut self, wb: waffle::Block, id: ValueId) -> Result<Limbs, WasmError> {
+        if let Some(&limbs) = self.wide.get(&id) {
+            return Ok(limbs);
+        }
+        let function = self.function;
+        match function.dfg.value(id) {
+            Value::Immediate {
+                imm: Immediate::I256(value),
+                ..
+            } => Ok(self.emit(wb).wide_const(*value)),
+            Value::Undef { ty: Type::I256 } => Ok(self.emit(wb).wide_zero()),
+            Value::Immediate { imm, .. } => Err(self.unsupported_type("an immediate", imm.ty())),
+            _ => Err(invalid(format!(
                 "function `{}`: value v{} is used before it is defined",
                 self.name, id.0
             ))),
@@ -507,11 +1198,33 @@ impl<'a> FunctionTranslator<'a> {
     /// lowering produced, which must be the declared type of the result.
     fn define(
         &mut self,
-        inst_id: sonatina_ir::InstId,
+        inst_id: InstId,
         index: usize,
         value: V,
         expected: Type,
     ) -> Result<(), WasmError> {
+        let result = self.result_of(inst_id, index, expected)?;
+        self.values.insert(result, value);
+        Ok(())
+    }
+
+    fn define_wide(
+        &mut self,
+        inst_id: InstId,
+        index: usize,
+        limbs: Limbs,
+    ) -> Result<(), WasmError> {
+        let result = self.result_of(inst_id, index, Type::I256)?;
+        self.wide.insert(result, limbs);
+        Ok(())
+    }
+
+    fn result_of(
+        &self,
+        inst_id: InstId,
+        index: usize,
+        expected: Type,
+    ) -> Result<ValueId, WasmError> {
         let function = self.function;
         let result = function
             .dfg
@@ -535,8 +1248,23 @@ impl<'a> FunctionTranslator<'a> {
                 type_name(&self.module.ctx, actual)
             )));
         }
-        self.values.insert(result, value);
-        Ok(())
+        Ok(result)
+    }
+
+    /// The type of the result of an instruction, as declared.
+    fn result_ty(&self, inst_id: InstId) -> Result<Type, WasmError> {
+        let function = self.function;
+        function
+            .dfg
+            .inst_result(inst_id)
+            .map(|result| function.dfg.value_ty(result))
+            .ok_or_else(|| {
+                invalid(format!(
+                    "function `{}`: `{}` has no result",
+                    self.name,
+                    function.dfg.inst(inst_id).as_text()
+                ))
+            })
     }
 
     /// Operands of a two-operand integer instruction, which must share a type.
@@ -572,11 +1300,28 @@ impl<'a> FunctionTranslator<'a> {
         Ok((int, ty, arg))
     }
 
+    /// Operands of a two-operand 256-bit instruction.
+    fn wide_operands(
+        &mut self,
+        wb: waffle::Block,
+        op: &str,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Result<(Limbs, Limbs), WasmError> {
+        if self.function.dfg.value_ty(rhs) != Type::I256 {
+            return Err(invalid(format!(
+                "function `{}`: `{op}` operands have different types",
+                self.name
+            )));
+        }
+        Ok((self.wide_operand(wb, lhs)?, self.wide_operand(wb, rhs)?))
+    }
+
     /// An integer instruction with one result of the operand type.
     fn binary(
         &mut self,
         wb: waffle::Block,
-        inst_id: sonatina_ir::InstId,
+        inst_id: InstId,
         (lhs, rhs): (ValueId, ValueId),
         lower: impl FnOnce(&mut Emit<'_>, Int, V, V) -> V,
     ) -> Result<(), WasmError> {
@@ -586,10 +1331,30 @@ impl<'a> FunctionTranslator<'a> {
         self.define(inst_id, 0, value, ty)
     }
 
+    /// A 256-bit instruction with one 256-bit result, when the operands are
+    /// 256-bit; otherwise the integer lowering.
+    fn binary_any(
+        &mut self,
+        wb: waffle::Block,
+        inst_id: InstId,
+        (lhs, rhs): (ValueId, ValueId),
+        wide: impl FnOnce(&mut Emit<'_>, Limbs, Limbs) -> Limbs,
+        lower: impl FnOnce(&mut Emit<'_>, Int, V, V) -> V,
+    ) -> Result<(), WasmError> {
+        if self.is_wide(lhs) {
+            let op = self.function.dfg.inst(inst_id).as_text();
+            let (lhs, rhs) = self.wide_operands(wb, op, lhs, rhs)?;
+            let limbs = wide(&mut self.emit(wb), lhs, rhs);
+            self.define_wide(inst_id, 0, limbs)
+        } else {
+            self.binary(wb, inst_id, (lhs, rhs), lower)
+        }
+    }
+
     fn unary(
         &mut self,
         wb: waffle::Block,
-        inst_id: sonatina_ir::InstId,
+        inst_id: InstId,
         arg: ValueId,
         lower: impl FnOnce(&mut Emit<'_>, Int, V) -> V,
     ) -> Result<(), WasmError> {
@@ -599,15 +1364,37 @@ impl<'a> FunctionTranslator<'a> {
         self.define(inst_id, 0, value, ty)
     }
 
+    fn unary_any(
+        &mut self,
+        wb: waffle::Block,
+        inst_id: InstId,
+        arg: ValueId,
+        wide: impl FnOnce(&mut Emit<'_>, Limbs) -> Limbs,
+        lower: impl FnOnce(&mut Emit<'_>, Int, V) -> V,
+    ) -> Result<(), WasmError> {
+        if self.is_wide(arg) {
+            let limbs = self.wide_operand(wb, arg)?;
+            let limbs = wide(&mut self.emit(wb), limbs);
+            self.define_wide(inst_id, 0, limbs)
+        } else {
+            self.unary(wb, inst_id, arg, lower)
+        }
+    }
+
     fn compare(
         &mut self,
         wb: waffle::Block,
-        inst_id: sonatina_ir::InstId,
+        inst_id: InstId,
         (lhs, rhs): (ValueId, ValueId),
         cmp: Cmp,
         signed: bool,
     ) -> Result<(), WasmError> {
         let op = self.function.dfg.inst(inst_id).as_text();
+        if self.is_wide(lhs) {
+            let (lhs, rhs) = self.wide_operands(wb, op, lhs, rhs)?;
+            let value = self.emit(wb).wide_compare(cmp, signed, lhs, rhs);
+            return self.define(inst_id, 0, value, Type::I1);
+        }
         let (int, _, lhs, rhs) = self.binary_operands(wb, op, lhs, rhs)?;
         let value = self.emit(wb).compare(int, cmp, signed, lhs, rhs);
         self.define(inst_id, 0, value, Type::I1)
@@ -617,12 +1404,35 @@ impl<'a> FunctionTranslator<'a> {
     fn overflow(
         &mut self,
         wb: waffle::Block,
-        inst_id: sonatina_ir::InstId,
+        inst_id: InstId,
         (lhs, rhs): (ValueId, ValueId),
         arith: Arith,
         signed: bool,
     ) -> Result<(), WasmError> {
         let op = self.function.dfg.inst(inst_id).as_text();
+        if self.is_wide(lhs) {
+            if matches!(arith, Arith::Mul) {
+                return Err(invalid(format!(
+                    "function `{}`: `{op}` on i256 reached the unsigned lowering",
+                    self.name
+                )));
+            }
+            let (lhs, rhs) = self.wide_operands(wb, op, lhs, rhs)?;
+            let sub = matches!(arith, Arith::Sub);
+            let mut emit = self.emit(wb);
+            let (result, carry) = if sub {
+                emit.wide_sub(lhs, rhs)
+            } else {
+                emit.wide_add(lhs, rhs)
+            };
+            let flag = if signed {
+                emit.wide_signed_overflow(sub, lhs, rhs, result)
+            } else {
+                carry
+            };
+            self.define_wide(inst_id, 0, result)?;
+            return self.define(inst_id, 1, flag, Type::I1);
+        }
         let (int, ty, lhs, rhs) = self.binary_operands(wb, op, lhs, rhs)?;
         let (value, overflow) = self.emit(wb).overflow(int, arith, signed, lhs, rhs);
         self.define(inst_id, 0, value, ty)?;
@@ -632,7 +1442,7 @@ impl<'a> FunctionTranslator<'a> {
     fn shift(
         &mut self,
         wb: waffle::Block,
-        inst_id: sonatina_ir::InstId,
+        inst_id: InstId,
         (value, bits): (ValueId, ValueId),
         kind: Shift,
     ) -> Result<(), WasmError> {
@@ -642,37 +1452,42 @@ impl<'a> FunctionTranslator<'a> {
         })
     }
 
-    fn address(&mut self, wb: waffle::Block, op: &str, addr: ValueId) -> Result<V, WasmError> {
-        let ty = self.function.dfg.value_ty(addr);
-        if ty != Type::I32 && !self.is_pointer(ty) {
-            return Err(unsupported(format!(
-                "function `{}`: `{op}` address of type {}; wasm32 addresses are pointers or i32",
-                self.name,
-                type_name(&self.module.ctx, ty)
-            )));
+    fn trap_block(&mut self) -> waffle::Block {
+        if let Some(block) = self.trap {
+            return block;
         }
-        self.operand(wb, addr)
+        let block = self.body.add_block();
+        self.body.set_terminator(block, Terminator::Unreachable);
+        self.trap = Some(block);
+        block
     }
 
-    fn access(&self, op: &str, ty: Type) -> Result<Access, WasmError> {
-        match ty {
-            Type::I1 | Type::I8 => Ok(Access::Byte),
-            Type::I16 => Ok(Access::Half),
-            Type::I32 => Ok(Access::Word),
-            Type::I64 => Ok(Access::Double),
-            _ if self.is_pointer(ty) => Ok(Access::Word),
-            _ => Err(unsupported(format!(
-                "function `{}`: `{op}` of {}; only scalar integers and pointers are stored in memory",
-                self.name,
-                type_name(&self.module.ctx, ty)
-            ))),
-        }
+    /// Trap if `cond` (an `i32`) is non-zero; the rest of the block continues
+    /// in a new WAFFLE block, which becomes `wb`.
+    fn trap_if(&mut self, wb: &mut waffle::Block, cond: V) {
+        let trap = self.trap_block();
+        let next = self.body.add_block();
+        self.body.set_terminator(
+            *wb,
+            Terminator::CondBr {
+                cond,
+                if_true: BlockTarget {
+                    block: trap,
+                    args: vec![],
+                },
+                if_false: BlockTarget {
+                    block: next,
+                    args: vec![],
+                },
+            },
+        );
+        *wb = next;
     }
 
-    fn memarg(&self, access: Access) -> MemoryArg {
+    fn memarg(&self, access: Access, offset: u32) -> MemoryArg {
         MemoryArg {
             align: access.align(),
-            offset: 0,
+            offset,
             memory: self.memory,
         }
     }
@@ -693,6 +1508,19 @@ impl<'a> FunctionTranslator<'a> {
                 to.as_u32()
             ))
         })?;
+        // Copying the inputs of several aggregate phis one after another in
+        // the target could overwrite an input that another phi still reads, so
+        // with more than one they are first copied to storage of their own.
+        let aggregate_phis = function
+            .layout
+            .iter_inst(to)
+            .take_while(|&inst_id| function.dfg.is_phi(inst_id))
+            .filter(|&inst_id| {
+                function.dfg.inst_result(inst_id).is_some_and(|result| {
+                    repr(&self.module.ctx, function.dfg.value_ty(result)) == Some(Repr::Aggregate)
+                })
+            })
+            .count();
         let mut args = Vec::new();
         for inst_id in function.layout.iter_inst(to) {
             let NativeInstKind::Phi(phi) = self.resolve(function.dfg.inst(inst_id))? else {
@@ -715,30 +1543,64 @@ impl<'a> FunctionTranslator<'a> {
                 .dfg
                 .inst_result(inst_id)
                 .ok_or_else(|| invalid(format!("function `{}`: a phi has no result", self.name)))?;
-            if function.dfg.value_ty(input) != function.dfg.value_ty(result) {
+            let ty = function.dfg.value_ty(result);
+            if function.dfg.value_ty(input) != ty {
                 return Err(invalid(format!(
                     "function `{}`: a phi input from block{} has the wrong type",
                     self.name,
                     from.as_u32()
                 )));
             }
-            args.push(self.operand(wb, input)?);
+            match repr(&self.module.ctx, ty) {
+                Some(Repr::Wide) => args.extend(self.wide_operand(wb, input)?),
+                Some(Repr::Aggregate) => {
+                    let mut address = self.operand(wb, input)?;
+                    if aggregate_phis > 1 {
+                        let (size, align) = self.layout_of(ty)?;
+                        let slot = match self.edge_slots.get(&(from, to, inst_id)) {
+                            Some(&slot) => slot,
+                            None => {
+                                let slot = self.slot(size, align)?;
+                                self.edge_slots.insert((from, to, inst_id), slot);
+                                slot
+                            }
+                        };
+                        let copy = self.slot_address(wb, slot)?;
+                        self.copy_bytes(wb, copy, address, size);
+                        address = copy;
+                    }
+                    args.push(address);
+                }
+                _ => args.push(self.operand(wb, input)?),
+            }
         }
         Ok(BlockTarget { block, args })
     }
 
-    fn trap_block(&mut self) -> waffle::Block {
-        let block = self.body.add_block();
-        self.body.set_terminator(block, Terminator::Unreachable);
-        block
-    }
-
     fn translate_block(&mut self, block: BlockId) -> Result<(), WasmError> {
-        let wb = self.blocks[&block];
+        let mut wb = self.blocks[&block];
         let function = self.function;
+        // Aggregate phis receive the address of their input; keep a copy in
+        // the storage of the phi, which no later definition overwrites.
+        for inst_id in function.layout.iter_inst(block) {
+            if !function.dfg.is_phi(inst_id) {
+                break;
+            }
+            let result = function
+                .dfg
+                .inst_result(inst_id)
+                .expect("a phi has a result");
+            if let Some(&param) = self.phi_params.get(&result) {
+                let slot = self.phi_slots[&result];
+                let address = self.slot_address(wb, slot)?;
+                let (size, _) = self.layout_of(function.dfg.value_ty(result))?;
+                self.copy_bytes(wb, address, param, size);
+                self.values.insert(result, address);
+            }
+        }
         for inst_id in function.layout.iter_inst(block) {
             let inst = function.dfg.inst(inst_id);
-            self.translate_inst(block, wb, inst_id, inst)?;
+            self.translate_inst(block, &mut wb, inst_id, inst)?;
             if inst.is_terminator() {
                 return Ok(());
             }
@@ -753,222 +1615,256 @@ impl<'a> FunctionTranslator<'a> {
     fn translate_inst(
         &mut self,
         block: BlockId,
-        wb: waffle::Block,
-        inst_id: sonatina_ir::InstId,
+        wb_ref: &mut waffle::Block,
+        inst_id: InstId,
+        inst: &'a dyn Inst,
+    ) -> Result<(), WasmError> {
+        let op = inst.as_text();
+        let mut wb = *wb_ref;
+        let result = self.translate_kind(block, &mut wb, inst_id, op, inst);
+        *wb_ref = wb;
+        result
+    }
+
+    fn translate_kind(
+        &mut self,
+        block: BlockId,
+        wb: &mut waffle::Block,
+        inst_id: InstId,
+        op: &str,
         inst: &'a dyn Inst,
     ) -> Result<(), WasmError> {
         let function = self.function;
-        let op = inst.as_text();
-        match self.resolve(inst)? {
+        let kind = self.resolve(inst)?;
+        if let Some((wide_op, lhs, rhs)) = wide_op_of(&kind)
+            && self.is_wide(lhs)
+        {
+            return self.wide_arith(*wb, self.wide_helpers, inst_id, wide_op, lhs, rhs);
+        }
+        match kind {
             // Phi inputs are passed as block arguments by the predecessors.
             NativeInstKind::Phi(_) => {}
 
-            NativeInstKind::Add(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
-                    e.add_sub_mul(int, Arith::Add, l, r)
-                })?
-            }
-            NativeInstKind::Sub(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
-                    e.add_sub_mul(int, Arith::Sub, l, r)
-                })?
-            }
+            NativeInstKind::Add(i) => self.binary_any(
+                *wb,
+                inst_id,
+                (*i.lhs(), *i.rhs()),
+                |e, l, r| e.wide_add(l, r).0,
+                |e, int, l, r| e.add_sub_mul(int, Arith::Add, l, r),
+            )?,
+            NativeInstKind::Sub(i) => self.binary_any(
+                *wb,
+                inst_id,
+                (*i.lhs(), *i.rhs()),
+                |e, l, r| e.wide_sub(l, r).0,
+                |e, int, l, r| e.add_sub_mul(int, Arith::Sub, l, r),
+            )?,
             NativeInstKind::Mul(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.add_sub_mul(int, Arith::Mul, l, r)
                 })?
             }
-            NativeInstKind::Neg(i) => {
-                self.unary(wb, inst_id, *i.arg(), |e, int, v| e.neg(int, v))?
-            }
-            NativeInstKind::Not(i) => {
-                self.unary(wb, inst_id, *i.arg(), |e, int, v| e.not(int, v))?
-            }
+            NativeInstKind::Neg(i) => self.unary_any(
+                *wb,
+                inst_id,
+                *i.arg(),
+                |e, v| e.wide_neg(v),
+                |e, int, v| e.neg(int, v),
+            )?,
+            NativeInstKind::Not(i) => self.unary_any(
+                *wb,
+                inst_id,
+                *i.arg(),
+                |e, v| e.wide_not(v),
+                |e, int, v| e.not(int, v),
+            )?,
             NativeInstKind::Bswap(i) => {
                 if function.dfg.value_ty(*i.arg()) == Type::I1 {
                     return Err(self.unsupported_type("`bswap`", Type::I1));
                 }
-                self.unary(wb, inst_id, *i.arg(), |e, int, v| e.bswap(int, v))?
+                self.unary(*wb, inst_id, *i.arg(), |e, int, v| e.bswap(int, v))?
             }
-            NativeInstKind::And(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
-                    e.bitwise(int, Operator::I32And, Operator::I64And, l, r)
-                })?
-            }
-            NativeInstKind::Or(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
-                    e.bitwise(int, Operator::I32Or, Operator::I64Or, l, r)
-                })?
-            }
-            NativeInstKind::Xor(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
-                    e.bitwise(int, Operator::I32Xor, Operator::I64Xor, l, r)
-                })?
-            }
+            NativeInstKind::And(i) => self.binary_any(
+                *wb,
+                inst_id,
+                (*i.lhs(), *i.rhs()),
+                |e, l, r| e.wide_bitwise(Operator::I64And, l, r),
+                |e, int, l, r| e.bitwise(int, Operator::I32And, Operator::I64And, l, r),
+            )?,
+            NativeInstKind::Or(i) => self.binary_any(
+                *wb,
+                inst_id,
+                (*i.lhs(), *i.rhs()),
+                |e, l, r| e.wide_bitwise(Operator::I64Or, l, r),
+                |e, int, l, r| e.bitwise(int, Operator::I32Or, Operator::I64Or, l, r),
+            )?,
+            NativeInstKind::Xor(i) => self.binary_any(
+                *wb,
+                inst_id,
+                (*i.lhs(), *i.rhs()),
+                |e, l, r| e.wide_bitwise(Operator::I64Xor, l, r),
+                |e, int, l, r| e.bitwise(int, Operator::I32Xor, Operator::I64Xor, l, r),
+            )?,
 
             NativeInstKind::Udiv(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.div_rem(int, DivRem::Udiv, l, r)
                 })?
             }
             NativeInstKind::Sdiv(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.div_rem(int, DivRem::Sdiv, l, r)
                 })?
             }
             NativeInstKind::Umod(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.div_rem(int, DivRem::Umod, l, r)
                 })?
             }
             NativeInstKind::Smod(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.div_rem(int, DivRem::Smod, l, r)
                 })?
             }
 
             NativeInstKind::Shl(i) => {
-                self.shift(wb, inst_id, (*i.value(), *i.bits()), Shift::Shl)?
+                self.shift(*wb, inst_id, (*i.value(), *i.bits()), Shift::Shl)?
             }
             NativeInstKind::Shr(i) => {
-                self.shift(wb, inst_id, (*i.value(), *i.bits()), Shift::Shr)?
+                self.shift(*wb, inst_id, (*i.value(), *i.bits()), Shift::Shr)?
             }
             NativeInstKind::Sar(i) => {
-                self.shift(wb, inst_id, (*i.value(), *i.bits()), Shift::Sar)?
+                self.shift(*wb, inst_id, (*i.value(), *i.bits()), Shift::Sar)?
             }
 
             NativeInstKind::Uaddo(i) => {
-                self.overflow(wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Add, false)?
+                self.overflow(*wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Add, false)?
             }
             NativeInstKind::Usubo(i) => {
-                self.overflow(wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Sub, false)?
+                self.overflow(*wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Sub, false)?
             }
             NativeInstKind::Umulo(i) => {
-                self.overflow(wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Mul, false)?
+                self.overflow(*wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Mul, false)?
             }
             NativeInstKind::Saddo(i) => {
-                self.overflow(wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Add, true)?
+                self.overflow(*wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Add, true)?
             }
             NativeInstKind::Ssubo(i) => {
-                self.overflow(wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Sub, true)?
+                self.overflow(*wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Sub, true)?
             }
             NativeInstKind::Smulo(i) => {
-                self.overflow(wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Mul, true)?
+                self.overflow(*wb, inst_id, (*i.lhs(), *i.rhs()), Arith::Mul, true)?
             }
             NativeInstKind::Snego(i) => {
-                let (int, ty, arg) = self.unary_operand(wb, op, *i.arg())?;
-                let (value, overflow) = self.emit(wb).signed_neg_overflow(int, arg);
-                self.define(inst_id, 0, value, ty)?;
-                self.define(inst_id, 1, overflow, Type::I1)?;
+                if self.is_wide(*i.arg()) {
+                    let arg = self.wide_operand(*wb, *i.arg())?;
+                    let (value, overflow) = self.emit(*wb).wide_snego(arg);
+                    self.define_wide(inst_id, 0, value)?;
+                    self.define(inst_id, 1, overflow, Type::I1)?;
+                } else {
+                    let (int, ty, arg) = self.unary_operand(*wb, op, *i.arg())?;
+                    let (value, overflow) = self.emit(*wb).signed_neg_overflow(int, arg);
+                    self.define(inst_id, 0, value, ty)?;
+                    self.define(inst_id, 1, overflow, Type::I1)?;
+                }
             }
             NativeInstKind::Uaddsat(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.saturating(int, Arith::Add, false, l, r)
                 })?
             }
             NativeInstKind::Usubsat(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.saturating(int, Arith::Sub, false, l, r)
                 })?
             }
             NativeInstKind::Umulsat(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.saturating(int, Arith::Mul, false, l, r)
                 })?
             }
             NativeInstKind::Saddsat(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.saturating(int, Arith::Add, true, l, r)
                 })?
             }
             NativeInstKind::Ssubsat(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.saturating(int, Arith::Sub, true, l, r)
                 })?
             }
             NativeInstKind::Smulsat(i) => {
-                self.binary(wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
+                self.binary(*wb, inst_id, (*i.lhs(), *i.rhs()), |e, int, l, r| {
                     e.saturating(int, Arith::Mul, true, l, r)
                 })?
             }
 
             NativeInstKind::Eq(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Eq, false)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Eq, false)?
             }
             NativeInstKind::Ne(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Ne, false)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Ne, false)?
             }
             NativeInstKind::Lt(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Lt, false)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Lt, false)?
             }
             NativeInstKind::Gt(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Gt, false)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Gt, false)?
             }
             NativeInstKind::Le(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Le, false)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Le, false)?
             }
             NativeInstKind::Ge(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Ge, false)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Ge, false)?
             }
             NativeInstKind::Slt(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Lt, true)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Lt, true)?
             }
             NativeInstKind::Sgt(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Gt, true)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Gt, true)?
             }
             NativeInstKind::Sle(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Le, true)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Le, true)?
             }
             NativeInstKind::Sge(i) => {
-                self.compare(wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Ge, true)?
+                self.compare(*wb, inst_id, (*i.lhs(), *i.rhs()), Cmp::Ge, true)?
             }
             NativeInstKind::IsZero(i) => {
-                let (int, _, arg) = self.unary_operand(wb, op, *i.lhs())?;
-                let value = self.emit(wb).is_zero(int, arg);
-                self.define(inst_id, 0, value, Type::I1)?;
+                if self.is_wide(*i.lhs()) {
+                    let arg = self.wide_operand(*wb, *i.lhs())?;
+                    let value = self.emit(*wb).wide_is_zero(arg);
+                    self.define(inst_id, 0, value, Type::I1)?;
+                } else {
+                    let (int, _, arg) = self.unary_operand(*wb, op, *i.lhs())?;
+                    let value = self.emit(*wb).is_zero(int, arg);
+                    self.define(inst_id, 0, value, Type::I1)?;
+                }
             }
 
-            NativeInstKind::Zext(i) => self.convert(wb, inst_id, op, *i.from(), *i.ty(), false)?,
-            NativeInstKind::Sext(i) => self.convert(wb, inst_id, op, *i.from(), *i.ty(), true)?,
-            NativeInstKind::Trunc(i) => self.convert(wb, inst_id, op, *i.from(), *i.ty(), false)?,
-            NativeInstKind::Bitcast(i) => {
-                let from_ty = function.dfg.value_ty(*i.from());
-                let to_ty = *i.ty();
-                let width = |ty: Type| match ty {
-                    Type::I1 => Some(1),
-                    Type::I8 => Some(8),
-                    Type::I16 => Some(16),
-                    Type::I32 => Some(32),
-                    Type::I64 => Some(64),
-                    _ if self.is_pointer(ty) => Some(32),
-                    _ => None,
-                };
-                let (Some(from_width), Some(to_width)) = (width(from_ty), width(to_ty)) else {
-                    let unsupported_ty = if width(from_ty).is_none() {
-                        from_ty
-                    } else {
-                        to_ty
-                    };
-                    return Err(self.unsupported_type("`bitcast`", unsupported_ty));
-                };
-                if from_width != to_width {
-                    return Err(invalid(format!(
-                        "function `{}`: `bitcast` between types of different widths",
-                        self.name
-                    )));
-                }
-                // Same-width scalars and pointers share one representation.
-                let value = self.operand(wb, *i.from())?;
-                self.define(inst_id, 0, value, to_ty)?;
+            NativeInstKind::Zext(i) => self.convert(*wb, inst_id, op, *i.from(), *i.ty(), false)?,
+            NativeInstKind::Sext(i) => self.convert(*wb, inst_id, op, *i.from(), *i.ty(), true)?,
+            NativeInstKind::Trunc(i) => {
+                self.convert(*wb, inst_id, op, *i.from(), *i.ty(), false)?
             }
+            NativeInstKind::Bitcast(i) => self.bitcast(wb, inst_id, op, *i.from(), *i.ty())?,
             NativeInstKind::IntToPtr(i) => {
                 let to_ty = *i.ty();
                 if !self.is_pointer(to_ty) {
                     return Err(self.unsupported_type("`int_to_ptr` result", to_ty));
                 }
-                let (int, _, arg) = self.unary_operand(wb, op, *i.from())?;
-                let value = self.emit(wb).resize(int, Int::I32, false, arg);
-                self.define(inst_id, 0, value, to_ty)?;
+                if self.is_wide(*i.from()) {
+                    // An address wider than 32 bits is not an address of this
+                    // module.
+                    let limbs = self.wide_operand(*wb, *i.from())?;
+                    let exceeds = self.emit(*wb).wide_exceeds_u32(limbs);
+                    self.trap_if(wb, exceeds);
+                    let value = self.emit(*wb).wide_trunc(Int::I32, limbs);
+                    self.define(inst_id, 0, value, to_ty)?;
+                } else {
+                    let (int, _, arg) = self.unary_operand(*wb, op, *i.from())?;
+                    let value = self.emit(*wb).resize(int, Int::I32, false, arg);
+                    self.define(inst_id, 0, value, to_ty)?;
+                }
             }
             NativeInstKind::PtrToInt(i) => {
                 let from_ty = function.dfg.value_ty(*i.from());
@@ -976,68 +1872,65 @@ impl<'a> FunctionTranslator<'a> {
                     return Err(self.unsupported_type("`ptr_to_int` operand", from_ty));
                 }
                 let to_ty = *i.ty();
-                let to = self.int_ty(op, to_ty)?;
-                let arg = self.operand(wb, *i.from())?;
-                let value = self.emit(wb).resize(Int::I32, to, false, arg);
-                self.define(inst_id, 0, value, to_ty)?;
+                let arg = self.operand(*wb, *i.from())?;
+                if to_ty == Type::I256 {
+                    let limbs = self.emit(*wb).wide_extend(Int::I32, false, arg);
+                    self.define_wide(inst_id, 0, limbs)?;
+                } else {
+                    let to = self.int_ty(op, to_ty)?;
+                    let value = self.emit(*wb).resize(Int::I32, to, false, arg);
+                    self.define(inst_id, 0, value, to_ty)?;
+                }
             }
 
-            NativeInstKind::Mload(i) => {
-                let ty = *i.ty();
-                let access = self.access(op, ty)?;
-                let addr = self.address(wb, op, *i.addr())?;
-                let memory = self.memarg(access);
-                let (load, carrier) = match access {
-                    Access::Byte => (Operator::I32Load8U { memory }, WType::I32),
-                    Access::Half => (Operator::I32Load16U { memory }, WType::I32),
-                    Access::Word => (Operator::I32Load { memory }, WType::I32),
-                    Access::Double => (Operator::I64Load { memory }, WType::I64),
-                };
-                let mut value = self.body.add_op(wb, load, &[addr], &[carrier]);
-                if ty == Type::I1 {
-                    // Only the low bit of a stored byte is the value.
-                    value = self.emit(wb).canonicalize(Int::I1, value);
-                }
-                self.define(inst_id, 0, value, ty)?;
+            NativeInstKind::Mload(i) => self.mload(wb, inst_id, op, *i.addr(), *i.ty())?,
+            NativeInstKind::Mstore(i) => self.mstore(wb, op, *i.addr(), *i.value(), *i.ty())?,
+            NativeInstKind::Memzero(i) => self.memzero(wb, op, *i.dest(), *i.len())?,
+            NativeInstKind::Gep(i) => self.gep(wb, inst_id, op, i.values())?,
+            NativeInstKind::Alloca(i) => self.alloca(*wb, inst_id, *i.ty())?,
+            NativeInstKind::MemAllocDynamic(i) => {
+                self.mem_alloc_dynamic(wb, inst_id, op, *i.size())?
             }
-            NativeInstKind::Mstore(i) => {
-                let ty = *i.ty();
-                let access = self.access(op, ty)?;
-                if function.dfg.value_ty(*i.value()) != ty {
-                    return Err(invalid(format!(
-                        "function `{}`: `mstore` value does not have the stored type",
-                        self.name
-                    )));
-                }
-                let addr = self.address(wb, op, *i.addr())?;
-                let value = self.operand(wb, *i.value())?;
-                let memory = self.memarg(access);
-                let store = match access {
-                    Access::Byte => Operator::I32Store8 { memory },
-                    Access::Half => Operator::I32Store16 { memory },
-                    Access::Word => Operator::I32Store { memory },
-                    Access::Double => Operator::I64Store { memory },
-                };
-                self.body.add_op(wb, store, &[addr, value], &[]);
+            NativeInstKind::ObjAlloc(i) => self.obj_alloc(*wb, inst_id, *i.ty())?,
+            NativeInstKind::ObjProj(i) => self.projection(*wb, inst_id, op, i.values())?,
+            NativeInstKind::ConstProj(i) => self.projection(*wb, inst_id, op, i.values())?,
+            NativeInstKind::ObjIndex(i) => {
+                self.element_address(wb, inst_id, op, *i.object(), *i.index())?
+            }
+            NativeInstKind::ConstIndex(i) => {
+                self.element_address(wb, inst_id, op, *i.object(), *i.index())?
+            }
+            NativeInstKind::ObjLoad(i) => self.obj_load(*wb, inst_id, *i.object(), true)?,
+            NativeInstKind::ConstLoad(i) => self.obj_load(*wb, inst_id, *i.object(), false)?,
+            NativeInstKind::ObjStore(i) => self.obj_store(*wb, *i.object(), *i.value())?,
+            NativeInstKind::ObjInitConst(i) => self.obj_init_const(*wb, *i.object(), *i.value())?,
+            NativeInstKind::ObjMaterializeStack(i) => self.alias(*wb, inst_id, *i.object())?,
+            NativeInstKind::ObjMaterializeHeap(i) => self.alias(*wb, inst_id, *i.object())?,
+            NativeInstKind::ConstRef(i) => self.const_ref(*wb, inst_id, i.global().gv())?,
+            NativeInstKind::InsertValue(i) => {
+                self.insert_value(block, *wb, inst_id, *i.dest(), *i.idx(), *i.value())?
+            }
+            NativeInstKind::ExtractValue(i) => {
+                self.extract_value(*wb, inst_id, *i.dest(), *i.idx())?
             }
 
             NativeInstKind::Call(call) => {
-                self.call(wb, inst_id, op, *call.callee(), call.args())?
+                self.call(*wb, inst_id, op, *call.callee(), call.args())?
             }
 
             NativeInstKind::Jump(jump) => {
-                let target = self.edge(block, *jump.dest(), wb)?;
-                self.body.set_terminator(wb, Terminator::Br { target });
+                let target = self.edge(block, *jump.dest(), *wb)?;
+                self.body.set_terminator(*wb, Terminator::Br { target });
             }
             NativeInstKind::Br(br) => {
                 let cond_ty = function.dfg.value_ty(*br.cond());
                 let int = self.int_ty(op, cond_ty)?;
-                let cond = self.operand(wb, *br.cond())?;
-                let nonzero = self.edge(block, *br.nz_dest(), wb)?;
-                let zero = self.edge(block, *br.z_dest(), wb)?;
+                let cond = self.operand(*wb, *br.cond())?;
+                let nonzero = self.edge(block, *br.nz_dest(), *wb)?;
+                let zero = self.edge(block, *br.z_dest(), *wb)?;
                 let terminator = if int.is_wide() {
                     // `br_if` takes an i32, so branch on the i64 being zero.
-                    let is_zero = self.emit(wb).is_zero(int, cond);
+                    let is_zero = self.emit(*wb).is_zero(int, cond);
                     Terminator::CondBr {
                         cond: is_zero,
                         if_true: zero,
@@ -1050,17 +1943,17 @@ impl<'a> FunctionTranslator<'a> {
                         if_false: zero,
                     }
                 };
-                self.body.set_terminator(wb, terminator);
+                self.body.set_terminator(*wb, terminator);
             }
             NativeInstKind::BrTable(table) => {
                 let scrutinee_ty = function.dfg.value_ty(*table.scrutinee());
                 let int = self.int_ty(op, scrutinee_ty)?;
-                let scrutinee = self.operand(wb, *table.scrutinee())?;
+                let scrutinee = self.operand(*wb, *table.scrutinee())?;
                 let default = *table.default();
 
                 // Each case is tested in turn; the edge arguments are
                 // materialized in the block that takes the edge.
-                let mut current = wb;
+                let mut current = *wb;
                 for (index, &(case, dest)) in table.table().iter().enumerate() {
                     if function.dfg.value_ty(case) != scrutinee_ty {
                         return Err(invalid(format!(
@@ -1105,55 +1998,22 @@ impl<'a> FunctionTranslator<'a> {
                             self.name
                         ))
                     })?;
-                    let target = self.edge(block, default, wb)?;
-                    self.body.set_terminator(wb, Terminator::Br { target });
+                    let target = self.edge(block, default, *wb)?;
+                    self.body.set_terminator(*wb, Terminator::Br { target });
                 }
             }
-            NativeInstKind::Return(ret) => {
-                let args = ret.args().as_slice();
-                if args.len() != self.return_tys.len() {
-                    return Err(invalid(format!(
-                        "function `{}`: `return` has {} values but the signature has {}",
-                        self.name,
-                        args.len(),
-                        self.return_tys.len()
-                    )));
-                }
-                let mut values = Vec::with_capacity(args.len());
-                for (index, &arg) in args.iter().enumerate() {
-                    if function.dfg.value_ty(arg) != self.return_tys[index] {
-                        return Err(invalid(format!(
-                            "function `{}`: `return` value {index} does not have the result type",
-                            self.name
-                        )));
-                    }
-                    values.push(self.operand(wb, arg)?);
-                }
-                self.body.set_terminator(wb, Terminator::Return { values });
-            }
+            NativeInstKind::Return(ret) => self.ret(*wb, ret.args().as_slice())?,
             NativeInstKind::Unreachable(_) => {
-                self.body.set_terminator(wb, Terminator::Unreachable);
+                self.body.set_terminator(*wb, Terminator::Unreachable);
             }
 
-            // Not part of the integer subset: aggregates, objects, enums,
-            // references, symbols, function pointers and bulk memory.
-            NativeInstKind::Memzero(_)
-            | NativeInstKind::Gep(_)
-            | NativeInstKind::GetFunctionPtr(_)
+            // Not translated: symbols and function pointers.
+            NativeInstKind::GetFunctionPtr(_)
             | NativeInstKind::SymAddr(_)
-            | NativeInstKind::SymSize(_)
-            | NativeInstKind::Alloca(_)
-            | NativeInstKind::ObjAlloc(_)
-            | NativeInstKind::ConstRef(_)
-            | NativeInstKind::ConstProj(_)
-            | NativeInstKind::ConstIndex(_)
-            | NativeInstKind::ConstLoad(_)
-            | NativeInstKind::ObjProj(_)
-            | NativeInstKind::ObjIndex(_)
-            | NativeInstKind::ObjLoad(_)
-            | NativeInstKind::ObjStore(_)
-            | NativeInstKind::ObjInitConst(_)
-            | NativeInstKind::EnumMake(_)
+            | NativeInstKind::SymSize(_) => return Err(self.unsupported_inst(op)),
+
+            // Enums are lowered to products before translation.
+            NativeInstKind::EnumMake(_)
             | NativeInstKind::EnumTag(_)
             | NativeInstKind::EnumIsVariant(_)
             | NativeInstKind::EnumAssertVariant(_)
@@ -1162,12 +2022,7 @@ impl<'a> FunctionTranslator<'a> {
             | NativeInstKind::EnumSetTag(_)
             | NativeInstKind::EnumWriteVariant(_)
             | NativeInstKind::EnumGetTag(_)
-            | NativeInstKind::EnumProj(_)
-            | NativeInstKind::ObjMaterializeStack(_)
-            | NativeInstKind::ObjMaterializeHeap(_)
-            | NativeInstKind::MemAllocDynamic(_)
-            | NativeInstKind::InsertValue(_)
-            | NativeInstKind::ExtractValue(_) => return Err(self.unsupported_inst(op)),
+            | NativeInstKind::EnumProj(_) => return Err(self.unsupported_inst(op)),
         }
         Ok(())
     }
@@ -1176,22 +2031,43 @@ impl<'a> FunctionTranslator<'a> {
     fn convert(
         &mut self,
         wb: waffle::Block,
-        inst_id: sonatina_ir::InstId,
+        inst_id: InstId,
         op: &str,
         from: ValueId,
         to_ty: Type,
         signed: bool,
     ) -> Result<(), WasmError> {
-        let (from_int, _, value) = self.unary_operand(wb, op, from)?;
-        let to_int = self.int_ty(op, to_ty)?;
-        let value = self.emit(wb).resize(from_int, to_int, signed, value);
-        self.define(inst_id, 0, value, to_ty)
+        let from_ty = self.function.dfg.value_ty(from);
+        match (from_ty == Type::I256, to_ty == Type::I256) {
+            (false, true) => {
+                let from_int = self.int_ty(op, from_ty)?;
+                let value = self.operand(wb, from)?;
+                let limbs = self.emit(wb).wide_extend(from_int, signed, value);
+                self.define_wide(inst_id, 0, limbs)
+            }
+            (true, false) => {
+                let to_int = self.int_ty(op, to_ty)?;
+                let limbs = self.wide_operand(wb, from)?;
+                let value = self.emit(wb).wide_trunc(to_int, limbs);
+                self.define(inst_id, 0, value, to_ty)
+            }
+            (true, true) => Err(invalid(format!(
+                "function `{}`: `{op}` between 256-bit integers",
+                self.name
+            ))),
+            (false, false) => {
+                let (from_int, _, value) = self.unary_operand(wb, op, from)?;
+                let to_int = self.int_ty(op, to_ty)?;
+                let value = self.emit(wb).resize(from_int, to_int, signed, value);
+                self.define(inst_id, 0, value, to_ty)
+            }
+        }
     }
 
     fn call(
         &mut self,
         wb: waffle::Block,
-        inst_id: sonatina_ir::InstId,
+        inst_id: InstId,
         op: &str,
         callee: FuncRef,
         call_args: &[ValueId],
@@ -1212,7 +2088,33 @@ impl<'a> FunctionTranslator<'a> {
                 callee.params.len()
             )));
         }
-        let mut args = Vec::with_capacity(call_args.len());
+        let mut args = Vec::with_capacity(call_args.len() + 2);
+        if callee.stack_param {
+            args.push(self.frame_top()?);
+        } else if callee.is_import
+            && let (Some(globals), Some(top)) = (self.globals, self.top)
+        {
+            // A host function may call back into an export. Tell the export
+            // where the stack of this call ends.
+            self.body.add_op(
+                wb,
+                Operator::GlobalSet {
+                    global_index: globals.stack_top,
+                },
+                &[top],
+                &[],
+            );
+        }
+        let sret_address = match callee.sret {
+            Some(storage) => {
+                let (size, align) = self.layout_of(storage)?;
+                let slot = self.slot(size, align)?;
+                let address = self.slot_address(wb, slot)?;
+                args.push(address);
+                Some(address)
+            }
+            None => None,
+        };
         for (index, &arg) in call_args.iter().enumerate() {
             if function.dfg.value_ty(arg) != callee.params[index] {
                 return Err(invalid(format!(
@@ -1220,7 +2122,11 @@ impl<'a> FunctionTranslator<'a> {
                     self.name
                 )));
             }
-            args.push(self.operand(wb, arg)?);
+            if self.is_wide(arg) {
+                args.extend(self.wide_operand(wb, arg)?);
+            } else {
+                args.push(self.operand(wb, arg)?);
+            }
         }
         let results = function.dfg.inst_results(inst_id);
         if results.len() != callee.rets.len() {
@@ -1232,45 +2138,84 @@ impl<'a> FunctionTranslator<'a> {
             )));
         }
 
-        let call = Operator::Call {
-            function_index: callee.func,
-        };
-        if results.is_empty() {
-            self.body.add_op(wb, call, &args, &[]);
+        let mut carriers = Vec::new();
+        if sret_address.is_none() {
+            for ty in &callee.rets {
+                repr(&self.module.ctx, *ty)
+                    .expect("signature types were checked")
+                    .push_carriers(&mut carriers);
+            }
+        }
+        let values = emit_call(&mut self.body, wb, callee.func, &args, &carriers);
+        if let Some(address) = sret_address {
+            return self.define(inst_id, 0, address, callee.rets[0]);
+        }
+        let mut next = 0;
+        for (index, ty) in callee.rets.iter().enumerate() {
+            match repr(&self.module.ctx, *ty).expect("signature types were checked") {
+                Repr::Wide => {
+                    let limbs: Limbs = [
+                        values[next],
+                        values[next + 1],
+                        values[next + 2],
+                        values[next + 3],
+                    ];
+                    next += LIMBS;
+                    self.define_wide(inst_id, index, limbs)?;
+                }
+                Repr::Int(int) => {
+                    let mut value = values[next];
+                    next += 1;
+                    if callee.is_import {
+                        // The host may return any bits above the width of a
+                        // narrow result.
+                        value = self.emit(wb).canonicalize(int, value);
+                    }
+                    self.define(inst_id, index, value, *ty)?;
+                }
+                Repr::Pointer | Repr::Aggregate => {
+                    self.define(inst_id, index, values[next], *ty)?;
+                    next += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ret(&mut self, wb: waffle::Block, args: &[ValueId]) -> Result<(), WasmError> {
+        if args.len() != self.return_tys.len() {
+            return Err(invalid(format!(
+                "function `{}`: `return` has {} values but the signature has {}",
+                self.name,
+                args.len(),
+                self.return_tys.len()
+            )));
+        }
+        for (index, &arg) in args.iter().enumerate() {
+            if self.function.dfg.value_ty(arg) != self.return_tys[index] {
+                return Err(invalid(format!(
+                    "function `{}`: `return` value {index} does not have the result type",
+                    self.name
+                )));
+            }
+        }
+        if let Some((buffer, storage)) = self.sret {
+            let source = self.operand(wb, args[0])?;
+            let (size, _) = self.layout_of(storage)?;
+            self.copy_bytes(wb, buffer, source, size);
+            self.body
+                .set_terminator(wb, Terminator::Return { values: vec![] });
             return Ok(());
         }
-        let carriers: Vec<WType> = callee
-            .rets
-            .iter()
-            .map(|ty| value_carrier(&self.module.ctx, *ty).expect("signature types were checked"))
-            .collect();
-        // WAFFLE stores a multi-value operator's results in forward order
-        // while the stack holds them in reverse, so declare the physical order
-        // and pick each result from the end.
-        let physical: Vec<WType> = carriers.iter().rev().copied().collect();
-        let call_value = self.body.add_op(wb, call, &args, &physical);
-        let count = carriers.len();
-        for (index, carrier) in carriers.into_iter().enumerate() {
-            let mut value = if count == 1 {
-                call_value
+        let mut values = Vec::with_capacity(args.len());
+        for &arg in args {
+            if self.is_wide(arg) {
+                values.extend(self.wide_operand(wb, arg)?);
             } else {
-                let picked = self.body.add_value(ValueDef::PickOutput(
-                    call_value,
-                    (count - 1 - index) as u32,
-                    carrier,
-                ));
-                self.body.append_to_block(wb, picked);
-                picked
-            };
-            if callee.is_import
-                && let Some(int) = Int::from_type(callee.rets[index])
-            {
-                // The host may return any bits above the width of a narrow
-                // result.
-                value = self.emit(wb).canonicalize(int, value);
+                values.push(self.operand(wb, arg)?);
             }
-            self.define(inst_id, index, value, callee.rets[index])?;
         }
+        self.body.set_terminator(wb, Terminator::Return { values });
         Ok(())
     }
 }

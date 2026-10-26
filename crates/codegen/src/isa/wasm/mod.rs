@@ -1,12 +1,21 @@
 #![doc = include_str!("../../../docs/wasm.md")]
 
 mod arith;
+mod memory;
 mod translate;
+mod wide;
 
 use sonatina_ir::Module;
 use sonatina_triple::{Architecture, OperatingSystem, TargetTriple, Vendor};
+use sonatina_verifier::{VerifierConfig, verify_function_signature};
 
-use crate::backend::{Backend, BackendOptions};
+use crate::{
+    backend::{Backend, BackendOptions},
+    transform::aggregate::{
+        EnumLowerToProduct, cleanup::DeadPureInstCleanup, combine::AggregateCombine,
+        object_abi::legalize_native_object_returns,
+    },
+};
 
 /// The import module used for `extern` functions unless
 /// [`WasmBackend::with_import_module`] selects another.
@@ -65,6 +74,7 @@ impl WasmArtifact {
 #[derive(Debug, Clone)]
 pub struct WasmBackend {
     import_module: String,
+    stack_bytes: u32,
 }
 
 impl Default for WasmBackend {
@@ -77,6 +87,7 @@ impl WasmBackend {
     pub fn new() -> Self {
         Self {
             import_module: DEFAULT_IMPORT_MODULE.to_string(),
+            stack_bytes: memory::DEFAULT_STACK_BYTES,
         }
     }
 
@@ -86,6 +97,41 @@ impl WasmBackend {
         self.import_module = module.into();
         self
     }
+
+    /// Set the size of the stack, in bytes. The stack holds the frames of all
+    /// active calls, and a call that does not fit traps. The default is
+    /// [`DEFAULT_STACK_BYTES`]. A module that needs no frames, global data or
+    /// arena has no stack and ignores the setting.
+    pub fn with_stack_size(mut self, bytes: u32) -> Self {
+        self.stack_bytes = bytes;
+        self
+    }
+}
+
+/// The default size of the stack, 1 MiB.
+pub const DEFAULT_STACK_BYTES: u32 = memory::DEFAULT_STACK_BYTES;
+
+/// Prepare a copy of the module for translation, as the native backend does:
+/// enums become products, products that are built and taken apart at once are
+/// combined, and the lifetime of objects returned by private functions is
+/// settled.
+fn legalize_module(module: &Module) -> Result<(), WasmError> {
+    EnumLowerToProduct.run(module);
+    for func in module.funcs() {
+        let report = verify_function_signature(&module.ctx, func, &VerifierConfig::default());
+        if report.has_errors() {
+            return Err(WasmError::Invalid(report.to_string()));
+        }
+    }
+    for func in module.funcs() {
+        module.func_store.modify(func, |function| {
+            AggregateCombine::default().run(function);
+            function.rebuild_users();
+            DeadPureInstCleanup::default().run_with_current_users(function);
+            function.rebuild_users();
+        });
+    }
+    legalize_native_object_returns(module).map_err(WasmError::Unsupported)
 }
 
 impl Backend for WasmBackend {
@@ -99,8 +145,11 @@ impl Backend for WasmBackend {
     ) -> Result<Self::Artifact, Vec<Self::Error>> {
         ensure_wasm32_target(module.ctx.triple).map_err(|error| vec![error])?;
 
-        let translated = translate::translate_module(module, &self.import_module)
-            .map_err(|error| vec![error])?;
+        let module = module.clone_for_funcs(&module.funcs());
+        legalize_module(&module).map_err(|error| vec![error])?;
+        let translated =
+            translate::translate_module(&module, &self.import_module, self.stack_bytes)
+                .map_err(|error| vec![error])?;
         let bytes = translated
             .module
             .to_wasm_bytes()
