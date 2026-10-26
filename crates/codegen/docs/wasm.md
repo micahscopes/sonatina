@@ -153,7 +153,14 @@ aggregate combination and object returns the backend runs first.
   address arithmetic wraps modulo 2^32, and an access outside the memory traps.
   `obj.index` and `const.index` do not check the index against the length; a
   program that needs the check compares first, as Fe does.
-- `memzero` is `memory.fill`.
+- `memzero` is `memory.fill`. A call to an external `memmove` or `memcpy` that
+  takes two pointers and a 32- or 64-bit length and returns a pointer is
+  `memory.copy` (the ranges may overlap, the call returns its destination) and
+  is not an import. A length that does not fit in 32 bits traps, and so does
+  an address beyond the memory, even for a length of zero.
+- Fe holds raw pointers in 256-bit integers, so `mload`, `mstore`, `memzero`
+  and `gep` also take an `i256` address, which traps if it does not fit in 32
+  bits.
 - Aggregate `undef` is zero-filled storage.
 
 ## 256-bit integers
