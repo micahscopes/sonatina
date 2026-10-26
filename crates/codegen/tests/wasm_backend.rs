@@ -1,9 +1,11 @@
-//! Tests for the integer WebAssembly backend.
+//! Tests for the WebAssembly backend.
 //!
 //! Every module is encoded by the backend, validated with `wasmparser` and
 //! executed with `wasmtime`. Arithmetic results are compared with the
 //! reference semantics of `sonatina_ir::Immediate`, which the IR interpreter
 //! uses.
+
+mod alias_execution;
 
 #[path = "wasm/aggregates.rs"]
 mod aggregates;
@@ -17,6 +19,8 @@ mod harness;
 mod memory_and_calls;
 #[path = "wasm/memory_runtime.rs"]
 mod memory_runtime;
+#[path = "wasm/shared_oracles.rs"]
+mod shared_oracles;
 #[path = "wasm/wide.rs"]
 mod wide;
 
