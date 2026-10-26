@@ -21,7 +21,7 @@ fn message(source: &str) -> String {
 }
 
 #[test]
-fn i256_parameters_results_and_operands_are_named() {
+fn i256_parameters_results_and_operations_are_named() {
     let parameter = message(
         "func public %f(v0.i256) -> i32 {
     block0:
@@ -45,18 +45,27 @@ fn i256_parameters_results_and_operands_are_named() {
         "{result}"
     );
 
-    let operation = message(
-        "func public %h(v0.i32) -> i32 {
+    // The saturating forms and `bswap` are not translated for 256 bits.
+    for (op, line) in [
+        ("bswap", "v3.i256 = bswap v1;"),
+        ("umulsat", "v3.i256 = umulsat v1 v1;"),
+        ("saddsat", "v3.i256 = saddsat v1 v1;"),
+    ] {
+        let message = message(&format!(
+            "func public %h(v0.i32) -> i32 {{
     block0:
         v1.i256 = zext v0 i256;
-        v2.i32 = trunc v1 i32;
-        return v2;
-}",
-    );
-    assert!(
-        operation.contains("i256") && operation.contains("zext"),
-        "{operation}"
-    );
+        {line}
+        v5.i32 = trunc v3 i32;
+        return v5;
+}}"
+        ));
+        assert!(
+            message.contains("i256") && message.contains(&format!("`{op}`")),
+            "{op}: {message}"
+        );
+        assert!(message.contains("function `h`"), "{op}: {message}");
+    }
 }
 
 #[test]
@@ -71,55 +80,24 @@ fn i128_is_rejected_like_i256() {
 }
 
 #[test]
-fn an_i256_immediate_is_named() {
-    let message = message(
-        "func public %f(v0.i32) -> i32 {
-    block0:
-        v1.i1 = eq v0 0.i32;
-        v2.i256 = zext v1 i256;
-        v3.i1 = is_zero v2;
-        br v3 block1 block2;
-    block1:
-        return 1.i32;
-    block2:
-        return 2.i32;
-}",
-    );
-    assert!(message.contains("i256"), "{message}");
-}
-
-#[test]
 fn unsupported_instructions_are_named() {
     let cases = [
         (
-            "alloca",
-            "func public %f() -> i32 {
+            "get_function_ptr",
+            "declare external %callee(i32) -> i32;
+func public %f() -> i32 {
     block0:
-        v0.*i32 = alloca i32;
-        return 0.i32;
-}",
-        ),
-        (
-            "memzero",
-            "func public %f(v0.*i8) {
-    block0:
-        memzero v0 4.i32;
-        return;
-}",
-        ),
-        (
-            "gep",
-            "func public %f(v0.*[i8; 4]) -> *i8 {
-    block0:
-        v1.*i8 = gep v0 0.i32 1.i32;
+        v0.*(i32) -> i32 = get_function_ptr %callee;
+        v1.i32 = ptr_to_int v0 i32;
         return v1;
 }",
         ),
         (
-            "mem.alloc_dynamic",
-            "func public %f(v0.i32) -> *i8 {
+            "sym_addr",
+            "func public %f() -> i32 {
     block0:
-        v1.*i8 = mem.alloc_dynamic v0;
+        v0.i256 = sym_addr .;
+        v1.i32 = trunc v0 i32;
         return v1;
 }",
         ),
@@ -135,18 +113,23 @@ fn unsupported_instructions_are_named() {
 }
 
 #[test]
-fn global_variables_are_rejected() {
-    let message = message(
-        "global private i32 $counter = 3;
-func public %f() -> i32 {
+fn global_variables_must_be_private() {
+    for (linkage, word) in [("public", "public"), ("external", "external")] {
+        let initializer = if linkage == "external" { "" } else { " = 3" };
+        let message = message(&format!(
+            "global {linkage} i32 $counter{initializer};
+func public %f() -> i32 {{
     block0:
         return 0.i32;
-}",
-    );
-    assert!(
-        message.contains("global variable") && message.contains("counter"),
-        "{message}"
-    );
+}}"
+        ));
+        assert!(
+            message.contains("global variable")
+                && message.contains("counter")
+                && message.contains(word),
+            "{linkage}: {message}"
+        );
+    }
 }
 
 #[test]

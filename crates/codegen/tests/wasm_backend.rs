@@ -5,6 +5,8 @@
 //! reference semantics of `sonatina_ir::Immediate`, which the IR interpreter
 //! uses.
 
+#[path = "wasm/aggregates.rs"]
+mod aggregates;
 #[path = "wasm/control_flow.rs"]
 mod control_flow;
 #[path = "wasm/diagnostics.rs"]
@@ -13,6 +15,10 @@ mod diagnostics;
 mod harness;
 #[path = "wasm/memory_and_calls.rs"]
 mod memory_and_calls;
+#[path = "wasm/memory_runtime.rs"]
+mod memory_runtime;
+#[path = "wasm/wide.rs"]
+mod wide;
 
 use harness::{Machine, compile_valid, parse};
 use sonatina_ir::Immediate;
