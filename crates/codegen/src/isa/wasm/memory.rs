@@ -407,3 +407,109 @@ pub(super) fn build_arena_allocator(
     super::schedule::keep_effect_order(&mut body);
     body
 }
+
+/// The body of `arena_mark`: the arena top, which is the address the next
+/// allocation gets.
+pub(super) fn build_arena_mark(
+    wmod: &WModule<'static>,
+    sig: Signature,
+    arena_top: Global,
+) -> FunctionBody {
+    let mut body = FunctionBody::new(wmod, sig);
+    let entry = body.entry;
+    let top = body.add_op(
+        entry,
+        Operator::GlobalGet {
+            global_index: arena_top,
+        },
+        &[],
+        &[WType::I32],
+    );
+    body.set_terminator(entry, Terminator::Return { values: vec![top] });
+    body
+}
+
+/// The body of `arena_release(mark)`: frees every block allocated since `mark`
+/// was read from `arena_mark`.
+///
+/// The bytes from `mark` to the arena top are cleared, so the blocks that the
+/// arena hands out next are zero again, and the top moves back to `mark`. The
+/// call traps, and changes nothing, unless `mark` is 16-byte aligned, not below
+/// the start of the arena (`arena_start`) and not above the top. A mark that
+/// was valid once can be above the top later (after a release to a lower mark);
+/// it is refused as well.
+pub(super) fn build_arena_release(
+    wmod: &WModule<'static>,
+    sig: Signature,
+    memory: Memory,
+    arena_top: Global,
+    arena_start: u32,
+) -> FunctionBody {
+    let mut body = FunctionBody::new(wmod, sig);
+    let entry = body.entry;
+    let mark = body.blocks[entry].params[0].1;
+
+    let trap = body.add_block();
+    body.set_terminator(trap, Terminator::Unreachable);
+    let clear = body.add_block();
+
+    let mut e = Emit {
+        body: &mut body,
+        block: entry,
+    };
+    let top = e.op(
+        Operator::GlobalGet {
+            global_index: arena_top,
+        },
+        &[],
+        WType::I32,
+    );
+    let start = e.c32(arena_start);
+    let below = e.op(Operator::I32LtU, &[mark, start], WType::I32);
+    let above = e.op(Operator::I32GtU, &[mark, top], WType::I32);
+    let align_mask = e.c32(ALIGN - 1);
+    let low_bits = e.op(Operator::I32And, &[mark, align_mask], WType::I32);
+    let no_bits = e.c32(0);
+    let bad_low = e.op(Operator::I32Ne, &[low_bits, no_bits], WType::I32);
+    let bad = e.op(Operator::I32Or, &[below, above], WType::I32);
+    let bad = e.op(Operator::I32Or, &[bad, bad_low], WType::I32);
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: bad,
+            if_true: BlockTarget {
+                block: trap,
+                args: vec![],
+            },
+            if_false: BlockTarget {
+                block: clear,
+                args: vec![],
+            },
+        },
+    );
+
+    let mut c = Emit {
+        body: &mut body,
+        block: clear,
+    };
+    let len = c.op(Operator::I32Sub, &[top, mark], WType::I32);
+    let zero = c.c32(0);
+    body.add_op(
+        clear,
+        Operator::MemoryFill { mem: memory },
+        &[mark, zero, len],
+        &[],
+    );
+    body.add_op(
+        clear,
+        Operator::GlobalSet {
+            global_index: arena_top,
+        },
+        &[mark],
+        &[],
+    );
+    body.set_terminator(clear, Terminator::Return { values: vec![] });
+    body.convert_to_max_ssa(None);
+    super::schedule::keep_effect_order(&mut body);
+    body
+}

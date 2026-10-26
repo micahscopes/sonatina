@@ -22,6 +22,11 @@ use crate::{
 /// [`WasmBackend::with_import_module`] selects another.
 pub const DEFAULT_IMPORT_MODULE: &str = "env";
 
+/// The names under which [`WasmBackend::with_host_allocator`] exports the
+/// allocator: `alloc(size) -> address`, `arena_mark() -> address` and
+/// `arena_release(mark)`.
+pub const HOST_ALLOCATOR_EXPORTS: [&str; 3] = ["alloc", "arena_mark", "arena_release"];
+
 #[derive(Debug)]
 pub enum WasmError {
     /// The module does not target `wasm32-unknown-native`.
@@ -76,6 +81,7 @@ impl WasmArtifact {
 pub struct WasmBackend {
     import_module: String,
     stack_bytes: u32,
+    host_allocator: bool,
 }
 
 impl Default for WasmBackend {
@@ -89,6 +95,7 @@ impl WasmBackend {
         Self {
             import_module: DEFAULT_IMPORT_MODULE.to_string(),
             stack_bytes: memory::DEFAULT_STACK_BYTES,
+            host_allocator: false,
         }
     }
 
@@ -105,6 +112,17 @@ impl WasmBackend {
     /// arena has no stack and ignores the setting.
     pub fn with_stack_size(mut self, bytes: u32) -> Self {
         self.stack_bytes = bytes;
+        self
+    }
+
+    /// Export the arena to the host, so that it can place data in linear
+    /// memory before a call: `alloc(size) -> address`, `arena_mark() ->
+    /// address` and `arena_release(mark)`, named by [`HOST_ALLOCATOR_EXPORTS`].
+    /// The module then has a stack and an arena even if its code uses neither,
+    /// and no function of the module may have one of these names. See the
+    /// section "The arena" of the module documentation for the protocol.
+    pub fn with_host_allocator(mut self) -> Self {
+        self.host_allocator = true;
         self
     }
 }
@@ -148,9 +166,13 @@ impl Backend for WasmBackend {
 
         let module = module.clone_for_funcs(&module.funcs());
         legalize_module(&module).map_err(|error| vec![error])?;
-        let translated =
-            translate::translate_module(&module, &self.import_module, self.stack_bytes)
-                .map_err(|error| vec![error])?;
+        let translated = translate::translate_module(
+            &module,
+            &self.import_module,
+            self.stack_bytes,
+            self.host_allocator,
+        )
+        .map_err(|error| vec![error])?;
         let bytes = translated
             .module
             .to_wasm_bytes()
