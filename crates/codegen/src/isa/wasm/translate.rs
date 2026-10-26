@@ -151,9 +151,18 @@ fn type_name(ctx: &ModuleCtx, ty: Type) -> String {
     }
 }
 
+/// What a call goes to.
+#[derive(Clone, Copy)]
+enum CallTarget {
+    Func(Func),
+    /// The C routine `memmove` or `memcpy`, which is `memory.copy` in the
+    /// module and not an import.
+    MemoryCopy,
+}
+
 /// A function the module can call: its WAFFLE index and its Sonatina signature.
 struct Callee {
-    func: Func,
+    target: CallTarget,
     params: Vec<Type>,
     rets: Vec<Type>,
     /// Results of an import come from the host and are not known to be
@@ -331,6 +340,22 @@ pub(super) fn translate_module(
             .unwrap_or(false);
 
         match (linkage, has_body) {
+            (Linkage::External, false) if is_memory_copy_declaration(module, func_ref, &name) => {
+                let (params, rets) = module.ctx.func_sig(func_ref, |sig| {
+                    (sig.args().to_vec(), sig.ret_tys().to_vec())
+                });
+                callees.insert(
+                    func_ref,
+                    Callee {
+                        target: CallTarget::MemoryCopy,
+                        params,
+                        rets,
+                        is_import: false,
+                        stack_param: false,
+                        sret: None,
+                    },
+                );
+            }
             (Linkage::External, false) => {
                 let signature = declared_signature(module, func_ref, &name, &plan, true)?;
                 let wsig = wmod.signatures.push(signature.wasm);
@@ -343,7 +368,7 @@ pub(super) fn translate_module(
                 callees.insert(
                     func_ref,
                     Callee {
-                        func,
+                        target: CallTarget::Func(func),
                         params: signature.params,
                         rets: signature.rets,
                         is_import: true,
@@ -427,7 +452,7 @@ pub(super) fn translate_module(
         callees.insert(
             func_ref,
             Callee {
-                func,
+                target: CallTarget::Func(func),
                 params: inner.params,
                 rets: inner.rets,
                 is_import: false,
@@ -561,6 +586,22 @@ enum HelperKind {
     Mulo,
     DivRem,
     Shift { left: bool },
+}
+
+/// Whether an external function is the C routine that copies memory:
+/// `memmove` or `memcpy` taking two pointers and a length of 32 or 64 bits, and
+/// returning a pointer.
+fn is_memory_copy_declaration(module: &Module, func_ref: FuncRef, name: &str) -> bool {
+    if !matches!(name, "memmove" | "memcpy") {
+        return false;
+    }
+    let ctx = &module.ctx;
+    let is_pointer = |ty: Type| ty.is_pointer(ctx);
+    module.ctx.func_sig(func_ref, |sig| {
+        matches!(sig.args(), [dst, src, len]
+            if is_pointer(*dst) && is_pointer(*src) && matches!(len, Type::I32 | Type::I64))
+            && matches!(sig.ret_tys(), [ret] if is_pointer(*ret))
+    })
 }
 
 struct DeclaredSignature {
@@ -1915,7 +1956,7 @@ impl<'a> FunctionTranslator<'a> {
             }
 
             NativeInstKind::Call(call) => {
-                self.call(*wb, inst_id, op, *call.callee(), call.args())?
+                self.call(wb, inst_id, op, *call.callee(), call.args())?
             }
 
             NativeInstKind::Jump(jump) => {
@@ -2066,7 +2107,7 @@ impl<'a> FunctionTranslator<'a> {
 
     fn call(
         &mut self,
-        wb: waffle::Block,
+        wb_ref: &mut waffle::Block,
         inst_id: InstId,
         op: &str,
         callee: FuncRef,
@@ -2080,6 +2121,35 @@ impl<'a> FunctionTranslator<'a> {
                 self.name
             ))
         })?;
+        let func = match callee.target {
+            CallTarget::Func(func) => func,
+            CallTarget::MemoryCopy => {
+                let [dst, src, len] = call_args else {
+                    return Err(invalid(format!(
+                        "function `{}`: `{op}` of a memory copy needs three arguments",
+                        self.name
+                    )));
+                };
+                let dst_value = self.operand(*wb_ref, *dst)?;
+                let src_value = self.operand(*wb_ref, *src)?;
+                let len_value = self.index32(wb_ref, op, *len, false)?;
+                self.body.add_op(
+                    *wb_ref,
+                    Operator::MemoryCopy {
+                        dst_mem: self.memory,
+                        src_mem: self.memory,
+                    },
+                    &[dst_value, src_value, len_value],
+                    &[],
+                );
+                // Like the C routine, the call returns its destination.
+                return match function.dfg.inst_results(inst_id) {
+                    [] => Ok(()),
+                    _ => self.define(inst_id, 0, dst_value, callee.rets[0]),
+                };
+            }
+        };
+        let wb = *wb_ref;
         if call_args.len() != callee.params.len() {
             return Err(invalid(format!(
                 "function `{}`: `{op}` passes {} arguments but the callee takes {}",
@@ -2146,7 +2216,7 @@ impl<'a> FunctionTranslator<'a> {
                     .push_carriers(&mut carriers);
             }
         }
-        let values = emit_call(&mut self.body, wb, callee.func, &args, &carriers);
+        let values = emit_call(&mut self.body, wb, func, &args, &carriers);
         if let Some(address) = sret_address {
             return self.define(inst_id, 0, address, callee.rets[0]);
         }

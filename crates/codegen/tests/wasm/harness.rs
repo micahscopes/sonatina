@@ -89,6 +89,14 @@ impl Machine {
             .expect("module exports its memory")
     }
 
+    /// Grow the memory by `pages`, as the host may.
+    pub fn grow_memory(&mut self, pages: u64) {
+        let memory = self.memory();
+        memory
+            .grow(&mut self.store, pages)
+            .expect("the host can grow the memory");
+    }
+
     pub fn read(&mut self, address: usize, len: usize) -> Vec<u8> {
         let memory = self.memory();
         memory.data(&self.store)[address..address + len].to_vec()

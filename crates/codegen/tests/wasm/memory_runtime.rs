@@ -318,6 +318,9 @@ fn the_stack_has_a_size_and_overflowing_it_traps() {
             WasmBackend::new().with_stack_size(1 << 16),
         );
         let mut machine = Machine::new(&bytes);
+        // Memory beyond the stack exists, so only the stack's own limit stops
+        // a deep call.
+        machine.grow_memory(64);
         let run = machine.func("run");
         for depth in [0, 1, 50, 200] {
             let got = machine.call(&run, &[Val::I32(depth)])[0].unwrap_i32();
@@ -789,4 +792,64 @@ func public %k(v0.i32) -> i32 {
 }",
     );
     assert!(mixed.contains("function `m`"), "{mixed}");
+}
+
+#[test]
+fn memmove_and_memcpy_are_memory_copy_and_not_imports() {
+    let source = "declare external %memmove(*i8, *i8, i64) -> *i8;
+declare external %memcpy(*i8, *i8, i32) -> *i8;
+func public %move(v0.i32, v1.i32, v2.i64) -> i32 {
+    block0:
+        v3.*i8 = int_to_ptr v0 *i8;
+        v4.*i8 = int_to_ptr v1 *i8;
+        v5.*i8 = call %memmove v3 v4 v2;
+        v6.i32 = ptr_to_int v5 i32;
+        return v6;
+}
+func public %copy(v0.i32, v1.i32, v2.i32) {
+    block0:
+        v3.*i8 = int_to_ptr v0 *i8;
+        v4.*i8 = int_to_ptr v1 *i8;
+        v5.*i8 = call %memcpy v3 v4 v2;
+        return;
+}";
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let bytes = build_with(source, level, WasmBackend::new());
+        // No import: the module runs with an empty linker.
+        let mut machine = Machine::new(&bytes);
+        let bytes_in = |from: u8| (from..from + 16).collect::<Vec<u8>>();
+        machine.write(100, &bytes_in(1));
+        let mv = machine.func("move");
+        // Overlapping ranges behave as `memmove`, and the call returns the
+        // destination.
+        let got = machine.call(&mv, &[Val::I32(104), Val::I32(100), Val::I64(8)]);
+        assert_eq!(got[0].unwrap_i32(), 104);
+        assert_eq!(
+            machine.read(100, 16),
+            [1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16]
+        );
+        machine.write(200, &bytes_in(50));
+        let copy = machine.func("copy");
+        machine.call(&copy, &[Val::I32(300), Val::I32(200), Val::I32(5)]);
+        assert_eq!(machine.read(300, 6), [50, 51, 52, 53, 54, 0]);
+        // A length of zero copies nothing. As in `memory.copy`, an address
+        // beyond the memory traps even then, and so does a length that does not
+        // fit in the memory or in 32 bits.
+        machine.call(&copy, &[Val::I32(300), Val::I32(200), Val::I32(0)]);
+        assert!(
+            machine
+                .try_call(&copy, &[Val::I32(-1), Val::I32(0), Val::I32(0)])
+                .is_err()
+        );
+        assert!(
+            machine
+                .try_call(&mv, &[Val::I32(0), Val::I32(0), Val::I64(1 << 32)])
+                .is_err()
+        );
+        assert!(
+            machine
+                .try_call(&mv, &[Val::I32(0), Val::I32(64), Val::I64(100_000)])
+                .is_err()
+        );
+    }
 }

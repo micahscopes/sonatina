@@ -306,27 +306,31 @@ impl FunctionTranslator<'_> {
         }
     }
 
-    /// A pointer-like operand: an address.
+    /// A pointer-like operand: an address. Fe holds a raw pointer in a 256-bit
+    /// integer; an address that does not fit in 32 bits traps.
     fn address_operand(
         &mut self,
-        wb: waffle::Block,
+        wb: &mut waffle::Block,
         op: &str,
         id: ValueId,
     ) -> Result<V, WasmError> {
         let ty = self.function.dfg.value_ty(id);
+        if ty == Type::I256 {
+            return self.index32(wb, op, id, false);
+        }
         if ty != Type::I32 && repr(&self.module.ctx, ty) != Some(Repr::Pointer) {
             return Err(unsupported(format!(
-                "function `{}`: `{op}` address of type {}; wasm32 addresses are pointers or i32",
+                "function `{}`: `{op}` address of type {}; wasm32 addresses are pointers, i32 or i256",
                 self.name,
                 type_name(&self.module.ctx, ty)
             )));
         }
-        self.operand(wb, id)
+        self.operand(*wb, id)
     }
 
     /// An index, length or size operand as an `i32`, trapping if the value does
     /// not fit in 32 bits (in the signed range when `signed`).
-    fn index32(
+    pub(super) fn index32(
         &mut self,
         wb: &mut waffle::Block,
         op: &str,
@@ -473,7 +477,7 @@ impl FunctionTranslator<'_> {
         addr: ValueId,
         ty: Type,
     ) -> Result<(), WasmError> {
-        let addr = self.address_operand(*wb, op, addr)?;
+        let addr = self.address_operand(wb, op, addr)?;
         if repr(&self.module.ctx, ty) == Some(Repr::Aggregate) {
             return self.snapshot(*wb, inst_id, ty, addr, 0);
         }
@@ -489,7 +493,7 @@ impl FunctionTranslator<'_> {
         value: ValueId,
         ty: Type,
     ) -> Result<(), WasmError> {
-        let addr = self.address_operand(*wb, op, addr)?;
+        let addr = self.address_operand(wb, op, addr)?;
         self.store_value(*wb, op, ty, addr, 0, value)
     }
 
@@ -518,7 +522,7 @@ impl FunctionTranslator<'_> {
         dest: ValueId,
         len: ValueId,
     ) -> Result<(), WasmError> {
-        let dest = self.address_operand(*wb, op, dest)?;
+        let dest = self.address_operand(wb, op, dest)?;
         let len = self.index32(wb, op, len, false)?;
         let zero = self.emit(*wb).c32(0);
         self.body.add_op(
@@ -543,7 +547,7 @@ impl FunctionTranslator<'_> {
                 self.name
             )));
         };
-        let mut address = self.address_operand(*wb, op, base_value)?;
+        let mut address = self.address_operand(wb, op, base_value)?;
         let mut current = self.function.dfg.value_ty(base_value);
         let mut constant = 0u32;
         for &index in indices {
