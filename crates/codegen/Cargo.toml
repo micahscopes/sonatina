@@ -76,3 +76,7 @@ required-features = ["cranelift-jit"]
 [[test]]
 name = "wasm_backend"
 required-features = ["wasm"]
+
+[[test]]
+name = "wasm_differential"
+required-features = ["wasm", "cranelift-jit"]
