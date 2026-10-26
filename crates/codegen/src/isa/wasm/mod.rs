@@ -2,7 +2,6 @@
 
 mod arith;
 mod memory;
-mod schedule;
 mod translate;
 mod wide;
 

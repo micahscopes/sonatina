@@ -230,11 +230,9 @@ native backend:
 
 ## Order of effects
 
-Reads, writes and calls happen in program order. WAFFLE, which encodes the
-module, can emit a load after a later store when the loaded value passes
-through a pure operation whose result is used after the store. The backend
-gives such a loaded value a second, unused use, which makes WAFFLE keep it in
-a local at the place of the load.
+Reads, writes and calls happen in program order. A test generates straight-line
+programs that mix them and compares the results and the final memory with a
+model at every optimization level.
 
 ## Unsupported input
 

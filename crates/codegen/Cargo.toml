@@ -34,7 +34,7 @@ bit-set = "0.8.0"
 indexmap = { version = "2.12" }
 tracing = "0.1"
 vec-collections = { version = "0.4.3", default-features = false }
-waffle = { version = "0.2", optional = true }
+waffle = { version = "0.3.3", optional = true }
 
 [dev-dependencies]
 hex = "0.4.3"

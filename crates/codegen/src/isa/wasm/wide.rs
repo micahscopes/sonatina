@@ -454,7 +454,6 @@ pub(super) fn build_mulo(
     values.push(overflow);
     body.set_terminator(entry, waffle::Terminator::Return { values });
     body.convert_to_max_ssa(None);
-    super::schedule::keep_effect_order(&mut body);
     body
 }
 
@@ -493,7 +492,6 @@ pub(super) fn build_shift(
         },
     );
     body.convert_to_max_ssa(None);
-    super::schedule::keep_effect_order(&mut body);
     body
 }
 
@@ -675,6 +673,5 @@ pub(super) fn build_udivrem(
         },
     );
     body.convert_to_max_ssa(None);
-    super::schedule::keep_effect_order(&mut body);
     body
 }

@@ -791,13 +791,10 @@ fn build_wrapper(
         &[],
     );
     body.set_terminator(entry, Terminator::Return { values: results });
-    super::schedule::keep_effect_order(&mut body);
     Ok(body)
 }
 
-/// Emit a call and return its results in order. WAFFLE stores a multi-value
-/// operator's results in forward order while the stack holds them in reverse, so
-/// the physical order is declared and each result is picked from the end.
+/// Emit a call and return its results in order.
 fn emit_call(
     body: &mut FunctionBody,
     block: waffle::Block,
@@ -812,8 +809,7 @@ fn emit_call(
         body.add_op(block, call, args, &[]);
         return Vec::new();
     }
-    let physical: Vec<WType> = carriers.iter().rev().copied().collect();
-    let call_value = body.add_op(block, call, args, &physical);
+    let call_value = body.add_op(block, call, args, carriers);
     let count = carriers.len();
     carriers
         .iter()
@@ -822,11 +818,8 @@ fn emit_call(
             if count == 1 {
                 call_value
             } else {
-                let picked = body.add_value(ValueDef::PickOutput(
-                    call_value,
-                    (count - 1 - index) as u32,
-                    *carrier,
-                ));
+                let picked =
+                    body.add_value(ValueDef::PickOutput(call_value, index as u32, *carrier));
                 body.append_to_block(block, picked);
                 picked
             }
@@ -1104,7 +1097,6 @@ impl<'a> FunctionTranslator<'a> {
         // Sonatina values can depend on memory, so make every cross-block use
         // an explicit block parameter to keep the definition-time snapshot.
         self.body.convert_to_max_ssa(None);
-        super::schedule::keep_effect_order(&mut self.body);
         Ok(self.body)
     }
 
