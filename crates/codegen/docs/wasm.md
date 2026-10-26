@@ -137,6 +137,28 @@ of a block is zero when it is returned, because the arena only moves up.
 - Nothing is freed. A trap leaves the blocks that were allocated before it
   allocated and unchanged, and the instance can be called again.
 
+### The host allocator
+
+`WasmBackend::with_host_allocator` lets the host place data in the arena before
+it calls an export, for example the bytes of a text argument. The module then
+has a stack and an arena even if its code uses neither, and exports three
+functions, whose names no function of the module may use (the module is
+rejected with an error that names the function):
+
+| Export | Meaning |
+| --- | --- |
+| `alloc(size: i32) -> i32` | The arena allocator described above. The block is 16-byte aligned, zeroed and at least 16 bytes. The call traps, and changes nothing, when the memory cannot grow. |
+| `arena_mark() -> i32` | The arena top: the address the next block gets. |
+| `arena_release(mark: i32)` | Frees every block allocated after `mark` was read: clears the bytes from `mark` to the arena top, so that new blocks read zero as before, and moves the top back to `mark`. Traps, and changes nothing, unless `mark` is a multiple of 16, not below the start of the arena and not above the top. |
+
+The protocol for one call is `mark = arena_mark()`, one `alloc` per argument,
+the call, reading whatever the call returned by address, and
+`arena_release(mark)`. Blocks that the call allocated itself are freed by the
+release as well, so an export must not keep arena data for a later call. The
+memory that the arena grew stays; a release does not shrink it. Releasing to a
+mark that an earlier release has already passed traps, which catches a host
+that releases twice.
+
 ## Aggregates, objects and constants
 
 The semantics follow the host-native backend, whose legalization of enums,

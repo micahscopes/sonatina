@@ -41,11 +41,11 @@ use sonatina_ir::{
 };
 
 use super::{
-    WasmError,
+    HOST_ALLOCATOR_EXPORTS, WasmError,
     arith::{Arith, Cmp, DivRem, Emit, Int, Shift},
     memory::{
-        self, ALIGN, MemoryPlan, RuntimeGlobals, align_up, build_arena_allocator,
-        declare_runtime_globals,
+        self, ALIGN, MemoryPlan, RuntimeGlobals, align_up, build_arena_allocator, build_arena_mark,
+        build_arena_release, declare_runtime_globals,
     },
     wide::{self, LIMBS, Limbs},
 };
@@ -302,8 +302,13 @@ pub(super) fn translate_module(
     module: &Module,
     import_module: &str,
     stack_bytes: u32,
+    host_allocator: bool,
 ) -> Result<Translated, WasmError> {
-    let scan = scan_module(module);
+    let mut scan = scan_module(module);
+    if host_allocator {
+        scan.runtime = true;
+        scan.arena = true;
+    }
     let plan = memory::plan_memory(module, scan.runtime, scan.arena, stack_bytes)?;
 
     let mut wmod = WaffleModule::empty();
@@ -327,6 +332,9 @@ pub(super) fn translate_module(
     let mut exports = Vec::new();
     let mut export_names: FxHashSet<String> = FxHashSet::default();
     export_names.insert("memory".to_string());
+    if host_allocator {
+        export_names.extend(HOST_ALLOCATOR_EXPORTS.map(String::from));
+    }
 
     // WAFFLE requires imported functions to take the lowest function indexes,
     // so declare every import before any defined function.
@@ -399,6 +407,11 @@ pub(super) fn translate_module(
     let mut wrappers = Vec::new();
     for (func_ref, name, linkage) in definitions {
         let public = linkage == Linkage::Public;
+        if public && host_allocator && HOST_ALLOCATOR_EXPORTS.contains(&name.as_str()) {
+            return Err(invalid(format!(
+                "export name `{name}` is reserved for the host allocator"
+            )));
+        }
         if public && !export_names.insert(name.clone()) {
             return Err(invalid(format!(
                 "export name `{name}` is used by more than one function or by the memory"
@@ -572,6 +585,34 @@ pub(super) fn translate_module(
             .expect("the arena global exists with an arena");
         let body = build_arena_allocator(&wmod, sig, memory, arena_top);
         wmod.funcs[func] = FuncDecl::Body(sig, "arena_alloc".to_string(), body);
+        if host_allocator {
+            let [alloc, mark, release] = HOST_ALLOCATOR_EXPORTS;
+            let mark_sig = wmod.signatures.push(SignatureData {
+                params: vec![],
+                returns: vec![WType::I32],
+            });
+            let mark_func = wmod.funcs.push(FuncDecl::Body(
+                mark_sig,
+                mark.to_string(),
+                build_arena_mark(&wmod, mark_sig, arena_top),
+            ));
+            let release_sig = wmod.signatures.push(SignatureData {
+                params: vec![WType::I32],
+                returns: vec![],
+            });
+            let release_func = wmod.funcs.push(FuncDecl::Body(
+                release_sig,
+                release.to_string(),
+                build_arena_release(&wmod, release_sig, memory, arena_top, plan.stack_limit),
+            ));
+            for (name, func) in [(alloc, func), (mark, mark_func), (release, release_func)] {
+                wmod.exports.push(waffle::Export {
+                    name: name.to_string(),
+                    kind: ExportKind::Func(func),
+                });
+                exports.push(name.to_string());
+            }
+        }
     }
 
     Ok(Translated {

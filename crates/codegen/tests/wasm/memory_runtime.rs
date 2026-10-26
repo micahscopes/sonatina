@@ -913,3 +913,222 @@ fn a_load_is_not_moved_past_a_later_store() {
         assert_eq!(got, (7 + 1 + 100) * 3, "{level:?}");
     }
 }
+
+/// A module whose code never allocates: it sums `len` bytes at an address that
+/// the host chose, and allocates one block when asked.
+const HOST_TEXT: &str = "func public %sum(v0.*i8, v1.i32) -> i32 {
+    block0:
+        jump block1;
+    block1:
+        v2.i32 = phi (0.i32 block0) (v7 block2);
+        v3.i32 = phi (0.i32 block0) (v8 block2);
+        v4.i1 = lt v3 v1;
+        br v4 block2 block3;
+    block2:
+        v5.*i8 = gep v0 v3;
+        v6.i8 = mload v5 i8;
+        v9.i32 = zext v6 i32;
+        v7.i32 = add v2 v9;
+        v8.i32 = add v3 1.i32;
+        jump block1;
+    block3:
+        return v2;
+}
+func public %grab(v0.i32) -> *i8 {
+    block0:
+        v1.*i8 = mem.alloc_dynamic v0;
+        return v1;
+}
+";
+
+fn with_host_allocator(source: &str, level: OptLevel) -> Vec<u8> {
+    build_with(
+        source,
+        level,
+        WasmBackend::new()
+            .with_stack_size(1 << 16)
+            .with_host_allocator(),
+    )
+}
+
+fn call_i32(machine: &mut Limited, name: &str, args: &[Val]) -> Result<u32, wasmtime::Error> {
+    Ok(machine.call(name, args)?[0].unwrap_i32() as u32)
+}
+
+#[test]
+fn the_host_allocator_places_data_that_the_module_reads() {
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let bytes = with_host_allocator(HOST_TEXT, level);
+        let mut machine = Limited::new(&bytes, usize::MAX);
+        // The exports exist, and the arena starts after the stack.
+        let arena = (DATA_BASE + (1 << 16)).next_multiple_of(PAGE) as u32;
+        assert_eq!(call_i32(&mut machine, "arena_mark", &[]).unwrap(), arena);
+        let text = b"hello, host";
+        let address = machine.alloc(text.len() as u32).unwrap();
+        assert_eq!(address, arena, "{level:?}");
+        machine.write(address, text);
+        let want: u32 = text.iter().map(|&b| u32::from(b)).sum();
+        let got = call_i32(
+            &mut machine,
+            "sum",
+            &[Val::I32(address as i32), Val::I32(text.len() as i32)],
+        );
+        assert_eq!(got.unwrap(), want, "{level:?}");
+        // A module allocation and a host allocation share the arena and do not
+        // overlap.
+        let own = call_i32(&mut machine, "grab", &[Val::I32(40)]).unwrap();
+        assert_eq!(own, address + 16, "{level:?}");
+        let next = machine.alloc(1).unwrap();
+        assert_eq!(next, own + 48, "{level:?}");
+        // The text is intact.
+        assert_eq!(machine.read(address, text.len()), text);
+        // A length of zero is a valid text and still has an address of its own.
+        let empty = machine.alloc(0).unwrap();
+        assert_ne!(empty, next);
+        let got = call_i32(&mut machine, "sum", &[Val::I32(empty as i32), Val::I32(0)]);
+        assert_eq!(got.unwrap(), 0);
+    }
+}
+
+#[test]
+fn releasing_to_a_mark_frees_the_blocks_after_it_and_clears_them() {
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let bytes = with_host_allocator(HOST_TEXT, level);
+        let mut machine = Limited::new(&bytes, usize::MAX);
+        let kept = machine.alloc(100).unwrap();
+        machine.write(kept, &[7; 100]);
+        let mark = call_i32(&mut machine, "arena_mark", &[]).unwrap();
+        assert_eq!(mark, kept + 112);
+        // Allocate across a page boundary so that the memory grows.
+        let first = machine.alloc(70_000).unwrap();
+        let second = call_i32(&mut machine, "grab", &[Val::I32(10)]).unwrap();
+        machine.write(first, &vec![0xAB; 70_000]);
+        machine.write(second, &[0xCD; 10]);
+        let grown = machine.memory_bytes();
+        machine
+            .call("arena_release", &[Val::I32(mark as i32)])
+            .unwrap();
+        // The top is back at the mark and the released bytes read as zero.
+        assert_eq!(call_i32(&mut machine, "arena_mark", &[]).unwrap(), mark);
+        assert!(machine.read(first, 70_000).iter().all(|&b| b == 0));
+        assert!(machine.read(second, 10).iter().all(|&b| b == 0));
+        // The next allocation reuses the address and is zero, as a new one is.
+        let again = machine.alloc(70_000).unwrap();
+        assert_eq!(again, first, "{level:?}");
+        assert!(machine.read(again, 70_000).iter().all(|&b| b == 0));
+        // The block before the mark is unchanged, and the memory stays grown.
+        assert_eq!(machine.read(kept, 100), vec![7; 100]);
+        assert_eq!(machine.memory_bytes(), grown);
+        // Releasing to the current top changes nothing.
+        let top = call_i32(&mut machine, "arena_mark", &[]).unwrap();
+        machine
+            .call("arena_release", &[Val::I32(top as i32)])
+            .unwrap();
+        assert_eq!(call_i32(&mut machine, "arena_mark", &[]).unwrap(), top);
+    }
+}
+
+#[test]
+fn a_bad_mark_traps_and_changes_nothing() {
+    let bytes = with_host_allocator(HOST_TEXT, OptLevel::O2);
+    let mut machine = Limited::new(&bytes, usize::MAX);
+    let arena = call_i32(&mut machine, "arena_mark", &[]).unwrap();
+    let block = machine.alloc(64).unwrap();
+    machine.write(block, &[9; 64]);
+    let top = call_i32(&mut machine, "arena_mark", &[]).unwrap();
+    for bad in [
+        0,
+        arena - 16,
+        arena - 1,
+        // Not 16-byte aligned.
+        arena + 8,
+        // Above the top.
+        top + 16,
+        u32::MAX,
+    ] {
+        let result = machine.call("arena_release", &[Val::I32(bad as i32)]);
+        assert!(result.is_err(), "mark {bad} was accepted");
+        assert_eq!(call_i32(&mut machine, "arena_mark", &[]).unwrap(), top);
+        assert_eq!(machine.read(block, 64), vec![9; 64]);
+    }
+    // The first mark of the arena is valid, and a mark released twice is not
+    // valid once the top has moved below it.
+    machine
+        .call("arena_release", &[Val::I32(arena as i32)])
+        .unwrap();
+    assert!(
+        machine
+            .call("arena_release", &[Val::I32(top as i32)])
+            .is_err()
+    );
+}
+
+#[test]
+fn the_host_allocator_traps_like_the_arena_when_memory_is_refused() {
+    let bytes = with_host_allocator(HOST_TEXT, OptLevel::O2);
+    let mut machine = Limited::new(&bytes, 4 << 20);
+    let mark = call_i32(&mut machine, "arena_mark", &[]).unwrap();
+    assert!(machine.alloc(8 << 20).is_err());
+    assert_eq!(call_i32(&mut machine, "arena_mark", &[]).unwrap(), mark);
+    assert!(machine.alloc(1000).is_ok());
+}
+
+#[test]
+fn the_host_allocator_is_not_exported_unless_asked_for() {
+    let bytes = build_with(HOST_TEXT, OptLevel::O2, WasmBackend::new());
+    let mut machine = Machine::new(&bytes);
+    for name in ["alloc", "arena_mark", "arena_release"] {
+        assert!(!machine.has_export(name), "{name}");
+    }
+    // A module that uses neither frames nor an arena is unchanged by default,
+    // and gains a stack and an arena with the option.
+    let plain = "func public %f(v0.i32) -> i32 {
+    block0:
+        v1.i32 = add v0 1.i32;
+        return v1;
+}";
+    let default = build_with(plain, OptLevel::O2, WasmBackend::new());
+    let with = build_with(
+        plain,
+        OptLevel::O2,
+        WasmBackend::new().with_host_allocator(),
+    );
+    assert_ne!(default, with);
+    let mut machine = Machine::new(&with);
+    for name in ["alloc", "arena_mark", "arena_release", "f"] {
+        assert!(machine.has_export(name), "{name}");
+    }
+    let f = machine.func("f");
+    assert_eq!(machine.call(&f, &[Val::I32(41)])[0].unwrap_i32(), 42);
+    // The same module and options give the same bytes.
+    assert_eq!(
+        with,
+        build_with(
+            plain,
+            OptLevel::O2,
+            WasmBackend::new().with_host_allocator()
+        )
+    );
+}
+
+#[test]
+fn the_names_of_the_host_allocator_are_reserved() {
+    for name in ["alloc", "arena_mark", "arena_release"] {
+        let source = format!(
+            "func public %{name}(v0.i32) -> i32 {{
+    block0:
+        return v0;
+}}"
+        );
+        // Without the option the name is an ordinary export.
+        build_with(&source, OptLevel::O0, WasmBackend::new());
+        let errors = Compile::new(parse(&source), WasmBackend::new().with_host_allocator())
+            .compile()
+            .expect_err("the name is reserved");
+        let message = format!("{errors:?}");
+        assert!(
+            message.contains(&format!("`{name}` is reserved for the host allocator")),
+            "{message}"
+        );
+    }
+}
