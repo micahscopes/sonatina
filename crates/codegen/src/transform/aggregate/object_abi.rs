@@ -18,9 +18,9 @@ use super::{
 };
 use crate::cfg_scc::CfgSccAnalysis;
 
-#[cfg(feature = "cranelift")]
+#[cfg(any(feature = "cranelift", feature = "wasm"))]
 mod native;
-#[cfg(feature = "cranelift")]
+#[cfg(any(feature = "cranelift", feature = "wasm"))]
 pub(crate) use native::{legalize_native_object_returns, native_heap_object_roots};
 
 /// Compiler-owned output storage, equivalent to a private result buffer during
