@@ -390,7 +390,7 @@ fn random_steps(rng: &mut crate::Lcg, count: usize) -> Vec<Step> {
         }
         steps.push(step);
         // Often follow a read with a pure operation on its value.
-        if matches!(step, Step::Load(_) | Step::Bump(_)) && rng.next() % 3 != 0 {
+        if matches!(step, Step::Load(_) | Step::Bump(_)) && !rng.next().is_multiple_of(3) {
             let newest = values - 1;
             let other = (rng.next() % values as u64) as usize;
             steps.push(match rng.next() % 3 {
@@ -505,7 +505,7 @@ fn generated_programs_keep_reads_writes_and_calls_in_order() {
     let mut rng = crate::Lcg(0x0dd5_eed5);
     for case in 0..250 {
         let steps = random_steps(&mut rng, 8 + (case % 24));
-        let mut memory = [3, 1, 4, 1, 5, 9, 2, 6];
+        let memory = [3, 1, 4, 1, 5, 9, 2, 6];
         let params = [rng.next() as i32, rng.next() as i32];
         let (source, want) = run_steps(&steps, &mut memory.clone(), params);
         let mut machine = Machine::new(&compile_valid(&parse(&source)));
