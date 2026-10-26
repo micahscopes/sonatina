@@ -397,3 +397,25 @@ func public %g(v0.i32) -> i32 {
         assert_eq!(machine.call(&g, &[Val::I32(77)])[0].unwrap_i32(), 77);
     }
 }
+
+#[test]
+fn a_function_without_parameters_can_count_in_256_bits() {
+    let source = "func public %f() -> i32 {
+    block0:
+        jump block1;
+    block1:
+        v0.i256 = phi (0.i256 block0) (v2 block1);
+        v1.i32 = phi (0.i32 block0) (v3 block1);
+        v2.i256 = add v0 3.i256;
+        v3.i32 = add v1 2.i32;
+        v4.i1 = lt v2 30.i256;
+        br v4 block1 block2;
+    block2:
+        return v3;
+}";
+    for level in LEVELS {
+        let mut machine = Machine::new(&build(source, level));
+        let f = machine.func("f");
+        assert_eq!(machine.call(&f, &[])[0].unwrap_i32(), 20, "{level:?}");
+    }
+}
