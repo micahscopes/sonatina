@@ -404,5 +404,6 @@ pub(super) fn build_arena_allocator(
     );
     body.set_terminator(done, Terminator::Return { values: vec![top] });
     body.convert_to_max_ssa(None);
+    super::schedule::keep_effect_order(&mut body);
     body
 }
