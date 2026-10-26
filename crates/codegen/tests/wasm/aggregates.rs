@@ -355,7 +355,7 @@ fn exports_keep_their_signatures_when_the_module_has_a_runtime() {
     // An export is a wrapper around a function with a hidden parameter. It
     // canonicalizes narrow parameters, passes several results through, and a
     // trap in the function reaches the host.
-    let source = "func public %f(v0.i8, v1.i64, v2.i1) -> (i64, i8, i32) {
+    let source = "func public %f(v0.i8, v1.i64, v2.i1) -> (i64, i8, i32, i32) {
     block0:
         v3.*[i8; 4] = alloca [i8; 4];
         v4.*i8 = gep v3 0.i32 3.i32;
@@ -364,7 +364,8 @@ fn exports_keep_their_signatures_when_the_module_has_a_runtime() {
         v6.i8 = add v5 1.i8;
         v7.i32 = zext v2 i32;
         v8.i64 = add v1 1.i64;
-        return (v8, v6, v7);
+        v9.i32 = zext v0 i32;
+        return (v8, v6, v7, v9);
 }
 func public %g(v0.i32) -> i32 {
     block0:
@@ -381,11 +382,16 @@ func public %g(v0.i32) -> i32 {
     for level in LEVELS {
         let mut machine = Machine::new(&build(source, level));
         let f = machine.func("f");
-        // The i8 parameter arrives with garbage above its 8 bits.
-        let out = machine.call(&f, &[Val::I32(0x1234_56ff), Val::I64(9), Val::I32(1)]);
+        // The i8 and i1 parameters arrive with garbage above their widths.
+        let out = machine.call(&f, &[Val::I32(0x1234_56ff), Val::I64(9), Val::I32(3)]);
         assert_eq!(out[0].unwrap_i64(), 10, "{level:?}");
         assert_eq!(out[1].unwrap_i32(), 0, "{level:?}: 0xff + 1 wraps to 0");
-        assert_eq!(out[2].unwrap_i32(), 1, "{level:?}");
+        assert_eq!(out[2].unwrap_i32(), 1, "{level:?}: the i1 is its low bit");
+        assert_eq!(
+            out[3].unwrap_i32(),
+            0xff,
+            "{level:?}: the i8 is its low byte"
+        );
         let g = machine.func("g");
         assert!(machine.try_call(&g, &[Val::I32(0)]).is_err());
         assert_eq!(machine.call(&g, &[Val::I32(77)])[0].unwrap_i32(), 77);
