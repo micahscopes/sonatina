@@ -111,8 +111,13 @@ There is no mutable stack pointer, so a trap leaves nothing to repair. An
 exported function is a wrapper that starts the stack at the `stack_top` global of
 the module (initially the start of region 3) and calls the function with it.
 A call to an import first stores the end of its caller's frame in that global, so
-that an export that the host calls back runs above the caller's frames, and the
-wrapper restores the global when it returns.
+that an export that the host calls back runs above the caller's frames, and puts
+the global back when the import returns. The wrapper of an export also restores
+it when the export returns. A trap in the module therefore leaves the global as
+it was, except a trap during the call to an import: when the host throws an
+error or a callback traps, the module does not run again before the host call
+ends, and the frame of the caller stays reserved. Each such error costs the
+frame of one function.
 
 ### The arena
 

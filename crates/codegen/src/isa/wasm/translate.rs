@@ -2157,13 +2157,25 @@ impl<'a> FunctionTranslator<'a> {
             )));
         }
         let mut args = Vec::with_capacity(call_args.len() + 2);
+        // The value of `stack_top` that the call to an import must put back.
+        let mut stack_top_before = None;
         if callee.stack_param {
             args.push(self.frame_top()?);
         } else if callee.is_import
             && let (Some(globals), Some(top)) = (self.globals, self.top)
         {
             // A host function may call back into an export. Tell the export
-            // where the stack of this call ends.
+            // where the stack of this call ends, and put the global back when
+            // the host function returns, so that a trap later in this call
+            // does not leave it pointing into a frame that is gone.
+            stack_top_before = Some(self.body.add_op(
+                wb,
+                Operator::GlobalGet {
+                    global_index: globals.stack_top,
+                },
+                &[],
+                &[WType::I32],
+            ));
             self.body.add_op(
                 wb,
                 Operator::GlobalSet {
@@ -2215,6 +2227,16 @@ impl<'a> FunctionTranslator<'a> {
             }
         }
         let values = emit_call(&mut self.body, wb, func, &args, &carriers);
+        if let (Some(before), Some(globals)) = (stack_top_before, self.globals) {
+            self.body.add_op(
+                wb,
+                Operator::GlobalSet {
+                    global_index: globals.stack_top,
+                },
+                &[before],
+                &[],
+            );
+        }
         if let Some(address) = sret_address {
             return self.define(inst_id, 0, address, callee.rets[0]);
         }
