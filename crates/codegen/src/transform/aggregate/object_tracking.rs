@@ -50,7 +50,7 @@ impl AggregateFacts {
         }
     }
 
-    #[cfg(any(feature = "cranelift", test))]
+    #[cfg(any(feature = "cranelift", feature = "wasm", test))]
     pub(crate) fn for_all_objref_args(
         func: &Function,
         layout_cache: &mut shape::AggregateLayoutCache,
