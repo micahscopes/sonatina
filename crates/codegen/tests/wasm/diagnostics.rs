@@ -210,3 +210,75 @@ func public %pair(v0.i32) -> (i32, i64) {
     assert_eq!(first, second);
     assert!(!first.is_empty());
 }
+
+#[test]
+fn malformed_aggregate_input_is_an_error_not_a_panic() {
+    let cases = [
+        (
+            "a struct field index that is not a constant",
+            "type @P = { i32, i32 };
+func public %f(v0.i32) -> i32 {
+    block0:
+        v1.@P = insert_value undef.@P v0 1.i32;
+        v2.i32 = extract_value v1 0.i32;
+        return v2;
+}",
+            "constant",
+        ),
+        (
+            "an element that does not exist",
+            "type @P = { i32, i32 };
+func public %f() -> i32 {
+    block0:
+        v0.objref<@P> = obj.alloc @P;
+        v1.objref<i32> = obj.proj v0 2.i32;
+        v2.i32 = obj.load v1;
+        return v2;
+}",
+            "offset",
+        ),
+        (
+            "an element of the wrong type",
+            "type @P = { i32, i64 };
+func private %take(v0.@P) -> i32 {
+    block0:
+        v1.i32 = extract_value v0 0.i32;
+        return v1;
+}
+func public %f(v0.i32) -> i32 {
+    block0:
+        v1.@P = insert_value undef.@P 1.i32 v0;
+        v2.i32 = call %take v1;
+        return v2;
+}",
+            "insert_value",
+        ),
+        (
+            "an address of the wrong type",
+            "func public %f(v0.i64) -> i32 {
+    block0:
+        v1.i32 = mload v0 i32;
+        return v1;
+}",
+            "address",
+        ),
+        (
+            "a 128-bit value read from memory",
+            "func public %f(v0.*i128) -> i32 {
+    block0:
+        v1.i128 = mload v0 i128;
+        v2.i32 = trunc v1 i32;
+        return v2;
+}",
+            "i128",
+        ),
+    ];
+    for (what, source, needle) in cases {
+        let module = parse(source);
+        let errors = WasmBackend::new()
+            .compile_module(&module, &BackendOptions::default())
+            .expect_err(what);
+        let text = errors[0].to_string();
+        assert!(text.contains(needle), "{what}: {text}");
+    }
+}

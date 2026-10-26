@@ -1019,10 +1019,8 @@ impl<'a> FunctionTranslator<'a> {
                 let wb = self.blocks[&block];
                 match representation {
                     Repr::Wide => {
-                        let mut limbs = [params[0]; LIMBS];
-                        for limb in &mut limbs {
-                            *limb = self.body.add_blockparam(wb, WType::I64);
-                        }
+                        let limbs: Limbs =
+                            std::array::from_fn(|_| self.body.add_blockparam(wb, WType::I64));
                         self.wide.insert(result, limbs);
                     }
                     Repr::Int(int) => {
@@ -1631,7 +1629,7 @@ impl<'a> FunctionTranslator<'a> {
             let result = function
                 .dfg
                 .inst_result(inst_id)
-                .expect("a phi has a result");
+                .ok_or_else(|| invalid(format!("function `{}`: a phi has no result", self.name)))?;
             if let Some(&param) = self.phi_params.get(&result) {
                 let slot = self.phi_slots[&result];
                 let address = self.slot_address(wb, slot)?;
