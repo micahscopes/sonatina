@@ -7,7 +7,7 @@ mod capture_state;
 pub(crate) mod cleanup;
 pub(crate) mod combine;
 pub(crate) mod enum_lowering;
-#[cfg(feature = "cranelift")]
+#[cfg(any(feature = "cranelift", feature = "wasm"))]
 pub(crate) mod frame_lifetimes;
 pub(crate) mod legalize;
 pub(crate) mod object;

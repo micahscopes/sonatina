@@ -191,13 +191,13 @@ aggregate combination and object returns the backend runs first.
 
 ## 256-bit integers
 
-Fe's `usize` has 256 bits, so every array index and loop counter is an `i256`.
+A front end whose `usize` has 256 bits makes every array index and loop counter an `i256`.
 The backend supports `add`, `sub`, `mul`, `neg`, `udiv`, `sdiv`, `umod`, `smod`,
 `shl`, `shr`, `sar`, `and`, `or`, `xor`, `not`, all comparisons, `is_zero`,
 `zext`, `sext` and `trunc` between `i256` and the narrower types, the checked
 forms `uaddo`, `usubo`, `umulo`, `saddo`, `ssubo`, `smulo` and `snego`, loads and
-stores of `i256`, `ptr_to_int` to `i256` and `int_to_ptr` from `i256`. Not
-translated: `bswap` and the saturating forms. `int_to_ptr` traps if the value
+stores of `i256`, `bswap`, `ptr_to_int` to `i256` and `int_to_ptr` from `i256`. Not
+translated: the saturating forms. `int_to_ptr` traps if the value
 does not fit in 32 bits.
 
 Multiplication, division and variable shifts are functions of the module,

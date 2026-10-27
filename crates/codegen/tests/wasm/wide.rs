@@ -201,6 +201,16 @@ fn cases() -> Vec<Case> {
             reference: |a, _| (!a, false),
         },
         Case {
+            name: "bswap",
+            instruction: "v10.i256 = bswap v8;",
+            shape: Shape::Value,
+            skip: never,
+            reference: |a, _| {
+                let bytes = a.to_big_endian();
+                (U256::from_little_endian(&bytes), false)
+            },
+        },
+        Case {
             name: "neg",
             instruction: "v10.i256 = neg v8;",
             shape: Shape::Value,

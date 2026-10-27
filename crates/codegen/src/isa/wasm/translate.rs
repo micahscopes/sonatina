@@ -1203,7 +1203,7 @@ impl<'a> FunctionTranslator<'a> {
                 return unsupported(format!(
                     "function `{}`: `{op}` on i256 is not supported by the wasm32 backend \
                      (256-bit integers support arithmetic, shifts, bitwise operations, \
-                     comparisons and conversions, but not `bswap` or the saturating forms)",
+                     comparisons, conversions and `bswap`, but not the saturating forms)",
                     self.name
                 ));
             }
@@ -1793,7 +1793,13 @@ impl<'a> FunctionTranslator<'a> {
                 if function.dfg.value_ty(*i.arg()) == Type::I1 {
                     return Err(self.unsupported_type("`bswap`", Type::I1));
                 }
-                self.unary(*wb, inst_id, *i.arg(), |e, int, v| e.bswap(int, v))?
+                self.unary_any(
+                    *wb,
+                    inst_id,
+                    *i.arg(),
+                    |e, v| e.wide_bswap(v),
+                    |e, int, v| e.bswap(int, v),
+                )?
             }
             NativeInstKind::And(i) => self.binary_any(
                 *wb,

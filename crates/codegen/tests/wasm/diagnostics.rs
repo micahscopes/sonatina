@@ -45,9 +45,8 @@ fn i256_parameters_results_and_operations_are_named() {
         "{result}"
     );
 
-    // The saturating forms and `bswap` are not translated for 256 bits.
+    // The saturating forms are not translated for 256 bits.
     for (op, line) in [
-        ("bswap", "v3.i256 = bswap v1;"),
         ("umulsat", "v3.i256 = umulsat v1 v1;"),
         ("saddsat", "v3.i256 = saddsat v1 v1;"),
     ] {

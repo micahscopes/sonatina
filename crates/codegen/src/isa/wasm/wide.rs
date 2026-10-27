@@ -8,8 +8,8 @@
 //!
 //! Supported: constants, `zext`, `sext`, `trunc`, `add`, `sub`, `neg`, `not`,
 //! `and`, `or`, `xor`, the ten comparisons, `is_zero`, `uaddo`, `usubo`,
-//! `saddo`, `ssubo` and `snego`. Multiplication, division, shifts and `bswap`
-//! are rejected with an error that names the instruction.
+//! `saddo`, `ssubo`, `snego`, `bswap`, multiplication, division and shifts. The
+//! saturating forms are rejected with an error that names the instruction.
 
 use waffle::{Operator, Type as WType};
 
@@ -116,6 +116,15 @@ impl Emit<'_> {
     pub(super) fn wide_neg(&mut self, value: Limbs) -> Limbs {
         let zero = self.wide_zero();
         self.wide_sub(zero, value).0
+    }
+
+    /// Byte reversal: the limbs in the opposite order, each reversed.
+    pub(super) fn wide_bswap(&mut self, value: Limbs) -> Limbs {
+        let mut result = value;
+        for index in 0..LIMBS {
+            result[index] = self.bswap(Int::I64, value[LIMBS - 1 - index]);
+        }
+        result
     }
 
     pub(super) fn wide_not(&mut self, value: Limbs) -> Limbs {
