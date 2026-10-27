@@ -177,7 +177,7 @@ struct Scan {
     arena: bool,
     /// Which 256-bit helper functions are used: multiplication, division, left
     /// and right shifts.
-    helpers: (bool, bool, bool, bool),
+    helpers: (bool, bool, bool, bool, bool, bool),
 }
 
 fn kind_needs_runtime(kind: &NativeInstKind<'_>) -> bool {
@@ -221,7 +221,7 @@ fn wide_op_of(kind: &NativeInstKind<'_>) -> Option<(WideOp, ValueId, ValueId)> {
 fn scan_module(module: &Module) -> Scan {
     let mut runtime = module.ctx.with_gv_store(|store| !store.is_empty());
     let mut arena = false;
-    let mut helpers = (false, false, false, false);
+    let mut helpers = (false, false, false, false, false, false);
     let inst_set = native_inst_set();
     for func_ref in module.funcs() {
         let is_aggregate = |ty: Type| {
@@ -265,6 +265,21 @@ fn scan_module(module: &Module) -> Scan {
                         helpers.1 |= divrem;
                         helpers.2 |= shl;
                         helpers.3 |= shr;
+                    }
+                    match &kind {
+                        NativeInstKind::EvmAddMod(i)
+                            if function.dfg.value_ty(*i.lhs()) == Type::I256 =>
+                        {
+                            helpers.1 = true;
+                            helpers.4 = true;
+                        }
+                        NativeInstKind::EvmMulMod(i)
+                            if function.dfg.value_ty(*i.lhs()) == Type::I256 =>
+                        {
+                            helpers.1 = true;
+                            helpers.5 = true;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -476,26 +491,36 @@ pub(super) fn translate_module(
     let mut helpers = WideHelpers::default();
     let mut helper_bodies = Vec::new();
     let wide_results = |count: usize| vec![WType::I64; count];
-    let mut declare =
-        |wmod: &mut WaffleModule<'static>, name: &str, results: Vec<WType>, kind: HelperKind| {
-            let sig = wide::helper_signature(wmod, 2 * LIMBS, &results);
-            let placeholder = FunctionBody::new(wmod, sig);
-            let func = wmod
-                .funcs
-                .push(FuncDecl::Body(sig, name.to_string(), placeholder));
-            helper_bodies.push((func, sig, name.to_string(), kind));
-            func
-        };
-    let (needs_mulo, needs_divrem, needs_shl, needs_shr) = scan.helpers;
+    let mut declare = |wmod: &mut WaffleModule<'static>,
+                       name: &str,
+                       operands: usize,
+                       results: Vec<WType>,
+                       kind: HelperKind| {
+        let sig = wide::helper_signature(wmod, operands * LIMBS, &results);
+        let placeholder = FunctionBody::new(wmod, sig);
+        let func = wmod
+            .funcs
+            .push(FuncDecl::Body(sig, name.to_string(), placeholder));
+        helper_bodies.push((func, sig, name.to_string(), kind));
+        func
+    };
+    let (needs_mulo, needs_divrem, needs_shl, needs_shr, needs_addmod, needs_mulmod) = scan.helpers;
     if needs_mulo {
         let mut results = wide_results(LIMBS);
         results.push(WType::I32);
-        helpers.mulo = Some(declare(&mut wmod, "i256.mulo", results, HelperKind::Mulo));
+        helpers.mulo = Some(declare(
+            &mut wmod,
+            "i256.mulo",
+            2,
+            results,
+            HelperKind::Mulo,
+        ));
     }
     if needs_divrem {
         helpers.udivrem = Some(declare(
             &mut wmod,
             "i256.udivrem",
+            2,
             wide_results(2 * LIMBS),
             HelperKind::DivRem,
         ));
@@ -504,6 +529,7 @@ pub(super) fn translate_module(
         helpers.shl = Some(declare(
             &mut wmod,
             "i256.shl",
+            2,
             wide_results(LIMBS),
             HelperKind::Shift { left: true },
         ));
@@ -512,8 +538,27 @@ pub(super) fn translate_module(
         helpers.shr = Some(declare(
             &mut wmod,
             "i256.shr",
+            2,
             wide_results(LIMBS),
             HelperKind::Shift { left: false },
+        ));
+    }
+    if needs_addmod {
+        helpers.addmod = Some(declare(
+            &mut wmod,
+            "i256.addmod",
+            3,
+            wide_results(LIMBS),
+            HelperKind::Modular { product: false },
+        ));
+    }
+    if needs_mulmod {
+        helpers.mulmod = Some(declare(
+            &mut wmod,
+            "i256.mulmod",
+            3,
+            wide_results(LIMBS),
+            HelperKind::Modular { product: true },
         ));
     }
 
@@ -556,6 +601,12 @@ pub(super) fn translate_module(
             HelperKind::Mulo => wide::build_mulo(&wmod, sig),
             HelperKind::DivRem => wide::build_udivrem(&wmod, sig),
             HelperKind::Shift { left } => wide::build_shift(&wmod, sig, left),
+            HelperKind::Modular { product } => {
+                let udivrem = helpers
+                    .udivrem
+                    .expect("modular helpers are declared with the division helper");
+                wide::build_modular(&wmod, sig, udivrem, product)
+            }
         };
         wmod.funcs[func] = FuncDecl::Body(sig, name, body);
     }
@@ -608,6 +659,7 @@ enum HelperKind {
     Mulo,
     DivRem,
     Shift { left: bool },
+    Modular { product: bool },
 }
 
 /// Whether an external function is the C routine that copies memory:
@@ -777,7 +829,7 @@ fn build_wrapper(
 }
 
 /// Emit a call and return its results in order.
-fn emit_call(
+pub(super) fn emit_call(
     body: &mut FunctionBody,
     block: waffle::Block,
     func: Func,
@@ -1697,11 +1749,11 @@ impl<'a> FunctionTranslator<'a> {
             // Phi inputs are passed as block arguments by the predecessors.
             NativeInstKind::Phi(_) => {}
 
-            NativeInstKind::EvmAddMod(_) | NativeInstKind::EvmMulMod(_) => {
-                return Err(unsupported(format!(
-                    "function `{}`: addmod and mulmod are not lowered to WebAssembly yet",
-                    self.name
-                )));
+            NativeInstKind::EvmAddMod(i) => {
+                self.wide_modular(*wb, inst_id, false, [*i.lhs(), *i.rhs(), *i.modulus()])?
+            }
+            NativeInstKind::EvmMulMod(i) => {
+                self.wide_modular(*wb, inst_id, true, [*i.lhs(), *i.rhs(), *i.modulus()])?
             }
 
             NativeInstKind::Add(i) => self.binary_any(

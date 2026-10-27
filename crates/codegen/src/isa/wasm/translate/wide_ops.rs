@@ -19,6 +19,8 @@ pub(super) struct WideHelpers {
     pub(super) udivrem: Option<Func>,
     pub(super) shl: Option<Func>,
     pub(super) shr: Option<Func>,
+    pub(super) addmod: Option<Func>,
+    pub(super) mulmod: Option<Func>,
 }
 
 /// The 256-bit operation that an instruction asks for.
@@ -267,5 +269,39 @@ impl FunctionTranslator<'_> {
                 self.define_wide(inst_id, 0, result)
             }
         }
+    }
+}
+
+impl FunctionTranslator<'_> {
+    /// `evm_add_mod` or `evm_mul_mod` on 256-bit operands: a call to the helper
+    /// function. The sum or product is exact, and zero if the modulus is zero.
+    pub(super) fn wide_modular(
+        &mut self,
+        wb: waffle::Block,
+        inst_id: InstId,
+        product: bool,
+        operands: [ValueId; 3],
+    ) -> Result<(), WasmError> {
+        let name = self.function.dfg.inst(inst_id).as_text();
+        if operands
+            .iter()
+            .any(|&value| self.function.dfg.value_ty(value) != Type::I256)
+        {
+            return Err(super::unsupported(format!(
+                "function `{}`: `{name}` is lowered for 256-bit operands only",
+                self.name
+            )));
+        }
+        let func = if product {
+            self.helper(self.wide_helpers.mulmod, "modular multiplication")?
+        } else {
+            self.helper(self.wide_helpers.addmod, "modular addition")?
+        };
+        let mut args = Vec::with_capacity(3 * LIMBS);
+        for value in operands {
+            args.extend(self.wide_operand(wb, value)?);
+        }
+        let out = self.call_helper(wb, func, &args, &[WType::I64; LIMBS]);
+        self.define_wide(inst_id, 0, [out[0], out[1], out[2], out[3]])
     }
 }

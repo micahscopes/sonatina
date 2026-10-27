@@ -541,3 +541,79 @@ fn division_by_zero_traps_and_leaves_the_instance_usable() {
         13
     );
 }
+
+/// `(a + b) mod n` or `(a * b) mod n` in full precision, and zero if `n` is
+/// zero.
+fn modular_reference(product: bool, a: U256, b: U256, n: U256) -> U256 {
+    if n.is_zero() {
+        return U256::zero();
+    }
+    let wide = |x: U256| x.full_mul(U256::one());
+    let modulus = wide(n);
+    let value = if product {
+        a.full_mul(b)
+    } else {
+        wide(a) + wide(b)
+    };
+    U256::try_from(value % modulus).expect("a remainder below a 256-bit modulus fits")
+}
+
+/// A modulus: boundary values and random values.
+fn modulus(rng: &mut Lcg) -> U256 {
+    match rng.next() % 8 {
+        0 => U256::zero(),
+        1 => U256::one(),
+        2 => U256::MAX,
+        3 => (U256::one() << 255) + U256::from(rng.next() % 3),
+        4 => U256::from(rng.next() | 1),
+        5 => U256::one() << (rng.next() % 256) as usize,
+        _ => operand(rng),
+    }
+}
+
+#[test]
+fn addmod_and_mulmod_match_the_exact_result() {
+    let source = format!(
+        "{PRELUDE}func public %f(v0.i64, v1.i64, v2.i64, v3.i64, v4.i64, v5.i64, v6.i64, v7.i64, v8.i64, v9.i64, v10.i64, v11.i64) -> (i64, i64, i64, i64, i64, i64, i64, i64) {{
+    block0:
+        v12.i256 = call %pack v0 v1 v2 v3;
+        v13.i256 = call %pack v4 v5 v6 v7;
+        v14.i256 = call %pack v8 v9 v10 v11;
+        v15.i256 = evm_add_mod v12 v13 v14;
+        v16.i256 = evm_mul_mod v12 v13 v14;
+        (v17.i64, v18.i64, v19.i64, v20.i64) = call %unpack v15;
+        (v21.i64, v22.i64, v23.i64, v24.i64) = call %unpack v16;
+        return (v17, v18, v19, v20, v21, v22, v23, v24);
+}}"
+    );
+    let mut rng = Lcg(0x5eed_3d0d);
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let mut machine = Machine::new(&build_at(&source, level));
+        let f = machine.func("f");
+        for _ in 0..300 {
+            let (a, b, n) = (operand(&mut rng), operand(&mut rng), modulus(&mut rng));
+            let arguments: Vec<Val> = limbs(a)
+                .into_iter()
+                .chain(limbs(b))
+                .chain(limbs(n))
+                .map(|limb| Val::I64(limb as i64))
+                .collect();
+            let got = machine.call(&f, &arguments);
+            let read = |range: std::ops::Range<usize>| {
+                let limbs: Vec<u64> = got[range].iter().map(|v| v.unwrap_i64() as u64).collect();
+                from_limbs(&limbs)
+            };
+            let what = format!("{level:?} a={a:#x} b={b:#x} n={n:#x}");
+            assert_eq!(
+                read(0..4),
+                modular_reference(false, a, b, n),
+                "addmod {what}"
+            );
+            assert_eq!(
+                read(4..8),
+                modular_reference(true, a, b, n),
+                "mulmod {what}"
+            );
+        }
+    }
+}

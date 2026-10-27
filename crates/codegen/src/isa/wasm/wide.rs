@@ -675,3 +675,175 @@ pub(super) fn build_udivrem(
     body.convert_to_max_ssa(None);
     body
 }
+
+/// `(x + y) mod n` for `x` and `y` below `n`: one conditional subtraction,
+/// taken when the sum carries out of 256 bits or reaches `n`.
+fn add_below_modulus(e: &mut Emit<'_>, x: Limbs, y: Limbs, n: Limbs) -> Limbs {
+    let (sum, carry) = e.wide_add(x, y);
+    let reaches = e.wide_compare(Cmp::Ge, false, sum, n);
+    let wrapped = e.op(Operator::I32Or, &[carry, reaches], WType::I32);
+    let (reduced, _) = e.wide_sub(sum, n);
+    let mut out = sum;
+    for k in 0..LIMBS {
+        out[k] = e.select64(reduced[k], sum[k], wrapped);
+    }
+    out
+}
+
+/// `addmod(a, b, n)` or `mulmod(a, b, n)`: the sum or product of `a` and `b`
+/// modulo `n`, computed without overflow, and zero if `n` is zero.
+///
+/// The operands are reduced with `udivrem`. The sum is then one addition and
+/// one conditional subtraction. The product takes one step per bit of `b`, from
+/// the top: double the running value modulo `n`, and add `a` modulo `n` when the
+/// bit is set. No step exceeds the modulus.
+pub(super) fn build_modular(
+    wmod: &waffle::Module<'static>,
+    sig: waffle::Signature,
+    udivrem: waffle::Func,
+    product: bool,
+) -> waffle::FunctionBody {
+    use waffle::{BlockTarget, Terminator};
+    let target = |block, args: Vec<V>| BlockTarget { block, args };
+
+    let mut body = waffle::FunctionBody::new(wmod, sig);
+    let entry = body.entry;
+    let params = helper_params(&body, 3 * LIMBS);
+    let (a, b, n) = (
+        limbs_at(&params, 0),
+        limbs_at(&params, LIMBS),
+        limbs_at(&params, 2 * LIMBS),
+    );
+    let remainder_carriers = [WType::I64; 2 * LIMBS];
+
+    let zero_block = body.add_block();
+    let work = body.add_block();
+    let modulus_zero = Emit {
+        body: &mut body,
+        block: entry,
+    }
+    .wide_is_zero(n);
+    body.set_terminator(
+        entry,
+        Terminator::CondBr {
+            cond: modulus_zero,
+            if_true: target(zero_block, vec![]),
+            if_false: target(work, vec![]),
+        },
+    );
+    let zero = Emit {
+        body: &mut body,
+        block: zero_block,
+    }
+    .wide_zero();
+    body.set_terminator(
+        zero_block,
+        Terminator::Return {
+            values: zero.to_vec(),
+        },
+    );
+
+    // The operands modulo `n`.
+    let args_a: Vec<V> = a.into_iter().chain(n).collect();
+    let out_a = super::translate::emit_call(&mut body, work, udivrem, &args_a, &remainder_carriers);
+    let a_reduced = limbs_at(&out_a, LIMBS);
+
+    if !product {
+        let args_b: Vec<V> = b.into_iter().chain(n).collect();
+        let out_b =
+            super::translate::emit_call(&mut body, work, udivrem, &args_b, &remainder_carriers);
+        let b_reduced = limbs_at(&out_b, LIMBS);
+        let sum = add_below_modulus(
+            &mut Emit {
+                body: &mut body,
+                block: work,
+            },
+            a_reduced,
+            b_reduced,
+            n,
+        );
+        body.set_terminator(
+            work,
+            Terminator::Return {
+                values: sum.to_vec(),
+            },
+        );
+        body.convert_to_max_ssa(None);
+        return body;
+    }
+
+    let header = body.add_block();
+    let step = body.add_block();
+    let done = body.add_block();
+    let start: Vec<V> = {
+        let mut e = Emit {
+            body: &mut body,
+            block: work,
+        };
+        let bits = e.c32(256);
+        let zero = e.c64(0);
+        std::iter::once(bits)
+            .chain(std::iter::repeat_n(zero, LIMBS))
+            .collect()
+    };
+    body.set_terminator(
+        work,
+        Terminator::Br {
+            target: target(header, start),
+        },
+    );
+
+    // The loop: `remaining` bits of `b` are still to be taken from the top.
+    let remaining = body.add_blockparam(header, WType::I32);
+    let r: Vec<V> = (0..LIMBS)
+        .map(|_| body.add_blockparam(header, WType::I64))
+        .collect();
+    let r = limbs_at(&r, 0);
+    let finished = Emit {
+        body: &mut body,
+        block: header,
+    }
+    .op(Operator::I32Eqz, &[remaining], WType::I32);
+    body.set_terminator(
+        header,
+        Terminator::CondBr {
+            cond: finished,
+            if_true: target(done, vec![]),
+            if_false: target(step, vec![]),
+        },
+    );
+
+    let mut e = Emit {
+        body: &mut body,
+        block: step,
+    };
+    let one = e.c32(1);
+    let index = e.op(Operator::I32Sub, &[remaining, one], WType::I32);
+    let six = e.c32(6);
+    let limb_index = e.op(Operator::I32ShrU, &[index, six], WType::I32);
+    let sixty_three = e.c32(63);
+    let bit_index32 = e.op(Operator::I32And, &[index, sixty_three], WType::I32);
+    let bit_index = e.op(Operator::I64ExtendI32U, &[bit_index32], WType::I64);
+    let source = e.pick_limb(b, limb_index);
+    let moved = e.op(Operator::I64ShrU, &[source, bit_index], WType::I64);
+    let one64 = e.c64(1);
+    let masked = e.op(Operator::I64And, &[moved, one64], WType::I64);
+    let bit = e.op(Operator::I32WrapI64, &[masked], WType::I32);
+    let doubled = add_below_modulus(&mut e, r, r, n);
+    let added = add_below_modulus(&mut e, doubled, a_reduced, n);
+    let mut next = doubled;
+    for k in 0..LIMBS {
+        next[k] = e.select64(added[k], doubled[k], bit);
+    }
+    let args: Vec<V> = std::iter::once(index).chain(next).collect();
+    body.set_terminator(
+        step,
+        Terminator::Br {
+            target: target(header, args),
+        },
+    );
+
+    body.set_terminator(done, Terminator::Return { values: r.to_vec() });
+    body.convert_to_max_ssa(None);
+    body
+}
