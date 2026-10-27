@@ -49,10 +49,6 @@ use super::{
     },
     wide::{self, LIMBS, Limbs},
 };
-use crate::transform::aggregate::{
-    compute_object_effect_summaries, object_abi::native_heap_object_roots,
-};
-
 mod aggregate;
 mod wide_ops;
 
@@ -182,7 +178,6 @@ struct Scan {
     /// Which 256-bit helper functions are used: multiplication, division, left
     /// and right shifts.
     helpers: (bool, bool, bool, bool),
-    heap_roots: FxHashMap<FuncRef, FxHashSet<ValueId>>,
 }
 
 fn kind_needs_runtime(kind: &NativeInstKind<'_>) -> bool {
@@ -199,7 +194,6 @@ fn kind_needs_runtime(kind: &NativeInstKind<'_>) -> bool {
             | NativeInstKind::ObjLoad(_)
             | NativeInstKind::ObjStore(_)
             | NativeInstKind::ObjMaterializeStack(_)
-            | NativeInstKind::ObjMaterializeHeap(_)
             | NativeInstKind::InsertValue(_)
             | NativeInstKind::ExtractValue(_)
             | NativeInstKind::MemAllocDynamic(_)
@@ -225,11 +219,9 @@ fn wide_op_of(kind: &NativeInstKind<'_>) -> Option<(WideOp, ValueId, ValueId)> {
 }
 
 fn scan_module(module: &Module) -> Scan {
-    let effects = compute_object_effect_summaries(module);
     let mut runtime = module.ctx.with_gv_store(|store| !store.is_empty());
     let mut arena = false;
     let mut helpers = (false, false, false, false);
-    let mut heap_roots = FxHashMap::default();
     let inst_set = native_inst_set();
     for func_ref in module.funcs() {
         let is_aggregate = |ty: Type| {
@@ -252,12 +244,6 @@ fn scan_module(module: &Module) -> Scan {
             }
         });
         module.func_store.try_view(func_ref, |function| {
-            let roots = native_heap_object_roots(function, &effects);
-            if !roots.is_empty() {
-                arena = true;
-                runtime = true;
-                heap_roots.insert(func_ref, roots);
-            }
             for block in function.layout.iter_block() {
                 for inst_id in function.layout.iter_inst(block) {
                     let inst = function.dfg.inst(inst_id);
@@ -293,7 +279,6 @@ fn scan_module(module: &Module) -> Scan {
         runtime,
         arena,
         helpers,
-        heap_roots,
     }
 }
 
@@ -532,9 +517,7 @@ pub(super) fn translate_module(
         ));
     }
 
-    let empty_roots = FxHashSet::default();
     for (func_ref, func, wsig, name, canonicalize_params) in pending {
-        let heap_roots = scan.heap_roots.get(&func_ref).unwrap_or(&empty_roots);
         let body = module
             .func_store
             .try_view(func_ref, |function| {
@@ -551,7 +534,6 @@ pub(super) fn translate_module(
                     globals,
                     arena_func.map(|(func, _)| func),
                     helpers,
-                    heap_roots,
                 )
                 .translate(canonicalize_params)
             })
@@ -857,7 +839,6 @@ struct FunctionTranslator<'a> {
     plan: &'a MemoryPlan,
     globals: Option<RuntimeGlobals>,
     arena: Option<Func>,
-    heap_roots: &'a FxHashSet<ValueId>,
     wide_helpers: WideHelpers,
     return_tys: Vec<Type>,
     /// Sonatina values defined so far, in canonical WAFFLE form. Not 256-bit
@@ -901,7 +882,6 @@ impl<'a> FunctionTranslator<'a> {
         globals: Option<RuntimeGlobals>,
         arena: Option<Func>,
         wide_helpers: WideHelpers,
-        heap_roots: &'a FxHashSet<ValueId>,
     ) -> Self {
         Self {
             module,
@@ -913,7 +893,6 @@ impl<'a> FunctionTranslator<'a> {
             plan,
             globals,
             arena,
-            heap_roots,
             wide_helpers,
             return_tys: callees[&func_ref].rets.clone(),
             values: FxHashMap::default(),
@@ -1718,6 +1697,13 @@ impl<'a> FunctionTranslator<'a> {
             // Phi inputs are passed as block arguments by the predecessors.
             NativeInstKind::Phi(_) => {}
 
+            NativeInstKind::EvmAddMod(_) | NativeInstKind::EvmMulMod(_) => {
+                return Err(unsupported(format!(
+                    "function `{}`: addmod and mulmod are not lowered to WebAssembly yet",
+                    self.name
+                )));
+            }
+
             NativeInstKind::Add(i) => self.binary_any(
                 *wb,
                 inst_id,
@@ -1977,7 +1963,6 @@ impl<'a> FunctionTranslator<'a> {
             NativeInstKind::ConstLoad(i) => self.obj_load(*wb, inst_id, *i.object(), false)?,
             NativeInstKind::ObjStore(i) => self.obj_store(*wb, *i.object(), *i.value())?,
             NativeInstKind::ObjMaterializeStack(i) => self.alias(*wb, inst_id, *i.object())?,
-            NativeInstKind::ObjMaterializeHeap(i) => self.alias(*wb, inst_id, *i.object())?,
             NativeInstKind::ConstRef(i) => self.const_ref(*wb, inst_id, i.global().gv())?,
             NativeInstKind::InsertValue(i) => {
                 self.insert_value(block, *wb, inst_id, *i.dest(), *i.idx(), *i.value())?

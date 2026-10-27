@@ -554,62 +554,6 @@ func public %short(v0.i32) -> i16 {
 }
 
 #[test]
-fn objects_that_outlive_their_frame_come_from_the_arena() {
-    let source = "func private %export(v0.objref<i64>) -> *i64 {
-    block0:
-        v1.*i64 = obj.materialize.heap v0;
-        return v1;
-}
-func private %make(v0.i64) -> *[i64; 2] {
-    block0:
-        v1.objref<[i64; 2]> = obj.alloc [i64; 2];
-        v2.objref<i64> = obj.index v1 1.i64;
-        obj.store v2 v0;
-        v3.*i64 = call %export v2;
-        mstore v3 40.i64 i64;
-        v4.i64 = obj.load v2;
-        v5.i64 = add v4 2.i64;
-        obj.store v2 v5;
-        v6.*[i64; 2] = obj.materialize.stack v1;
-        return v6;
-}
-func public %first(v0.i64) -> *[i64; 2] {
-    block0:
-        v1.*[i64; 2] = call %make v0;
-        return v1;
-}
-func public %exercise() -> i64 {
-    block0:
-        v0.*[i64; 2] = call %make 11.i64;
-        v1.*[i64; 2] = call %make 22.i64;
-        v2.*i64 = gep v0 0.i32 1.i32;
-        v3.*i64 = gep v1 0.i32 1.i32;
-        mstore v2 17.i64 i64;
-        v4.i64 = mload v2 i64;
-        v5.i64 = mload v3 i64;
-        v6.i64 = mul v4 100.i64;
-        v7.i64 = add v6 v5;
-        return v7;
-}";
-    for level in [OptLevel::O0, OptLevel::O2] {
-        let bytes = build_with(source, level, WasmBackend::new().with_stack_size(1 << 16));
-        let mut machine = Limited::new(&bytes, usize::MAX);
-        // The first object keeps 17 after the write, the second keeps 42.
-        let got = machine.call("exercise", &[]).unwrap()[0].unwrap_i64();
-        assert_eq!(got, 1742, "{level:?}");
-        // The pointer a call returns names storage that is still valid, and
-        // each call gets storage of its own.
-        let a = machine.call("first", &[Val::I64(5)]).unwrap()[0].unwrap_i32() as u32;
-        let b = machine.call("first", &[Val::I64(6)]).unwrap()[0].unwrap_i32() as u32;
-        assert_ne!(a, b);
-        let arena = (DATA_BASE + (1 << 16)).next_multiple_of(PAGE) as u32;
-        assert!(a >= arena && b >= arena, "{level:?}: {a} {b}");
-        assert_eq!(machine.read(a + 8, 8), 42u64.to_le_bytes(), "{level:?}");
-        assert_eq!(machine.read(b + 8, 8), 42u64.to_le_bytes(), "{level:?}");
-    }
-}
-
-#[test]
 fn gep_follows_the_native_rules_for_indices() {
     let source = "func public %narrow(v0.*i64, v1.i8) -> i64 {
     block0:

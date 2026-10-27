@@ -98,8 +98,8 @@ should treat regions 1 and 2 as owned by the module.
 
 Every function of such a module takes the address of the first free byte of the
 stack as a hidden first parameter. It places its frame there: one slot, with
-the alignment of its type, for each `alloca`, each `obj.alloc` that does not
-outlive the call, each struct or array that an instruction builds (results of
+the alignment of its type, for each `alloca`, each `obj.alloc` (an object lives until
+its function returns, as the front end promises), each struct or array that an instruction builds (results of
 `insert_value`, `obj.load`, `mload` of an aggregate, a call that returns an
 aggregate, an aggregate `undef`), and each aggregate phi. It passes the end of
 its frame to the functions it calls. Frames are 16-byte aligned. A call whose
@@ -121,9 +121,8 @@ frame of one function.
 
 ### The arena
 
-`mem.alloc_dynamic` and every object that must outlive its frame (the targets of
-`obj.materialize.heap`, as the native backend determines them) are allocated
-from the arena. An allocation takes the size rounded up to 16 bytes (a size of
+`mem.alloc_dynamic` allocates from the arena. No object does: every `obj.alloc` is a slot of
+the frame. An allocation takes the size rounded up to 16 bytes (a size of
 zero takes 16 bytes, so that it has an address of its own), returns the old
 arena top and moves it. Blocks are never freed and never overlap, and the memory
 of a block is zero when it is returned, because the arena only moves up.

@@ -2,6 +2,7 @@ mod common;
 
 use dir_test::{Fixture, dir_test};
 use sonatina_codegen::{
+    OptLevel,
     domtree::DomTree,
     loop_analysis::LoopTree,
     optim::{
@@ -30,6 +31,138 @@ fn test_opt_pipeline(fixture: Fixture<&str>) {
 
     let mut writer = ModuleWriter::with_debug_provider(&parsed.module, &parsed.debug);
     snap_test!(writer.dump_string(), fixture.path());
+}
+
+#[test]
+fn native_pipelines_inline_helpers_with_many_call_sites() {
+    // EVM tuning keeps a helper with many call sites out of line to save
+    // bytecode; native code inlines it.
+    let calls: String = (0..8)
+        .map(|i| format!("        call %push v0 {i}.i64;\n"))
+        .collect();
+    let source = format!(
+        r#"
+target = "x86_64-unknown-native"
+
+declare external %fault(*i64);
+
+func private %push(v0.*i64, v1.i64) {{
+    block0:
+        v2.i64 = mload v0 i64;
+        v3.i1 = lt v2 1024.i64;
+        br v3 block1 block2;
+    block1:
+        v4.i64 = mul v1 v2;
+        v5.i64 = xor v4 v1;
+        v6.i64 = add v5 v2;
+        v7.i64 = add v2 1.i64;
+        mstore v0 v7 i64;
+        v8.i64 = ptr_to_int v0 i64;
+        v9.i64 = add v8 8.i64;
+        v10.*i64 = int_to_ptr v9 *i64;
+        mstore v10 v6 i64;
+        return;
+    block2:
+        call %fault v0;
+        return;
+}}
+
+func public %entry(v0.*i64) {{
+    block0:
+{calls}        return;
+}}
+"#
+    );
+    let optimized = |pipeline: Pipeline| {
+        let mut parsed = parse_module(&source).unwrap();
+        pipeline.run(&mut parsed.module);
+        verify_module_or_panic(
+            &parsed.module,
+            &VerifierConfig::for_level(VerificationLevel::Full),
+        );
+        ModuleWriter::new(&parsed.module).dump_string()
+    };
+    let speed = optimized(Pipeline::speed());
+    assert!(speed.contains("call %push"), "{speed}");
+    for level in [OptLevel::O1, OptLevel::O2] {
+        let native = optimized(Pipeline::native(level));
+        assert!(!native.contains("call %push"), "{level:?}\n{native}");
+    }
+}
+
+#[test]
+fn native_pipelines_inline_helpers_with_slow_path_calls() {
+    // Like a vector push: a bounds check, an out-of-line grow and a fault
+    // flag, called from many sites. The call does not make it cold.
+    let calls: String = (0..8)
+        .map(|i| {
+            let value = i + 2;
+            format!("        v{value}.i64 = add v1 {i}.i64;\n        call %push v0 v{value};\n")
+        })
+        .collect();
+    // The stored value's computation sizes the helper between the native
+    // cold threshold and the native threshold.
+    let mix: String = (100..110)
+        .map(|v| format!("        v{}.i64 = add v{v} 3.i64;\n", v + 1))
+        .collect();
+    let source = format!(
+        r#"
+target = "x86_64-unknown-native"
+
+declare external %grow(*i64) -> i1;
+
+func private %push(v0.*i64, v1.i64) {{
+    block0:
+        v2.i64 = mload v0 i64;
+        v3.i1 = lt v2 1024.i64;
+        br v3 block2 block1;
+    block1:
+        mstore v0 11.i64 i64;
+        return;
+    block2:
+        v4.i64 = ptr_to_int v0 i64;
+        v5.i64 = add v4 8.i64;
+        v6.*i64 = int_to_ptr v5 *i64;
+        v7.i64 = mload v6 i64;
+        v8.i1 = eq v2 v7;
+        br v8 block3 block5;
+    block3:
+        v9.i1 = call %grow v0;
+        br v9 block5 block4;
+    block4:
+        mstore v0 21.i64 i64;
+        return;
+    block5:
+        v100.i64 = add v1 1.i64;
+{mix}        v10.i64 = add v4 16.i64;
+        v11.*i64 = int_to_ptr v10 *i64;
+        v12.i64 = mload v11 i64;
+        v13.i64 = mload v0 i64;
+        v14.i64 = shl 3.i64 v13;
+        v15.i64 = add v12 v14;
+        v16.*i64 = int_to_ptr v15 *i64;
+        mstore v16 v110 i64;
+        v17.i64 = add v13 1.i64;
+        mstore v0 v17 i64;
+        return;
+}}
+
+func public %entry(v0.*i64, v1.i64) {{
+    block0:
+{calls}        return;
+}}
+"#
+    );
+    for level in [OptLevel::O1, OptLevel::O2] {
+        let mut parsed = parse_module(&source).unwrap();
+        Pipeline::native(level).run(&mut parsed.module);
+        verify_module_or_panic(
+            &parsed.module,
+            &VerifierConfig::for_level(VerificationLevel::Full),
+        );
+        let native = ModuleWriter::new(&parsed.module).dump_string();
+        assert!(!native.contains("call %push"), "{level:?}\n{native}");
+    }
 }
 
 #[test]
@@ -1966,4 +2099,161 @@ block0:
             );
         }
     }
+}
+
+#[test]
+fn gvn_merges_object_reads_after_a_call_that_writes_the_object() {
+    // After `%bump` may have written field 0, its contents are not proven
+    // defined, but two reads with nothing between them read the same bits.
+    let source = r#"
+target = "x86_64-unknown-native"
+
+type @vm = {i64, i64};
+
+func inline(never) private %bump(v0.objref<@vm>) {
+    block0:
+        v1.objref<i64> = obj.proj v0 0.i256;
+        v2.i64 = obj.load v1;
+        v3.i64 = add v2 1.i64;
+        obj.store v1 v3;
+        return;
+}
+
+func inline(never) private %reads_after_call(v0.objref<@vm>) -> i64 {
+    block0:
+        v1.objref<i64> = obj.proj v0 0.i256;
+        call %bump v0;
+        v3.i64 = obj.load v1;
+        v4.i64 = obj.load v1;
+        v5.i64 = mul v3 v4;
+        return v5;
+}
+
+func public %entry(v0.i64) -> i64 {
+    block0:
+        v1.objref<@vm> = obj.alloc @vm;
+        v2.objref<i64> = obj.proj v1 0.i256;
+        obj.store v2 v0;
+        v3.objref<i64> = obj.proj v1 1.i256;
+        obj.store v3 v0;
+        v4.i64 = call %reads_after_call v1;
+        return v4;
+}
+"#;
+    let mut parsed = parse_module(source).unwrap();
+    Pipeline::native(OptLevel::O2).run(&mut parsed.module);
+    verify_module_or_panic(
+        &parsed.module,
+        &VerifierConfig::for_level(VerificationLevel::Full),
+    );
+    let ir = ModuleWriter::new(&parsed.module).dump_string();
+    let body = ir
+        .split("func inline(never) private %reads_after_call")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .unwrap_or_else(|| panic!("{ir}"));
+    assert_eq!(body.matches("obj.load").count(), 1, "{ir}");
+}
+
+#[test]
+fn licm_hoists_reads_of_an_argument_another_noalias_argument_cannot_write() {
+    // The loop writes `pc` through `v0` and reads `len` through `v1`. Only a
+    // `noalias` `v0` rules out that the write changes `len`.
+    for noalias in [false, true] {
+        let marker = if noalias { "noalias " } else { "" };
+        let source = format!(
+            r#"
+target = "x86_64-unknown-native"
+
+type @vm = {{ i64, i64 }};
+type @code = {{ i64, i64 }};
+
+func private %run({marker}v0.objref<@vm>, v1.objref<@code>) -> i64 {{
+    block0:
+        v2.objref<i64> = obj.proj v0 0.i64;
+        v3.objref<i64> = obj.proj v1 1.i64;
+        jump block1;
+    block1:
+        v4.i64 = obj.load v2;
+        v5.i64 = obj.load v3;
+        v6.i1 = lt v4 v5;
+        br v6 block2 block3;
+    block2:
+        v7.i64 = add v4 1.i64;
+        obj.store v2 v7;
+        jump block1;
+    block3:
+        return v4;
+}}
+"#
+        );
+        let mut parsed = parse_module(&source).unwrap();
+        verify_module_or_panic(
+            &parsed.module,
+            &VerifierConfig::for_level(VerificationLevel::Full),
+        );
+        let mut pipeline = Pipeline::new();
+        pipeline.add_step(Step::FuncPasses(vec![Pass::Licm]));
+        pipeline.run(&mut parsed.module);
+        let text = ModuleWriter::new(&parsed.module).dump_string();
+        let header = text.split("block1:").nth(1).unwrap();
+        assert_eq!(header.contains("obj.load v3"), !noalias, "{text}");
+        assert!(
+            text.contains(&format!("%run({marker}v0.objref<@vm>")),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn object_load_store_forwards_noalias_arguments_across_opaque_calls() {
+    // An opaque call reaches a caller's object unless it is `noalias` and
+    // not passed on.
+    for noalias in [false, true] {
+        let marker = if noalias { "noalias " } else { "" };
+        let source = format!(
+            r#"
+target = "x86_64-unknown-native"
+
+declare external %opaque();
+
+func private %f({marker}v0.objref<i64>) -> i64 {{
+    block0:
+        obj.store v0 7.i64;
+        call %opaque;
+        v1.i64 = obj.load v0;
+        return v1;
+}}
+"#
+        );
+        let mut parsed = parse_module(&source).unwrap();
+        let mut pipeline = Pipeline::new();
+        pipeline.add_step(Step::FuncPasses(vec![Pass::ObjectLoadStore]));
+        pipeline.run(&mut parsed.module);
+        let text = ModuleWriter::new(&parsed.module).dump_string();
+        assert_eq!(text.contains("return 7.i64"), noalias, "{text}");
+    }
+}
+
+#[test]
+fn object_load_store_keeps_final_stores_to_noalias_arguments() {
+    // Nothing else reaches a `noalias` argument during the call, but its
+    // caller reads the object afterwards.
+    let source = r#"
+target = "x86_64-unknown-native"
+
+func private %f(noalias v0.objref<i64>) {
+    block0:
+        obj.store v0 7.i64;
+        obj.store v0 8.i64;
+        return;
+}
+"#;
+    let mut parsed = parse_module(source).unwrap();
+    let mut pipeline = Pipeline::new();
+    pipeline.add_step(Step::FuncPasses(vec![Pass::ObjectLoadStore]));
+    pipeline.run(&mut parsed.module);
+    let text = ModuleWriter::new(&parsed.module).dump_string();
+    assert!(text.contains("obj.store v0 8.i64"), "{text}");
+    assert!(!text.contains("obj.store v0 7.i64"), "{text}");
 }

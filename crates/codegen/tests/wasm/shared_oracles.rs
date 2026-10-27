@@ -36,14 +36,12 @@ fn the_object_alias_matrix_gives_the_results_the_other_backends_give() {
 }
 
 #[test]
-fn a_captured_stack_reference_is_rejected_as_it_is_natively() {
+fn a_returned_local_allocation_is_rejected_as_it_is_natively() {
     for level in [OptLevel::O0, OptLevel::O1, OptLevel::O2] {
         let error = compile_at(alias_execution::CAPTURE_SOURCE, level)
             .expect_err("the captured reference must not compile");
         assert!(
-            error.contains(
-                "native reference lifetime in captured_alias: unproven escape of local object"
-            ),
+            error.contains("returns a reference to local object"),
             "{level:?}: {error}"
         );
     }
@@ -107,87 +105,6 @@ block0:
             9922,
             "{level:?}"
         );
-    }
-}
-
-#[test]
-fn mixed_returns_preserve_fresh_lifetimes_and_borrowed_projection_aliases() {
-    for separate_returns in [true, false] {
-        let choose = if separate_returns {
-            r#"block0:
-    br v0 block1 block2;
-block1:
-    v3.objref<i64> = obj.alloc i64;
-    obj.store v3 v2;
-    return v3;
-block2:
-    v4.objref<i64> = obj.index v1 1.i64;
-    return v4;"#
-        } else {
-            r#"block0:
-    br v0 block1 block2;
-block1:
-    v3.objref<i64> = obj.alloc i64;
-    obj.store v3 v2;
-    jump block3;
-block2:
-    v4.objref<i64> = obj.index v1 1.i64;
-    jump block3;
-block3:
-    v5.objref<i64> = phi (v3 block1) (v4 block2);
-    return v5;"#
-        };
-        let source = format!(
-            r#"
-func private %choose(v0.i1, v1.objref<[i64; 2]>, v2.i64) -> objref<i64> {{
-{choose}
-}}
-func private %forward(v0.i1, v1.objref<[i64; 2]>, v2.i64) -> objref<i64> {{
-block0:
-    v3.objref<i64> = call %choose v0 v1 v2;
-    return v3;
-}}
-func public %exercise(v0.i8, v1.i8) -> i64 {{
-block0:
-    v2.objref<[i64; 2]> = obj.alloc [i64; 2];
-    v3.objref<i64> = obj.index v2 1.i64;
-    obj.store v3 42.i64;
-    v4.i1 = trunc v0 i1;
-    v5.i1 = trunc v1 i1;
-    v6.objref<i64> = call %forward v4 v2 111.i64;
-    v7.objref<i64> = call %forward v5 v2 222.i64;
-    v8.i64 = obj.load v6;
-    v9.i64 = obj.load v7;
-    v10.i64 = add v8 v9;
-    obj.store v6 10.i64;
-    v11.i64 = obj.load v7;
-    v12.i64 = obj.load v3;
-    v13.i64 = mul v10 10000.i64;
-    v14.i64 = mul v11 100.i64;
-    v15.i64 = add v13 v14;
-    v16.i64 = add v15 v12;
-    return v16;
-}}
-"#
-        );
-        for level in [OptLevel::O0, OptLevel::O2] {
-            let mut machine = machine_at(&source, level);
-            for first in [0, 1] {
-                for second in [0, 1] {
-                    let lhs = if first == 1 { 111 } else { 42 };
-                    let rhs = if second == 1 { 222 } else { 42 };
-                    let borrowed = if first == 1 { 42 } else { 10 };
-                    let second_after = if second == 1 { 222 } else { borrowed };
-                    let expected = (lhs + rhs) * 10000 + second_after * 100 + borrowed;
-                    let got = call_i64(
-                        &mut machine,
-                        "exercise",
-                        &[Val::I32(first), Val::I32(second)],
-                    );
-                    assert_eq!(got, expected, "{first} {second} {level:?}");
-                }
-            }
-        }
     }
 }
 
@@ -273,7 +190,7 @@ block2:
                 if carries_old_alias {
                     let error = result.expect_err("a backedge alias must prevent slot reuse");
                     assert!(
-                        error.contains("loop-carried fresh object"),
+                        error.contains("refers to an earlier instance"),
                         "{split_latch} {level:?}: {error}"
                     );
                 } else {
@@ -422,147 +339,6 @@ block0:
         for input in [0, 4, -9] {
             let got = call_i64(&mut machine, "exercise", &[Val::I64(input)]);
             assert_eq!(got, (input + 1) * 10, "{level:?}");
-        }
-    }
-}
-
-#[test]
-fn references_held_beyond_the_frame_are_rejected_as_they_are_natively() {
-    for (name, body) in [
-        (
-            "returned_pair",
-            "v2.@pair = insert_value undef.@pair 1.i64 v1;\n    return v2;",
-        ),
-        (
-            "stored_in_argument",
-            "v2.@pair = insert_value undef.@pair 1.i64 v1;\n    obj.store v0 v2;\n    return undef.@pair;",
-        ),
-        (
-            "holder_passed_on",
-            "v2.objref<@holder> = obj.alloc @holder;\n    v3.objref<objref<i64>> = obj.proj v2 0.i64;\n    obj.store v3 v1;\n    call %keep v2 v0;\n    return undef.@pair;",
-        ),
-        (
-            "recovered_from_holder",
-            "v2.objref<@holder> = obj.alloc @holder;\n    v3.objref<objref<i64>> = obj.proj v2 0.i64;\n    obj.store v3 v1;\n    v4.objref<i64> = obj.load v3;\n    v5.@pair = insert_value undef.@pair 1.i64 v4;\n    obj.store v0 v5;\n    return undef.@pair;",
-        ),
-    ] {
-        let source = format!(
-            r#"
-type @pair = {{ i64, objref<i64> }};
-type @holder = {{ objref<i64> }};
-func inline(never) private %keep(v0.objref<@holder>, v1.objref<@pair>) {{
-block0:
-    v2.objref<objref<i64>> = obj.proj v0 0.i64;
-    v3.objref<i64> = obj.load v2;
-    v4.objref<objref<i64>> = obj.proj v1 1.i64;
-    obj.store v4 v3;
-    return;
-}}
-func inline(never) private %{name}(v0.objref<@pair>) -> @pair {{
-block0:
-    v1.objref<i64> = obj.alloc i64;
-    obj.store v1 5.i64;
-    {body}
-}}
-func public %entry() -> i64 {{
-block0:
-    v0.objref<@pair> = obj.alloc @pair;
-    v1.@pair = call %{name} v0;
-    v2.i64 = extract_value v1 0.i64;
-    return v2;
-}}
-"#
-        );
-        let error = compile_at(&source, OptLevel::O0)
-            .expect_err(&format!("{name}: an escaping stack reference was accepted"));
-        assert!(
-            error.contains(&format!("native reference lifetime in {name}: unproven")),
-            "{name}: {error}"
-        );
-    }
-}
-
-#[test]
-fn heap_exports_survive_and_stack_exports_that_overlap_are_rejected() {
-    // An explicit heap export preserves distinct iterations (here from the
-    // arena, with a host `free` that does nothing); the same loop with a stack
-    // export must fail when an older alias overlaps the next allocation.
-    for raw_pointer_phi in [false, true] {
-        let source = format!(
-            r#"
-func public %exercise(v0.i64) -> i64 {{
-block0:
-    v1.objref<[i64; 2]> = obj.alloc [i64; 2];
-    v2.objref<i64> = obj.index v1 1.i64;
-    obj.store v2 37.i64;
-    {initial_pointer}
-    jump block1;
-block1:
-    {phi}
-    v4.i64 = phi (0.i64 block0) (v11 block1);
-    {materialize}
-    v14.*i64 = gep v13 0.i64 1.i64;
-    v15.*i8 = bitcast v14 *i8;
-    v16.*i64 = bitcast v15 *i64;
-    v8.objref<[i64; 2]> = obj.alloc [i64; 2];
-    v9.objref<i64> = obj.index v8 1.i64;
-    obj.store v9 v4;
-    {next_pointer}
-    v5.i64 = mload v16 i64;
-    v11.i64 = add v4 1.i64;
-    v12.i1 = lt v11 v0;
-    br v12 block1 block2;
-block2:
-    return v5;
-}}
-"#,
-            initial_pointer = if raw_pointer_phi {
-                "v17.*[i64; 2] = obj.materialize.stack v1;"
-            } else {
-                ""
-            },
-            phi = if raw_pointer_phi {
-                "v13.*[i64; 2] = phi (v17 block0) (v18 block1);"
-            } else {
-                "v3.objref<[i64; 2]> = phi (v1 block0) (v8 block1);"
-            },
-            materialize = if raw_pointer_phi {
-                ""
-            } else {
-                "v13.*[i64; 2] = obj.materialize.stack v3;"
-            },
-            next_pointer = if raw_pointer_phi {
-                "v18.*[i64; 2] = obj.materialize.stack v8;"
-            } else {
-                ""
-            },
-        );
-        for level in [OptLevel::O0, OptLevel::O2] {
-            let error =
-                compile_at(&source, level).expect_err("overlapping pointer must be rejected");
-            assert!(
-                error.contains("loop-carried fresh object"),
-                "{raw_pointer_phi} {level:?}: {error}"
-            );
-            let heap_source = format!(
-                "declare external %free(*[i64; 2]);\n{}",
-                source
-                    .replace("obj.materialize.stack", "obj.materialize.heap")
-                    .replace("v5.i64 = mload v16 i64;", "v5.i64 = mload v16 i64;\n    call %free v13;")
-                    .replace(
-                        "return v5;",
-                        "v19.*[i64; 2] = obj.materialize.heap v8;\n    call %free v19;\n    return v5;"
-                    )
-            );
-            let bytes = compile_at(&heap_source, level).unwrap();
-            let mut machine = Machine::with_imports(&bytes, |linker| {
-                linker.func_wrap("env", "free", |_: i32| {}).unwrap();
-            });
-            for iterations in [1, 2, 3, 17] {
-                let expected = if iterations == 1 { 37 } else { iterations - 2 };
-                let got = call_i64(&mut machine, "exercise", &[Val::I64(iterations)]);
-                assert_eq!(got, expected, "{raw_pointer_phi} {level:?}");
-            }
         }
     }
 }

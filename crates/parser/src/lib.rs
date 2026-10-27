@@ -142,7 +142,7 @@ pub fn parse_module(input: &str) -> Result<ParsedModule, Vec<Error>> {
                 let args = sig
                     .params
                     .iter()
-                    .map(|decl| ctx.type_(&builder, &decl.1))
+                    .map(|param| ctx.type_(&builder, &param.decl.1))
                     .collect::<Vec<_>>();
 
                 let ret_tys = ctx.ret_tys(&builder, &sig.ret_types);
@@ -270,9 +270,12 @@ impl BuildCtx {
         self.blocks.clear();
         let mut assign_result_values: Vec<SmallVec<[Option<ir::ValueId>; 2]>> = Vec::new();
 
-        for (i, ValueDeclaration(name, _ty)) in func.signature.params.iter().enumerate() {
+        for (i, param) in func.signature.params.iter().enumerate() {
             let value = fb.func.arg_values[i];
-            self.name_value(value, name);
+            self.name_value(value, &param.decl.0);
+            if param.noalias {
+                fb.func.set_noalias_arg(value);
+            }
         }
 
         for stmt in func.blocks.iter().flat_map(|b| b.stmts.iter()) {
@@ -1192,7 +1195,6 @@ func private %ops(v0.i256, v1.i256, v2.i256) -> i256 {
         v7.i256 = obj.load v6;
         v8.*@pair = obj.materialize.stack v3;
         v9.*i8 = mem.alloc_dynamic v2;
-        v10.*@pair = obj.materialize.heap v3;
         return v7;
 }
 "#;
@@ -1207,7 +1209,6 @@ func private %ops(v0.i256, v1.i256, v2.i256) -> i256 {
         assert!(printed.contains("obj.load v6"));
         assert!(printed.contains("obj.materialize.stack v3"));
         assert!(printed.contains("mem.alloc_dynamic v2"));
-        assert!(printed.contains("obj.materialize.heap v3"));
     }
 
     #[test]

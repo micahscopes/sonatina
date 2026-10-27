@@ -1,22 +1,192 @@
-use std::collections::HashMap;
-
-use cranelift_codegen::ir::{
-    self as clif, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
+use cranelift_codegen::{
+    ir::{self as clif, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind},
+    isa::TargetFrontendConfig,
 };
 use cranelift_frontend::FunctionBuilder;
-use sonatina_ir::{Function, Type, ValueId, module::ModuleCtx, types::CompoundType};
+use sonatina_ir::{Function, Type, Value, ValueId, module::ModuleCtx, types::CompoundType};
 
 use super::{
-    copy_bytes, create_stack_slot_for_type, load_i256_limb, resize_int_value, resolve_value,
-    signed_scalar, sonatina_type_to_clif_or_err, uses_indirect_value_representation,
+    ValueMap, load_limbs, resize_int_value, resolve_i256, resolve_value, signed_scalar,
+    sonatina_type_to_clif_or_err, store_limbs, uses_indirect_value_representation,
 };
+
+/// Copies and fills of at most this many bytes use inline loads and stores.
+/// Larger ones call `memcpy` or `memset`, so their code size is constant.
+pub(super) const INLINE_MEMORY_BYTES: u32 = 128;
+
+/// Copies `size` bytes between distinct, non-overlapping storage.
+pub(super) fn copy_bytes(
+    src: clif::Value,
+    dst: clif::Value,
+    size: u32,
+    config: TargetFrontendConfig,
+    builder: &mut FunctionBuilder,
+) {
+    if size > INLINE_MEMORY_BYTES {
+        let size = builder.ins().iconst(config.pointer_type(), i64::from(size));
+        builder.call_memcpy(config, dst, src, size);
+        return;
+    }
+    for (offset, ty) in storage_chunks(size) {
+        let value = builder.ins().load(ty, MemFlagsData::new(), src, offset);
+        builder.ins().store(MemFlagsData::new(), value, dst, offset);
+    }
+}
+
+/// Copies at most `INLINE_MEMORY_BYTES` between storage that may overlap,
+/// loading every word before storing any.
+pub(super) fn move_bytes(
+    src: clif::Value,
+    dst: clif::Value,
+    size: u32,
+    builder: &mut FunctionBuilder,
+) {
+    debug_assert!(size <= INLINE_MEMORY_BYTES);
+    let words: Vec<_> = storage_chunks(size)
+        .map(|(offset, ty)| {
+            (
+                offset,
+                builder.ins().load(ty, MemFlagsData::new(), src, offset),
+            )
+        })
+        .collect();
+    for (offset, word) in words {
+        builder.ins().store(MemFlagsData::new(), word, dst, offset);
+    }
+}
+
+pub(super) fn zero_bytes(
+    dst: clif::Value,
+    size: u32,
+    config: TargetFrontendConfig,
+    builder: &mut FunctionBuilder,
+) {
+    if size > INLINE_MEMORY_BYTES {
+        let zero = builder.ins().iconst(clif::types::I8, 0);
+        let size = builder.ins().iconst(config.pointer_type(), i64::from(size));
+        builder.call_memset(config, dst, zero, size);
+        return;
+    }
+    for (offset, ty) in storage_chunks(size) {
+        let zero = builder.ins().iconst(ty, 0);
+        builder.ins().store(MemFlagsData::new(), zero, dst, offset);
+    }
+}
+
+pub(super) fn is_undef(function: &Function, value: ValueId) -> bool {
+    matches!(function.dfg.value(value), Value::Undef { .. })
+}
+
+/// Zeroes the bytes of `dst..dst + size` outside the `written` ranges.
+pub(super) fn zero_unwritten(
+    dst: clif::Value,
+    size: u32,
+    mut written: Vec<(u32, u32)>,
+    config: TargetFrontendConfig,
+    builder: &mut FunctionBuilder,
+) {
+    written.sort_unstable();
+    let mut zeroed = 0;
+    for (offset, len) in written.into_iter().chain([(size, 0)]) {
+        if offset > zeroed {
+            let gap = builder.ins().iadd_imm_s(dst, i64::from(zeroed));
+            zero_bytes(gap, offset - zeroed, config, builder);
+        }
+        zeroed = zeroed.max(offset + len);
+    }
+}
+
+/// Loads the scalar or i256 value `result` of type `ty` from `src + offset`.
+pub(super) fn load_value(
+    result: ValueId,
+    ty: Type,
+    src: clif::Value,
+    offset: i32,
+    value_map: &mut ValueMap,
+    pointer_type: clif::Type,
+    builder: &mut FunctionBuilder,
+) -> Result<(), String> {
+    if ty == Type::I256 {
+        let limbs = load_limbs(src, offset, MemFlagsData::new(), builder);
+        value_map.insert_limbs(result, limbs);
+    } else {
+        let clif_ty = sonatina_type_to_clif_or_err(ty, pointer_type)?;
+        let loaded = builder
+            .ins()
+            .load(clif_ty, MemFlagsData::new(), src, offset);
+        value_map.insert(result, loaded);
+    }
+    Ok(())
+}
+
+/// Stores the scalar or i256 value `value` at `dst + offset`.
+pub(super) fn store_value(
+    function: &Function,
+    value: ValueId,
+    dst: clif::Value,
+    offset: i32,
+    value_map: &ValueMap,
+    builder: &mut FunctionBuilder,
+) -> Result<(), String> {
+    if function.dfg.value_ty(value) == Type::I256 {
+        let limbs = resolve_i256(function, value, value_map, builder)?;
+        store_limbs(limbs, dst, offset, MemFlagsData::new(), builder);
+    } else {
+        let value = resolve_value(function, value, value_map, builder)?;
+        builder.ins().store(MemFlagsData::new(), value, dst, offset);
+    }
+    Ok(())
+}
+
+/// Writes the `size`-byte contents of `value` to `dst`. Native undef values
+/// are zero, so an undef value zeroes `dst` without a zeroed temporary.
+pub(super) fn store_indirect(
+    function: &Function,
+    value: ValueId,
+    dst: clif::Value,
+    size: u32,
+    value_map: &ValueMap,
+    config: TargetFrontendConfig,
+    builder: &mut FunctionBuilder,
+) -> Result<(), String> {
+    if is_undef(function, value) {
+        zero_bytes(dst, size, config, builder);
+    } else {
+        let src = resolve_value(function, value, value_map, builder)?;
+        copy_bytes(src, dst, size, config, builder);
+    }
+    Ok(())
+}
+
+/// Resolves `value` like `resolve_value`, but reads an undef aggregate from a
+/// fresh zeroed slot. Consumers that only copy a value use `store_indirect`.
+pub(super) fn resolve_operand(
+    function: &Function,
+    value: ValueId,
+    value_map: &ValueMap,
+    config: TargetFrontendConfig,
+    builder: &mut FunctionBuilder,
+) -> Result<clif::Value, String> {
+    let ty = function.dfg.value_ty(value);
+    if !is_undef(function, value) || !uses_indirect_value_representation(function.ctx(), ty) {
+        return resolve_value(function, value, value_map, builder);
+    }
+    let address = create_stack_slot_for_type(ty, function.ctx(), builder)?;
+    zero_bytes(
+        address,
+        value_storage_size(ty, function.ctx())?,
+        config,
+        builder,
+    );
+    Ok(address)
+}
 
 pub(super) fn translate_bitcast(
     value: clif::Value,
     from_ty: Type,
     to_ty: Type,
     ctx: &ModuleCtx,
-    pointer_type: clif::Type,
+    config: TargetFrontendConfig,
     builder: &mut FunctionBuilder,
 ) -> Result<clif::Value, String> {
     let size = value_storage_size(from_ty, ctx)?;
@@ -31,13 +201,13 @@ pub(super) fn translate_bitcast(
         // for the destination layout, which may require stronger alignment.
         let dest = create_stack_slot_for_type(to_ty, ctx, builder)?;
         if from_indirect {
-            copy_bytes(value, dest, size, builder);
+            copy_bytes(value, dest, size, config, builder);
         } else {
             builder.ins().store(MemFlagsData::new(), value, dest, 0);
         }
         Ok(dest)
     } else {
-        let clif_ty = sonatina_type_to_clif_or_err(to_ty, pointer_type)?;
+        let clif_ty = sonatina_type_to_clif_or_err(to_ty, config.pointer_type())?;
         if from_indirect {
             Ok(builder.ins().load(clif_ty, MemFlagsData::new(), value, 0))
         } else if builder.func.dfg.value_type(value) == clif_ty {
@@ -50,7 +220,7 @@ pub(super) fn translate_bitcast(
     }
 }
 
-pub(super) fn storage_chunks(size: u32) -> impl Iterator<Item = (i32, clif::Type)> {
+fn storage_chunks(size: u32) -> impl Iterator<Item = (i32, clif::Type)> {
     let mut offset = 0;
     std::iter::from_fn(move || {
         let (bytes, ty) = match size - offset {
@@ -71,7 +241,7 @@ pub(super) fn translate_aggregate_projection(
     function: &Function,
     values: &[ValueId],
     inst_name: &str,
-    value_map: &HashMap<ValueId, clif::Value>,
+    value_map: &ValueMap,
     builder: &mut FunctionBuilder,
 ) -> Result<clif::Value, String> {
     let Some((&base_value, indices)) = values.split_first() else {
@@ -99,7 +269,7 @@ pub(super) fn translate_gep(
     ctx: &ModuleCtx,
     function: &Function,
     values: &[ValueId],
-    value_map: &HashMap<ValueId, clif::Value>,
+    value_map: &ValueMap,
     builder: &mut FunctionBuilder,
 ) -> Result<clif::Value, String> {
     let Some((&base_value, indices)) = values.split_first() else {
@@ -146,15 +316,14 @@ pub(super) fn resolve_index(
     function: &Function,
     value: ValueId,
     signed: bool,
-    value_map: &HashMap<ValueId, clif::Value>,
+    value_map: &ValueMap,
     builder: &mut FunctionBuilder,
 ) -> Result<clif::Value, String> {
     let ty = function.dfg.value_ty(value);
-    let value = resolve_value(function, value, value_map, builder)?;
     let value = if ty == Type::I256 {
-        load_i256_limb(value, 0, builder)
+        resolve_i256(function, value, value_map, builder)?[0]
     } else {
-        value
+        resolve_value(function, value, value_map, builder)?
     };
     let value = if signed {
         signed_scalar(value, ty, builder)
@@ -181,6 +350,15 @@ pub(super) fn value_storage_alignment(ty: Type, ctx: &ModuleCtx) -> Result<u64, 
         ));
     }
     Ok(alignment as u64)
+}
+
+pub(super) fn create_stack_slot_for_type(
+    ty: Type,
+    ctx: &ModuleCtx,
+    builder: &mut FunctionBuilder,
+) -> Result<clif::Value, String> {
+    let slot = builder.create_sized_stack_slot(stack_slot_data(ty, ctx)?);
+    Ok(builder.ins().stack_addr(clif::types::I64, slot, 0))
 }
 
 pub(super) fn stack_slot_data(ty: Type, ctx: &ModuleCtx) -> Result<StackSlotData, String> {

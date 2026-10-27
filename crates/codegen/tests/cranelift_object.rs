@@ -184,6 +184,262 @@ fn aggregate_construction_has_linear_code_size_and_executes_large_arrays() {
     }
 }
 
+fn text_size(bytes: &[u8]) -> u64 {
+    object::File::parse(bytes)
+        .unwrap()
+        .sections()
+        .filter(|section| section.kind() == object::SectionKind::Text)
+        .map(|section| section.size())
+        .sum()
+}
+
+fn imports(bytes: &[u8], name: &str) -> bool {
+    object::File::parse(bytes).unwrap().symbols().any(|symbol| {
+        symbol.is_undefined()
+            && symbol
+                .name()
+                .is_ok_and(|symbol| symbol.trim_start_matches('_') == name)
+    })
+}
+
+#[test]
+fn large_aggregate_copies_have_constant_code_size() {
+    // Snapshot loads, chain-head copies, return buffers, stores and undef
+    // zero fills of every length share one bounded code size.
+    for length in [8, 4096] {
+        let triple = native_isa(host_architecture()).triple();
+        let source = format!(
+            r#"target = "{triple}"
+type @Pair = {{[i64; {length}], [i64; {length}]}};
+func inline(never) private %update(v0.[i64; {length}], v1.i64) -> [i64; {length}] {{
+block0:
+    v2.[i64; {length}] = insert_value v0 1.i64 v1;
+    return v2;
+}}
+func public %copy(v0.*[i64; {length}], v1.*[i64; {length}], v2.*@Pair) {{
+block0:
+    v3.[i64; {length}] = mload v0 [i64; {length}];
+    mstore v0 undef.[i64; {length}] [i64; {length}];
+    v4.[i64; {length}] = call %update v3 99.i64;
+    mstore v1 v4 [i64; {length}];
+    v5.@Pair = insert_value undef.@Pair 0.i64 v3;
+    mstore v2 v5 @Pair;
+    return;
+}}
+"#
+        );
+        let module = sonatina_parser::parse_module(&source).unwrap().module;
+        let report = verify_module(&module, &VerifierConfig::for_level(VerificationLevel::Full));
+        assert!(!report.has_errors(), "{report}");
+        for level in [OptLevel::O0, OptLevel::O2] {
+            let artifact = Compile::new(
+                module.clone_for_funcs(&module.funcs()),
+                CraneliftObjectBackend::new(),
+            )
+            .with_opt_level(level)
+            .compile()
+            .unwrap();
+            let bytes = artifact.as_bytes();
+            let text_size = text_size(bytes);
+            assert!(
+                text_size > 0 && text_size < 4096,
+                "[i64; {length}] copies at {level:?} emitted {text_size} text bytes"
+            );
+            // 64-byte arrays and 128-byte pairs stay inline; 32 KiB ones call libc.
+            assert_eq!(imports(bytes, "memcpy"), length > 16, "{length} {level:?}");
+            assert_eq!(imports(bytes, "memset"), length > 16, "{length} {level:?}");
+            #[cfg(feature = "cranelift-jit")]
+            {
+                let artifact = Compile::new(
+                    module.clone_for_funcs(&module.funcs()),
+                    CraneliftJitBackend::new(),
+                )
+                .with_opt_level(level)
+                .compile()
+                .unwrap();
+                let copy: unsafe extern "C" fn(*mut i64, *mut i64, *mut i64) =
+                    unsafe { std::mem::transmute(artifact.function_address("copy").unwrap()) };
+                let length = length as usize;
+                let original: Vec<i64> = (0..length as i64).map(|i| i * 3 - 7).collect();
+                let mut source = original.clone();
+                let mut updated = vec![-1; length];
+                let mut pair = vec![-1; length * 2];
+                unsafe { copy(source.as_mut_ptr(), updated.as_mut_ptr(), pair.as_mut_ptr()) };
+                assert!(source.iter().all(|&word| word == 0), "{level:?}");
+                let mut expected = original.clone();
+                expected[1] = 99;
+                assert_eq!(updated, expected, "{level:?}");
+                assert_eq!(pair[..length], original[..], "{level:?}");
+                assert!(pair[length..].iter().all(|&word| word == 0), "{level:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn undef_insert_chains_zero_only_unwritten_bytes() {
+    // A chain that writes both halves needs no zero fill, one that writes a
+    // half zeroes the other, and padding is zeroed inline.
+    let triple = native_isa(host_architecture()).triple();
+    let cases = [
+        (
+            "v3.@T = insert_value undef.@T 0.i64 v2;\n    v4.@T = insert_value v3 1.i64 v2;",
+            false,
+        ),
+        ("v4.@T = insert_value undef.@T 1.i64 v2;", true),
+    ];
+    for (inserts, zero_fill) in cases {
+        let source = format!(
+            r#"target = "{triple}"
+type @T = {{[i64; 32], [i64; 32]}};
+type @Padded = {{i8, [i64; 32]}};
+func public %build(v0.*[i64; 32], v1.*@T) {{
+block0:
+    v2.[i64; 32] = mload v0 [i64; 32];
+    {inserts}
+    mstore v1 v4 @T;
+    return;
+}}
+func public %pad(v0.*[i64; 32], v1.i8, v2.*@Padded) {{
+block0:
+    v3.[i64; 32] = mload v0 [i64; 32];
+    v4.@Padded = insert_value undef.@Padded 1.i64 v3;
+    v5.@Padded = insert_value v4 0.i64 v1;
+    mstore v2 v5 @Padded;
+    return;
+}}
+"#
+        );
+        let module = sonatina_parser::parse_module(&source).unwrap().module;
+        let report = verify_module(&module, &VerifierConfig::for_level(VerificationLevel::Full));
+        assert!(!report.has_errors(), "{report}");
+        let artifact = CraneliftObjectBackend::new()
+            .compile_module(
+                &module,
+                &BackendOptions {
+                    opt_level: OptLevel::O2,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            imports(artifact.as_bytes(), "memset"),
+            zero_fill,
+            "{inserts}"
+        );
+        #[cfg(feature = "cranelift-jit")]
+        {
+            let artifact = CraneliftJitBackend::new()
+                .compile_module(
+                    &module,
+                    &BackendOptions {
+                        opt_level: OptLevel::O2,
+                    },
+                )
+                .unwrap();
+            let build: unsafe extern "C" fn(*const i64, *mut i64) =
+                unsafe { std::mem::transmute(artifact.function_address("build").unwrap()) };
+            let pad: unsafe extern "C" fn(*const i64, u8, *mut u8) =
+                unsafe { std::mem::transmute(artifact.function_address("pad").unwrap()) };
+            let input: Vec<i64> = (1..=32).collect();
+            let mut output = vec![-1; 64];
+            unsafe { build(input.as_ptr(), output.as_mut_ptr()) };
+            let first: &[i64] = if zero_fill { &[0; 32] } else { &input };
+            assert_eq!(output[..32], first[..], "{inserts}");
+            assert_eq!(output[32..], input[..], "{inserts}");
+            let mut padded = vec![0xa5u8; 8 + 256];
+            unsafe { pad(input.as_ptr(), 7, padded.as_mut_ptr()) };
+            assert_eq!(padded[..8], [7, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(padded[8..16], 1i64.to_le_bytes());
+        }
+    }
+}
+
+/// The number of relocations in text sections that refer to symbol `name`.
+fn references(bytes: &[u8], name: &str) -> usize {
+    let object = object::File::parse(bytes).unwrap();
+    object
+        .sections()
+        .filter(|section| section.kind() == object::SectionKind::Text)
+        .flat_map(|section| section.relocations())
+        .filter(|(_, relocation)| match relocation.target() {
+            object::RelocationTarget::Symbol(index) => object
+                .symbol_by_index(index)
+                .and_then(|symbol| symbol.name())
+                .is_ok_and(|symbol| symbol.trim_start_matches('_') == name),
+            _ => false,
+        })
+        .count()
+}
+
+#[test]
+fn aggregates_skip_temporary_copies() {
+    // Each case's only memcpy calls are the copies its result needs: paths
+    // build results in the return buffer, and a single-use load copies
+    // straight from memory into its consumer.
+    let cases = [
+        (
+            "func private %pair(v0.i1, v1.[i64; 32], v2.[i64; 32]) -> @Pair {
+block0:
+    br v0 block1 block2;
+block1:
+    v3.@Pair = insert_value undef.@Pair 0.i64 v1;
+    v4.@Pair = insert_value v3 1.i64 v2;
+    return v4;
+block2:
+    v5.@Pair = insert_value undef.@Pair 0.i64 v2;
+    v6.@Pair = insert_value v5 1.i64 v1;
+    return v6;
+}",
+            4,
+        ),
+        (
+            "func private %load(v0.*[i64; 32]) -> [i64; 32] {
+block0:
+    v1.[i64; 32] = mload v0 [i64; 32];
+    return v1;
+}",
+            1,
+        ),
+        (
+            "func private %wrap(v0.*[i64; 32], v1.*@Pair) {
+block0:
+    v2.[i64; 32] = mload v0 [i64; 32];
+    v3.@Pair = insert_value undef.@Pair 1.i64 v2;
+    mstore v1 v3 @Pair;
+    return;
+}",
+            2,
+        ),
+        (
+            "func private %update(v0.*@Pair, v1.[i64; 32]) -> @Pair {
+block0:
+    v2.@Pair = mload v0 @Pair;
+    v3.@Pair = insert_value v2 0.i64 v1;
+    return v3;
+}",
+            2,
+        ),
+    ];
+    let triple = native_isa(host_architecture()).triple();
+    for (function, copies) in cases {
+        let source =
+            format!("target = \"{triple}\"\ntype @Pair = {{[i64; 32], [i64; 32]}};\n{function}\n");
+        let module = sonatina_parser::parse_module(&source).unwrap().module;
+        let report = verify_module(&module, &VerifierConfig::for_level(VerificationLevel::Full));
+        assert!(!report.has_errors(), "{report}");
+        for level in [OptLevel::O0, OptLevel::O2] {
+            let artifact = CraneliftObjectBackend::new()
+                .compile_module(&module, &BackendOptions { opt_level: level })
+                .unwrap();
+            assert_eq!(
+                references(artifact.as_bytes(), "memcpy"),
+                copies,
+                "{level:?}\n{function}"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "cranelift-jit")]
 #[test]
 #[ignore = "manual release-profile compile/runtime measurement; run with --release --ignored --nocapture"]
@@ -499,6 +755,84 @@ fn object_backend_emits_external_import_relocations() {
             .sections()
             .any(|section| section.relocations().next().is_some())
     );
+}
+
+/// A chain of `count` public functions: each runs `ops` dependent i64
+/// operations on its argument and returns the next one's result. With
+/// enough instructions, Cranelift compiles the functions in parallel.
+fn function_chain(count: usize, ops: usize) -> String {
+    let triple = TargetTriple::new(
+        host_architecture(),
+        Vendor::Unknown,
+        OperatingSystem::Native,
+    );
+    let mut source = format!("target = \"{triple}\"\n");
+    for i in 0..count {
+        source += &format!("func public %f{i}(v0.i64) -> i64 {{\nblock0:\n");
+        for k in 0..ops {
+            let op = ["add", "xor", "mul"][k % 3];
+            source += &format!("    v{}.i64 = {op} v{k} {}.i64;\n", k + 1, 2 * k + 1);
+        }
+        let result = if i + 1 < count {
+            source += &format!("    v{}.i64 = call %f{} v{ops};\n", ops + 1, i + 1);
+            ops + 1
+        } else {
+            ops
+        };
+        source += &format!("    return v{result};\n}}\n");
+    }
+    source
+}
+
+/// What `%f0` of `function_chain(count, ops)` returns for `input`.
+#[cfg(feature = "cranelift-jit")]
+fn function_chain_result(count: usize, ops: usize, input: i64) -> i64 {
+    (0..count).fold(input, |value, _| {
+        (0..ops).fold(value, |value, k| {
+            let constant = 2 * k as i64 + 1;
+            match k % 3 {
+                0 => value.wrapping_add(constant),
+                1 => value ^ constant,
+                _ => value.wrapping_mul(constant),
+            }
+        })
+    })
+}
+
+#[test]
+fn functions_compiled_in_parallel_give_deterministic_objects() {
+    let source = function_chain(80, 120);
+    let compile = || {
+        let module = sonatina_parser::parse_module(&source).unwrap().module;
+        Compile::new(module, CraneliftObjectBackend::new())
+            .compile()
+            .unwrap()
+            .into_bytes()
+    };
+    let object = compile();
+    assert!(text_size(&object) > 0);
+    for _ in 0..3 {
+        assert!(
+            compile() == object,
+            "parallel compilation changed the object"
+        );
+    }
+}
+
+#[cfg(feature = "cranelift-jit")]
+#[test]
+fn jit_runs_functions_compiled_in_parallel() {
+    let module = sonatina_parser::parse_module(&function_chain(80, 120))
+        .unwrap()
+        .module;
+    let artifact = Compile::new(module, CraneliftJitBackend::new())
+        .compile()
+        .unwrap();
+    let f0: unsafe extern "C" fn(i64) -> i64 =
+        unsafe { std::mem::transmute(artifact.function_address("f0").unwrap()) };
+    for input in [0, 7, -3, i64::MAX] {
+        assert_eq!(unsafe { f0(input) }, function_chain_result(80, 120, input));
+    }
 }
 
 #[test]

@@ -1,5 +1,7 @@
-use sonatina_codegen::{Compile, compile::OptLevel, isa::cranelift::CraneliftJitBackend};
-use sonatina_ir::{I256, Immediate, Type, U256};
+use sonatina_codegen::{
+    Compile, compile::OptLevel, isa::cranelift::CraneliftJitBackend, optim::Pipeline,
+};
+use sonatina_ir::{I256, Immediate, Type, U256, ir_writer::ModuleWriter};
 
 use super::{parse_native_module, parse_verified_native_module};
 
@@ -225,6 +227,510 @@ block0:
                 "{level:?}"
             );
             assert_eq!(output, U256::from(expected).to_little_endian(), "{level:?}");
+        }
+    }
+}
+
+#[test]
+fn aggregate_phi_rotations_copy_through_a_temporary() {
+    // Three phis rotate each loop iteration: every destination is another
+    // copy's source, so the edge saves one phi before overwriting it.
+    for (ty, size) in [("[i64; 20]", 160), ("[i8; 15]", 15)] {
+        let source = format!(
+            r#"
+func public %rotate(v0.*{ty}, v1.*{ty}, v2.*{ty}, v3.i64, v4.*{ty}) {{
+block0:
+    v5.{ty} = mload v0 {ty};
+    v6.{ty} = mload v1 {ty};
+    v7.{ty} = mload v2 {ty};
+    jump block1;
+block1:
+    v8.{ty} = phi (v5 block0) (v9 block1);
+    v9.{ty} = phi (v6 block0) (v10 block1);
+    v10.{ty} = phi (v7 block0) (v8 block1);
+    v11.i64 = phi (0.i64 block0) (v12 block1);
+    v12.i64 = add v11 1.i64;
+    v13.i1 = lt v12 v3;
+    br v13 block1 block2;
+block2:
+    mstore v4 v8 {ty};
+    return;
+}}
+"#
+        );
+        for level in [OptLevel::O0, OptLevel::O2] {
+            let artifact = Compile::new(
+                parse_verified_native_module(&source),
+                CraneliftJitBackend::new(),
+            )
+            .with_opt_level(level)
+            .compile()
+            .unwrap();
+            let rotate: unsafe extern "C" fn(*const u8, *const u8, *const u8, i64, *mut u8) =
+                unsafe { std::mem::transmute(artifact.function_address("rotate").unwrap()) };
+            let inputs: [Vec<u8>; 3] = std::array::from_fn(|i| vec![0x11 * (i as u8 + 1); size]);
+            for count in 1..=7 {
+                let mut output = vec![0; size];
+                unsafe {
+                    rotate(
+                        inputs[0].as_ptr(),
+                        inputs[1].as_ptr(),
+                        inputs[2].as_ptr(),
+                        count,
+                        output.as_mut_ptr(),
+                    )
+                };
+                // After `count` iterations the first phi holds input `count - 1`.
+                let expected = &inputs[(count as usize - 1) % 3];
+                assert_eq!(&output, expected, "{ty} {level:?} {count}");
+            }
+        }
+    }
+}
+
+#[test]
+fn aggregate_phi_reads_a_view_of_another_phi_before_it_changes() {
+    // The backedge sets `v7` to a view into `v6` while replacing `v6`, so
+    // (a, b, c) rotates to (b, c, a) only if `v7` copies first.
+    let source = r#"
+type @Half = {[i64; 20]};
+type @Whole = {@Half, @Half};
+func public %rotate(v0.*@Whole, v1.*@Half, v2.i64, v3.*@Whole, v4.*@Half) {
+block0:
+    v5.@Whole = mload v0 @Whole;
+    v6.@Half = mload v1 @Half;
+    jump block1;
+block1:
+    v7.@Whole = phi (v5 block0) (v12 block1);
+    v8.@Half = phi (v6 block0) (v9 block1);
+    v13.i64 = phi (0.i64 block0) (v14 block1);
+    v9.@Half = extract_value v7 0.i64;
+    v10.@Half = extract_value v7 1.i64;
+    v11.@Whole = insert_value undef.@Whole 0.i64 v10;
+    v12.@Whole = insert_value v11 1.i64 v8;
+    v14.i64 = add v13 1.i64;
+    v15.i1 = lt v14 v2;
+    br v15 block1 block2;
+block2:
+    mstore v3 v7 @Whole;
+    mstore v4 v8 @Half;
+    return;
+}
+"#;
+    for level in [OptLevel::O0, OptLevel::O1, OptLevel::O2] {
+        let artifact = Compile::new(
+            parse_verified_native_module(source),
+            CraneliftJitBackend::new(),
+        )
+        .with_opt_level(level)
+        .compile()
+        .unwrap();
+        let rotate: unsafe extern "C" fn(*const i64, *const i64, i64, *mut i64, *mut i64) =
+            unsafe { std::mem::transmute(artifact.function_address("rotate").unwrap()) };
+        let halves: [[i64; 20]; 3] =
+            std::array::from_fn(|half| std::array::from_fn(|i| (half * 100 + i) as i64));
+        let whole: Vec<i64> = halves[0].iter().chain(&halves[1]).copied().collect();
+        for count in 1..=6 {
+            let mut state = [0usize, 1, 2];
+            for _ in 1..count {
+                state.rotate_left(1);
+            }
+            let mut output_whole = vec![0; 40];
+            let mut output_half = [0; 20];
+            unsafe {
+                rotate(
+                    whole.as_ptr(),
+                    halves[2].as_ptr(),
+                    count,
+                    output_whole.as_mut_ptr(),
+                    output_half.as_mut_ptr(),
+                )
+            };
+            assert_eq!(output_whole[..20], halves[state[0]], "{level:?} {count}");
+            assert_eq!(output_whole[20..], halves[state[1]], "{level:?} {count}");
+            assert_eq!(output_half, halves[state[2]], "{level:?} {count}");
+        }
+    }
+}
+
+#[test]
+fn aggregate_phi_copies_stay_on_their_edge() {
+    // `v5` stays live on the loop exit while the backedge replaces it, and
+    // a br_table reaches aggregate phis in several successors. Copies for
+    // one edge must not clobber the values another edge carries. The exit
+    // starts with a multi-result instruction rather than a phi.
+    let source = r#"
+func public %select(v0.*[i64; 20], v1.i64, v2.i64, v3.*[i64; 20]) {
+block0:
+    v4.[i64; 20] = mload v0 [i64; 20];
+    jump block1;
+block1:
+    v5.[i64; 20] = phi (v4 block0) (v8 block1);
+    v6.i64 = phi (0.i64 block0) (v9 block1);
+    v7.i64 = extract_value v5 0.i64;
+    v8.[i64; 20] = insert_value v5 0.i64 v6;
+    v9.i64 = add v6 1.i64;
+    v10.i1 = lt v9 v1;
+    br v10 block1 block2;
+block2:
+    (v20.i64, v21.i1) = uaddo v2 0.i64;
+    br_table v20 block5 (0.i64 block3) (1.i64 block4);
+block3:
+    jump block6;
+block4:
+    jump block6;
+block5:
+    jump block6;
+block6:
+    v11.[i64; 20] = phi (v5 block3) (v8 block4) (undef.[i64; 20] block5);
+    v12.i64 = phi (v7 block3) (v9 block4) (-1.i64 block5);
+    v13.[i64; 20] = insert_value v11 19.i64 v12;
+    mstore v3 v13 [i64; 20];
+    return;
+}
+"#;
+    for level in [OptLevel::O0, OptLevel::O1, OptLevel::O2] {
+        let artifact = Compile::new(
+            parse_verified_native_module(source),
+            CraneliftJitBackend::new(),
+        )
+        .with_opt_level(level)
+        .compile()
+        .unwrap();
+        let select: unsafe extern "C" fn(*const i64, i64, i64, *mut i64) =
+            unsafe { std::mem::transmute(artifact.function_address("select").unwrap()) };
+        let input: [i64; 20] = std::array::from_fn(|i| 50 + i as i64);
+        for count in [1, 2, 5] {
+            for choice in [0, 1, 2] {
+                let mut output = [0; 20];
+                unsafe { select(input.as_ptr(), count, choice, output.as_mut_ptr()) };
+                // The final iteration reads phi `v5`, whose word zero the
+                // previous iteration set to `count - 2`.
+                let mut last = input;
+                if count > 1 {
+                    last[0] = count - 2;
+                }
+                let expected = match choice {
+                    0 => {
+                        let mut expected = last;
+                        expected[19] = last[0];
+                        expected
+                    }
+                    1 => {
+                        let mut expected = last;
+                        expected[0] = count - 1;
+                        expected[19] = count;
+                        expected
+                    }
+                    _ => {
+                        let mut expected = [0; 20];
+                        expected[19] = -1;
+                        expected
+                    }
+                };
+                assert_eq!(output, expected, "{level:?} {count} {choice}");
+            }
+        }
+    }
+}
+
+/// Checks `%select`, which loads a `ty` scrutinee through its first argument
+/// and dispatches on it with a `br_table`. The `i`th of `keys` returns `i`,
+/// `shared` keys branch straight to the merge block and return the second
+/// argument, and every other value takes the default and returns -1.
+fn check_br_table(ty: Type, keys: &[i128], shared: &[i128], probes: &[i128]) {
+    let name = match ty {
+        Type::I8 => "i8",
+        Type::I32 => "i32",
+        Type::I64 => "i64",
+        Type::I128 => "i128",
+        Type::I256 => "i256",
+        _ => unreachable!(),
+    };
+    let imm = |value: i128| Immediate::from_i256(I256::from(value), ty);
+    let default = keys.len() + 1;
+    let merge = keys.len() + 2;
+    let table: String = keys
+        .iter()
+        .enumerate()
+        .map(|(i, &key)| format!(" ({}.{name} block{})", imm(key), i + 1))
+        .chain(
+            shared
+                .iter()
+                .map(|&key| format!(" ({}.{name} block{merge})", imm(key))),
+        )
+        .collect();
+    let blocks: String = (1..=default)
+        .map(|block| format!("block{block}:\n    jump block{merge};\n"))
+        .collect();
+    let inputs: String = (0..keys.len())
+        .map(|i| format!(" ({i}.i64 block{})", i + 1))
+        .chain((!shared.is_empty()).then(|| " (v1 block0)".to_string()))
+        .collect();
+    let source = format!(
+        "func public %select(v0.*{name}, v1.i64) -> i64 {{
+block0:
+    v2.{name} = mload v0 {name};
+    br_table v2 block{default}{table};
+{blocks}block{merge}:
+    v3.i64 = phi{inputs} (-1.i64 block{default});
+    return v3;
+}}
+"
+    );
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let artifact = Compile::new(
+            parse_verified_native_module(&source),
+            CraneliftJitBackend::new(),
+        )
+        .with_opt_level(level)
+        .compile()
+        .unwrap_or_else(|errors| panic!("{source}\n{errors:?}"));
+        let select: unsafe extern "C" fn(*const u8, i64) -> i64 =
+            unsafe { std::mem::transmute(artifact.function_address("select").unwrap()) };
+        for &probe in probes {
+            let probe = imm(probe);
+            let bytes = probe
+                .zext(Type::I256)
+                .as_i256()
+                .to_u256()
+                .to_little_endian();
+            let expected = if let Some(i) = keys.iter().position(|&key| imm(key) == probe) {
+                i as i64
+            } else if shared.iter().any(|&key| imm(key) == probe) {
+                77
+            } else {
+                -1
+            };
+            let actual = unsafe { select(bytes.as_ptr(), 77) };
+            assert_eq!(actual, expected, "{level:?} {name} {probe}\n{source}");
+        }
+    }
+}
+
+#[test]
+fn br_table_dense_keys() {
+    let probes: Vec<_> = (-3..=20)
+        .chain([i32::MIN as i128, i32::MAX as i128])
+        .collect();
+    check_br_table(Type::I32, &(0..16).collect::<Vec<_>>(), &[16, 17], &probes);
+    // In unsigned order the keys are two ranges, 0..=3 and 252..=255.
+    check_br_table(
+        Type::I8,
+        &(-4..=3).collect::<Vec<_>>(),
+        &[-128, 127],
+        &(-128..=127).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn br_table_holes_in_dense_keys_take_the_default() {
+    // Every other value is a key: one jump table covers them, with the
+    // default in its holes.
+    let keys: Vec<_> = (0..12).map(|key| key * 2).collect();
+    check_br_table(Type::I32, &keys, &[25], &(-3..=30).collect::<Vec<_>>());
+}
+
+#[test]
+fn br_table_sparse_keys() {
+    let keys = [
+        -5,
+        0,
+        3,
+        1000,
+        1 << 40,
+        i64::MIN as i128,
+        i64::MAX as i128,
+        77777,
+    ];
+    let probes: Vec<_> = keys
+        .iter()
+        .chain(&[9, 2, -1])
+        .flat_map(|&key: &i128| [key - 1, key, key + 1])
+        .collect();
+    check_br_table(Type::I64, &keys, &[9], &probes);
+    let wide = [0, 1, 1 << 64, 1 << 100, -1, i128::MIN];
+    let probes: Vec<_> = wide
+        .iter()
+        .chain(&[2])
+        .flat_map(|&key: &i128| [key.wrapping_sub(1), key, key.wrapping_add(1)])
+        .collect();
+    check_br_table(Type::I128, &wide, &[2], &probes);
+}
+
+#[test]
+fn br_table_on_i256_switches_on_the_low_limb() {
+    // Every key fits the low limb, so a scrutinee with any upper bit set
+    // takes the default even when its low limb matches a key.
+    let probes: Vec<_> = (-2..=8)
+        .chain([(1 << 64) + 2, (1 << 127) + 3, 1 << 64, -(1 << 64) + 1])
+        .collect();
+    check_br_table(Type::I256, &[0, 1, 2, 3, 5, 1000], &[6], &probes);
+}
+
+#[test]
+fn br_table_with_only_a_default() {
+    for ty in [Type::I64, Type::I256] {
+        check_br_table(ty, &[], &[], &[0, 1, -1, 1 << 70]);
+    }
+}
+
+#[test]
+fn br_table_with_few_keys() {
+    check_br_table(Type::I8, &[-1, 0], &[5], &(-128..=127).collect::<Vec<_>>());
+    check_br_table(
+        Type::I128,
+        &[1 << 100],
+        &[-1],
+        &[0, 1, -1, -2, 1 << 100, (1 << 100) + 1, 1 << 36],
+    );
+    check_br_table(
+        Type::I256,
+        &[0, 7],
+        &[-1],
+        &[0, 7, 8, -1, -2, (1 << 64) + 7, 1 << 64],
+    );
+}
+
+#[test]
+fn compare_trees_become_switches_with_the_same_results() {
+    // The shape Fe gives an `if`/`else if` chain over one integer: a tree of
+    // blocks that each compare it with a constant.
+    let source = "func public %cost(v0.i16) -> i64 {
+block0:
+    v1.i1 = slt v0 -8.i16;
+    br v1 block20 block1;
+block1:
+    v2.i1 = sgt v0 60.i16;
+    br v2 block20 block2;
+block2:
+    v3.i1 = eq v0 2.i16;
+    br v3 block21 block3;
+block3:
+    v4.i1 = slt v0 4.i16;
+    br v4 block4 block5;
+block5:
+    v5.i1 = sgt v0 7.i16;
+    br v5 block4 block21;
+block4:
+    v6.i1 = eq v0 11.i16;
+    br v6 block21 block6;
+block6:
+    v7.i1 = is_zero v0;
+    br v7 block22 block7;
+block7:
+    v8.i1 = lt v0 24.i16;
+    br v8 block23 block8;
+block8:
+    v9.i1 = sle v0 40.i16;
+    br v9 block24 block25;
+block20:
+    return 99.i64;
+block21:
+    return 5.i64;
+block22:
+    return 1.i64;
+block23:
+    return 3.i64;
+block24:
+    return 4.i64;
+block25:
+    return 6.i64;
+}
+";
+    let cost = |v: i16| -> i64 {
+        if !(-8..=60).contains(&v) {
+            99
+        } else if v == 2 || (4..=7).contains(&v) || v == 11 {
+            5
+        } else if v == 0 {
+            1
+        } else if (v as u16) < 24 {
+            3
+        } else if v <= 40 {
+            4
+        } else {
+            6
+        }
+    };
+
+    let mut optimized = parse_verified_native_module(source);
+    Pipeline::native(OptLevel::O2).run(&mut optimized);
+    let ir = ModuleWriter::new(&optimized).dump_string();
+    assert!(
+        ir.contains("br_table") && !ir.contains(" lt ") && !ir.contains(" slt "),
+        "{ir}"
+    );
+
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let artifact = Compile::new(
+            parse_verified_native_module(source),
+            CraneliftJitBackend::new(),
+        )
+        .with_opt_level(level)
+        .compile()
+        .unwrap_or_else(|errors| panic!("{level:?}: {errors:?}"));
+        let run: unsafe extern "C" fn(i16) -> i64 =
+            unsafe { std::mem::transmute(artifact.function_address("cost").unwrap()) };
+        for v in i16::MIN..=i16::MAX {
+            assert_eq!(unsafe { run(v) }, cost(v), "{level:?} {v}");
+        }
+    }
+}
+
+#[test]
+fn constant_arms_joined_by_a_phi_become_switches_with_the_same_results() {
+    // A `match` whose arms produce constants: each test branches to one
+    // join, and the join's phi takes the arm's value.
+    let source = "func public %arm(v0.i16) -> i64 {
+block0:
+    v1.i1 = eq v0 1.i16;
+    br v1 block9 block1;
+block1:
+    v2.i1 = eq v0 2.i16;
+    br v2 block9 block2;
+block2:
+    v3.i1 = eq v0 -3.i16;
+    br v3 block9 block3;
+block3:
+    v4.i1 = eq v0 10.i16;
+    br v4 block9 block4;
+block4:
+    v5.i1 = eq v0 4.i16;
+    br v5 block9 block5;
+block5:
+    jump block9;
+block9:
+    v6.i64 = phi (30.i64 block0) (50.i64 block1) (30.i64 block2) (100.i64 block3) (50.i64 block4) (0.i64 block5);
+    return v6;
+}
+";
+    let arm = |v: i16| -> i64 {
+        match v {
+            1 | -3 => 30,
+            2 | 4 => 50,
+            10 => 100,
+            _ => 0,
+        }
+    };
+
+    let mut optimized = parse_verified_native_module(source);
+    Pipeline::native(OptLevel::O2).run(&mut optimized);
+    let ir = ModuleWriter::new(&optimized).dump_string();
+    assert!(ir.contains("br_table") && !ir.contains(" eq "), "{ir}");
+
+    for level in [OptLevel::O0, OptLevel::O2] {
+        let artifact = Compile::new(
+            parse_verified_native_module(source),
+            CraneliftJitBackend::new(),
+        )
+        .with_opt_level(level)
+        .compile()
+        .unwrap_or_else(|errors| panic!("{level:?}: {errors:?}"));
+        let run: unsafe extern "C" fn(i16) -> i64 =
+            unsafe { std::mem::transmute(artifact.function_address("arm").unwrap()) };
+        for v in i16::MIN..=i16::MAX {
+            assert_eq!(unsafe { run(v) }, arm(v), "{level:?} {v}");
         }
     }
 }

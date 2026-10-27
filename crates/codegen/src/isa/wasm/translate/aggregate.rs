@@ -4,8 +4,9 @@
 //! address of an immutable snapshot in memory. `insert_value` and `obj.load`
 //! make a new snapshot, `extract_value` of an aggregate is a view into its
 //! source, and a function passes aggregates by address and returns one through
-//! a buffer that its caller provides. `obj.alloc` is a slot of the frame unless
-//! the object must outlive it, in which case it comes from the arena.
+//! a buffer that its caller provides. `obj.alloc` is a slot of the frame:
+//! the front end promises that no reference to it is used after the function
+//! returns. The arena serves only `mem.alloc.dynamic`.
 //!
 //! Frame slots are static: an instruction in a loop uses the same slot on every
 //! iteration, as `alloca` does on the native target.
@@ -634,15 +635,9 @@ impl FunctionTranslator<'_> {
         inst_id: InstId,
         ty: Type,
     ) -> Result<(), WasmError> {
-        let result = self.result_of(inst_id, 0, self.result_ty(inst_id)?)?;
         let (size, align) = self.layout_of(ty)?;
-        let address = if self.heap_roots.contains(&result) {
-            let size = self.emit(wb).c32(size);
-            self.arena_alloc(wb, size)?
-        } else {
-            let slot = self.slot(size, align)?;
-            self.slot_address(wb, slot)?
-        };
+        let slot = self.slot(size, align)?;
+        let address = self.slot_address(wb, slot)?;
         let result_ty = self.result_ty(inst_id)?;
         self.define(inst_id, 0, address, result_ty)
     }

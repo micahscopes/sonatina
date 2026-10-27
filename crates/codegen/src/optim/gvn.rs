@@ -590,8 +590,8 @@ impl GvnSolver {
         };
 
         // If insn has a side effect, create new class if the value still belongs to
-        // `INITIAL_CLASS`.
-        if !func.dfg.has_value_semantics(insn) && object_read.is_none() {
+        // `INITIAL_CLASS`. A phi has none: its class follows its inputs.
+        if func.dfg.effect_summary(insn).has_effect() && object_read.is_none() {
             if self.value_class(inst_result) == INITIAL_CLASS {
                 let class = self.make_class(gvn_insn, None);
                 let move_result = self.assign_class(inst_result, class);
@@ -647,15 +647,13 @@ impl GvnSolver {
         inst_result: ValueId,
     ) -> Option<GvnInsn> {
         let read = object_memory?.read_state(insn)?;
-        if read.may_be_undef() {
-            return None;
-        }
-
-        // ObjectMemory proves the demanded contents defined, including
-        // reconstructed aggregates and immutable load snapshots. Its covering
-        // carrier proof is stronger than the generic SSA walk.
         let key = read.key();
-        if let CarrierSource::Value(value) = key.source
+        // Forwarding the carried value needs ObjectMemory's proof that the
+        // demanded contents are defined, including reconstructed aggregates
+        // and immutable load snapshots; it is stronger than the generic SSA
+        // walk. Reads of the same contents return the same bits either way.
+        if !read.may_be_undef()
+            && let CarrierSource::Value(value) = key.source
             && key.carrier_slice == key.read_slice
             && func.dfg.value_ty(value) == func.dfg.value_ty(inst_result)
         {
@@ -2400,7 +2398,7 @@ impl<'a> RedundantCodeRemover<'a> {
 
                     let mut changed = false;
                     let mut aliased_results = FxHashSet::default();
-                    if func.dfg.has_value_semantics(insn)
+                    if !func.dfg.effect_summary(insn).has_effect()
                         || self.inst_is_eliminable_object_read(func, object_memory, insn)
                     {
                         for &inst_result in &inst_results {
@@ -2513,10 +2511,11 @@ impl<'a> RedundantCodeRemover<'a> {
             return false;
         };
         // The analysis predates code removal, so its carrier may already have
-        // been erased. Only the initialization proof is needed to eliminate a read.
+        // been erased. A read with a state was numbered by what it reads, which
+        // is all its elimination needs.
         object_memory
             .and_then(|memory| memory.read_state(insn))
-            .is_some_and(|read| !read.may_be_undef())
+            .is_some()
     }
 
     /// Returns `true` if the `value_phi` can be resolved, i.e. all phi args are dominated by

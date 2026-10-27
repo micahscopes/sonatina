@@ -23,7 +23,7 @@ use super::{
     },
     object_alias::ObjectAliasFacts,
     object_locality::{object_root_stays_local_with_effects, packed_reference_stays_packed},
-    object_reachability::reference_bearing,
+    object_reachability::object_reference_bearing,
     object_tracking::{AggregateFacts, objref_element_ty, single_result_value},
     provenance::{
         CompleteProvenance, CompleteRootSet, MayProvenance, Projection, ProvenanceSnapshot,
@@ -70,7 +70,7 @@ pub(crate) struct NonArgObjectEffects {
     pub unknown: ObjectMayEffects,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ObjectCaptureDestination {
     Arg {
         index: usize,
@@ -81,14 +81,14 @@ pub(crate) enum ObjectCaptureDestination {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ObjectCaptureEffect {
     pub dst: ObjectCaptureDestination,
     pub src_arg: usize,
     pub src_slice: shape::AggregateSlice,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct RootCaptureEffect {
     dst_slice: shape::AggregateSlice,
     /// A target the slice may reach directly: a stored reference's target, or
@@ -182,12 +182,11 @@ pub(crate) struct ObjectArgEffect {
     /// May-write slices; these never establish overwrite or initialization.
     pub writes: SliceSet,
     pub materializes_stack: bool,
-    pub materializes_heap: bool,
 }
 
 impl ObjectArgEffect {
     pub(crate) fn needs_unknown_object_barrier(&self) -> bool {
-        self.escapes || self.materializes_stack || self.materializes_heap
+        self.escapes || self.materializes_stack
     }
 }
 
@@ -340,7 +339,6 @@ impl ObjectEffectSummary {
             let whole = whole_root_slice(layout_cache, module, elem_ty);
             effect.escapes = true;
             effect.local_only = false;
-            effect.materializes_heap = true;
             effect.reads = SliceSet::whole_root(whole.leaf_count);
             effect.writes = SliceSet::whole_root(whole.leaf_count);
         }
@@ -362,7 +360,6 @@ impl ObjectArgEffect {
             reads: SliceSet::empty(total_leaves),
             writes: SliceSet::empty(total_leaves),
             materializes_stack: false,
-            materializes_heap: false,
         }
     }
 }
@@ -540,7 +537,7 @@ fn compute_summary_for_func(
             let ty = function.dfg.value_ty(value);
             !matches!(ty, Type::Compound(_))
                 || !checked_types.insert(ty)
-                || !reference_bearing(function, value)
+                || !object_reference_bearing(function, value)
         }) {
             return compute_reference_free_summary(function, summaries, layout_cache, summary);
         }
@@ -700,18 +697,6 @@ fn compute_summary_for_func(
                         &root_captures,
                         effect_provenance,
                         *mat_stack.object(),
-                        false,
-                    );
-                    continue;
-                }
-
-                if let Some(mat_heap) = function.dfg.downcast::<&data::ObjMaterializeHeap>(inst) {
-                    record_materialize(
-                        &mut summary,
-                        &root_captures,
-                        effect_provenance,
-                        *mat_heap.object(),
-                        true,
                     );
                     continue;
                 }
@@ -726,7 +711,7 @@ fn compute_summary_for_func(
                     for &value in ret
                         .args()
                         .iter()
-                        .filter(|&&value| unclassified && reference_bearing(function, value))
+                        .filter(|&&value| unclassified && object_reference_bearing(function, value))
                     {
                         for (src_arg, _) in
                             capture_source_slices(&root_captures, effect_provenance, value, None)
@@ -750,8 +735,12 @@ fn compute_summary_for_func(
                     // not references embedded in SSA aggregate values. Crossing
                     // that boundary lets the reference escape our tracked uses,
                     // as through an aggregate return, a later call or an
-                    // extraction, unless it stays packed.
-                    for &value in values {
+                    // extraction, unless it stays packed. A raw pointer
+                    // publishes what it reaches instead.
+                    for &value in values
+                        .iter()
+                        .filter(|&&value| object_reference_bearing(function, value))
+                    {
                         let sources =
                             capture_source_slices(&root_captures, effect_provenance, value, None);
                         if sources.is_empty()
@@ -799,7 +788,7 @@ fn compute_summary_for_func(
             effect_provenance,
             &return_analysis.returned_fresh_slices,
         );
-        dedup_capture_effects(&mut summary.captures);
+        canonicalize_capture_effects(&mut summary.captures);
         summary.ret_effect = return_analysis.ret_effect;
         for idx in 0..summary.arg_effects.len() {
             summary.arg_effects[idx].local_only = !summary.arg_effects[idx]
@@ -903,12 +892,14 @@ fn apply_inst_capture_transfer(
     match capture_relevant_inst(function, inst) {
         Some(CaptureRelevantInst::ObjStore(obj_store)) => {
             kill_capture_access(root_captures, effect_provenance, *obj_store.object(), None);
-            record_capture(
-                root_captures,
-                effect_provenance,
-                *obj_store.object(),
-                *obj_store.value(),
-            );
+            if object_reference_bearing(function, *obj_store.value()) {
+                record_capture(
+                    root_captures,
+                    effect_provenance,
+                    *obj_store.object(),
+                    *obj_store.value(),
+                );
+            }
         }
         Some(CaptureRelevantInst::EnumSetTag(enum_set_tag)) => {
             kill_capture_access(
@@ -1443,7 +1434,6 @@ fn merge_call_arg_effect(
             }
             summary.arg_effects[src_arg].escapes |= callee_effect.escapes;
             summary.arg_effects[src_arg].materializes_stack |= callee_effect.materializes_stack;
-            summary.arg_effects[src_arg].materializes_heap |= callee_effect.materializes_heap;
         }
     }
 }
@@ -1459,7 +1449,6 @@ fn merge_effect_into_arg(
     };
     arg_effect.escapes |= callee_effect.escapes;
     arg_effect.materializes_stack |= callee_effect.materializes_stack;
-    arg_effect.materializes_heap |= callee_effect.materializes_heap;
     map_into_slice_set(&mut arg_effect.reads, base_slice, &callee_effect.reads);
     map_into_slice_set(&mut arg_effect.writes, base_slice, &callee_effect.writes);
 }
@@ -1522,7 +1511,7 @@ fn record_enum_variant_captures(
     variant: sonatina_ir::types::EnumVariantRef,
 ) {
     for (field_idx, &value) in values.iter().enumerate() {
-        if !reference_bearing(function, value) {
+        if !object_reference_bearing(function, value) {
             continue;
         }
         let Some(field_slice) = shape::enum_variant_field_slice(
@@ -1761,9 +1750,11 @@ fn push_capture_effect(summary: &mut ObjectEffectSummary, capture: ObjectCapture
     summary.captures.push(capture);
 }
 
-fn dedup_capture_effects(captures: &mut Vec<ObjectCaptureEffect>) {
-    let mut seen = FxHashSet::default();
-    captures.retain(|capture| seen.insert(*capture));
+/// Sorts and dedups `captures`, so the effect SCC fixpoint compares capture
+/// sets rather than the order a pass found them in.
+fn canonicalize_capture_effects(captures: &mut Vec<ObjectCaptureEffect>) {
+    captures.sort_unstable();
+    captures.dedup();
 }
 
 fn map_into_slice_set(
@@ -1931,7 +1922,7 @@ fn record_unmapped_publication(
         return;
     }
     for &value in values {
-        if reference_bearing(function, value) {
+        if object_reference_bearing(function, value) {
             summary.non_arg.unknown.publishes = true;
             for (src_arg, _) in capture_source_slices(root_captures, capture_ctx, value, None) {
                 summary.arg_effects[src_arg].escapes = true;
@@ -1945,24 +1936,19 @@ fn record_materialize(
     root_captures: &RootCaptureMap,
     capture_ctx: EffectProvenance<'_>,
     object: ValueId,
-    heap: bool,
 ) {
     if capture_ctx.has_unmapped_alternative(object) {
         summary.non_arg.unknown.publishes = true;
     }
     for root_idx in capture_ctx.arg_root_indices_for_observation(object) {
-        summary.arg_effects[root_idx].materializes_stack |= !heap;
-        summary.arg_effects[root_idx].materializes_heap |= heap;
-        summary.arg_effects[root_idx].escapes |= heap;
+        summary.arg_effects[root_idx].materializes_stack = true;
     }
     let mut seen = FxHashSet::default();
     for (src_arg, _) in capture_source_slices(root_captures, capture_ctx, object, None) {
         if !seen.insert(src_arg) {
             continue;
         }
-        summary.arg_effects[src_arg].materializes_stack |= !heap;
-        summary.arg_effects[src_arg].materializes_heap |= heap;
-        summary.arg_effects[src_arg].escapes |= heap;
+        summary.arg_effects[src_arg].materializes_stack = true;
     }
 }
 
@@ -2119,11 +2105,12 @@ mod tests {
 
     #[test]
     fn reference_aggregate_formals_require_alias_barriers() {
+        // A raw pointer publishes what it reaches when it enters an aggregate.
         for (ty, barrier) in [
             ("@Wrapper", true),
             ("@Choice", true),
             ("[@Wrapper; 2]", true),
-            ("@Pointers", true),
+            ("@Pointers", false),
             ("@Words", false),
             ("[@Wrapper; 0]", false),
         ] {
@@ -2167,6 +2154,33 @@ block0:
                 }
             }
         }
+    }
+
+    #[test]
+    fn raw_pointer_fields_keep_their_holder_local() {
+        let module = parse_test_module(
+            r#"
+target = "evm-ethereum-osaka"
+type @Buffer = { *i8, i256 };
+declare external %release(*i8);
+func private %grow(v0.objref<@Buffer>) {
+block0:
+    v1.objref<*i8> = obj.proj v0 0.i256;
+    v2.*i8 = obj.load v1;
+    call %release v2;
+    v3.*i8 = mem.alloc_dynamic 64.i256;
+    obj.store v1 v3;
+    return;
+}
+"#,
+        );
+        let summaries = compute_object_effect_summaries(&module);
+        let summary = &summaries[&lookup_func(&module, "grow")];
+        // Neither the old buffer passed on nor the new one stored carries a
+        // reference to the holder's contents.
+        assert!(summary.captures.is_empty(), "{:?}", summary.captures);
+        assert!(!summary.arg_effects[0].escapes);
+        assert!(summary.arg_effects[0].local_only);
     }
 
     #[test]

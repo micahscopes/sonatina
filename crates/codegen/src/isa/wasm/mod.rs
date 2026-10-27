@@ -11,10 +11,8 @@ use sonatina_verifier::{VerifierConfig, verify_function_signature};
 
 use crate::{
     backend::{Backend, BackendOptions},
-    transform::aggregate::{
-        EnumLowerToProduct, cleanup::DeadPureInstCleanup, combine::AggregateCombine,
-        object_abi::legalize_native_object_returns,
-    },
+    optim::Pipeline,
+    transform::aggregate::{EnumLowerToProduct, frame_lifetimes::check_frame_lifetimes},
 };
 
 /// The import module used for `extern` functions unless
@@ -130,9 +128,8 @@ impl WasmBackend {
 pub const DEFAULT_STACK_BYTES: u32 = memory::DEFAULT_STACK_BYTES;
 
 /// Prepare a copy of the module for translation, as the native backend does:
-/// enums become products, products that are built and taken apart at once are
-/// combined, and the lifetime of objects returned by private functions is
-/// settled.
+/// enums become products, and objects are checked against the frame rule of
+/// `obj.alloc`: no reference outlives its frame.
 fn legalize_module(module: &Module) -> Result<(), WasmError> {
     EnumLowerToProduct.run(module);
     for func in module.funcs() {
@@ -141,20 +138,16 @@ fn legalize_module(module: &Module) -> Result<(), WasmError> {
             return Err(WasmError::Invalid(report.to_string()));
         }
     }
-    for func in module.funcs() {
-        module.func_store.modify(func, |function| {
-            AggregateCombine::default().run(function);
-            function.rebuild_users();
-            DeadPureInstCleanup::default().run_with_current_users(function);
-            function.rebuild_users();
-        });
-    }
-    legalize_native_object_returns(module).map_err(WasmError::Unsupported)
+    check_frame_lifetimes(module).map_err(WasmError::Unsupported)
 }
 
 impl Backend for WasmBackend {
     type Artifact = WasmArtifact;
     type Error = WasmError;
+
+    fn pipeline(&self, options: &BackendOptions) -> Pipeline {
+        Pipeline::native(options.opt_level)
+    }
 
     fn compile_module(
         &self,

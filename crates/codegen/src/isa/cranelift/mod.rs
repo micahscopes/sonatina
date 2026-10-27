@@ -25,10 +25,8 @@ use sonatina_verifier::{VerifierConfig, verify_function_signature};
 use crate::{
     backend::{Backend, BackendOptions},
     compile::OptLevel,
-    transform::aggregate::{
-        EnumLowerToProduct, cleanup::DeadPureInstCleanup, combine::AggregateCombine,
-        object_abi::legalize_native_object_returns,
-    },
+    optim::Pipeline,
+    transform::aggregate::{EnumLowerToProduct, frame_lifetimes::check_frame_lifetimes},
 };
 
 #[derive(Debug)]
@@ -78,17 +76,28 @@ impl CraneliftObjectBackend {
         is_pic: bool,
     ) -> Result<settings::Builder, CraneliftError> {
         let mut builder = settings::builder();
-        builder
-            .set("opt_level", cranelift_opt_level(options.opt_level))
-            .map_err(|error| CraneliftError::Compilation(error.to_string()))?;
-        builder
-            .set("is_pic", if is_pic { "true" } else { "false" })
-            .map_err(|error| CraneliftError::Compilation(error.to_string()))?;
-        // The native ABI passes i128 scalars directly. Cranelift's x86_64
-        // calling conventions require LLVM ABI extensions for these values.
-        builder
-            .set("enable_llvm_abi_extensions", "true")
-            .map_err(|error| CraneliftError::Compilation(error.to_string()))?;
+        for (name, value) in [
+            ("opt_level", cranelift_opt_level(options.opt_level)),
+            ("is_pic", if is_pic { "true" } else { "false" }),
+            // The native ABI passes i128 scalars directly. Cranelift's x86_64
+            // calling conventions require LLVM ABI extensions for these values.
+            ("enable_llvm_abi_extensions", "true"),
+            // Like Sonatina's own IR checks, Cranelift's verifier runs only
+            // in builds with debug assertions: it can take most of the
+            // backend's time.
+            (
+                "enable_verifier",
+                if cfg!(debug_assertions) {
+                    "true"
+                } else {
+                    "false"
+                },
+            ),
+        ] {
+            builder
+                .set(name, value)
+                .map_err(|error| CraneliftError::Compilation(error.to_string()))?;
+        }
         Ok(builder)
     }
 
@@ -165,6 +174,10 @@ impl Backend for CraneliftJitBackend {
     type Artifact = CraneliftJitArtifact;
     type Error = CraneliftError;
 
+    fn pipeline(&self, options: &BackendOptions) -> Pipeline {
+        Pipeline::native(options.opt_level)
+    }
+
     fn compile_module(
         &self,
         module: &Module,
@@ -207,6 +220,10 @@ impl Backend for CraneliftObjectBackend {
     type Artifact = CraneliftObjectArtifact;
     type Error = CraneliftError;
 
+    fn pipeline(&self, options: &BackendOptions) -> Pipeline {
+        Pipeline::native(options.opt_level)
+    }
+
     fn compile_module(
         &self,
         module: &Module,
@@ -241,18 +258,7 @@ fn legalize_module(module: &Module) -> Result<(), String> {
             return Err(report.to_string());
         }
     }
-    // Product construction followed by projection does not capture a reference.
-    // Remove that representational round trip before lifetime summaries inspect
-    // SSA aggregates; this is required legalization even without optimization.
-    for func in module.funcs() {
-        module.func_store.modify(func, |function| {
-            AggregateCombine::default().run(function);
-            function.rebuild_users();
-            DeadPureInstCleanup::default().run_with_current_users(function);
-            function.rebuild_users();
-        });
-    }
-    legalize_native_object_returns(module)
+    check_frame_lifetimes(module)
 }
 
 fn cranelift_opt_level(level: OptLevel) -> &'static str {
@@ -296,7 +302,32 @@ mod tests {
     use cranelift_codegen::settings::Flags;
 
     use super::{CraneliftObjectBackend, cranelift_opt_level};
-    use crate::{backend::BackendOptions, compile::OptLevel};
+    use crate::{
+        backend::{Backend, BackendOptions},
+        compile::OptLevel,
+        optim::Pipeline,
+    };
+
+    #[test]
+    fn native_backends_use_native_pipelines() {
+        for opt_level in [OptLevel::O0, OptLevel::O1, OptLevel::Os, OptLevel::O2] {
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    CraneliftObjectBackend.pipeline(&BackendOptions { opt_level })
+                ),
+                format!("{:?}", Pipeline::native(opt_level)),
+            );
+            #[cfg(feature = "cranelift-jit")]
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    super::CraneliftJitBackend.pipeline(&BackendOptions { opt_level })
+                ),
+                format!("{:?}", Pipeline::native(opt_level)),
+            );
+        }
+    }
 
     #[test]
     fn object_and_jit_flags_enable_direct_i128_signatures() {
@@ -308,6 +339,16 @@ mod tests {
                 );
                 assert!(flags.enable_llvm_abi_extensions());
             }
+        }
+    }
+
+    #[test]
+    fn cranelift_verifier_runs_with_debug_assertions() {
+        for opt_level in [OptLevel::O0, OptLevel::O2] {
+            let flags = Flags::new(
+                CraneliftObjectBackend::flag_builder(&BackendOptions { opt_level }, true).unwrap(),
+            );
+            assert_eq!(flags.enable_verifier(), cfg!(debug_assertions));
         }
     }
 
