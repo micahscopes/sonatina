@@ -419,16 +419,38 @@ impl Emit<'_> {
             Arith::Add => self.pick_cmp(int, Operator::I32LtU, Operator::I64LtU, &[raw, lhs]),
             Arith::Sub => self.pick_cmp(int, Operator::I32LtU, Operator::I64LtU, &[lhs, rhs]),
             Arith::Mul => {
-                // Only i64 reaches here. The product wrapped iff lhs != 0 and
-                // (lhs * rhs) / lhs != rhs. A zero divisor is replaced by one
-                // so that the division is total.
-                let lhs_zero = self.op(Operator::I64Eqz, &[lhs], WType::I32);
-                let lhs_zero_word = self.op(Operator::I64ExtendI32U, &[lhs_zero], WType::I64);
-                let divisor = self.op(Operator::I64Or, &[lhs, lhs_zero_word], WType::I64);
-                let quotient = self.op(Operator::I64DivU, &[raw, divisor], WType::I64);
-                let mismatch = self.op(Operator::I64Ne, &[quotient, rhs], WType::I32);
-                let lhs_nonzero = self.op(Operator::I32Eqz, &[lhs_zero], WType::I32);
-                self.op(Operator::I32And, &[mismatch, lhs_nonzero], WType::I32)
+                // Only i64 reaches here. Write each operand as hi * 2^32 + lo.
+                // The product overflows iff both high halves are nonzero, or a
+                // cross product (hi * lo) does not fit 32 bits, or adding the
+                // two cross products shifted up by 32 carries out of 64 bits
+                // when the low product is added. This costs three multiplications
+                // and no division.
+                let shift = self.c64(32);
+                let mask = self.c64(0xffff_ffff);
+                let zero = self.c64(0);
+                let lhs_hi = self.op(Operator::I64ShrU, &[lhs, shift], WType::I64);
+                let rhs_hi = self.op(Operator::I64ShrU, &[rhs, shift], WType::I64);
+                let lhs_lo = self.op(Operator::I64And, &[lhs, mask], WType::I64);
+                let rhs_lo = self.op(Operator::I64And, &[rhs, mask], WType::I64);
+                let lhs_has_hi = self.op(Operator::I64Ne, &[lhs_hi, zero], WType::I32);
+                let rhs_has_hi = self.op(Operator::I64Ne, &[rhs_hi, zero], WType::I32);
+                let both_hi = self.op(Operator::I32And, &[lhs_has_hi, rhs_has_hi], WType::I32);
+                let cross_a = self.op(Operator::I64Mul, &[lhs_hi, rhs_lo], WType::I64);
+                let cross_b = self.op(Operator::I64Mul, &[lhs_lo, rhs_hi], WType::I64);
+                let cross = self.op(Operator::I64Add, &[cross_a, cross_b], WType::I64);
+                // Each cross product is below 2^64; when either has bits above 32
+                // the sum is certainly too large, so test them together with
+                // the sum itself.
+                let cross_a_hi = self.op(Operator::I64ShrU, &[cross_a, shift], WType::I64);
+                let cross_b_hi = self.op(Operator::I64ShrU, &[cross_b, shift], WType::I64);
+                let cross_hi = self.op(Operator::I64Or, &[cross_a_hi, cross_b_hi], WType::I64);
+                let cross_sum_hi = self.op(Operator::I64ShrU, &[cross, shift], WType::I64);
+                let cross_big = self.op(Operator::I64Or, &[cross_hi, cross_sum_hi], WType::I64);
+                let cross_overflow = self.op(Operator::I64Ne, &[cross_big, zero], WType::I32);
+                let cross_up = self.op(Operator::I64Shl, &[cross, shift], WType::I64);
+                let carry = self.op(Operator::I64LtU, &[raw, cross_up], WType::I32);
+                let any_cross = self.op(Operator::I32Or, &[both_hi, cross_overflow], WType::I32);
+                self.op(Operator::I32Or, &[any_cross, carry], WType::I32)
             }
         };
         (raw, overflow)

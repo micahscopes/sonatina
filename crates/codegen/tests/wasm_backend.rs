@@ -122,6 +122,10 @@ fn operands(width: u32) -> Vec<u64> {
         0x8000_0000,
         0xffff_ffff,
         0x1_0000_0000,
+        0x1_0000_0001,
+        0x1_ffff_ffff,
+        0xffff_ffff_0000_0000,
+        0xffff_ffff_ffff_fffe,
         0xdead_beef,
     ];
     values.retain(|v| *v <= top);
